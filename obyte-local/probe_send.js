@@ -11,7 +11,7 @@ const { Network } = Testkit({
   NETWORK_PORT: 16619,
 });
 
-setTimeout(() => { console.log("TIMEOUT: sendMulti never resolved in 30s"); process.exit(2); }, 30000).unref();
+setTimeout(() => { console.log("TIMEOUT: sendMulti never resolved in 120s"); process.exit(2); }, 120000).unref();
 
 (async () => {
   const network = await Network.create()
@@ -19,6 +19,17 @@ setTimeout(() => { console.log("TIMEOUT: sendMulti never resolved in 30s"); proc
     .run();
   console.log("network up");
   const w = network.wallet.t;
+  // if batch.json exists, post the COMPACT summary (what provider posts)
+  const fs = require("fs");
+  const bf = path.join(__dirname, "stress-out/batch.json");
+  let data;
+  if (fs.existsSync(bf)) {
+    const full = JSON.parse(fs.readFileSync(bf, "utf8"));
+    data = { chain_id: full.chain_id, height: full.height, prev_state_hash: full.prev_state_hash, state_root: full.state_root, last_unit: full.last_unit, seq: full.seq, fill_count: full.fill_count, fills_hash: full.fills_hash, unit_ids: full.unit_ids };
+  } else {
+    data = { probe: 1, t: Date.now() };
+  }
+  console.log("payload bytes:", JSON.stringify(data).length);
   // proper obyte object rules (same as post_real_batch.js)
   function getLength(value) {
     const cache = new WeakMap();
@@ -57,7 +68,6 @@ setTimeout(() => { console.log("TIMEOUT: sendMulti never resolved in 30s"); proc
     return s(obj);
   }
   const crypto = require("crypto");
-  const data = { probe: 1, t: Date.now() };
   const msg = {
     app: "temp_data",
     payload_location: "inline",

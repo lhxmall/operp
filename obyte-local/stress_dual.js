@@ -211,12 +211,26 @@ async function main() {
         const bf = path.join(OUT, "batch.json");
         let data;
         if (fs.existsSync(bf)) {
-          data = JSON.parse(fs.readFileSync(bf, "utf8"));
+          const full = JSON.parse(fs.readFileSync(bf, "utf8"));
+          // compact on-chain summary: ocore cannot validate huge inline payloads
+          // (312KB never resolves); full reveal stays off-chain per OIP-0007.
+          data = {
+            chain_id: full.chain_id,
+            height: full.height,
+            prev_state_hash: full.prev_state_hash,
+            state_root: full.state_root,
+            last_unit: full.last_unit,
+            seq: full.seq,
+            fill_count: full.fill_count,
+            fills_hash: full.fills_hash,
+            unit_ids: full.unit_ids,
+          };
         } else {
           data = { chain_id: "odex-mvp-1", height, prev_state_hash: "00".repeat(32), state_root: ("11" + height).slice(0, 64).padEnd(64, "0"), fills_hash: "ff".repeat(32), fill_count: 0, unit_ids: [] };
         }
-        // 1) post to main chain as temp_data
+        console.log(`[provider] posting h=${data.height} units=${(data.unit_ids || []).length} bytes=${JSON.stringify(data).length}`);
         const mu = await W.provider.sendMulti({ messages: [tempDataMessage(data)] });
+        if (mu.error) throw new Error("sendMulti: " + mu.error);
         stats.main_units++;
         // 2) submit+lock into AA (accelerate via timetravel)
         try {
