@@ -243,18 +243,21 @@ mod tests {
     #[test]
     fn margin_ratio_liq_boundary() {
         let mut a = Account::new(AccountId([1; 32]));
-        a.apply_fill(Side::Bid, true, 100 * PRICE_SCALE, QTY_SCALE, BTC_USD)
+        a.apply_fill(Side::Bid, true, 2_000 * PRICE_SCALE, QTY_SCALE, BTC_USD)
             .unwrap();
-        let mark = 100 * PRICE_SCALE;
+        let mark = 2_000 * PRICE_SCALE;
         let mm = a.snapshot(&marks(mark)).mm;
-        assert_eq!(mm, 5 * USD_SCALE as i128);
-        a.collateral = 105 * USD_SCALE as i128 / 20;
+        assert_eq!(mm, 100 * USD_SCALE as i128);
+        a.collateral = 105 * USD_SCALE as i128;
         a.realized_pnl = 0;
         let s = a.snapshot(&marks(mark));
-        assert!(!s.liquidatable);
-        a.collateral = 104 * USD_SCALE as i128 / 20;
+        assert!(s.liquidatable);
+        a.collateral = 104 * USD_SCALE as i128;
         let s = a.snapshot(&marks(mark));
         assert!(s.liquidatable);
+        a.collateral = 106 * USD_SCALE as i128;
+        let s = a.snapshot(&marks(mark));
+        assert!(!s.liquidatable);
     }
 
     #[test]

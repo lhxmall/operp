@@ -2,7 +2,7 @@ mod aa;
 
 pub use aa::{AaStateNames, AA_STATE, BOUNCE_FEES, AA_CHALLENGE_SECS, AA_STABILITY_SECS};
 
-use odex_dag::{Unit, Unit as DagUnit};
+use odex_dag::Unit;
 use odex_exec::Engine;
 use odex_state::{verify_proof, MerkleProof};
 use odex_types::{
@@ -23,7 +23,7 @@ pub struct Checkpoint {
     pub fill_count: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Batch {
     pub chain_id: String,
     pub checkpoint: Checkpoint,
@@ -201,11 +201,6 @@ pub fn check_withdraw(claim: &WithdrawClaim, finalized_root: [u8; 32]) -> Result
     Ok(())
 }
 
-impl Engine {
-    pub fn checkpoint_units(&self, prev: &odex_state::ChainState, applied: &[UnitId]) -> Result<Batch, SettleError> {
-        Batch::from_applied(prev, self, applied)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -386,9 +381,6 @@ mod tests {
         assert!(pick_stable_winner(h, &[none]).is_none());
     }
 
-    #[allow(dead_code)]
-    fn _use_dag_unit(_: &DagUnit) {}
-
     #[test]
     fn events_are_optimistic() {
         let (eng, _, _, _) = seed_trade();
@@ -397,5 +389,33 @@ mod tests {
                 assert_eq!(*status, ExecStatus::Optimistic);
             }
         }
+    }
+
+    #[test]
+    fn optimistic_then_checkpoint() {
+        let (eng, mut pre, applied, prev_root) = seed_trade();
+        let alice = acct_of(&sk(1));
+        let bob = acct_of(&sk(2));
+        let qty = QTY_SCALE as i64;
+        assert_eq!(eng.state.accounts.get(&alice).unwrap().positions[&BTC_USD].qty, qty);
+        assert_eq!(eng.state.accounts.get(&bob).unwrap().positions[&BTC_USD].qty, -qty);
+        assert_eq!(
+            *eng.state.marks.get(&BTC_USD).unwrap(),
+            100_000 * PRICE_SCALE
+        );
+        let fills: Vec<_> = eng
+            .log
+            .iter()
+            .filter_map(|e| match e {
+                odex_exec::ExecEvent::Applied { fills, status, .. } if !fills.is_empty() => {
+                    assert_eq!(*status, ExecStatus::Optimistic);
+                    Some(fills.len())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fills.iter().sum::<usize>(), 1);
+        let batch = Batch::from_applied(&pre.state, &eng, &applied).unwrap();
+        batch.validate_against(prev_root, &mut pre).unwrap();
     }
 }

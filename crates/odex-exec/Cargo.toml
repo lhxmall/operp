@@ -14,4 +14,3 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
-odex-settle = { workspace = true }

@@ -38,7 +38,7 @@ pub enum Op {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unit {
     pub parents: Vec<UnitId>,
     pub op: Op,

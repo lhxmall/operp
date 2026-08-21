@@ -1,12 +1,11 @@
 use odex_account::AccountError;
 use odex_book::{BookError, Fill, Order};
-use odex_dag::{unit_id, verify_sig, Dag, DagError, Op, Unit};
+use odex_dag::{verify_sig, Dag, DagError, Op, Unit};
 use odex_state::ChainState;
 use odex_types::{
     bps, liq_order_id, notional_usd, order_id, AccountId, ExecStatus, OrderId, OrderType, Qty, Seq,
     Side, TimeInForce, UnitId, Usd, IM_RATE_BPS, BTC_USD,
 };
-use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct Engine {
@@ -551,7 +550,7 @@ mod tests {
         let g = genesis_id();
         let alice = sk(1);
         let bob = sk(2);
-        let d1 = deposit(vec![g], &alice, 6_000 * USD_SCALE as i128, 1);
+        let d1 = deposit(vec![g], &alice, 15_000 * USD_SCALE as i128, 1);
         let id1 = unit_id(&d1);
         eng.ingest(d1).unwrap();
         let d2 = deposit(vec![id1], &bob, 1_000_000 * USD_SCALE as i128, 2);
