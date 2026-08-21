@@ -1,0 +1,137 @@
+{
+	bounce_fees: { base: 10000 },
+	messages: {
+		cases: [
+			{
+				if: "{trigger.data.deposit}",
+				init: "{
+					$paid = trigger.output[[asset=base]] - 10000;
+					if ($paid <= 0)
+						bounce('deposit too small');
+					$k = 'bal_' || trigger.address;
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							if (!var['boot']){
+								var['boot'] = 1;
+								var['chain_id'] = 'odex-mvp-1';
+								var['last_locked'] = 0;
+								var['last_finalized'] = 0;
+							}
+							var['bal_' || trigger.address] = var['bal_' || trigger.address] + trigger.output[[asset=base]] - 10000;
+						}"
+					}
+				]
+			},
+			{
+				if: "{trigger.data.submit}",
+				init: "{
+					if (trigger.data.chain_id != 'odex-mvp-1')
+						bounce('bad chain');
+					$h = trigger.data.height;
+					if ($h != var['last_locked'] + 1)
+						bounce('bad height');
+					if (var['last_locked'] > 0 AND trigger.data.prev_state_hash != var['root_' || var['last_locked']])
+						bounce('prev mismatch');
+					if (var['cand_root_' || $h])
+						bounce('candidate exists');
+					if (!trigger.data.state_root)
+						bounce('no root');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							var['cand_root_' || trigger.data.height] = trigger.data.state_root;
+							var['cand_prev_' || trigger.data.height] = trigger.data.prev_state_hash;
+							var['cand_fills_' || trigger.data.height] = trigger.data.fills_hash;
+							var['cand_unit_' || trigger.data.height] = trigger.unit;
+							var['cand_who_' || trigger.data.height] = trigger.address;
+						}"
+					}
+				]
+			},
+			{
+				if: "{trigger.data.lock}",
+				init: "{
+					$h = trigger.data.height;
+					if (!var['cand_root_' || $h])
+						bounce('no candidate');
+					if (var['root_' || $h])
+						bounce('already locked');
+					if ($h != var['last_locked'] + 1)
+						bounce('bad lock height');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							var['root_' || trigger.data.height] = var['cand_root_' || trigger.data.height];
+							var['winner_' || trigger.data.height] = var['cand_unit_' || trigger.data.height];
+							var['stable_at_' || trigger.data.height] = timestamp;
+							var['last_locked'] = trigger.data.height;
+						}"
+					}
+				]
+			},
+			{
+				if: "{trigger.data.challenge}",
+				init: "{
+					$h = trigger.data.height;
+					if (!var['root_' || $h])
+						bounce('not locked');
+					if (var['frozen_' || $h])
+						bounce('already frozen');
+					if (trigger.output[[asset=base]] < 20000)
+						bounce('bond');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							var['frozen_' || trigger.data.height] = 1;
+						}"
+					}
+				]
+			},
+			{
+				if: "{trigger.data.withdraw}",
+				init: "{
+					$h = var['last_locked'];
+					if ($h <= 0)
+						bounce('not locked');
+					if (var['frozen_' || $h])
+						bounce('frozen');
+					$amt = trigger.data.amount;
+					if ($amt <= 0)
+						bounce('bad amount');
+					$bal = var['bal_' || trigger.address];
+					if ($amt > $bal)
+						bounce('insufficient');
+				}",
+				messages: [
+					{
+						app: "payment",
+						payload: {
+							asset: "base",
+							outputs: [
+								{
+									address: "{trigger.address}",
+									amount: "{trigger.data.amount}"
+								}
+							]
+						}
+					},
+					{
+						app: "state",
+						state: "{
+							var['bal_' || trigger.address] = var['bal_' || trigger.address] - trigger.data.amount;
+						}"
+					}
+				]
+			}
+		]
+	}
+}

@@ -14,3 +14,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+odex-settle = { path = "../odex-settle" }

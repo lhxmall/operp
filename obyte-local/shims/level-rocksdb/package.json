@@ -1,0 +1,5 @@
+{
+  "name": "level-rocksdb",
+  "version": "5.0.0-shim",
+  "main": "index.js"
+}

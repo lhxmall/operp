@@ -3,3 +3,10 @@
 .idea/
 .vscode/
 *.pdb
+/vendor
+/obyte-local/node_modules
+/obyte-local/testdata
+/obyte-local/package-lock.json
+
+/obyte-local/testdata-stress
+/obyte-local/stress-out

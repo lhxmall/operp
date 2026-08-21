@@ -204,11 +204,14 @@ name = "odex-exec"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "hex",
  "odex-account",
  "odex-book",
  "odex-dag",
+ "odex-settle",
  "odex-state",
  "odex-types",
+ "serde_json",
  "thiserror",
 ]
 

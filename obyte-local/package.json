@@ -1,0 +1,17 @@
+{
+  "name": "odex-obyte-local",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local Obyte DAG + temp_data batch poster for odex",
+  "main": "post_temp_data.js",
+  "scripts": {
+    "post-batch": "node post_temp_data.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "aa-testkit": "file:../vendor/aa-testkit",
+    "ocore": "git+https://github.com/byteball/ocore.git"
+  }
+}
