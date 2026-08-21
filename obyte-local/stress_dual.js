@@ -232,26 +232,28 @@ async function main() {
         const mu = await W.provider.sendMulti({ messages: [tempDataMessage(data)] });
         if (mu.error) throw new Error("sendMulti: " + mu.error);
         stats.main_units++;
+        console.log(`[provider] posted h=${data.height} main_unit=${String(mu.unit).slice(0, 12)}`);
         // 2) submit+lock into AA (accelerate via timetravel)
         try {
           const su = await trigger("provider", {
-            submit: 1, chain_id: "odex-mvp-1", height,
+            submit: 1, chain_id: "odex-mvp-1", height: data.height,
             prev_state_hash: data.prev_state_hash || "0",
-            state_root: data.state_root || "stress_root_" + height,
+            state_root: data.state_root || "stress_root_" + data.height,
             fills_hash: data.fills_hash || "0",
           }, 100000);
           await network.timetravel({ shift: "11m" });
           await network.witnessUntilStable(su);
-          const lu = await trigger("provider", { lock: 1, height }, 100000);
+          const lu = await trigger("provider", { lock: 1, height: data.height }, 100000);
           await network.witnessUntilStable(lu);
           stats.aa_ok += 2;
-          console.log(`[provider] height ${height} submitted+locked, main_unit=${mu.slice(0, 12)}`);
+          console.log(`[provider] AA locked h=${data.height}`);
         } catch (e) {
           stats.aa_bounced++;
-          console.log(`[provider] aa err h=${height}`, e.message);
+          console.log(`[provider] aa err h=${data.height}`, e.message);
         }
         stats.side_batches++;
-        height++;
+        stats.side_units_total += (data.unit_ids || []).length;
+        height = data.height + 1;
       } catch (e) { console.log("[provider] err", e.message); }
     }
   })();
