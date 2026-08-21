@@ -30,28 +30,33 @@ const RUN_MS = 20 * 60 * 1000;
 const ORDER_PROVIDER_MS = 5 * 60 * 1000;
 const FORK_EVERY_MS = 30 * 1000;
 
-/* ---------- obyte object hash (same as post_real_batch) ---------- */
 function getLength(value, bWithKeys) {
   const cache = new WeakMap();
   function _getLength(v) {
+    if (v === null) return 0;
     switch (typeof v) {
-      case "string": return v.length + 1;
+      case "string":
+        return v.length;
       case "number":
-        if (!isFinite(v)) throw Error("invalid number");
-        return 8 + (v % 1 ? Math.ceil(Math.log(Math.abs(v)) / Math.log(10)) : String(v).length + 1);
-      case "boolean": return 1;
-      case "object":
-        if (v === null) throw Error("invalid type null");
+        return 8;
+      case "boolean":
+        return 1;
+      case "object": {
         if (cache.has(v)) return cache.get(v);
-        let len = v instanceof Array ? 0 : bWithKeys ? Object.keys(v).length : 0;
-        if (bWithKeys && !(v instanceof Array)) {
-          for (const k of Object.keys(v)) len += k.length + 1 + _getLength(v[k]);
-        } else if (v instanceof Array) {
-          for (const item of v) len += _getLength(item);
+        let len = 0;
+        if (Array.isArray(v)) {
+          for (const el of v) len += _getLength(el);
+        } else {
+          for (const key of Object.keys(v)) {
+            if (bWithKeys) len += key.length;
+            len += _getLength(v[key]);
+          }
         }
         cache.set(v, len);
         return len;
-      default: throw Error("invalid type " + typeof v);
+      }
+      default:
+        throw new Error("unknown type");
     }
   }
   return _getLength(value);
