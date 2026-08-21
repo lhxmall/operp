@@ -1,0 +1,11 @@
+[package]
+name = "odex-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+odex-types = { workspace = true }
+odex-book = { workspace = true }
+odex-account = { workspace = true }
+sha2 = { workspace = true }

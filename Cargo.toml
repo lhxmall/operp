@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/odex-types",
+  "crates/odex-book",
+  "crates/odex-account",
+  "crates/odex-dag",
+  "crates/odex-state",
+  "crates/odex-exec",
+  "crates/odex-settle",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+sha2 = "0.10"
+ed25519-dalek = "2"
+hex = "0.4"
+odex-types = { path = "crates/odex-types" }
+odex-book = { path = "crates/odex-book" }
+odex-account = { path = "crates/odex-account" }
+odex-dag = { path = "crates/odex-dag" }
+odex-state = { path = "crates/odex-state" }
+odex-exec = { path = "crates/odex-exec" }
+odex-settle = { path = "crates/odex-settle" }

@@ -1,0 +1,17 @@
+[package]
+name = "odex-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+odex-types = { workspace = true }
+odex-book = { workspace = true }
+odex-account = { workspace = true }
+odex-dag = { workspace = true }
+odex-state = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+odex-settle = { workspace = true }
