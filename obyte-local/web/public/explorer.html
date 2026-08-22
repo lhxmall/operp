@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ODEX · Explorer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0d0f12; --panel: #14171c; --panel2: #181c22; --line: #232830;
+      --ink: #e8ecf1; --dim: #8b93a1; --up: #26a69a; --down: #ef5350;
+      --acc: #4a9eff; --warn: #e5a50a; --mc: #d4a017;
+      --mono: "IBM Plex Mono", ui-monospace, monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body { background: var(--bg); color: var(--ink); font: 13px/1.5 "IBM Plex Sans", system-ui, sans-serif; display: flex; flex-direction: column; overflow: hidden; }
+    .top {
+      display: flex; align-items: center; gap: 16px; padding: 0 16px; height: 46px; flex: none;
+      border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap;
+    }
+    .logo { font-weight: 600; letter-spacing: .18em; }
+    .tag { font-size: 11px; padding: 2px 8px; border-radius: 3px; background: rgba(74,158,255,.14); color: var(--acc); letter-spacing: .08em; }
+    .stat { display: flex; flex-direction: column; }
+    .stat .k { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .08em; }
+    .stat .v { font-family: var(--mono); font-size: 12px; }
+    .spacer { flex: 1; }
+    .nav a { color: var(--dim); text-decoration: none; padding: 6px 12px; border-radius: 4px; }
+    .nav a.on, .nav a:hover { color: var(--ink); background: var(--panel2); }
+    @media (max-width: 900px) {
+      .drawer { width: 100%; right: auto; left: 100%; transform: none; }
+      .drawer.open { right: auto; left: 0; }
+    }
+    .legend { display: flex; gap: 14px; align-items: center; font-size: 11px; color: var(--dim); }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+    main { flex: 1; position: relative; min-height: 0; overflow: hidden; }
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; }
+    canvas.dragging { cursor: grabbing; }
+    /* detail drawer */
+    .drawer {
+      position: absolute; top: 0; right: -420px; width: 420px; bottom: 0;
+      background: var(--panel); border-left: 1px solid var(--line);
+      transition: right .25s ease; z-index: 10; overflow-y: auto;
+    }
+    .drawer.open { right: 0; }
+    .drawer h3 {
+      font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--dim);
+      padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel2);
+      display: flex; justify-content: space-between; position: sticky; top: 0;
+    }
+    .kv { padding: 12px 16px; display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-family: var(--mono); font-size: 12px; }
+    .kv b { color: var(--dim); font-weight: 400; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; }
+    .kv a, .kv span.lnk { color: var(--acc); cursor: pointer; word-break: break-all; text-decoration: none; }
+    pre.json {
+      margin: 0 16px 16px; font-family: var(--mono); font-size: 11px; line-height: 1.55;
+      background: var(--bg); border-radius: 6px; padding: 12px; overflow: auto; max-height: 300px;
+      white-space: pre-wrap; word-break: break-all;
+    }
+    .close { cursor: pointer; color: var(--ink); background: none; border: none; font-size: 16px; }
+    .tooltip {
+      position: fixed; pointer-events: none; background: var(--panel2); border: 1px solid var(--line);
+      border-radius: 5px; padding: 8px 10px; font-family: var(--mono); font-size: 11px;
+      opacity: 0; transition: opacity .12s; max-width: 340px; word-break: break-all; z-index: 20;
+    }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <span class="logo">ODEX</span><span class="tag">EXPLORER</span>
+    <div class="stat"><span class="k">units</span><span class="v" id="sUnits">—</span></div>
+    <div class="stat"><span class="k">mci</span><span class="v" id="sMci">—</span></div>
+    <div class="stat"><span class="k">stable</span><span class="v" id="sStable">—</span></div>
+    <div class="legend">
+      <span><span class="dot" style="background:var(--mc)"></span>主链</span>
+      <span><span class="dot" style="background:var(--acc)"></span>侧枝</span>
+      <span><span class="dot" style="background:#5a6270"></span>未稳定</span>
+      <span style="color:var(--up)">◎ = AA 动作</span>
+    </div>
+    <div class="spacer"></div>
+    <nav class="nav">
+      <a href="/trade.html">交易</a>
+      <a href="/admin.html">管理</a>
+      <a class="on" href="/explorer.html">浏览器</a>
+    </nav>
+  </div>
+
+  <main id="main">
+    <canvas id="cv"></canvas>
+    <div class="drawer" id="drawer">
+      <h3>Unit 详情<button class="close" id="btnClose">×</button></h3>
+      <div class="kv" id="uKv"></div>
+      <h3>Messages</h3>
+      <pre class="json" id="uMsgs">—</pre>
+    </div>
+    <div class="tooltip" id="tip"></div>
+  </main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const cv = $("cv"), g = cv.getContext("2d");
+const tip = $("tip");
+
+let units = [];
+let layout = new Map();
+let view = { x: 0, y: 0, s: 1 };
+let selected = null;
+
+async function j(url) {
+  const r = await fetch(url);
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || r.status);
+  return d;
+}
+
+function computeLayout(us) {
+  const byLevel = new Map();
+  for (const u of us) {
+    if (!byLevel.has(u.level)) byLevel.set(u.level, []);
+    byLevel.get(u.level).push(u);
+  }
+  const levels = [...byLevel.keys()].sort((a, b) => a - b);
+  if (!levels.length) return new Map();
+  const minL = levels[0];
+  const COLW = 46, ROWH = 34;
+  const out = new Map();
+  for (const lv of levels) {
+    const col = lv - minL;
+    const list = byLevel.get(lv);
+    list.sort((a, b) => String(a.unit).localeCompare(String(b.unit)));
+    list.forEach((u, i) => {
+      out.set(u.unit, { x: col * COLW, y: (i - (list.length - 1) / 2) * ROWH });
+    });
+  }
+  return out;
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = cv.clientWidth * dpr;
+  cv.height = cv.clientHeight * dpr;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function draw() {
+  resize();
+  const w = cv.clientWidth, h = cv.clientHeight;
+  g.clearRect(0, 0, w, h);
+  const cx = w / 2 + view.x, cy = h / 2 + view.y;
+
+  g.lineWidth = 1;
+  for (const u of units) {
+    const a = layout.get(u.unit);
+    if (!a) continue;
+    for (const p of u.parents) {
+      const b = layout.get(p);
+      if (!b) continue;
+      const ax = cx + a.x * view.s, ay = cy + a.y * view.s;
+      const bx = cx + b.x * view.s, by = cy + b.y * view.s;
+      const isSelEdge = selected && (u.unit === selected || p === selected);
+      g.strokeStyle = isSelEdge ? "#4a9eff" : u.mc ? "rgba(212,160,23,.35)" : "rgba(139,147,161,.22)";
+      g.beginPath();
+      const mx = (ax + bx) / 2;
+      g.moveTo(ax, ay);
+      g.bezierCurveTo(mx, ay, mx, by, bx, by);
+      g.stroke();
+    }
+  }
+
+  for (const u of units) {
+    const p = layout.get(u.unit);
+    if (!p) continue;
+    const x = cx + p.x * view.s, y = cy + p.y * view.s;
+    if (x < -30 || x > w + 30 || y < -30 || y > h + 30) continue;
+    let color = "#4a9eff";
+    if (u.mc) color = "#d4a017";
+    if (!u.st) color = u.mc ? "#8a6d1f" : "#5a6270";
+    if (selected === u.unit) color = "#ffffff";
+    const r = u.mc ? 5.5 : 4;
+    g.beginPath();
+    g.arc(x, y, r, 0, Math.PI * 2);
+    g.fillStyle = color;
+    g.fill();
+    if (u.apps.some(a => !["pay", "feed", "def"].includes(a))) {
+      g.beginPath();
+      g.arc(x, y, r + 3, 0, Math.PI * 2);
+      g.strokeStyle = "rgba(38,166,154,.7)";
+      g.lineWidth = 1.5;
+      g.stroke();
+    }
+    if (u.mc && u.mci % 10 === 0 && view.s > 0.5) {
+      g.fillStyle = "rgba(212,160,23,.8)";
+      g.font = "9px IBM Plex Mono";
+      g.fillText(u.mci, x - 8, y + 18);
+    }
+  }
+  requestAnimationFrame(draw);
+}
+
+let drag = null;
+cv.addEventListener("mousedown", (e) => { drag = { x: e.clientX, y: e.clientY }; cv.classList.add("dragging"); });
+window.addEventListener("mouseup", () => { drag = null; cv.classList.remove("dragging"); });
+window.addEventListener("mousemove", (e) => {
+  if (drag) {
+    view.x += e.clientX - drag.x;
+    view.y += e.clientY - drag.y;
+    drag = { x: e.clientX, y: e.clientY };
+    return;
+  }
+  const rect = cv.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  const cx = w / 2 + view.x, cy = h / 2 + view.y;
+  let hit = null;
+  for (const u of units) {
+    const p = layout.get(u.unit);
+    if (!p) continue;
+    const x = cx + p.x * view.s, y = cy + p.y * view.s;
+    if ((mx - x) ** 2 + (my - y) ** 2 <= 81) { hit = u; break; }
+  }
+  if (hit) {
+    cv.style.cursor = "pointer";
+    tip.style.opacity = 1;
+    tip.style.left = e.clientX + 12 + "px";
+    tip.style.top = e.clientY + 12 + "px";
+    tip.innerHTML = `<b style="color:${hit.mc ? "#d4a017" : "#4a9eff"}">${hit.unit.slice(0, 12)}…</b><br>` +
+      `mci ${hit.mci ?? "—"} · level ${hit.level} · ${hit.st ? "stable" : "pending"}<br>` +
+      hit.apps.map(a => `<span style="color:#26a69a">${a}</span>`).join(" ");
+  } else {
+    cv.style.cursor = "";
+    tip.style.opacity = 0;
+  }
+});
+cv.addEventListener("click", (e) => {
+  const rect = cv.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  const cx = w / 2 + view.x, cy = h / 2 + view.y;
+  for (const u of units) {
+    const p = layout.get(u.unit);
+    if (!p) continue;
+    const x = cx + p.x * view.s, y = cy + p.y * view.s;
+    if ((mx - x) ** 2 + (my - y) ** 2 <= 81) {
+      selected = u.unit;
+      openDetail(u.unit);
+      return;
+    }
+  }
+});
+cv.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  view.s *= e.deltaY < 0 ? 1.1 : 0.9;
+  view.s = Math.min(4, Math.max(0.15, view.s));
+}, { passive: false });
+
+$("btnClose").onclick = () => { $("drawer").classList.remove("open"); selected = null; };
+
+async function openDetail(unit) {
+  $("drawer").classList.add("open");
+  try {
+    const d = await j("/api/ex/unit?unit=" + encodeURIComponent(unit));
+    const u = d.unit;
+    $("uKv").innerHTML = `
+      <b>unit</b><span>${unit}</span>
+      <b>mci</b><span>${u.main_chain_index ?? "—"}</span>
+      <b>level</b><span>${u.level}</span>
+      <b>stable</b><span>${u.is_stable ? "yes" : "no"} · ${u.sequence}</span>
+      <b>time</b><span>${u.timestamp ? new Date(u.timestamp * 1000).toLocaleString("zh-CN", { hour12: false }) : "—"}</span>
+      <b>authors</b><span>${d.authors.join("<br>") || "—"}</span>
+      <b>ball</b><span>${d.ball ? d.ball.ball : "—"}</span>
+      <b>parents</b><span>${d.parents.map((p) => `<span class="lnk" data-u="${p}">${p.slice(0, 24)}…</span>`).join("<br>") || "—"}</span>
+      <b>children</b><span>${d.children.map((p) => `<span class="lnk" data-u="${p}">${p.slice(0, 24)}…</span>`).join("<br>") || "—"}</span>`;
+    $("uKv").querySelectorAll("[data-u]").forEach((el) =>
+      el.addEventListener("click", () => openDetail(el.dataset.u)));
+    $("uMsgs").textContent = d.messages.map((m) =>
+      `[${m.message_index}] app=${m.app} (${m.payload_location})\n${(m.payload || "").slice(0, 800) || "(no inline payload)"}`
+    ).join("\n\n") || "(none)";
+  } catch (err) {
+    $("uMsgs").textContent = "加载失败: " + err.message;
+  }
+}
+
+let lastCount = -1;
+async function refresh() {
+  try {
+    const d = await j("/api/ex/dag");
+    units = d.units;
+    layout = computeLayout(units);
+    $("sUnits").textContent = units.length;
+    $("sMci").textContent = Math.max(0, ...units.map((u) => u.mci || 0));
+    $("sStable").textContent = units.filter((u) => u.st).length;
+    if (lastCount < 0) fitView();
+    lastCount = units.length;
+  } catch (_) {}
+}
+function fitView() {
+  if (!units.length) return;
+  const xs = [...layout.values()].map((p) => p.x);
+  const ys = [...layout.values()].map((p) => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const w = cv.clientWidth, h = cv.clientHeight;
+  view.s = Math.min((w - 80) / Math.max(1, maxX - minX), (h - 80) / Math.max(1, maxY - minY), 2);
+  view.x = -(minX + maxX) / 2 * view.s;
+  view.y = -(minY + maxY) / 2 * view.s;
+}
+
+(async function boot() {
+  for (let i = 0; i < 60; i++) {
+    try { const hh = await j("/api/ex/health"); if (hh.ok && hh.db === "found") break; } catch (_) {}
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  await refresh();
+  setInterval(refresh, 3000);
+  requestAnimationFrame(draw);
+})();
+document.addEventListener("keydown", (e) => { if (e.key === "f") fitView(); });
+window.addEventListener("resize", () => resize());
+</script>
+</body>
+</html>
