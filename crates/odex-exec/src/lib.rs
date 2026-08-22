@@ -64,17 +64,11 @@ impl Engine {
     }
 
     pub fn ingest(&mut self, unit: Unit) -> Result<Vec<ExecEvent>, ExecError> {
-        let dbg = std::env::var("ODEX_TRACE").map(|v| v == "1").unwrap_or(false);
-        if dbg { eprintln!("TRACE ingest begin"); }
         if !verify_sig(&unit) {
-            if dbg { eprintln!("TRACE bad sig"); }
             return Err(ExecError::BadSig);
         }
         self.dag.insert(unit)?;
-        if dbg { eprintln!("TRACE inserted, linearizing"); }
-        let r = self.apply_ready();
-        if dbg { eprintln!("TRACE applied {}", r.len()); }
-        Ok(r)
+        Ok(self.apply_ready())
     }
 
     pub fn apply_ready(&mut self) -> Vec<ExecEvent> {
