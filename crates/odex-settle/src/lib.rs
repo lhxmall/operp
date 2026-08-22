@@ -128,7 +128,7 @@ impl Batch {
                 height: prev.height + 1,
                 prev_state_hash: prev.state_root(),
                 state_root: engine.state.state_root(),
-                aa_root: odex_state::aa_root_of(&engine.state),
+                aa_root: odex_state::aa_root_of_state(&engine.state),
                 last_unit,
                 seq: engine.state.seq,
                 unit_ids: applied.to_vec(),

@@ -68,13 +68,9 @@ async function triggerRaw(wallet, data, amount) {
     data,
   });
   await network.witnessUntilStable(unit);
-  let resp = null;
-  try {
-    resp = await network.getAaResponseToUnit(unit);
-  } catch (e) {
-    resp = null;
-  }
-  return { unit, response: resp };
+  // network.getAaResponseToUnit resolves { response: { bounced, info, ... } }
+  const res = await network.getAaResponseToUnit(unit);
+  return { unit, response: (res && res.response) || null };
 }
 
 let network;
@@ -95,18 +91,33 @@ async function main() {
   await trigger(alice, { deposit: 1 }, 1e6);
   await trigger(bob, { deposit: 1 }, 2e6);
   let st = await vars();
-  console.log("after deposits: bal_alice =", st["bal_" + (await alice.getAddress())]);
-  if (!(st["bal_" + (await alice.getAddress())] > 0)) throw new Error("deposit not credited");
+  const aliceAddr = await alice.getAddress();
+  console.log("after deposits: bal_alice =", st["bal_" + aliceAddr]);
+  if (!(st["bal_" + aliceAddr] > 0)) throw new Error("deposit not credited");
+
+  // ---------- 1b. generate the REAL withdrawal claim (root committed at submit) ----------
+  require("child_process").execSync(
+    "cargo run -p odex-settle --example gen_withdraw_proof -- " + aliceAddr + " 10000000000",
+    { cwd: path.join(__dirname, ".."), stdio: "inherit" }
+  );
+  const claim = JSON.parse(fs.readFileSync(path.join(__dirname, "withdraw_claim.json"), "utf8"));
+  console.log("claim:", claim.leaf_account, claim.collateral, "aa_root:", claim.aa_root);
+
+  // sanity: recompute the root locally exactly like the AA does
+  let lh = sha256Hex("acct:" + claim.leaf_account + ":" + claim.collateral);
+  for (const s of claim.proof) lh = sha256Hex(s.right ? lh + s.hash : s.hash + lh);
+  if (lh !== claim.aa_root) throw new Error("local proof check mismatch: " + lh);
+  console.log("local proof recheck OK");
 
   // ---------- 2. submit height 1 + candidate replacement ----------
   const submit1 = { submit: 1, chain_id: "odex-mvp-1", height: 1, prev_state_hash: "prev0", state_root: "rootCAND1", aa_root: "aacand1", fills_hash: "f1" };
   await trigger(bob, submit1);
-  // second submit must REPLACE the first (pre-lock)
-  const submit2 = { submit: 1, chain_id: "odex-mvp-1", height: 1, prev_state_hash: "prev0", state_root: "rootFINAL1", aa_root: "aafinal1", fills_hash: "f1" };
+  // second submit must REPLACE the first (pre-lock) — commits the REAL root
+  const submit2 = { submit: 1, chain_id: "odex-mvp-1", height: 1, prev_state_hash: "prev0", state_root: "rootFINAL1", aa_root: claim.aa_root, fills_hash: "f1" };
   await trigger(alice, submit2);
   st = await vars();
   console.log("cand after replacement:", st["cand_root_1"], st["cand_aa_root_1"]);
-  if (st["cand_root_1"] !== "rootFINAL1" || st["cand_aa_root_1"] !== "aafinal1")
+  if (st["cand_root_1"] !== "rootFINAL1" || st["cand_aa_root_1"] !== claim.aa_root)
     throw new Error("candidate replacement failed");
 
   // ---------- 3. early lock must bounce ----------
@@ -116,9 +127,10 @@ async function main() {
   console.log("  early lock bounced as expected");
 
   // ---------- 4. stability window then lock ----------
-  await network.timetravel({ shift: 700 });
+  await network.timetravel({ shift: '700s' });
   const lockRes = await triggerRaw(bob, { lock: 1, height: 1 });
-  console.log("lock response:", JSON.stringify(lockRes.response && lockRes.response.responseVars), "bounced:", lockRes.response && lockRes.response.bounced, JSON.stringify(lockRes.response && lockRes.response.error || lockRes.response && lockRes.response.info));
+  const lr = JSON.stringify(lockRes.response);
+  console.log("lock response tail:", lr.slice(-300));
   st = await vars();
   console.log("after lock: root_1 =", st["root_1"], "last_locked =", st["last_locked"]);
   if (st["root_1"] !== "rootFINAL1" || Number(st["last_locked"]) !== 1) throw new Error("lock failed");
@@ -137,7 +149,7 @@ async function main() {
   if (Number(st["frozen_1"]) !== 1) throw new Error("challenge did not freeze");
   console.log("  frozen_1 =", st.frozen_1, "bond_bob =", st["bond_" + (await bob.getAddress())]);
 
-  await network.timetravel({ shift: 100 });
+  await network.timetravel({ shift: '100s' });
   await trigger(alice, { respond: 1, height: 1, root_confirmed: "rootFINAL1" }, 20000);
   st = await vars();
   if (Number(st["frozen_1"]) !== 0) throw new Error("respond did not unfreeze");
@@ -154,13 +166,13 @@ async function main() {
   // ---------- 8. challenge FAILURE path at height 2 ----------
   // submit+lock height 2 (bogus root), challenge it, never respond.
   await trigger(bob, { submit: 1, chain_id: "odex-mvp-1", height: 2, prev_state_hash: "rootFINAL1", state_root: "rootEVIL2", aa_root: "aaevil2", fills_hash: "f2" });
-  await network.timetravel({ shift: 600 });
+  await network.timetravel({ shift: '600s' });
   await trigger(bob, { lock: 1, height: 2 });
   st = await vars();
   if (st.root_2 !== "rootEVIL2") throw new Error("height2 lock failed");
   await alice.triggerAaWithData({ toAddress: vault, amount: 30000, data: { challenge: 1, height: 2 } })
     .then(async (r) => { if (r.error) throw new Error(r.error); await network.witnessUntilStable(r.unit); });
-  await network.timetravel({ shift: 3600 }); // operator stays silent past the window
+  await network.timetravel({ shift: '3600s' }); // operator stays silent past the window
   const failFin = await triggerRaw(alice, { finalize: 1, height: 2 }, 20000);
   st = await vars();
   console.log("after failed challenge: frozen_2 =", st.frozen_2, "last_locked =", st.last_locked);
@@ -177,19 +189,7 @@ async function main() {
   if (Number(st.last_finalized) !== 1) throw new Error("finalize h1 failed");
   console.log("height 1 finalized");
 
-  // generate a REAL merkle proof from the Rust engine state
-  require("child_process").execSync(
-    "cargo run -p odex-settle --example gen_withdraw_proof",
-    { cwd: path.join(__dirname, ".."), stdio: "inherit" }
-  );
-  const claim = JSON.parse(fs.readFileSync(path.join(__dirname, "withdraw_claim.json"), "utf8"));
-  console.log("claim:", claim.leaf_account, claim.collateral);
-
-  // sanity: recompute the root locally exactly like the AA does
-  let h = sha256Hex("acct:" + claim.leaf_account + ":" + claim.collateral);
-  for (const s of claim.proof) h = sha256Hex(s.right ? h + s.hash : s.hash + h);
-  if (h !== claim.aa_root) throw new Error("local proof check mismatch: " + h);
-  console.log("local proof recheck OK");
+  // claim was generated and its aa_root committed at submit time (section 1b)
 
   // fund the AA enough to pay (it holds deposits from step 1)
   const wdAmount = Math.min(Number(claim.collateral), 900000);
@@ -201,8 +201,8 @@ async function main() {
     collateral: claim.collateral,
     proof: claim.proof,
   });
-  if (JSON.stringify(good).includes("bounced")) {
-    throw new Error("good proof withdrawn bounced: " + JSON.stringify(good).slice(0, 500));
+  if (!(good.response && good.response.bounced === false && good.response.response_unit)) {
+    throw new Error("good proof withdraw did not pay: " + JSON.stringify(good).slice(0, 500));
   }
   console.log("GOOD PROOF WITHDRAWAL PAID");
 

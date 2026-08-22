@@ -1,16 +1,12 @@
 {
-  "aa_root": "60c20d907e86983468470505810bc36cd247ab122ae93b9fddd594736ca3205f",
+  "aa_root": "bf27e37531068a08e5fed1e78139bd13b9e4dcb300742a70be3d8bd82af0a7eb",
   "collateral": "10000000000",
   "height": 1,
-  "leaf_account": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+  "leaf_account": "GBOAKSIVBIERC2D6QON3WCNICAFTTMYU",
   "proof": [
     {
-      "hash": "eae5624c0d59bba63803450e98a37630f1061a5337d1f9c47aca9fb74e634b16",
-      "right": true
-    },
-    {
-      "hash": "02b8da04c1c13046261164215271eff71d47cf69498b024fa0fda16425e94e94",
-      "right": true
+      "hash": "03a349a481b02883fc62abc1fd388e494671ece5277ed86a8f2f894efd9c72aa",
+      "right": false
     }
   ]
 }

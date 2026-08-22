@@ -1,4 +1,4 @@
-use odex_account::Account;
+pub use odex_account::Account;
 use odex_book::{Fill, OrderBook};
 use odex_types::{
     sha256, AccountId, Height, MarketId, Price, Seq, UnitId, Usd, BTC_USD, INSURANCE_ACCOUNT,
@@ -267,15 +267,13 @@ fn merkle_proof_for(mut leaves: Vec<[u8; 32]>, leaf: [u8; 32]) -> (Vec<([u8; 32]
 ///
 /// Oscript's `sha256()` hashes the UTF-8 string of its argument, so the vault
 /// AA can only verify proofs whose nodes are hashes of concatenated hex
-/// strings. This mirrors the byte-level tree above but lives in the hex-text
-/// domain, letting the AA verify withdrawals with pure string ops:
-///   leaf  = sha256_hex("acct:" || account_hex || ":" || collateral_string)
+/// strings. Leaves are keyed by the WITHDRAWAL ADDRESS (an Obyte address
+/// string — the same value the AA compares `leaf_account` against):
+///   leaf  = sha256_hex("acct:" || address || ":" || collateral_decimal)
 ///   node  = sha256_hex(left_hex || right_hex)
-/// The root of this tree is committed to the AA as the batch's `state_root`
-/// companion (`aa_root`); both trees commit identical (account,collateral).
 
-pub fn aa_account_leaf(id: &AccountId, collateral: Usd) -> String {
-    let s = format!("acct:{}:{}", hex::encode(id.0), collateral);
+pub fn aa_account_leaf_str(addr: &str, collateral: Usd) -> String {
+    let s = format!("acct:{}:{}", addr, collateral);
     hex::encode(sha256(s.as_bytes()))
 }
 
@@ -286,12 +284,11 @@ fn aa_parent(l: &str, r: &str) -> String {
     hex::encode(sha256(buf.as_bytes()))
 }
 
-/// Root of the hex-domain tree over all (account, collateral) pairs.
-pub fn aa_root_of(state: &ChainState) -> String {
-    let mut level: Vec<String> = state
-        .accounts
-        .values()
-        .map(|a| aa_account_leaf(&a.id, a.collateral))
+/// Root of the hex-domain tree over (address, collateral) pairs.
+pub fn aa_root_of(pairs: &[(String, Usd)]) -> String {
+    let mut level: Vec<String> = pairs
+        .iter()
+        .map(|(addr, col)| aa_account_leaf_str(addr, *col))
         .collect();
     if level.is_empty() {
         return hex::encode(sha256(b"empty"));
@@ -302,24 +299,22 @@ pub fn aa_root_of(state: &ChainState) -> String {
             let last = level.last().unwrap().clone();
             level.push(last);
         }
-        level = level
-            .chunks(2)
-            .map(|c| aa_parent(&c[0], &c[1]))
-            .collect();
+        level = level.chunks(2).map(|c| aa_parent(&c[0], &c[1])).collect();
     }
     level[0].clone()
 }
 
-/// Proof path for one account in the hex-domain tree: sibling hash + whether
-/// the sibling sits to the RIGHT of the running node at each level.
-pub fn aa_proof_for(state: &ChainState, id: &AccountId) -> Option<(Vec<(String, bool)>, String)> {
-    let mut level: Vec<String> = state
-        .accounts
-        .values()
-        .map(|a| aa_account_leaf(&a.id, a.collateral))
+/// Proof path for one address in the hex-domain tree over `pairs`.
+pub fn aa_proof_for(
+    pairs: &[(String, Usd)],
+    addr: &str,
+) -> Option<(Vec<(String, bool)>, String)> {
+    let mut level: Vec<String> = pairs
+        .iter()
+        .map(|(a, c)| aa_account_leaf_str(a, *c))
         .collect();
+    let leaf = aa_account_leaf_str(addr, pairs.iter().find(|(a, _)| a == addr)?.1);
     level.sort();
-    let leaf = aa_account_leaf(id, state.accounts.get(id)?.collateral);
     let mut idx = level.iter().position(|l| *l == leaf)?;
     let mut siblings = Vec::new();
     while level.len() > 1 {
@@ -333,6 +328,30 @@ pub fn aa_proof_for(state: &ChainState, id: &AccountId) -> Option<(Vec<(String, 
         idx /= 2;
     }
     Some((siblings, level[0].clone()))
+}
+
+/// Root of the hex-domain tree over the sidechain accounts, keyed by each
+/// account's id hex (engine-side convenience wrapper).
+pub fn aa_root_of_state(state: &ChainState) -> String {
+    let pairs: Vec<(String, Usd)> = state
+        .accounts
+        .values()
+        .map(|a| (hex::encode(a.id.0), a.collateral))
+        .collect();
+    aa_root_of(&pairs)
+}
+
+/// Proof path for one sidechain account (id hex key).
+pub fn aa_proof_for_account(
+    state: &ChainState,
+    id: &AccountId,
+) -> Option<(Vec<(String, bool)>, String)> {
+    let pairs: Vec<(String, Usd)> = state
+        .accounts
+        .values()
+        .map(|a| (hex::encode(a.id.0), a.collateral))
+        .collect();
+    aa_proof_for(&pairs, &hex::encode(id.0))
 }
 
 #[cfg(test)]

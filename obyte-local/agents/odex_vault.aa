@@ -224,16 +224,15 @@
 				if: "{trigger.data.withdraw}",
 				init: "{
 					// merkle helpers (each function has its own complexity budget)
-					$fold = ($acc, $sib) => {
-						if (!$sib.hash)
+					$fold = ($acc, $i, $sib) => {
+						if (!$acc OR !$sib.hash)
 							return false;
 						if ($sib.right)
-							return sha256($acc || $sib.hash);
+							return sha256($acc || $sib.hash, 'hex');
 						else
-							return sha256($sib.hash || $acc);
+							return sha256($sib.hash || $acc, 'hex');
 					};
-					$leaf_of = ($addr, $col) => sha256('acct:' || $addr || ':' || $col);
-					// reduce count must be a static literal; 16 levels cover 2^16 accounts
+					$leaf_of = ($addr, $col) => sha256('acct:' || $addr || ':' || $col, 'hex');
 					$root_of = ($leaf, $proof) => reduce($proof, 16, $fold, $leaf);
 					$h = var['last_finalized'];
 					if (!$h OR $h <= 0)
@@ -258,7 +257,7 @@
 						bounce('proof too deep');
 					$leaf = $leaf_of($leaf_account, $collateral);
 					$root = $root_of($leaf, $proof);
-					if (!$root OR $root == true)
+					if (!$root)
 						bounce('bad sibling');
 					if ($root != var['aa_root_' || $h])
 						bounce('bad merkle root');
