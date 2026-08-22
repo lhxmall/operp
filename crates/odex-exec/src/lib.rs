@@ -3,8 +3,8 @@ use odex_book::{BookError, Fill, Order};
 use odex_dag::{verify_sig, Dag, DagError, Op, Unit};
 use odex_state::ChainState;
 use odex_types::{
-    bps, liq_order_id, notional_usd, order_id, AccountId, ExecStatus, OrderId, OrderType, Qty, Seq,
-    Side, TimeInForce, UnitId, Usd, IM_RATE_BPS, BTC_USD,
+    bps, liq_order_id, notional_usd, order_id, AccountId, ExecStatus, OrderId,
+    OrderType, Qty, Seq, Side, TimeInForce, UnitId, Usd, IM_RATE_BPS, BTC_USD,
 };
 
 #[derive(Clone, Debug)]
@@ -54,7 +54,6 @@ impl Default for Engine {
         Self::new()
     }
 }
-
 impl Engine {
     pub fn new() -> Self {
         Self {
@@ -65,11 +64,17 @@ impl Engine {
     }
 
     pub fn ingest(&mut self, unit: Unit) -> Result<Vec<ExecEvent>, ExecError> {
+        let dbg = std::env::var("ODEX_TRACE").map(|v| v == "1").unwrap_or(false);
+        if dbg { eprintln!("TRACE ingest begin"); }
         if !verify_sig(&unit) {
+            if dbg { eprintln!("TRACE bad sig"); }
             return Err(ExecError::BadSig);
         }
         self.dag.insert(unit)?;
-        Ok(self.apply_ready())
+        if dbg { eprintln!("TRACE inserted, linearizing"); }
+        let r = self.apply_ready();
+        if dbg { eprintln!("TRACE applied {}", r.len()); }
+        Ok(r)
     }
 
     pub fn apply_ready(&mut self) -> Vec<ExecEvent> {
