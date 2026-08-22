@@ -128,7 +128,7 @@ async function main() {
 
   /* --- start sidechain HFT engine in background; it writes batch.json per height --- */
   console.log("starting sidechain HFT engine...");
-  const hft = spawn("cargo", ["run", "--release", "-p", "odex-exec", "--example", "hft_stress_feed", "--", String(RUN_MS), OUT], {
+  const hft = spawn("cargo", ["run", "--release", "-p", "odex-exec", "--example", "hft_parallel", "--", String(RUN_MS), OUT], {
     cwd: path.join(__dirname, ".."),
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -208,7 +208,19 @@ async function main() {
       nextProviderAt += ORDER_PROVIDER_MS;
       try {
         // read latest batch file from sidechain exporter
-        const bf = path.join(OUT, "batch.json");
+        // parallel engines write batch-e<N>.json; take the newest by mtime
+        const files = fs.existsSync(OUT)
+          ? fs.readdirSync(OUT).filter((f) => /^batch-e\d+(-final)?\.json$/.test(f))
+          : [];
+        let bf = null;
+        if (files.length) {
+          bf = path.join(OUT, files[files.length - 1]);
+          let best = fs.statSync(bf).mtimeMs;
+          for (const f of files) {
+            const m = fs.statSync(path.join(OUT, f)).mtimeMs;
+            if (m > best) { best = m; bf = path.join(OUT, f); }
+          }
+        }
         let data;
         if (fs.existsSync(bf)) {
           const full = JSON.parse(fs.readFileSync(bf, "utf8"));

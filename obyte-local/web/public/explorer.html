@@ -157,13 +157,35 @@ function draw() {
       const b = layout.get(p);
       if (!b) continue;
       const ax = cx + a.x * view.s, ay = cy + a.y * view.s;
+function computeLayout(us) {
+  const byLevel = new Map();
+  for (const u of us) {
+    if (!byLevel.has(u.level)) byLevel.set(u.level, []);
+    byLevel.get(u.level).push(u);
+  }
+  const levels = [...byLevel.keys()].sort((a, b) => a - b);
+  if (!levels.length) return new Map();
+  const minL = levels[0];
+  const ROWH = 40, COLW = 36;
+  const out = new Map();
+  for (const lv of levels) {
+    // vertical: level increases DOWNWARD (genesis top, newest bottom)
+    const row = lv - minL;
+    const list = byLevel.get(lv);
+    list.sort((a, b) => String(a.unit).localeCompare(String(b.unit)));
+    list.forEach((u, i) => {
+      out.set(u.unit, { x: (i - (list.length - 1) / 2) * COLW, y: row * ROWH });
+    });
+  }
+  return out;
+}
       const bx = cx + b.x * view.s, by = cy + b.y * view.s;
       const isSelEdge = selected && (u.unit === selected || p === selected);
       g.strokeStyle = isSelEdge ? "#4a9eff" : u.mc ? "rgba(212,160,23,.35)" : "rgba(139,147,161,.22)";
       g.beginPath();
-      const mx = (ax + bx) / 2;
+      const mx = (ax + bx) / 2, my = (ay + by) / 2;
       g.moveTo(ax, ay);
-      g.bezierCurveTo(mx, ay, mx, by, bx, by);
+      g.bezierCurveTo(ax, my, bx, my, bx, by);
       g.stroke();
     }
   }
@@ -182,7 +204,7 @@ function draw() {
     g.arc(x, y, r, 0, Math.PI * 2);
     g.fillStyle = color;
     g.fill();
-    if (u.apps.some(a => !["pay", "feed", "def"].includes(a))) {
+    if (u.apps.some((a) => !["pay", "feed", "def"].includes(a))) {
       g.beginPath();
       g.arc(x, y, r + 3, 0, Math.PI * 2);
       g.strokeStyle = "rgba(38,166,154,.7)";
@@ -301,9 +323,10 @@ function fitView() {
   const minX = Math.min(...xs), maxX = Math.max(...xs);
   const minY = Math.min(...ys), maxY = Math.max(...ys);
   const w = cv.clientWidth, h = cv.clientHeight;
+  // vertical: pin top of DAG (genesis) near top, scale to fit height
   view.s = Math.min((w - 80) / Math.max(1, maxX - minX), (h - 80) / Math.max(1, maxY - minY), 2);
   view.x = -(minX + maxX) / 2 * view.s;
-  view.y = -(minY + maxY) / 2 * view.s;
+  view.y = -minY * view.s + 40;
 }
 
 (async function boot() {
