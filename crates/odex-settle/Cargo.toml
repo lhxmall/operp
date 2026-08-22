@@ -14,6 +14,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
+odex-book = { version = "0.1.0", path = "../odex-book" }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }

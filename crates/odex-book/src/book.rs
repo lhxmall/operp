@@ -9,6 +9,10 @@ pub struct OrderBook {
     bids: BTreeMap<Reverse<Price>, VecDeque<OrderId>>,
     asks: BTreeMap<Price, VecDeque<OrderId>>,
     orders: HashMap<OrderId, Order>,
+    /// Incrementally-maintained visible qty per price level (bids).
+    bid_qty: BTreeMap<Reverse<Price>, Qty>,
+    /// Incrementally-maintained visible qty per price level (asks).
+    ask_qty: BTreeMap<Price, Qty>,
 }
 
 impl OrderBook {
@@ -18,6 +22,8 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             orders: HashMap::new(),
+            bid_qty: BTreeMap::new(),
+            ask_qty: BTreeMap::new(),
         }
     }
 
@@ -37,31 +43,34 @@ impl OrderBook {
     }
 
     pub fn best_bid(&self) -> Option<(Price, Qty)> {
-        for (Reverse(price), deque) in self.bids.iter() {
-            let qty = self.level_qty(deque);
-            if qty > 0 {
-                return Some((*price, qty));
-            }
-        }
-        None
+        // O(log depth): cached visible qty; zero-qty levels pruned on update.
+        self.bid_qty
+            .iter()
+            .next()
+            .map(|(Reverse(price), q)| (*price, *q))
     }
 
     pub fn best_ask(&self) -> Option<(Price, Qty)> {
-        for (price, deque) in self.asks.iter() {
-            let qty = self.level_qty(deque);
-            if qty > 0 {
-                return Some((*price, qty));
-            }
-        }
-        None
+        self.ask_qty.iter().next().map(|(price, q)| (*price, *q))
     }
 
-    fn level_qty(&self, deque: &VecDeque<OrderId>) -> Qty {
-        deque
-            .iter()
-            .filter_map(|id| self.orders.get(id))
-            .map(|o| o.remaining)
-            .sum()
+    fn level_add(&mut self, side: Side, price: Price, delta: i64) {
+        match side {
+            Side::Bid => {
+                let e = self.bid_qty.entry(Reverse(price)).or_insert(0);
+                *e = (*e as i64 + delta) as Qty;
+                if *e == 0 {
+                    self.bid_qty.remove(&Reverse(price));
+                }
+            }
+            Side::Ask => {
+                let e = self.ask_qty.entry(price).or_insert(0);
+                *e = (*e as i64 + delta) as Qty;
+                if *e == 0 {
+                    self.ask_qty.remove(&price);
+                }
+            }
+        }
     }
 
     pub fn submit(&mut self, mut order: Order) -> Result<MatchResult, BookError> {
@@ -118,12 +127,16 @@ impl OrderBook {
                 break;
             }
 
-            let maker = self.orders.get_mut(&maker_id).expect("maker present");
-            let fill_qty = order.remaining.min(maker.remaining);
-            maker.remaining -= fill_qty;
-            order.remaining -= fill_qty;
-            let maker_done = maker.remaining == 0;
-            let maker_acct = maker.account;
+            let (fill_qty, maker_side, maker_acct, maker_done) = {
+                let maker = self.orders.get_mut(&maker_id).expect("maker present");
+                let fill_qty = order.remaining.min(maker.remaining);
+                maker.remaining -= fill_qty;
+                order.remaining -= fill_qty;
+                let maker_done = maker.remaining == 0;
+                (fill_qty, maker.side, maker.account, maker_done)
+            };
+            // Cache: maker's visible qty shrinks by the filled amount.
+            self.level_add(maker_side, maker_price, -(fill_qty as i64));
 
             fills.push(Fill {
                 taker_id: order.id,
@@ -139,7 +152,7 @@ impl OrderBook {
 
             if maker_done {
                 self.orders.remove(&maker_id);
-                self.pop_head(order.side.opposite());
+                self.pop_head(maker_side.opposite());
             }
         }
 
@@ -156,9 +169,13 @@ impl OrderBook {
             && order.tif == TimeInForce::Gtc
             && order.remaining > 0;
 
+
         let taker_remaining = if rest { order.remaining } else { 0 };
         if rest {
+            let (order_side, order_price, q) = (order.side, order.price, order.remaining);
             self.enqueue(order);
+            // Cache: resting order adds visible qty at its level.
+            self.level_add(order_side, order_price, q as i64);
         }
 
         Ok(MatchResult {
@@ -186,6 +203,8 @@ impl OrderBook {
             if dq.front() == Some(&id) {
                 dq.pop_front();
                 self.drop_empty_level(side, price);
+                // Cache: canceled head order removes its visible qty.
+                self.level_add(side, price, -(order.remaining as i64));
             }
         }
         order.remaining = 0;

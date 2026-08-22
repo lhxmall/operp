@@ -50,6 +50,8 @@ fn place(
 
 fn main() {
     let mut eng = Engine::new();
+    eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+    eng.state.allowed_markets.insert(BTC_USD);
     let g = genesis_id();
     let alice = sk(1);
     let bob = sk(2);

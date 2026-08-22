@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use odex_types::{
     account_id_from_pubkey, sha256, AccountId, MarketId, OrderId, OrderType, Price, Qty, Side,
     TimeInForce, UnitId, Usd, MAX_PARENTS,
@@ -32,7 +32,10 @@ pub enum Op {
         amount: Usd,
         nonce: u64,
     },
+    /// Keeper-initiated liquidation. `caller` is the keeper requesting it and
+    /// receives the keeper reward; signature must belong to `caller`.
     Liquidate {
+        caller: AccountId,
         target: AccountId,
         market: MarketId,
     },
@@ -117,8 +120,13 @@ pub fn canonical_bytes(unit: &Unit) -> Vec<u8> {
             b.extend_from_slice(&amount.to_le_bytes());
             b.extend_from_slice(&nonce.to_le_bytes());
         }
-        Op::Liquidate { target, market } => {
+        Op::Liquidate {
+            caller,
+            target,
+            market,
+        } => {
             b.push(5);
+            b.extend_from_slice(&caller.0);
             b.extend_from_slice(&target.0);
             b.extend_from_slice(&market.0.to_le_bytes());
         }
@@ -136,9 +144,11 @@ pub fn verify_sig(unit: &Unit) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
+    // verify_strict rejects non-canonical s / small-order components
+    // (signature malleability), satisfying strict r/s group-order checks.
     let sig = Signature::from_bytes(&unit.sig);
     let id = unit_id(unit);
-    vk.verify(&id.0, &sig).is_ok() && account_matches(unit)
+    vk.verify_strict(&id.0, &sig).is_ok() && account_matches(unit)
 }
 
 fn account_matches(unit: &Unit) -> bool {
@@ -148,7 +158,7 @@ fn account_matches(unit: &Unit) -> bool {
         | Op::Cancel { account, .. }
         | Op::Deposit { account, .. }
         | Op::Withdraw { account, .. } => *account == expected,
-        Op::Liquidate { .. } => true,
+        Op::Liquidate { caller, .. } => *caller == expected,
     }
 }
 
@@ -175,7 +185,12 @@ pub struct Dag {
     executed: HashSet<UnitId>,
     /// non-executed units; keeps ready_linearized O(pending) not O(all units)
     pending: HashSet<UnitId>,
+    /// units whose parents are not (yet) known; FIFO-evicted past capacity
+    pending_orphans: HashMap<UnitId, (Unit, std::time::Instant)>,
 }
+
+/// Max buffered orphan units. Beyond this the oldest orphans are dropped.
+const ORPHAN_CAP: usize = 4096;
 
 impl Dag {
     pub fn new() -> Self {
@@ -186,9 +201,15 @@ impl Dag {
             children: HashMap::new(),
             executed,
             pending: HashSet::new(),
+            pending_orphans: HashMap::new(),
         }
     }
 
+    /// Insert a unit. Unknown parents no longer drop the unit: on first sight
+    /// it is buffered as an orphan and `Err(MissingParent)` returned; a retry
+    /// of the same unit while still orphaned returns its id without error.
+    /// Buffered orphans are linked automatically once their parents arrive
+    /// (see `mark_executed` / `insert`), so out-of-order delivery recovers.
     pub fn insert(&mut self, unit: Unit) -> Result<UnitId, DagError> {
         if unit.parents.is_empty() {
             return Err(DagError::EmptyParents);
@@ -202,21 +223,46 @@ impl Dag {
         if sorted != unit.parents {
             return Err(DagError::BadParents);
         }
-        for p in &unit.parents {
-            if !self.known(*p) {
-                return Err(DagError::MissingParent);
-            }
-        }
         let id = unit_id(&unit);
         if self.units.contains_key(&id) {
             return Err(DagError::Duplicate);
         }
+        let missing: Vec<UnitId> = unit
+            .parents
+            .iter()
+            .copied()
+            .filter(|p| !self.known(*p))
+            .collect();
+        if !missing.is_empty() {
+            // Already buffered? Then report acceptance (pending), not an error.
+            if self.pending_orphans.contains_key(&id) {
+                return Ok(id);
+            }
+            if self.pending_orphans.len() >= ORPHAN_CAP {
+                // FIFO eviction of the oldest orphan.
+                let oldest = self
+                    .pending_orphans
+                    .iter()
+                    .min_by_key(|(_, (_, t))| *t)
+                    .map(|(k, _)| *k);
+                if let Some(k) = oldest {
+                    self.pending_orphans.remove(&k);
+                }
+            }
+            self.pending_orphans.insert(id, (unit, std::time::Instant::now()));
+            return Err(DagError::MissingParent);
+        }
+        self.link(id, unit);
+        Ok(id)
+    }
+
+    /// Attach a validated unit to the DAG structures.
+    fn link(&mut self, id: UnitId, unit: Unit) {
         for p in &unit.parents {
             self.children.entry(*p).or_default().push(id);
         }
         self.units.insert(id, unit);
         self.pending.insert(id);
-        Ok(id)
     }
 
     fn known(&self, id: UnitId) -> bool {
@@ -242,6 +288,24 @@ impl Dag {
     pub fn mark_executed(&mut self, id: UnitId) {
         self.executed.insert(id);
         self.pending.remove(&id);
+        // Newly known parent: link any buffered orphans whose parents are now
+        // all present. Repeat until fixpoint (orphans may chain).
+        loop {
+            let ready: Vec<UnitId> = self
+                .pending_orphans
+                .iter()
+                .filter(|(_, (u, _))| u.parents.iter().all(|p| self.known(*p)))
+                .map(|(k, _)| *k)
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            for oid in ready {
+                if let Some((unit, _)) = self.pending_orphans.remove(&oid) {
+                    self.link(oid, unit);
+                }
+            }
+        }
     }
 
     pub fn get(&self, id: UnitId) -> Option<&Unit> {
@@ -335,5 +399,25 @@ mod tests {
             &sk(1),
         );
         assert_eq!(dag.insert(u2), Err(DagError::EmptyParents));
+    }
+
+    #[test]
+    fn out_of_order_ingest_recovered() {
+        let mut dag = Dag::new();
+        let g = genesis_id();
+        // child first: parent unknown -> buffered orphan, Err(MissingParent)
+        let parent = deposit(vec![g], &sk(1), 1);
+        let pid = unit_id(&parent);
+        let child = deposit(vec![pid], &sk(1), 2);
+        assert_eq!(dag.insert(child.clone()), Err(DagError::MissingParent));
+        // retry of the same orphan reports acceptance (still pending)
+        assert_eq!(dag.insert(child.clone()), Ok(unit_id(&child)));
+        // parent arrives: both become known; after executing the parent the
+        // child is linked and ready.
+        dag.insert(parent).unwrap();
+        assert!(dag.ready_linearized().contains(&pid));
+        dag.mark_executed(pid);
+        let ready = dag.ready_linearized();
+        assert!(ready.contains(&unit_id(&child)), "orphan must be recovered");
     }
 }

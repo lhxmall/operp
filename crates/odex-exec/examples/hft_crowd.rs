@@ -49,6 +49,8 @@ fn ingest_place(
 
 fn main() {
     let mut eng = Engine::new();
+    eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+    eng.state.allowed_markets.insert(BTC_USD);
     let mut secrets: Vec<[u8; 32]> = (1..=N as u8).map(sk).collect();
     let mut seqs = vec![1u64; N];
     let px = 100_000 * PRICE_SCALE;

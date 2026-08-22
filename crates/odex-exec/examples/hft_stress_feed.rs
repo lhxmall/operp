@@ -38,6 +38,8 @@ fn main() {
     std::fs::create_dir_all(&cfg.out).expect("mkdir");
 
     let mut eng = Engine::new();
+    eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+    eng.state.allowed_markets.insert(BTC_USD);
     let secrets: Vec<[u8; 32]> = (1..=N as u8).map(sk).collect();
     let mut seqs = vec![1u64; N];
     let px = 100_000 * PRICE_SCALE;
@@ -125,16 +127,14 @@ fn main() {
             }
         }
 
-        if eng.log.len() > 16_384 {
-            eng.log.clear();
-        }
-
         // cut a batch every 512 units
         if pending_units.len() >= 512 {
             height += 1;
             let units = std::mem::take(&mut pending_units);
-            match Batch::from_applied(&prev_state, &eng, &units) {
+            let mut settled: Vec<UnitId> = Vec::new();
+            let batch_ok = match Batch::from_applied(&prev_state, &eng, &units) {
                 Ok(batch) => {
+                    settled = units.clone();
                     let payload = batch.temp_data_payload();
                     let text = serde_json::to_string(&payload.data).unwrap();
                     let f = cfg.out.join("batch.json");
@@ -148,8 +148,16 @@ fn main() {
                         batch.checkpoint.fill_count,
                         hex::encode(&batch.checkpoint.state_root[..8])
                     );
+                    true
                 }
-                Err(e) => eprintln!("batch err: {e}"),
+                Err(e) => {
+                    eprintln!("batch err: {e}");
+                    false
+                }
+            };
+            // prune log entries already settled into the batch (bounded log)
+            if batch_ok {
+                eng.prune_below(&settled);
             }
             prev_state = eng.state.clone();
         }
@@ -183,6 +191,7 @@ fn main() {
                 units.len(),
                 batch.checkpoint.fill_count
             );
+            eng.prune_below(&units);
         }
     }
 

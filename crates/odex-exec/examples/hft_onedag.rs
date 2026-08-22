@@ -49,7 +49,14 @@ fn main() {
         cfg.markets, cfg.generators, cfg.run_ms
     );
 
-    let eng = std::sync::Arc::new(std::sync::Mutex::new(Engine::new()));
+    let mut eng0 = Engine::new();
+    // Standalone example: no real AA feed — admit all synthetic deposit units
+    // and all markets the generators will use.
+    eng0.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+    for m in 1..=16u32 {
+        eng0.state.allowed_markets.insert(MarketId(m));
+    }
+    let eng = std::sync::Arc::new(std::sync::Mutex::new(eng0));
     let executed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let fills = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let rejected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));

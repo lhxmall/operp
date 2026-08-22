@@ -1,7 +1,8 @@
 use odex_account::Account;
 use odex_book::{Fill, OrderBook};
 use odex_types::{
-    sha256, AccountId, Height, MarketId, Price, Seq, UnitId, Usd, BTC_USD, PRICE_SCALE,
+    sha256, AccountId, Height, MarketId, Price, Seq, UnitId, Usd, BTC_USD, INSURANCE_ACCOUNT,
+    INSURANCE_SEED, PRICE_SCALE,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -22,6 +23,11 @@ pub struct ChainState {
     pub withdrawals: BTreeMap<(AccountId, u64), Withdrawal>,
     pub seen_aa_units: HashSet<[u8; 32]>,
     pub seen_client_seq: HashMap<AccountId, u64>,
+    /// AA deposit events observed on-chain for the pending batch window.
+    /// Deposit ops referencing units outside this set are rejected.
+    pub deposits_allowed: HashSet<[u8; 32]>,
+    /// Markets permitted for trading; place() rejects anything else.
+    pub allowed_markets: HashSet<MarketId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,16 +51,23 @@ impl ChainState {
         books.insert(BTC_USD, OrderBook::new(BTC_USD));
         let mut marks = BTreeMap::new();
         marks.insert(BTC_USD, 100_000 * PRICE_SCALE);
+        let mut accounts = BTreeMap::new();
+        // Insurance fund seeded at genesis; absorbs bad debt and pays keepers.
+        let mut insurance = Account::new(INSURANCE_ACCOUNT);
+        insurance.collateral = INSURANCE_SEED;
+        accounts.insert(INSURANCE_ACCOUNT, insurance);
         Self {
             height: 0,
             last_unit: odex_book_genesis(),
             seq: 0,
-            accounts: BTreeMap::new(),
+            accounts,
             books,
             marks,
             withdrawals: BTreeMap::new(),
             seen_aa_units: HashSet::new(),
             seen_client_seq: HashMap::new(),
+            deposits_allowed: HashSet::new(),
+            allowed_markets: HashSet::new(),
         }
     }
 
@@ -79,6 +92,26 @@ impl ChainState {
             fill.qty,
             fill.market,
         );
+        // Bad-debt cap: if the taker went bankrupt (equity < 0), the shortfall
+        // is absorbed by the insurance fund's realized_pnl so it never leaks
+        // to counterparties. Insurance itself can never be liquidated.
+        if fill.taker != INSURANCE_ACCOUNT && fill.maker != INSURANCE_ACCOUNT {
+            let shortfall = {
+                let marks = &self.marks;
+                let s = match self.accounts.get(&fill.taker) {
+                    Some(a) => a.snapshot(marks),
+                    None => return,
+                };
+                if s.equity < 0 { -s.equity } else { 0 }
+            };
+            if shortfall > 0 {
+                self.accounts
+                    .get_mut(&fill.taker)
+                    .map(|a| a.realized_pnl -= shortfall);
+                let ins = self.account_mut(INSURANCE_ACCOUNT);
+                ins.realized_pnl -= shortfall;
+            }
+        }
         self.marks.insert(fill.market, fill.price);
     }
 
@@ -226,7 +259,80 @@ fn merkle_proof_for(mut leaves: Vec<[u8; 32]>, leaf: [u8; 32]) -> (Vec<([u8; 32]
         idx /= 2;
         level = next;
     }
+
     (siblings, level[0])
+}
+
+/// ---- AA-facing merkle tree (hex-string domain) ----
+///
+/// Oscript's `sha256()` hashes the UTF-8 string of its argument, so the vault
+/// AA can only verify proofs whose nodes are hashes of concatenated hex
+/// strings. This mirrors the byte-level tree above but lives in the hex-text
+/// domain, letting the AA verify withdrawals with pure string ops:
+///   leaf  = sha256_hex("acct:" || account_hex || ":" || collateral_string)
+///   node  = sha256_hex(left_hex || right_hex)
+/// The root of this tree is committed to the AA as the batch's `state_root`
+/// companion (`aa_root`); both trees commit identical (account,collateral).
+
+pub fn aa_account_leaf(id: &AccountId, collateral: Usd) -> String {
+    let s = format!("acct:{}:{}", hex::encode(id.0), collateral);
+    hex::encode(sha256(s.as_bytes()))
+}
+
+fn aa_parent(l: &str, r: &str) -> String {
+    let mut buf = String::with_capacity(l.len() + r.len());
+    buf.push_str(l);
+    buf.push_str(r);
+    hex::encode(sha256(buf.as_bytes()))
+}
+
+/// Root of the hex-domain tree over all (account, collateral) pairs.
+pub fn aa_root_of(state: &ChainState) -> String {
+    let mut level: Vec<String> = state
+        .accounts
+        .values()
+        .map(|a| aa_account_leaf(&a.id, a.collateral))
+        .collect();
+    if level.is_empty() {
+        return hex::encode(sha256(b"empty"));
+    }
+    level.sort();
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            let last = level.last().unwrap().clone();
+            level.push(last);
+        }
+        level = level
+            .chunks(2)
+            .map(|c| aa_parent(&c[0], &c[1]))
+            .collect();
+    }
+    level[0].clone()
+}
+
+/// Proof path for one account in the hex-domain tree: sibling hash + whether
+/// the sibling sits to the RIGHT of the running node at each level.
+pub fn aa_proof_for(state: &ChainState, id: &AccountId) -> Option<(Vec<(String, bool)>, String)> {
+    let mut level: Vec<String> = state
+        .accounts
+        .values()
+        .map(|a| aa_account_leaf(&a.id, a.collateral))
+        .collect();
+    level.sort();
+    let leaf = aa_account_leaf(id, state.accounts.get(id)?.collateral);
+    let mut idx = level.iter().position(|l| *l == leaf)?;
+    let mut siblings = Vec::new();
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            let last = level.last().unwrap().clone();
+            level.push(last);
+        }
+        let pair = idx ^ 1;
+        siblings.push((level[pair].clone(), pair > idx));
+        level = level.chunks(2).map(|c| aa_parent(&c[0], &c[1])).collect();
+        idx /= 2;
+    }
+    Some((siblings, level[0].clone()))
 }
 
 #[cfg(test)]

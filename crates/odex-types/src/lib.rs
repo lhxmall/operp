@@ -33,6 +33,12 @@ pub type Bps = u64;
 pub struct MarketId(pub u32);
 
 pub const BTC_USD: MarketId = MarketId(1);
+/// Insurance fund vault account (sidechain-internal). Seeded at genesis.
+pub const INSURANCE_ACCOUNT: AccountId = AccountId([0u8; 32]);
+/// Keeper reward paid from the insurance fund on successful liquidation fill.
+pub const KEEPER_REWARD_BPS: u64 = 100;
+/// Genesis seed collateral of the insurance fund: 10_000 USD.
+pub const INSURANCE_SEED: Usd = 10_000 * USD_SCALE as Usd;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TypesError {

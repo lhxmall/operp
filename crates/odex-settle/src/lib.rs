@@ -2,20 +2,25 @@ mod aa;
 
 pub use aa::{AaStateNames, AA_STATE, BOUNCE_FEES, AA_CHALLENGE_SECS, AA_STABILITY_SECS};
 
+use odex_book::Fill;
 use odex_dag::Unit;
 use odex_exec::Engine;
 use odex_state::{verify_proof, MerkleProof};
 use odex_types::{
-    sha256, AccountId, Height, Seq, UnitId, Usd, CHAIN_ID,
+    sha256, AccountId, Height, Seq, UnitId, Usd, BATCH_MAX_UNITS, CHAIN_ID,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub height: Height,
     pub prev_state_hash: [u8; 32],
     pub state_root: [u8; 32],
+    /// Hex-domain merkle root the vault AA verifies withdrawal proofs against
+    /// (Oscript sha256 hashes UTF-8 strings; see odex_state::aa_root_of).
+    pub aa_root: String,
     pub last_unit: UnitId,
     pub seq: Seq,
     pub unit_ids: Vec<UnitId>,
@@ -59,16 +64,36 @@ pub struct WithdrawClaim {
 pub enum SettleError {
     #[error("empty batch")]
     Empty,
+    #[error("too many units")]
+    TooManyUnits,
+    #[error("chain id mismatch")]
+    ChainMismatch,
     #[error("prev root mismatch")]
     PrevMismatch,
     #[error("state root mismatch")]
     RootMismatch,
     #[error("replay failed")]
     Replay,
+    #[error("fills mismatch")]
+    FillsMismatch,
     #[error("bad merkle")]
     BadMerkle,
     #[error("amount exceeds collateral")]
     AmountExceedsCollateral,
+}
+
+/// Canonical byte encoding of fills shared by batch construction and replay
+/// verification. Order: taker_id || maker_id || price_le || qty_le || seq_le.
+pub fn fills_bytes(fills: &[Fill]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(fills.len() * (32 + 32 + 8 + 8 + 8));
+    for f in fills {
+        buf.extend_from_slice(&f.taker_id.0);
+        buf.extend_from_slice(&f.maker_id.0);
+        buf.extend_from_slice(&f.price.to_le_bytes());
+        buf.extend_from_slice(&f.qty.to_le_bytes());
+        buf.extend_from_slice(&f.seq.to_le_bytes());
+    }
+    buf
 }
 
 impl Batch {
@@ -76,24 +101,22 @@ impl Batch {
         if applied.is_empty() {
             return Err(SettleError::Empty);
         }
-        let mut units = Vec::new();
-        let mut fills_buf = Vec::new();
-        let mut fill_count = 0u32;
+        if applied.len() > BATCH_MAX_UNITS as usize {
+            return Err(SettleError::TooManyUnits);
+        }
+        let mut units = Vec::with_capacity(applied.len());
         for id in applied {
             let u = engine.dag.get(*id).cloned().ok_or(SettleError::Replay)?;
             units.push(u);
         }
+        let applied_set: HashSet<&UnitId> = applied.iter().collect();
+        let mut fills_buf = Vec::new();
+        let mut fill_count = 0u32;
         for ev in &engine.log {
             if let odex_exec::ExecEvent::Applied { unit, fills, .. } = ev {
-                if applied.contains(unit) {
+                if applied_set.contains(unit) {
                     fill_count += fills.len() as u32;
-                    for f in fills {
-                        fills_buf.extend_from_slice(&f.taker_id.0);
-                        fills_buf.extend_from_slice(&f.maker_id.0);
-                        fills_buf.extend_from_slice(&f.price.to_le_bytes());
-                        fills_buf.extend_from_slice(&f.qty.to_le_bytes());
-                        fills_buf.extend_from_slice(&f.seq.to_le_bytes());
-                    }
+                    fills_buf.extend_from_slice(&fills_bytes(fills));
                 }
             }
         }
@@ -105,6 +128,7 @@ impl Batch {
                 height: prev.height + 1,
                 prev_state_hash: prev.state_root(),
                 state_root: engine.state.state_root(),
+                aa_root: odex_state::aa_root_of(&engine.state),
                 last_unit,
                 seq: engine.state.seq,
                 unit_ids: applied.to_vec(),
@@ -133,6 +157,7 @@ impl Batch {
             "height": self.checkpoint.height,
             "prev_state_hash": hex::encode(self.checkpoint.prev_state_hash),
             "state_root": hex::encode(self.checkpoint.state_root),
+            "aa_root": self.checkpoint.aa_root,
             "last_unit": hex::encode(self.checkpoint.last_unit.0),
             "seq": self.checkpoint.seq,
             "unit_ids": self.checkpoint.unit_ids.iter().map(|u| hex::encode(u.0)).collect::<Vec<_>>(),
@@ -157,11 +182,40 @@ impl Batch {
         if self.units.is_empty() {
             return Err(SettleError::Empty);
         }
+        if self.chain_id != CHAIN_ID {
+            return Err(SettleError::ChainMismatch);
+        }
         if replay.state.state_root() != prev_root {
             return Err(SettleError::PrevMismatch);
         }
+        // Inject the AA deposit set implied by this batch's deposit ops so the
+        // replay admits exactly the deposits the batch claims are on-chain.
+        replay.state.deposits_allowed.clear();
+        for u in &self.units {
+            if let odex_dag::Op::Deposit { aa_unit, .. } = &u.op {
+                replay.state.deposits_allowed.insert(*aa_unit);
+            }
+        }
+        let pre_seq = replay.state.seq;
         for u in &self.units {
             replay.ingest(u.clone()).map_err(|_| SettleError::Replay)?;
+        }
+        // Fill integrity: recompute hash/count from replay events.
+        let applied_set: HashSet<&UnitId> = self.checkpoint.unit_ids.iter().collect();
+        let mut fills_buf = Vec::new();
+        let mut fill_count = 0u32;
+        for ev in replay.log.iter().skip(pre_seq as usize) {
+            if let odex_exec::ExecEvent::Applied { unit, fills, .. } = ev {
+                if applied_set.contains(unit) {
+                    fill_count += fills.len() as u32;
+                    fills_buf.extend_from_slice(&fills_bytes(fills));
+                }
+            }
+        }
+        if sha256(&fills_buf) != self.checkpoint.fills_hash
+            || fill_count != self.checkpoint.fill_count
+        {
+            return Err(SettleError::FillsMismatch);
         }
         if replay.state.state_root() != self.checkpoint.state_root {
             return Err(SettleError::RootMismatch);
@@ -222,6 +276,8 @@ mod tests {
 
     fn seed_trade() -> (Engine, Engine, Vec<UnitId>, [u8; 32]) {
         let mut eng = Engine::new();
+        eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+        eng.state.allowed_markets.insert(BTC_USD);
         let prev_root = eng.state.state_root();
         let pre = eng.clone();
         let g = genesis_id();

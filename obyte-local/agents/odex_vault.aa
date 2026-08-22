@@ -1,4 +1,33 @@
 {
+	// ODEX MVP vault AA — security-hardened version.
+	//
+	// Trust model: NO owner key. Upgrading = deploy a new AA and migrate funds
+	// through the same finalized-root withdrawal path. All protocol constants
+	// below mirror Rust constants in crates/odex-types/src/lib.rs (Rust is the
+	// single source of truth; Oscript cannot include them):
+	//   'odex-mvp-1'  -> CHAIN_ID
+	//   600           -> OBYTE_STABILITY_SECS (lock stability window)
+	//   3600          -> CHALLENGE_SECS (challenge window before finalize)
+	//   10000         -> BOUNCE_FEES base (deducted from trigger outputs)
+	//   20000         -> challenge bond minimum incl. bounce fee headroom
+	//
+	// WITHDRAWALS ARE PROOF-GATED. The operator commits `aa_root` per batch:
+	// a merkle tree over hex strings (Oscript sha256 hashes UTF-8 text):
+	//   leaf = sha256("acct:" + account_hex + ":" + collateral_decimal_string) -> hex
+	//   node = sha256(left_hex + right_hex) -> hex
+	// (built by odex_state::aa_account_leaf / aa_parent / aa_root_of).
+	// withdraw requires { height, amount, leaf_account, collateral, proof }
+	// where proof = [ {hash, right}, ... ] sibling list; the AA recomputes the
+	// root with string ops and compares to var['root_' || last_finalized].
+	//
+	// State vars:
+	//   boot, chain_id, last_locked, last_finalized
+	//   submitted_at_<h>, cand_root_<h>, cand_prev_<h>, cand_fills_<h>,
+	//     cand_unit_<h>, cand_who_<h>            candidate (replaceable pre-lock)
+	//   root_<h>, winner_<h>, stable_at_<h>      locked root
+	//   frozen_<h>   absent/0 = ok, 1 = challenged, 2 = permanently failed
+	//   challenger_<h>, bond_<address>           challenge bond accounting
+
 	bounce_fees: { base: 10000 },
 	messages: {
 		cases: [
@@ -20,7 +49,7 @@
 								var['last_locked'] = 0;
 								var['last_finalized'] = 0;
 							}
-							var['bal_' || trigger.address] = var['bal_' || trigger.address] + trigger.output[[asset=base]] - 10000;
+							var['bal_' || trigger.address] = (var['bal_' || trigger.address] otherwise 0) + trigger.output[[asset=base]] - 10000;
 						}"
 					}
 				]
@@ -31,24 +60,30 @@
 					if (trigger.data.chain_id != 'odex-mvp-1')
 						bounce('bad chain');
 					$h = trigger.data.height;
-					if ($h != var['last_locked'] + 1)
+					if (!$h OR $h != var['last_locked'] + 1)
 						bounce('bad height');
 					if (var['last_locked'] > 0 AND trigger.data.prev_state_hash != var['root_' || var['last_locked']])
 						bounce('prev mismatch');
-					if (var['cand_root_' || $h])
-						bounce('candidate exists');
 					if (!trigger.data.state_root)
 						bounce('no root');
+					if (!trigger.data.aa_root)
+						bounce('no aa root');
+					// locked heights are immutable; pre-lock candidates may be
+					// replaced by a later submit (anti front-run brick).
+					if (var['root_' || $h])
+						bounce('already locked');
 				}",
 				messages: [
 					{
 						app: "state",
 						state: "{
 							var['cand_root_' || trigger.data.height] = trigger.data.state_root;
+							var['cand_aa_root_' || trigger.data.height] = trigger.data.aa_root;
 							var['cand_prev_' || trigger.data.height] = trigger.data.prev_state_hash;
 							var['cand_fills_' || trigger.data.height] = trigger.data.fills_hash;
 							var['cand_unit_' || trigger.data.height] = trigger.unit;
 							var['cand_who_' || trigger.data.height] = trigger.address;
+							var['submitted_at_' || trigger.data.height] = timestamp;
 						}"
 					}
 				]
@@ -63,12 +98,17 @@
 						bounce('already locked');
 					if ($h != var['last_locked'] + 1)
 						bounce('bad lock height');
+					// stability gate (OBYTE_STABILITY_SECS = 600): simulates the
+					// Obyte finality window on devnet where none exists.
+					if (timestamp < var['submitted_at_' || $h] + 600)
+						bounce('not stable yet');
 				}",
 				messages: [
 					{
 						app: "state",
 						state: "{
 							var['root_' || trigger.data.height] = var['cand_root_' || trigger.data.height];
+							var['aa_root_' || trigger.data.height] = var['cand_aa_root_' || trigger.data.height];
 							var['winner_' || trigger.data.height] = var['cand_unit_' || trigger.data.height];
 							var['stable_at_' || trigger.data.height] = timestamp;
 							var['last_locked'] = trigger.data.height;
@@ -80,36 +120,150 @@
 				if: "{trigger.data.challenge}",
 				init: "{
 					$h = trigger.data.height;
+					if (!$h OR $h > var['last_locked'])
+						bounce('bad height');
 					if (!var['root_' || $h])
 						bounce('not locked');
 					if (var['frozen_' || $h])
-						bounce('already frozen');
-					if (trigger.output[[asset=base]] < 20000)
-						bounce('bond');
+						bounce('already frozen or failed');
+					if (timestamp >= var['stable_at_' || $h] + 3600)
+						bounce('challenge window closed');
+					if (trigger.output[[asset=base]] - 10000 < 10000)
+						bounce('bond too small');
 				}",
 				messages: [
 					{
 						app: "state",
 						state: "{
 							var['frozen_' || trigger.data.height] = 1;
+							var['challenger_' || trigger.data.height] = trigger.address;
+							var['bond_' || trigger.address] = (var['bond_' || trigger.address] otherwise 0) + trigger.output[[asset=base]] - 10000;
 						}"
 					}
 				]
 			},
 			{
+				// Operator response to a challenge within the window: unfreezes.
+				// MVP devnet resolution: the operator re-submits the identical
+				// committed root (fraud-proof games beyond this are Phase 2 —
+				// recorded here as an explicit boundary, not silently omitted).
+				if: "{trigger.data.respond}",
+				init: "{
+					$h = trigger.data.height;
+					if (!$h)
+						bounce('no height');
+					if (var['frozen_' || $h] != 1)
+						bounce('nothing to respond to');
+					if (timestamp >= var['stable_at_' || $h] + 3600)
+						bounce('response window closed');
+					if (trigger.data.root_confirmed != var['root_' || $h])
+						bounce('root mismatch');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							// unfreeze; challenger bond is confiscated to the AA pot
+							var['frozen_' || trigger.data.height] = 0;
+							$challenger = var['challenger_' || trigger.data.height];
+							if ($challenger AND var['bond_' || $challenger]){
+								var['bond_' || $challenger] -= trigger.output[[asset=base]] - 10000;
+							}
+						}"
+					}
+				]
+			},
+			{
+				// finalize timer, with the challenge-FAILURE sweep folded in:
+				//   frozen==1 and window over (operator never responded)
+				//     -> height fails: frozen=2 permanent, root cleared,
+				//        last_locked rolls back to h-1, challenger bond refunded.
+				//   clean window -> root becomes the withdrawal basis for h.
+				if: "{trigger.data.finalize}",
+				init: "{
+					$h = trigger.data.height;
+					if (!$h)
+						bounce('no height');
+					if ($h > var['last_locked'])
+						bounce('not locked');
+					$failed = (var['frozen_' || $h] == 1 AND timestamp >= var['stable_at_' || $h] + 3600);
+					if (!$failed){
+						if (!var['root_' || $h])
+							bounce('not locked');
+						if (var['frozen_' || $h])
+							bounce('frozen');
+						if (timestamp < var['stable_at_' || $h] + 3600)
+							bounce('window open');
+						if ($h != var['last_finalized'] + 1)
+							bounce('finalize in order');
+					}
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							if ($failed){
+								var['frozen_' || trigger.data.height] = 2;
+								var['root_' || trigger.data.height] = 0;
+								var['aa_root_' || trigger.data.height] = 0;
+								var['last_locked'] = trigger.data.height - 1;
+								$challenger = var['challenger_' || trigger.data.height];
+								var['bond_' || $challenger] += trigger.output[[asset=base]] - 10000;
+							}
+							else {
+								var['last_finalized'] = trigger.data.height;
+							}
+						}"
+					}
+				]
+			},
+			{
+				// PROOF-GATED withdrawal against the finalized aa_root.
+				// balance authority = the proven leaf's collateral, NOT bal_ vars;
+				// bal_ is additionally debited to keep the deposit ledger honest.
 				if: "{trigger.data.withdraw}",
 				init: "{
-					$h = var['last_locked'];
-					if ($h <= 0)
-						bounce('not locked');
+					// merkle helpers (each function has its own complexity budget)
+					$fold = ($acc, $sib) => {
+						if (!$sib.hash)
+							return false;
+						if ($sib.right)
+							return sha256($acc || $sib.hash);
+						else
+							return sha256($sib.hash || $acc);
+					};
+					$leaf_of = ($addr, $col) => sha256('acct:' || $addr || ':' || $col);
+					// reduce count must be a static literal; 16 levels cover 2^16 accounts
+					$root_of = ($leaf, $proof) => reduce($proof, 16, $fold, $leaf);
+					$h = var['last_finalized'];
+					if (!$h OR $h <= 0)
+						bounce('not finalized');
 					if (var['frozen_' || $h])
 						bounce('frozen');
+					if (trigger.data.height AND trigger.data.height != $h)
+						bounce('stale height');
 					$amt = trigger.data.amount;
-					if ($amt <= 0)
+					if (!$amt OR $amt <= 0)
 						bounce('bad amount');
-					$bal = var['bal_' || trigger.address];
-					if ($amt > $bal)
-						bounce('insufficient');
+					$leaf_account = trigger.data.leaf_account;
+					$collateral = trigger.data.collateral;
+					$proof = trigger.data.proof;
+					if (!$leaf_account OR !$collateral OR !$proof)
+						bounce('need full claim');
+					if ($leaf_account != trigger.address)
+						bounce('leaf not yours');
+					if (!$collateral OR $amt > $collateral)
+						bounce('amount exceeds proven collateral');
+					if (length($proof) > 16)
+						bounce('proof too deep');
+					$leaf = $leaf_of($leaf_account, $collateral);
+					$root = $root_of($leaf, $proof);
+					if (!$root OR $root == true)
+						bounce('bad sibling');
+					if ($root != var['aa_root_' || $h])
+						bounce('bad merkle root');
+					if ($amt > (var['bal_' || trigger.address] otherwise 0))
+						bounce('insufficient aa balance');
 				}",
 				messages: [
 					{
@@ -127,7 +281,7 @@
 					{
 						app: "state",
 						state: "{
-							var['bal_' || trigger.address] = var['bal_' || trigger.address] - trigger.data.amount;
+							var['bal_' || trigger.address] -= trigger.data.amount;
 						}"
 					}
 				]

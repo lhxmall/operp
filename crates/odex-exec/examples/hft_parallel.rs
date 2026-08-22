@@ -104,7 +104,10 @@ fn main() {
     println!("READY");
     println!("PIPELINE HFT: {} signers -> 1 executor, {}ms", cfg.engines, cfg.run_ms);
 
-    let eng = Arc::new(Mutex::new(Engine::new()));
+    let mut eng0 = Engine::new();
+    eng0.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+    eng0.state.allowed_markets.insert(BTC_USD);
+    let eng = Arc::new(Mutex::new(eng0));
     let executed = Arc::new(AtomicU64::new(0));
     let fills = Arc::new(AtomicU64::new(0));
     let generated = Arc::new(AtomicU64::new(0));

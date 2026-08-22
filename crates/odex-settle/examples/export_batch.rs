@@ -17,6 +17,8 @@ fn acct(secret: &[u8; 32]) -> AccountId {
 
 fn main() {
     let mut eng = Engine::new();
+    eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+    eng.state.allowed_markets.insert(BTC_USD);
     let prev = eng.state.clone();
     let g = genesis_id();
     let alice = sk(1);
