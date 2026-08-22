@@ -173,6 +173,8 @@ pub struct Dag {
     units: HashMap<UnitId, Unit>,
     children: HashMap<UnitId, Vec<UnitId>>,
     executed: HashSet<UnitId>,
+    /// non-executed units; keeps ready_linearized O(pending) not O(all units)
+    pending: HashSet<UnitId>,
 }
 
 impl Dag {
@@ -183,6 +185,7 @@ impl Dag {
             units: HashMap::new(),
             children: HashMap::new(),
             executed,
+            pending: HashSet::new(),
         }
     }
 
@@ -212,6 +215,7 @@ impl Dag {
             self.children.entry(*p).or_default().push(id);
         }
         self.units.insert(id, unit);
+        self.pending.insert(id);
         Ok(id)
     }
 
@@ -221,10 +225,9 @@ impl Dag {
 
     pub fn ready_linearized(&self) -> Vec<UnitId> {
         let mut ready: Vec<UnitId> = self
-            .units
-            .keys()
+            .pending
+            .iter()
             .copied()
-            .filter(|id| !self.executed.contains(id))
             .filter(|id| {
                 self.units
                     .get(id)
@@ -238,6 +241,7 @@ impl Dag {
 
     pub fn mark_executed(&mut self, id: UnitId) {
         self.executed.insert(id);
+        self.pending.remove(&id);
     }
 
     pub fn get(&self, id: UnitId) -> Option<&Unit> {
