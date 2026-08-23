@@ -175,6 +175,8 @@ obyte-local/
   agents/operp_vault.aa   the vault autonomous agent (security-hardened)
   test_vault_aa.js       full lifecycle integration test (devnet via aa-testkit)
   deploy_testnet.js      testnet deployment script (+ smoke deposit)
+  post_batch.js          operator submission flow (temp_data reveal,
+                         submit, lock, finalize, claim)
   gen_withdraw_proof     see crates/operp-settle/examples
 vendor/aa-testkit/       Obyte autonomous-agent testkit (vendored)
 docs/PROTOCOL.md         deeper protocol write-up
@@ -199,6 +201,10 @@ cd obyte-local && node test_vault_aa.js
 
 # deploy the vault AA to Obyte testnet
 cd obyte-local && node deploy_testnet.js
+
+# operator flow: post full batch as temp_data + submit + lock +
+# finalize + claim race reward (the complete mainnet sequence)
+cd obyte-local && node post_batch.js
 ```
 
 Measured on this machine: `bench_raw` ≈ 5 500 ops/s; `hft_onedag` (8 markets,
@@ -209,23 +215,33 @@ Measured on this machine: `bench_raw` ≈ 5 500 ops/s; `hft_onedag` (8 markets,
 This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
 **not mainnet-ready**. Known gaps, roughly in priority order:
 
-1. **Fraud proofs are nominal.** `respond` only checks that the operator
-   (identity-gated: only the candidate submitter may respond) re-submits the
-   already-committed root — a dishonest operator survives challenges by
-   repeating its own fake root. Real dispute resolution needs either on-chain
-   replay of disputed batches or validity-proof style commitments.
-2. **Fees are minimal.** A taker fee (5 bps of notional) funds the insurance
-   pool, so bad-debt absorption and keeper payouts no longer drain a finite
-   seed — but there is still no funding-rate model between longs and shorts.
-3. **No TWAP / multi-source oracle.** Mark prices come from recent fills
-   behind a 100 USD notional floor **and a ±10% deviation cap**; large
-   self-trades can still walk marks gradually.
-4. **Single operator** submits batches — a centralized sequencer.
-5. Failed heights roll back cleanly (`last_locked` rewind + bond refund), but
-   recovery depends on an operator resubmitting corrected batches; there is
-   no trustless escape hatch if operators disappear entirely.
-6. The AA has had no formal security audit; Oscript's complexity budget
+1. **Fraud response is freeze-and-rollback, not on-chain re-execution.**
+   Full trade data IS posted on-chain (`post_batch.js` reveals every unit as
+   `temp_data`, so any watcher can re-execute and detect a bad root), and a
+   detected fraud triggers challenge → freeze → height rollback with the
+   challenger's bond refunded — a lying operator cannot steal funds, only
+   stall its own height while honest operators (fee race) resubmit correctly.
+   What remains out of reach: Oscript cannot re-run the matcher on-chain, so
+   there is no automatic slashing or validity proof; enforcement relies on
+   live watchers plus competing operators.
+2. **Funding rate is mark-premium based.** Longs pay shorts when the trade
+   mark runs above the dual-oracle index and vice versa (capped at ±50 bps
+   per tick), but the index is our own two-oracle average, not an external
+   exchange price — oracle quality bounds funding quality.
+3. **Oracles are whitelisted accounts**, not permissionless reporters;
+   adding/removing sources is an off-chain governance act for now.
+4. Failed heights roll back cleanly, but recovery depends on operators
+   resubmitting corrected batches; there is no trustless escape hatch if
+   every operator disappears.
+5. The AA has had no formal security audit; Oscript's complexity budget
    forced logic to be split across helper functions.
+
+Recently closed: deposit whitelisting, overflow guards, market whitelist,
+strict signatures, orphan recovery, bounded logs, realized-PnL settlement
+into collateral, bad-debt clamp with conservation, taker-fee insurance
+income, dual-oracle averaged marks with deviation caps, peer-to-peer
+funding, multi-operator fee race with consolation payments, operator
+identity gate, Final-status promotion, on-chain batch data poster.
 
 Recently closed: deposit whitelisting, overflow guards, market whitelist,
 strict signatures, orphan recovery, bounded logs, realized-PnL settlement

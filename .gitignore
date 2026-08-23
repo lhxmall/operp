@@ -22,3 +22,4 @@ testdata-testnet/
 /obyte-local/web/
 /obyte-local/batch.json
 /obyte-local/withdraw_claim.json
+testdata-poster/

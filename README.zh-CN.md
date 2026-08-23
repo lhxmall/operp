@@ -82,6 +82,9 @@ cd obyte-local && node test_vault_aa.js
 
 # 部署 vault AA 到 Obyte 测试网
 cd obyte-local && node deploy_testnet.js
+
+# operator 完整提交流程：temp_data 全量披露 + submit + lock + finalize + 领取竞速奖励
+cd obyte-local && node post_batch.js
 ```
 
 实测数据（开发机）：`bench_raw` ≈ 5 500 ops/s；

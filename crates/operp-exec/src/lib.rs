@@ -97,6 +97,25 @@ impl Engine {
         });
     }
 
+    /// Promote log entries for units contained in a FINALIZED batch height
+    /// from Optimistic to Final (local node view; the AA finalize event is
+    /// observed off-engine). Returns the number of promoted entries. Log
+    /// statuses are not part of state_root, so replay determinism is intact.
+    pub fn promote_finalized(&mut self, unit_ids: &[UnitId]) -> usize {
+        let fin: HashSet<UnitId> = unit_ids.iter().copied().collect();
+        let mut n = 0;
+        for e in self.log.iter_mut() {
+            if let ExecEvent::Applied { unit, status, .. } = e {
+                if *status == ExecStatus::Optimistic && fin.contains(unit) {
+                    *status = ExecStatus::Final;
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+
     fn apply_one(&mut self, id: UnitId) -> ExecEvent {
         let unit = self.dag.get(id).cloned().expect("unit in dag");
         let seq = self.state.seq;
@@ -883,6 +902,30 @@ mod tests {
         assert!(keeper_bal > 0, "keeper must be rewarded");
         let ins_after = eng.state.accounts.get(&INSURANCE_ACCOUNT).unwrap().collateral;
         assert!(ins_after < ins_before, "insurance pays the reward");
+    }
+
+    #[test]
+    fn finalize_promotes_log_status() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        let alice = sk(1);
+        let d1 = deposit(vec![g], &alice, 10_000 * operp_types::USD_SCALE as i128, 1);
+        let id1 = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        // All applied events start Optimistic.
+        assert!(eng.log.iter().all(
+            |e| !matches!(e, ExecEvent::Applied { status, .. } if *status == ExecStatus::Final)
+        ));
+        // Operator observes the AA finalizing height 1 (containing id1).
+        let promoted = eng.promote_finalized(&[id1]);
+        assert_eq!(promoted, 1);
+        assert!(eng.log.iter().any(
+            |e| matches!(e, ExecEvent::Applied { unit, status, .. }
+                if *unit == id1 && *status == ExecStatus::Final)
+        ));
+        // Idempotent: promoting again is a no-op.
+        assert_eq!(eng.promote_finalized(&[id1]), 0);
     }
     #[test]
     fn unauthorized_oracle_rejected() {

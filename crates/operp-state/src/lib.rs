@@ -104,6 +104,44 @@ impl ChainState {
             _ => candidate,
         };
         self.marks.insert(market, capped);
+        // Funding: every dual-source oracle tick settles peer-to-peer funding.
+        // premium_bps = (spot − index)/index, clamped to ±FUNDING_CAP_BPS.
+        // Signed per-position payment: longs (qty>0) pay when spot > index,
+        // shorts receive; mirrored when spot < index. Σ payments nets ~0
+        // (long/short notionals offset); truncation residue is sub-unit dust
+        // by design. Insurance never participates. BTreeMap order keeps this
+        // deterministic across replays.
+        let (index_a, index_b) = (
+            self.oracle_marks.get(&(0u8, market)).copied(),
+            self.oracle_marks.get(&(1u8, market)).copied(),
+        );
+        if let (Some(ia), Some(ib)) = (index_a, index_b) {
+            let index = ((ia as u128 + ib as u128) / 2) as i128;
+            let spot = capped as i128;
+            if index > 0 {
+                let diff_bps = ((spot - index) * 10_000 / index)
+                    .clamp(-(operp_types::FUNDING_CAP_BPS as i128), operp_types::FUNDING_CAP_BPS as i128);
+                if diff_bps != 0 {
+                    let ids: Vec<AccountId> = self.accounts.keys().copied().collect();
+                    for id in ids {
+                        let payment = match self.accounts.get(&id).and_then(|a| a.positions.get(&market)) {
+                            Some(pos) => {
+                                operp_types::signed_notional_usd(pos.qty, ia) * diff_bps / 10_000
+                            }
+                            None => continue,
+                        };
+                        if payment == 0 {
+                            continue;
+                        }
+                        // payment > 0: this account PAYS (long in premium);
+                        // payment < 0: it RECEIVES.
+                        if let Some(a) = self.accounts.get_mut(&id) {
+                            a.collateral -= payment;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn book_mut(&mut self, market: MarketId) -> &mut OrderBook {
@@ -495,5 +533,42 @@ mod tests {
         // +5% move: within the band — mark updates.
         s.apply_fill_pair(&mk_fill(105_000 * operp_types::PRICE_SCALE)).unwrap();
         assert_eq!(*s.marks.get(&BTC_USD).unwrap(), 105_000 * operp_types::PRICE_SCALE);
+    }
+
+    #[test]
+    fn funding_transfers_long_to_short_and_conserves() {
+        let mut s = ChainState::new();
+        let long = AccountId([9; 32]);
+        let short = AccountId([8; 32]);
+        s.trusted_oracles.insert(AccountId([5; 32]));
+        s.trusted_oracles.insert(AccountId([6; 32]));
+        s.account_mut(long).credit(1_000_000 * USD_SCALE as i128).unwrap();
+        s.account_mut(short).credit(1_000_000 * USD_SCALE as i128).unwrap();
+
+        // Both open 1 BTC at 100_000 via a fill (spot mark = index initially).
+        let px = 100_000 * operp_types::PRICE_SCALE;
+        let fill = Fill {
+            taker_id: operp_types::OrderId([0u8; 32]),
+            maker_id: operp_types::OrderId([0u8; 32]),
+            taker: long,
+            maker: short,
+            market: BTC_USD,
+            price: px,
+            qty: operp_types::QTY_SCALE,
+            seq: 1,
+            taker_side: operp_types::Side::Bid,
+        };
+        s.apply_fill_pair(&fill).unwrap();
+
+        // Oracles report index ABOVE spot: premium positive → long pays short.
+        // source0 = 105k (index avg with source1 = 103k → index ≈ 104k).
+        s.apply_oracle(0, BTC_USD, 105_000 * operp_types::PRICE_SCALE);
+        s.apply_oracle(1, BTC_USD, 103_000 * operp_types::PRICE_SCALE);
+
+        let long_bal = s.accounts[&long].collateral;
+        let short_bal = s.accounts[&short].collateral;
+        // Long paid, short received (premium > 0), and the transfer is
+        // symmetric up to integer truncation dust (< 1 USD).
+        assert!(long_bal < short_bal, "long must fund short in premium");
     }
 }

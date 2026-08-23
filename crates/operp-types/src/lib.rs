@@ -19,6 +19,10 @@ pub const REDUCE_ONLY_RATIO_BPS: u64 = 12_000;
 /// Taker fee (bps of notional), routed to the insurance fund so it has
 /// income to offset bad-debt absorption and keeper payouts.
 pub const TAKER_FEE_BPS: u64 = 5;
+/// Per-tick funding cap (bps): longs pay shorts when mark > oracle index,
+/// shorts pay longs when mark < oracle. Payment per position =
+/// signed_notional(qty, oracle) * clamp(diff_bps, ±FUNDING_CAP_BPS)/10000.
+pub const FUNDING_CAP_BPS: i64 = 50;
 pub const CHALLENGE_SECS: u64 = 3600;
 pub const OBYTE_STABILITY_SECS: u64 = 600;
 pub const BATCH_INTERVAL_MS: u64 = 2000;

@@ -99,9 +99,10 @@ reduce_only      : equity·10000 ≤ mm·12000
 - **坏账封顶**：成交后若 taker equity < 0，其 equity 被钳到恰好 0
   （collateral 吸收缺口），保险基金 collateral 等额扣减——守恒、且后续
   成交不会重复触发。损失社会化到基金，绝不转嫁对手方。
-- **mark 双重防线**：notional ≥ 100 USD 才可更新 mark，且新价相对旧 mark
-  偏离不得超过 ±10%（未定价市场首笔合格成交无条件设定），
-  防止灰尘单与小额对敲操纵清算（完整 TWAP 属于 Phase 2）。
+- **mark 三重防线**：① notional ≥ 100 USD 才可更新；② 新价相对旧 mark
+  偏离不得超过 ±10%；③ 一旦市场有预言机报价（`Op::OracleSet`，双源均值，
+  白名单账户签名），成交价即失去 mark 定价权。资金费率：每个双源 tick 按
+  (spot − index)/index（钳 ±50bps）在多空间对等转移，净零守恒。
 
 ### 2.5 市场与存款白名单
 
