@@ -8,7 +8,7 @@ periodic state roots to the [Obyte](https://obyte.org) ledger through an
 autonomous agent (AA) vault. Withdrawals from the vault are **proof-gated**:
 users must present a Merkle proof of their balance against a finalized root.
 
-> **Status: testnet-ready MVP.** All 30 workspace tests pass; the full AA
+> **Status: testnet-ready MVP.** All 37 workspace tests pass; the full AA
 > lifecycle (deposit → submit → lock → challenge → finalize → proof withdrawal)
 > is verified end-to-end on an aa-testkit devnet. Mainnet deployment requires
 > closing the gaps listed in [Limitations](#limitations--mainnet-readiness).
@@ -210,19 +210,29 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
 **not mainnet-ready**. Known gaps, roughly in priority order:
 
 1. **Fraud proofs are nominal.** `respond` only checks that the operator
-   re-submits the already-committed root — a dishonest operator survives
-   challenges by repeating its own fake root. Real dispute resolution needs
-   either on-chain replay of disputed batches or validity-proof style
-   commitments.
-2. **No fee / funding-rate model.** Keeper incentives come from a finite
-   insurance seed; once depleted there is no bad-debt funding.
+   (identity-gated: only the candidate submitter may respond) re-submits the
+   already-committed root — a dishonest operator survives challenges by
+   repeating its own fake root. Real dispute resolution needs either on-chain
+   replay of disputed batches or validity-proof style commitments.
+2. **Fees are minimal.** A taker fee (5 bps of notional) funds the insurance
+   pool, so bad-debt absorption and keeper payouts no longer drain a finite
+   seed — but there is still no funding-rate model between longs and shorts.
 3. **No TWAP / multi-source oracle.** Mark prices come from recent fills
-   behind a 100 USD notional floor; large self-trades can still bias marks.
+   behind a 100 USD notional floor **and a ±10% deviation cap**; large
+   self-trades can still walk marks gradually.
 4. **Single operator** submits batches — a centralized sequencer.
-5. `respond` has no identity gate (anyone may answer for the operator);
-   failed heights strand funds with no recovery path yet.
+5. Failed heights roll back cleanly (`last_locked` rewind + bond refund), but
+   recovery depends on an operator resubmitting corrected batches; there is
+   no trustless escape hatch if operators disappear entirely.
 6. The AA has had no formal security audit; Oscript's complexity budget
    forced logic to be split across helper functions.
+
+Recently closed: deposit whitelisting, overflow guards, market whitelist,
+strict signatures, orphan recovery, bounded logs, realized-PnL settlement
+into collateral (profitable withdrawals), bad-debt clamp with conservation,
+mark deviation cap, taker-fee insurance income, non-head cancel depth
+correctness, maker-queue pop regression, operator identity gate on
+`respond`, proof-withdrawal decoupled from the diagnostic `bal_` ledger.
 
 See the commit history for the full security-audit remediation this repo
 went through (proof-gated withdrawals, deposit whitelisting, overflow

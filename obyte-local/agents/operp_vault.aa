@@ -152,6 +152,10 @@
 					$h = trigger.data.height;
 					if (!$h)
 						bounce('no height');
+					// Identity gate: only the account that submitted (last
+					// replaced) the candidate for this height may respond.
+					if (trigger.address != var['cand_who_' || $h])
+						bounce('not operator');
 					if (var['frozen_' || $h] != 1)
 						bounce('nothing to respond to');
 					if (timestamp >= var['stable_at_' || $h] + 3600)

@@ -150,6 +150,12 @@ async function main() {
   console.log("  frozen_1 =", st.frozen_1, "bond_bob =", st["bond_" + (await bob.getAddress())]);
 
   await network.timetravel({ shift: '100s' });
+  // identity gate: a non-operator (bob here — alice owns the final candidate)
+  // must be rejected even with the correct root.
+  const impostor = await triggerRaw(bob, { respond: 1, height: 1, root_confirmed: "rootFINAL1" }, 20000);
+  if (!JSON.stringify(impostor).includes("not operator"))
+    throw new Error("impostor respond not rejected: " + JSON.stringify(impostor).slice(0, 300));
+  console.log("  impostor respond bounced as expected");
   await trigger(alice, { respond: 1, height: 1, root_confirmed: "rootFINAL1" }, 20000);
   st = await vars();
   if (Number(st["frozen_1"]) !== 0) throw new Error("respond did not unfreeze");
