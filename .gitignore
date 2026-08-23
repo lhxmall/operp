@@ -11,3 +11,14 @@
 /obyte-local/testdata-stress
 /obyte-local/stress-out
 testdata-testnet/
+
+# Legacy MVP dev tooling & samples (kept locally, not part of the project)
+/obyte-local/crowd_mainnet.js
+/obyte-local/stress_dual.js
+/obyte-local/serial_parallel.js
+/obyte-local/post_temp_data.js
+/obyte-local/post_real_batch.js
+/obyte-local/probe_send.js
+/obyte-local/web/
+/obyte-local/batch.json
+/obyte-local/withdraw_claim.json
