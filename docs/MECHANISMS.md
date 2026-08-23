@@ -1,0 +1,559 @@
+# OPERP 机制详解（Mechanism Reference）
+
+本文是 OPERP 所有运行机制的完整参考，面向需要理解或复现每一层内部行为
+的读者。概览见 [README](../README.md)；设计动机叙事版见
+[PROTOCOL.md](PROTOCOL.md)。本文按"机制 → 精确规则 → 边界情况"逐层展开，
+所有数字均可在 `crates/operp-types/src/lib.rs` 找到对应常量。
+
+---
+
+## 目录
+
+1. [账本与定值体系](#1-账本与定值体系)
+2. [DAG 与单元](#2-dag-与单元)
+3. [订单簿撮合](#3-订单簿撮合)
+4. [账户与风险引擎](#4-账户与风险引擎)
+5. [清算、keeper 与保险基金](#5-清算keeper-与保险基金)
+6. [手续费与资金费率](#6-手续费与资金费率)
+7. [预言机与 mark 价格](#7-预言机与-mark-价格)
+8. [批次与结算验证](#8-批次与结算验证)
+9. [双 Merkle 树](#9-double-merkle-树)
+10. [vault AA 状态机](#10-vault-aa-状态机)
+11. [多 operator 手续费竞速](#11-multi-operator-手续费竞速)
+12. [Optimistic / Final 状态提升](#12-optimistic--final-状态提升)
+13. [威胁模型对照表](#13-威胁模型对照表)
+
+---
+
+## 1. 账本与定值体系
+
+### 1.1 三种数量纲
+
+| 类型 | 底层 | 缩放 | 例子 |
+|---|---|---|---|
+| `Price` | u64 | 1e8 | BTC 价格 $100,000 = `10_000_000_000_000` |
+| `Qty` | u64 | 1e8 | 1 BTC = `100_000_000` |
+| `Usd` | i128 | 1e6 | $1 = `1_000_000`（微美元） |
+
+全程整数运算，无浮点。名义额：
+
+```
+notional_usd(qty, price) =
+    i128(qty) × i128(price) / PRICE_SCALE × USD_SCALE / QTY_SCALE
+```
+
+例：1 BTC @ $100,000 → `1e8 × 1e13 / 1e8 × 1e6 / 1e8 = 1e11`（= $100,000）。
+
+### 1.2 标识符推导
+
+| 标识 | 推导 |
+|---|---|
+| `AccountId` | `sha256(ed25519 公钥)`，32 字节 |
+| `OrderId` | `sha256(account32 ‖ market_u32le ‖ client_seq_u64le)` |
+| `UnitId` | `sha256(canonical_bytes)`，canonical 前缀为 ASCII `"ODX1"` |
+| 清算单 id | `sha256(b"liq" ‖ unit_id_32)` |
+
+### 1.3 入口溢出防护（DoS 防线）
+
+place() 在任何算术前拒绝：
+
+```
+qty > i64::MAX                    → Risk（仓位以 i64 存储）
+price·qty 溢出 i128               → Risk（名义额计算前置校验）
+market ∉ allowed_markets          → Risk（市场白名单）
+client_seq ≠ last+1               → DuplicateClientSeq
+```
+
+### 1.4 client_seq 连续性
+
+每账户的 Place 携带严格递增 client_seq（首笔必须 = 1）。作用：订单幂等
+（重复 seq 被拒）、重放安全（无法重发历史订单）、缺口检测（跳号即丢单）。
+client_seq 是账户级全局计数（跨市场），非每市场独立。
+
+---
+
+## 2. DAG 与单元
+
+### 2.1 单元结构
+
+```rust
+Unit {
+    parents: Vec<UnitId>,   // 1..=2 个，升序、去重
+    op: Op,                 // 业务操作
+    pubkey: [u8; 32],       // ed25519 公钥
+    sig: [u8; 64],          // 对 UnitId 的签名
+}
+```
+
+操作类型与 canonical 编码 tag：
+
+| op | tag | 字段序 |
+|---|---|---|
+| Place | 1 | account, market_le4, side_u8, typ_u8, tif_u8, price_le8, qty_le8, client_seq_le8 |
+| Cancel | 2 | account, order_id |
+| Deposit | 3 | account, amount_le16, aa_unit_32 |
+| Withdraw | 4 | account, amount_le16, nonce_le8 |
+| OracleSet | 6 | oracle, source_u8, market_le4, price_le8 |
+| Liquidate | 7 | caller, target, market_le4 |
+
+canonical 尾部追加 pubkey。签名验证用 ed25519 **verify_strict**：
+拒绝可延展签名（非规范 s 值、小阶分量）。
+
+### 2.2 身份绑定
+
+每个 op 的关键字段必须与签名者一致：
+
+- Place/Cancel/Deposit/Withdraw：account == sha256(pubkey)
+- Liquidate：caller == sha256(pubkey) —— keeper 身份密码学绑定，
+  自我清算在验证层即被拒（caller == target → BadAccount）
+- OracleSet：oracle == sha256(pubkey)，执行时另验 trusted_oracles 白名单
+
+### 2.3 插入与乱序恢复
+
+```
+insert(unit):
+  EmptyParents / TooManyParents(>2) / BadParents(未排序或重复) → 拒绝
+  UnitId 已存在            → Duplicate
+  存在未知父单元:
+    首次见到               → 写入 orphan 缓冲，返回 MissingParent
+    已在缓冲中             → 返回 Ok(id)（幂等）
+  全部父母已知             → link 进 DAG，进 pending 集
+```
+
+orphan 缓冲容量 4096，超出按 Instant 时间 FIFO 驱逐。mark_executed 时
+做不动点扫描：所有"父母已全部已知"的孤儿链式解锁。效果：乱序投递
+不丢单元，最终全部恢复执行。
+
+### 2.4 确定性线性化
+
+ready_linearized()：收集 pending 中父母均已执行的单元，按 UnitId 字节
+升序返回。这是唯一公开全序——任何副本对同一批单元算出同一执行顺序，
+无需通信。该排序即撮合"价格时间优先"中的时间。
+
+---
+
+## 3. 订单簿撮合
+
+### 3.1 数据结构
+
+```
+bids: BTreeMap<Reverse<Price>, VecDeque<OrderId>>   # Reverse 使最高价居首
+asks: BTreeMap<Price, VecDeque<OrderId>>
+orders: HashMap<OrderId, Order>                      # O(1) 查询/撤单
+bid_qty / ask_qty: BTreeMap<..., Qty>                # level 可见量缓存
+```
+
+### 3.2 撮合循环规则
+
+```
+while taker.remaining > 0:
+  head = 对手方向队列头（taker 为 Bid → 取 ask 头；反之 bid 头）
+  无对手头 → break
+
+  crosses:
+    Limit Bid: maker_price ≤ order.price
+    Limit Ask: maker_price ≥ order.price
+    Market:    无条件
+
+  fill_qty = min(taker.remaining, maker.remaining)
+  双方 remaining -= fill_qty；可见量缓存 -= fill_qty（maker level）
+  记录 Fill（成交价 = maker_price）
+
+  maker_done → orders.remove(maker_id); pop_head(maker 自己所在侧)
+  maker.account == taker.account → self_trade，停止撮合，
+  taker 剩余作废不挂单
+```
+
+TIF：GTC Limit 余量回挂队尾（缓存 += remaining）；IOC/Market 余量丢弃。
+
+### 3.3 可见量缓存不变量
+
+任意时刻 `bid_qty[p] == Σ remaining(bids[p] 中活单)`。维护点：
+挂单 += remaining；成交 −= fill_qty（maker 侧）；撤单（任意位置）
+−= remaining。非队首撤单留 ghost id 在 deque 中，next_*_head 匹配时
+惰性弹出——O(1) 撤单且深度始终正确。best_bid/best_ask 读缓存首元素：
+O(log depth)。
+
+### 3.4 价格时间优先的正确含义
+
+"时间"由 §2.4 确定性线性化赋予：同价位先后就是 unit_id 排序中先执行者。
+跨副本永远一致。
+
+---
+
+## 4. 账户与风险引擎
+
+### 4.1 成交应用（apply_fill）
+
+每笔成交同时更新 taker/maker 两腿：
+
+- 开仓/加仓（旧仓零或同向）：VWAP 入场价
+  entry' = (|pos|·entry + qty·price) / (|pos|+qty)，u128 中间量
+- 平仓/反手：实现 PnL
+  多头 pnl = close × (exit − entry)/PRICE_SCALE × USD_SCALE/QTY_SCALE；
+  空头符号翻转。PnL 即时结算进 collateral（§4.3）；反手余量按成交价开新仓
+- 仓位数量 checked_add（防累计溢出 → Overflow）
+
+### 4.2 风险快照
+
+```
+upnl   = Σ signed_notional(qty, mark) − signed_notional(qty, entry)
+mm     = Σ bps(|qty·mark|, 500)          # 5%
+im     = Σ bps(|qty·mark|, 1000)         # 10%
+equity = collateral + upnl               # PnL 已结算进 collateral
+liquidatable : mm>0 ∧ equity×10000 ≤ mm×10500   # ≤1.05
+reduce_only  : has_unmarked ∨ (mm>0 ∧ equity×10000 ≤ mm×12000)  # ≤1.20
+```
+
+无 mark 仓位：不计入 upnl/mm/im 且强制 reduce_only。否则 mark=0 给多头
+记全额虚亏（可提光）、给空头记全额虚利（可无限加仓）。
+
+### 4.3 PnL 结算模型
+
+平仓瞬间已实现 PnL 进入 collateral：collateral += pnl（checked）；
+realized_pnl 仅作统计累加。效果：赢利者立刻可提取全部利润；提款证明
+叶子（只承诺 collateral）反映真实偿付能力。
+
+### 4.4 提款
+
+debit(amount)：amount>0；collateral 足额；debit 后快照落入 reduce-only
+带则回滚报 Insufficient。重复 nonce 返回 DuplicateNonce。
+
+---
+
+## 5. 清算、keeper 与保险基金
+
+### 5.1 清算流程
+
+```
+Liquidate { caller, target, market }（caller 签名绑定）:
+  caller == target                      → BadAccount（自我清算禁止）
+  target/caller ∈ {INSURANCE_ACCOUNT}   → NotLiquidatable
+  target 不满足 liquidatable            → NotLiquidatable
+  target 无仓位                         → NotLiquidatable
+
+  Market IOC 单：平仓方向，qty=|pos.qty|，account=target
+  吃对手盘至干净；残余仍 liquidatable → 以 mark 与保险基金对敲强平
+  （合成 fill，maker_id = OrderId([0;32])）
+```
+
+### 5.2 keeper 奖励
+
+reward = Σ bps(每笔成交名义额, KEEPER_REWARD_BPS=100)
+pay    = min(reward, max(insurance.collateral, 0))
+基金枯竭时清算仍发生，keeper 暂无酬但不阻塞清算。
+
+### 5.3 坏账钳零
+
+apply_fill_pair 后 taker snapshot.equity < 0:
+  shortfall = −equity
+  taker.collateral   −= shortfall      # equity 精确归零
+  insurance.collateral −= shortfall    # 基金吸收
+
+守恒：总权益减少恰为缺口。归零后不会重复触发。保险余额可为负 =
+显式社会化债务，由手续费回补。保险永不被清算/不自我清算（双向排除）。
+
+### 5.4 保险基金
+
+创世注入 INSURANCE_SEED = 10,000 USD。收入腿：taker 手续费（§6.1）。
+支出腿：坏账吸收 + keeper 奖励。
+
+---
+
+## 6. 手续费与资金费率
+
+### 6.1 Taker 手续费（保险收入腿）
+
+每笔成交后：fee = bps(notional, TAKER_FEE_BPS=5)  # 0.05%
+taker.collateral −= fee；insurance.collateral += fee。
+走 Account 结算路径自动进入证明叶子承诺的 collateral。
+
+### 6.2 资金费率（多空互付）
+
+每个双源预言机 tick 结算一次：
+index = (oracle₀ + oracle₁)/2
+diff_bps = clamp((spot−index)×10000/index, ±FUNDING_CAP_BPS=50)
+每账户 payment = signed_notional(pos.qty, oracle_a) × diff_bps / 10000
+collateral −= payment
+
+spot > index：正 payment → 多头付，空头收；反向镜像。
+Σ payment ≈ 0（多空互抵），截断残差为亚单位灰尘（设计允许）。
+保险基金绝不参与。±50bps 钳幅防极端偏差抽干一方。
+
+### 6.3 dust 说明
+
+整数除法截断产生亚微美元残差，随交易数线性累积，经济上可忽略。
+系统性 dust 归集属 Phase 2 卫生项。
+
+---
+
+---
+
+## 7. 预言机与 mark 价格
+
+### 7.1 mark 的三重防线
+
+| 防线 | 规则 | 目的 |
+|---|---|---|
+| 名义额门槛 | notional ≥ 100 USD 的成交才有资格动 mark | 灰尘单无法操纵 |
+| 偏离帽 | 新价相对旧 mark 偏移 ≤ ±10%（旧价 > 0 时） | 单笔巨价无法跳变 |
+| 预言机权威 | 一旦市场有任一预言机源报价，成交永久失去 mark 定价权 | 撮合层与定价层解耦 |
+
+### 7.2 双预言机源
+
+```
+Op::OracleSet { oracle, source: u8(0|1), market, price }
+```
+
+- `oracle` 必须在 `trusted_oracles` 白名单（空集 = 无预言机可用），
+  且与签名者一致
+- 报价存入 `oracle_marks[(source, market)]`
+- 有效 mark = 可用源均值；单源先到先用该源
+- 写入 marks 前过 ±10% 帽（首个报价无条件设定）
+- price = 0 的报价被忽略
+
+### 7.3 无 TWAP 时的残余风险
+
+±10% 帽允许攻击者以每 tick 10% 步进逐渐走偏 mark（需真实成交或双源
+配合）。完整解法是 TWAP 或外部多源中位数——Phase 2。
+
+---
+
+## 8. 批次与结算验证
+
+### 8.1 批次切分
+
+operator 从线性化执行流中切出前缀（≤ BATCH_MAX_UNITS=512 units），
+调用 `Batch::from_applied(prev_state, engine, applied)`：
+
+```
+applied 为空                    → Empty
+applied.len() > 512             → TooManyUnits
+checkpoint.height               = prev.height + 1
+prev_state_hash                 = prev.state_root()
+engine.state.height ← height    （先推进再取根，meta_leaf 绑定高度）
+state_root                      = engine.state.state_root()
+aa_root                         = aa_root_of(engine)
+fills_hash / fill_count         = sha256(fills_bytes) / Σlen
+```
+
+高度进入 meta_leaf ⇒ state_root 跨批次成链：`prev_state_hash` 断链
+即重组可见。
+
+### 8.2 temp_data 全量披露
+
+`temp_data_payload()` 把**全部 unit（含签名）+ 所有根/哈希**序列化为
+OIP-0007 `temp_data` 消息发上 Obyte。意义：
+
+- 数据可用性：任何观察者可在 1 天保留窗口内下载并本地重放
+- 重放结果与 checkpoint 逐字段比对 → 欺诈必然可被检测
+- 检测后的执行依赖 §10 的挑战机制
+
+`data_hash` 为 sha256(serde_json bytes)，注明是侧链内部值；
+正式上主网时 poster 需换用 Obyte getBase64Hash。
+
+### 8.3 validate_against（任何人可审计）
+
+```
+chain_id ≠ CHAIN_ID                          → ChainMismatch
+replay 初始 root ≠ prev_root                 → PrevMismatch
+注入 deposits_allowed ← batch 内 Deposit ops 的 aa_unit 集
+逐 unit ingest（BadSig 等）                  → Replay
+重放事件聚合 fills_hash/fill_count 不符      → FillsMismatch
+replay 高度推进后 state_root 不符            → RootMismatch
+```
+
+---
+
+## 9. 双 Merkle 树
+
+侧链维护两棵承诺同一组余额的 Merkle 树，原因见 §9.3。
+
+### 9.1 字节域树（state_root）
+
+叶子（排序后两两合并，奇数复制末位，父 = sha256(left‖right)）：
+
+```
+account_leaf = sha256("acct" ‖ id32 ‖ collateral_i128le16
+                      ‖ realized_i128le16 ‖ pos_count_u32le ‖ positions…)
+book_leaf    = sha256(b"book" ‖ market_le4 ‖ best_bid_le8 ‖ best_ask_le8 ‖ order_count_u64le)
+meta_leaf    = sha256(b"meta" ‖ height_le ‖ seq_le ‖ last_unit ‖ finalized_height_le)
+```
+
+meta_leaf 同时包含 height 与 finalized_height：前者绑定批次链，
+后者使 Final 提升进度也成为被承诺的共识状态。
+
+### 9.2 hex 字符串域树（aa_root）
+
+Oscript 的 `sha256()` 对参数 UTF-8 文本哈希且默认输出 base64——字节域树
+无法在 AA 内复算。因此另建同构字符串树：
+
+```
+leaf = sha256_hex("acct:" + address + ":" + collateral十进制串)
+node = sha256_hex(left_hex + right_hex)
+```
+
+Rust `aa_root_of(pairs)` / `aa_proof_for(pairs, addr)` 构造；
+AA 用 `sha256(x, 'hex')` 复算。两树承诺相同 (地址, 抵押) 集。
+经探针 AA 对拍验证 root 逐字节一致。
+
+### 9.3 为什么提款用 aa_root
+
+AA 只能做字符串拼接与 sha256——它无法解析 i128 LE、无法遍历仓位数组。
+字符串域树把"证明我有多少钱"压缩成 AA 能完成的两次 sha256 调用。
+字节域树则继续承担完整状态承诺（撮合簿、仓位、进度），供 Rust 观察者
+全量审计。
+
+---
+
+## 10. vault AA 状态机
+
+AA 地址上的状态变量（`<h>` 为高度数字后缀）：
+
+```
+boot, chain_id='operp-mvp-1', last_locked, last_finalized
+submitted_at_h, cand_root_h, cand_aa_root_h, cand_prev_h,
+  cand_fills_h, cand_unit_h, cand_who_h      # 候选（lock 前可替换）
+root_h, aa_root_h, winner_h, stable_at_h     # 已锁定
+frozen_h ∈ {∅/0=正常, 1=已挑战, 2=永久失败}
+challenger_h, bond_<addr>, fee_winner_h,
+reward_<addr>, bal_<addr>(诊断影子账本)
+```
+
+### 10.1 submit(h)
+
+前置：chain_id 正确 ∧ h == last_locked+1 ∧ prev 匹配 root_{h−1}
+∧ 有 state_root/aa_root/fills_hash ∧ 未锁定。
+
+副作用：写候选五元组 + submitted_at_h；竞速判定（§11）。
+
+### 10.2 lock(h)
+
+候选存在 ∧ 未锁 ∧ h == last_locked+1 ∧ now ≥ submitted_at_h + 600
+→ root/aa_root/winner/stable_at 落定，last_locked = h。锁后不可变。
+
+600s 是 OBYTE_STABILITY_SECS 的模拟（devnet 用 timetravel 测试）。
+
+### 10.3 challenge(h)
+
+root 已锁 ∧ 未冻结 ∧ now < stable_at_h + 3600 ∧ 输出 ≥ 20000 base
+→ frozen_h = 1，记录 challenger，收 bond。
+
+### 10.4 respond(h)
+
+身份门：`trigger.address == cand_who_h`（只有提交该候选的账户能应诉）
+∧ frozen == 1 ∧ 窗口内 ∧ root_confirmed == root_h
+→ 解冻，挑战者 bond 没收归 AA 库。
+
+已知边界：MVP 应诉只校验重发根一致，不能证明根正确——真欺诈 operator
+重复自己的假根即可通过。完整方案需要链上重放或有效性证明（README
+Limitations #1）。
+
+### 10.5 finalize(h)
+
+两条路：
+
+```
+失败路: frozen_h == 1 ∧ 已超窗（operator 未应诉）
+        → frozen_h = 2（永久）、root_h/aa_root_h 清零、
+          last_locked 回退 h−1、bond 全额退挑战者
+正常路: 根存在 ∧ 未冻结 ∧ 超窗 ∧ h == last_finalized+1
+        → last_finalized = h；fee_winner 累加 20000 bytes 奖励（§11）
+```
+
+### 10.6 withdraw(h = last_finalized)
+
+```
+未冻结 ∧ (height 参数若给必须等于 last_finalized)
+amount > 0 ∧ leaf_account == trigger.address
+amount ≤ collateral（proof 叶子声明值）
+proof 深度 ≤ 8
+leaf  = sha256('acct:'+address+':'+collateral, 'hex')
+fold proof[]: right ? sha256(acc‖sib,'hex') : sha256(sib‖acc,'hex')
+结果 == var['aa_root_' || h]   否则 bounce('bad merkle root')
+→ 支付 trigger.address amount；bal_ 同步扣减（仅诊断）
+```
+
+余额权威是 **证明叶子**，不是 bal_。bal_ 移除门控的原因：
+它与 aa_root 是永不严格同步的双账本（费扣口径、批次延迟、回滚都会漂移），
+只会产生错误拒付；支付本身由 AA 原生余额机械兜底。
+
+### 10.7 claim_reward
+
+领取竞速累积奖励（§11）。AA 临时缺币时单元 bounce，奖励仍记账，
+稍后重试即可——finalize 流程不会因付款失败而卡死。
+
+---
+
+## 11. Multi-operator 手续费竞速
+
+多个 operator 并行观察侧链、各自向 AA submit 批次。赢家判定利用
+Obyte 原生性质：**AA 只被稳定单元触发，触发按稳定序生效**。因此
+"最先稳定"天然等价于"AA 最先处理"：
+
+```
+submit(h) 竞速:
+  $is_loser = fee_winner_h 已设置 ∧ ≠ trigger.address
+  if (!fee_winner_h): fee_winner_h ← trigger.address   # 首个稳定者赢
+  else: 立即支付安慰金 5000 bytes 给后来者
+```
+
+- 输家刷补贴无利可图：每次提交净成本 10000 bytes（留存处理费）> 补贴
+- 赢家奖励在 finalize 成功路径累加（失败高度不发放），claim_reward 提取
+- "交易按第一个稳定的填充下一个"由 prev_state_hash 链保证：
+  h+1 必须引用赢家的 root_h
+- 高度失败回滚后重新竞速（fee_winner/cand_* 随回滚语义自然重置）
+
+---
+
+## 12. Optimistic / Final 状态提升
+
+引擎事件生命周期：
+
+```
+ingest → Applied{status: Optimistic}     # 立即执行、立即成交
+   │
+   ├─ 批次切出（settle 层）                # 数据准备提交
+   ├─ temp_data 上链 + submit             # 数据可用 + 进竞速
+   ├─ lock（稳定窗后）                     # 根锁定
+   ├─ finalize（挑战窗后）                 # 根成为提款依据
+   └─ 操作者观测到 finalize 事件后调用
+      Engine::promote_finalized(unit_ids)
+      → 该高度所有 Applied 状态翻转为 ExecStatus::Final
+```
+
+- `promote_finalized` 幂等：重复调用返回 0
+- 日志状态**不是** state_root 的一部分——提升只影响本地节点视图，
+  重放确定性无损。每个节点依据自己观测到的 AA finalize 事件独立推进
+- 客户端职责：同时展示 Optimistic（可挑战推翻）与 Final（已成定局）
+
+---
+
+## 13. 威胁模型对照表
+
+| 攻击 | 防线 |
+|---|---|
+| 伪造成交 / 锁假根 | 双 Merkle 根 + validate_against 全量重放审计 + fills_hash |
+| 偷 AA 资金 | 提款只认 finalized aa_root 的 Merkle 证明；leaf 绑定提款人地址 |
+| 冒名应诉挑战 | respond 身份门（cand_who 绑定） |
+| 存款凭空铸造 | deposits_allowed 白名单 + replay 注入交叉校验 |
+| qty/名义额溢出 DoS | 入口 checked-mul + i64 上限 |
+| 签名延展 | ed25519 verify_strict |
+| 乱序投递丢单元 | orphan 缓冲（4096 FIFO）+ 不动点解锁 |
+| 自我清算 | caller 密码学绑定 + BadAccount 拒绝 |
+| 灰尘单操纵 mark | 100 USD 名义额门槛 |
+| 单笔巨价操纵 mark | ±10% 偏离帽 |
+| 撮合簿深度造假 | visible_qty 缓存三路增量维护 + 幽灵惰性清理（回归测试覆盖） |
+| 盈利不可提 / 亏损超提 | PnL 即时结算进 collateral + reduce-only 提款带 |
+| 坏账转嫁对手方 | 钳零 + 保险基金等额吸收（守恒） |
+| 保险基金枯竭 | taker 手续费收入腿 + 负值显式记账 |
+| 无 mark 市场风险失真 | 无 mark 仓位强制 reduce_only 且剔除出快照 |
+| 乱序投递 | orphan 缓冲自动恢复 |
+| 日志无限增长 | prune_below 按批裁剪 |
+
+## 14. 明确的已知边界
+
+- respond 不能证明根正确（Oscript 无法重放撮合）；作恶 operator 只能
+  造成停摆，配合 fee race 由诚实 operator 接管
+- 预言机为白名单账户制，增减源属链下治理
+- 无第三方安全审计；Oscript 复杂度预算迫使逻辑拆分为辅助函数

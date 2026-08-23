@@ -179,7 +179,9 @@ obyte-local/
                          submit, lock, finalize, claim)
   gen_withdraw_proof     see crates/operp-settle/examples
 vendor/aa-testkit/       Obyte autonomous-agent testkit (vendored)
-docs/PROTOCOL.md         deeper protocol write-up
+docs/PROTOCOL.md         protocol design narrative
+  docs/MECHANISMS.md     full mechanism reference (zh): every rule, constant,
+                         edge case, and the threat-model matrix
 ```
 
 ## Running

@@ -1,5 +1,9 @@
 # OPERP 协议原理
 
+> 本文是设计动机的叙事版。逐条规则的精确参考（常量、边界情况、
+> 威胁模型矩阵）见 [MECHANISMS.md](MECHANISMS.md)。
+
+
 本文深入说明 OPERP（乐观 DAG 侧链永续 DEX，结算到 Obyte）的设计原理与安全机制。
 README 是概览；这里是"为什么这样设计"。
 
