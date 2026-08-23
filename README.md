@@ -1,3 +1,5 @@
+English | [简体中文](README.zh-CN.md)
+
 # ODEX — Optimistic DAG Sidechain Perpetual DEX settling to Obyte
 
 ODEX is a research/MVP implementation of a **perpetual futures exchange** that
