@@ -152,7 +152,7 @@ impl OrderBook {
 
             if maker_done {
                 self.orders.remove(&maker_id);
-                self.pop_head(maker_side.opposite());
+                self.pop_head(maker_side);
             }
         }
 
@@ -195,17 +195,30 @@ impl OrderBook {
         let side = order.side;
         let mut order = self.orders.remove(&id).ok_or(BookError::NotFound)?;
 
-        let deque = match side {
-            Side::Bid => self.bids.get_mut(&Reverse(price)),
-            Side::Ask => self.asks.get_mut(&price),
-        };
-        if let Some(dq) = deque {
-            if dq.front() == Some(&id) {
-                dq.pop_front();
-                self.drop_empty_level(side, price);
-                // Cache: canceled head order removes its visible qty.
-                self.level_add(side, price, -(order.remaining as i64));
+        let at_front = {
+            let dq = match side {
+                Side::Bid => self.bids.get_mut(&Reverse(price)),
+                Side::Ask => self.asks.get_mut(&price),
+            };
+            match dq {
+                Some(dq) => {
+                    if dq.front() == Some(&id) {
+                        dq.pop_front();
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => false,
             }
+        };
+        // Visible qty is defined by order existence, not queue position: the
+        // cache decrements for EVERY cancel. A non-head order leaves its id in
+        // the deque as a ghost; next_*_head lazily skips ids missing from
+        // `orders`, so correctness is preserved with O(1) cancel.
+        self.level_add(side, price, -(order.remaining as i64));
+        if at_front {
+            self.drop_empty_level(side, price);
         }
         order.remaining = 0;
         Ok(order)

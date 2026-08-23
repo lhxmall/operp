@@ -74,7 +74,9 @@ impl Account {
         });
         let old = pos.qty;
         if old == 0 || same_sign(old, delta) {
-            let new_qty = old + delta;
+            let new_qty = old
+                .checked_add(delta)
+                .ok_or(AccountError::Overflow)?;
             let entry = if old == 0 {
                 price
             } else {
@@ -91,7 +93,15 @@ impl Account {
         } else {
             let close = old.unsigned_abs().min(delta.unsigned_abs()) as u64;
             let pnl = realize(old, pos.entry_price, price, close);
-            self.realized_pnl += pnl;
+            // Settle realized PnL into spendable collateral immediately so
+            // winners can withdraw profits and the withdrawal-proof leaf
+            // (which commits collateral only) reflects true solvency.
+            // `realized_pnl` remains a cumulative statistic only.
+            self.collateral = self
+                .collateral
+                .checked_add(pnl)
+                .ok_or(AccountError::Overflow)?;
+            self.realized_pnl = self.realized_pnl.saturating_add(pnl);
             let leftover = (old.unsigned_abs() as i64) - (close as i64);
             if leftover == 0 {
                 let open = delta.unsigned_abs() as u64 - close;
@@ -138,7 +148,9 @@ impl Account {
             mm += bps(abs_n, MM_RATE_BPS);
             im += bps(abs_n, IM_RATE_BPS);
         }
-        let equity = self.collateral + self.realized_pnl + upnl;
+        // Realized PnL settles into `collateral` at close time, so equity is
+        // collateral + unrealized. realized_pnl is a cumulative stat only.
+        let equity = self.collateral + upnl;
         let margin_ratio_bps = if mm == 0 {
             None
         } else if equity < 0 {
@@ -237,9 +249,23 @@ mod tests {
         a.apply_fill(Side::Ask, true, 110_000 * PRICE_SCALE, QTY_SCALE, BTC_USD)
             .unwrap();
         assert!(a.positions.is_empty());
-        assert!(a.realized_pnl > 0);
+        // PnL settles into collateral: 10k deposit + 10k profit.
+        assert_eq!(a.collateral, 20_000 * USD_SCALE as i128);
     }
 
+    #[test]
+    fn profitable_pnl_is_withdrawable() {
+        let mut a = Account::new(AccountId([1; 32]));
+        a.credit(10_000 * USD_SCALE as i128).unwrap();
+        a.apply_fill(Side::Bid, true, 100_000 * PRICE_SCALE, QTY_SCALE, BTC_USD)
+            .unwrap();
+        a.apply_fill(Side::Ask, true, 110_000 * PRICE_SCALE, QTY_SCALE, BTC_USD)
+            .unwrap();
+        let m = marks(110_000 * PRICE_SCALE);
+        // Full balance (deposit + settled profit) is withdrawable.
+        a.debit(20_000 * USD_SCALE as i128, &m).unwrap();
+        assert_eq!(a.collateral, 0);
+    }
     #[test]
     fn margin_ratio_liq_boundary() {
         let mut a = Account::new(AccountId([1; 32]));
@@ -249,7 +275,6 @@ mod tests {
         let mm = a.snapshot(&marks(mark)).mm;
         assert_eq!(mm, 100 * USD_SCALE as i128);
         a.collateral = 105 * USD_SCALE as i128;
-        a.realized_pnl = 0;
         let s = a.snapshot(&marks(mark));
         assert!(s.liquidatable);
         a.collateral = 104 * USD_SCALE as i128;

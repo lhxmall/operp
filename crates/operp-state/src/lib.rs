@@ -81,42 +81,59 @@ impl ChainState {
         self.accounts.entry(id).or_insert_with(|| Account::new(id))
     }
 
-    pub fn apply_fill_pair(&mut self, fill: &Fill) {
-        let taker = self.account_mut(fill.taker);
-        let _ = taker.apply_fill(fill.taker_side, true, fill.price, fill.qty, fill.market);
-        let maker = self.account_mut(fill.maker);
-        let _ = maker.apply_fill(
-            fill.taker_side.opposite(),
-            false,
-            fill.price,
-            fill.qty,
-            fill.market,
-        );
-        // Bad-debt cap: if the taker went bankrupt (equity < 0), the shortfall
-        // is absorbed by the insurance fund's realized_pnl so it never leaks
-        // to counterparties. Insurance itself can never be liquidated.
-        if fill.taker != INSURANCE_ACCOUNT && fill.maker != INSURANCE_ACCOUNT {
+    pub fn apply_fill_pair(&mut self, fill: &Fill) -> Result<(), operp_account::AccountError> {
+        {
+            let taker = self.account_mut(fill.taker);
+            taker.apply_fill(fill.taker_side, true, fill.price, fill.qty, fill.market)?;
+        }
+        {
+            let maker = self.account_mut(fill.maker);
+            maker.apply_fill(
+                fill.taker_side.opposite(),
+                false,
+                fill.price,
+                fill.qty,
+                fill.market,
+            )?;
+        }
+        // Bad-debt cap: if the taker went bankrupt (equity < 0), its equity is
+        // clamped to exactly 0 (collateral absorbs the hole — realized PnL is
+        // settled into collateral since the settlement refactor) and the
+        // insurance fund takes an equal debit. Conservation holds; a repeat
+        // fill cannot re-trigger because equity is now 0. Insurance itself is
+        // exempt (never clamped).
+        if fill.taker != INSURANCE_ACCOUNT {
             let shortfall = {
                 let marks = &self.marks;
                 let s = match self.accounts.get(&fill.taker) {
                     Some(a) => a.snapshot(marks),
-                    None => return,
+                    None => return Ok(()),
                 };
                 if s.equity < 0 { -s.equity } else { 0 }
             };
             if shortfall > 0 {
-                self.accounts
-                    .get_mut(&fill.taker)
-                    .map(|a| a.realized_pnl -= shortfall);
+                if let Some(a) = self.accounts.get_mut(&fill.taker) {
+                    a.collateral -= shortfall;
+                }
                 let ins = self.account_mut(INSURANCE_ACCOUNT);
-                ins.realized_pnl -= shortfall;
+                ins.collateral -= shortfall;
             }
         }
-        // Mark oracle floor: only fills with notional >= 100 USD move the mark
-        // (minimal manipulation resistance; full TWAP is Phase 2).
+        // Mark oracle guards: only fills with notional >= 100 USD may move the
+        // mark, and then at most ±10% from the previous mark (first qualifying
+        // fill on an unmarked market sets it unconditionally). Minimal
+        // manipulation resistance until a TWAP oracle lands.
         if notional_usd(fill.qty, fill.price) >= 100 * USD_SCALE as i128 {
-            self.marks.insert(fill.market, fill.price);
+            let capped = match self.marks.get(&fill.market) {
+                Some(&old) if old > 0 => {
+                    let dev = (fill.price as i128 - old as i128).abs();
+                    if dev <= old as i128 / 10 { fill.price } else { old }
+                }
+                _ => fill.price,
+            };
+            self.marks.insert(fill.market, capped);
         }
+        Ok(())
     }
 
     pub fn leaves(&self) -> Vec<[u8; 32]> {

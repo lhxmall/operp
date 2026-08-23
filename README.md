@@ -92,16 +92,20 @@ incremental `visible_qty` cache keeps best-bid/best-ask at O(log depth).
 
 ### 3. Risk model (cross margin)
 
-Each fill updates both legs (VWAP entry for opens, realized PnL for closes).
-Snapshots compute maintenance margin (5% of abs notional) and initial margin
-(10%). Liquidation is keeper-initiated and pays the keeper 1% of filled
-notional from the insurance fund; if the liquidated account still goes
-negative, the shortfall is absorbed by the insurance fund's `realized_pnl`,
-never leaked to counterparties. Insurance is seeded at genesis (10 000 USD),
-can never be liquidated itself, and never self-liquidates.
+Each fill updates both legs (VWAP entry for opens); **realized PnL settles
+into collateral immediately at close time**, so winners can withdraw profits
+and the withdrawal-proof leaf (which commits `collateral`) reflects true
+solvency. Snapshots compute maintenance margin (5% of abs notional) and
+initial margin (10%). Liquidation is keeper-initiated and pays the keeper 1%
+of filled notional from the insurance fund; if the liquidated account still
+goes negative, its equity is clamped to exactly 0 and the shortfall is
+debited from the insurance fund's collateral — never leaked to
+counterparties. Insurance is seeded at genesis (10 000 USD), can never be
+liquidated itself, and never self-liquidates.
 
-Mark prices only move on fills with notional ≥ 100 USD — a minimal
-manipulation floor (full TWAP oracle is future work).
+Mark prices only move on fills with notional ≥ 100 USD **and within ±10% of
+the previous mark** (the first qualifying fill on an unmarked market sets it)
+- minimal manipulation resistance; full TWAP oracle is future work.
 
 ### 4. Settlement: two roots per batch
 

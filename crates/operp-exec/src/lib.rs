@@ -210,7 +210,6 @@ impl Engine {
                 Side::Ask => pos_qty > 0,
             };
             if !reducing {
-                eprintln!("DBG4 reduce_only");
                 return Err(RejectReason::Risk);
             }
         }
@@ -245,7 +244,7 @@ impl Engine {
             .submit(order)
             .map_err(RejectReason::Book)?;
         for fill in &result.fills {
-            self.state.apply_fill_pair(fill);
+            self.state.apply_fill_pair(fill).map_err(map_acct)?;
         }
         self.state.seen_client_seq.insert(account, client_seq);
         Ok(result.fills)
@@ -370,7 +369,7 @@ impl Engine {
             .map_err(RejectReason::Book)?;
         let mut fills = result.fills;
         for fill in &fills {
-            self.state.apply_fill_pair(fill);
+            self.state.apply_fill_pair(fill).map_err(map_acct)?;
         }
         let still = self
             .state
@@ -402,7 +401,7 @@ impl Engine {
                 seq,
                 taker_side: close_side,
             };
-            self.state.apply_fill_pair(&fill);
+            self.state.apply_fill_pair(&fill).map_err(map_acct)?;
             fills.push(fill);
         }
         // Keeper reward: bps of filled notional, paid from the insurance fund.
@@ -410,11 +409,13 @@ impl Engine {
             keeper_paid += bps(notional_usd(f.qty, f.price), KEEPER_REWARD_BPS);
         }
         if keeper_paid > 0 {
+            // Realized PnL settles into collateral, so the fund's spendable
+            // balance is just its collateral.
             let ins_bal = self
                 .state
                 .accounts
                 .get(&INSURANCE_ACCOUNT)
-                .map(|a| a.collateral + a.realized_pnl)
+                .map(|a| a.collateral)
                 .unwrap_or(0);
             let pay = keeper_paid.min(ins_bal.max(0));
             if pay > 0 {

@@ -79,7 +79,8 @@ notional = qty · price / PRICE_SCALE · USD_SCALE / QTY_SCALE
 ```
 mm (maintenance) = 5%   of Σ|qty|·mark     (MM_RATE_BPS = 500)
 im (initial)     = 10%  of Σ|qty|·mark     (IM_RATE_BPS = 1000)
-equity           = collateral + realized_pnl + unrealized_pnl
+equity           = collateral + unrealized_pnl
+                   （已实现 PnL 平仓即结算进 collateral）
 liquidatable     : equity·10000 ≤ mm·10500
 reduce_only      : equity·10000 ≤ mm·12000
 ```
@@ -95,10 +96,12 @@ reduce_only      : equity·10000 ≤ mm·12000
 - keeper 奖励 = Σ bps(每笔成交名义额, 100)，从保险基金支付。
   保险基金在创世时注入 10 000 USD 种子金，永不参与清算判定（不可被清算、
   不自我清算）。
-- **坏账封顶**：清算后若目标账户 equity < 0，缺口记入保险基金 `realized_pnl`
-  （负值），同时从该账户扣除等额——损失社会化到基金，绝不转嫁给对手方。
-- **mark 名义额门槛**：只有 notional ≥ 100 USD 的成交才更新 mark，
-  防止灰尘单操纵清算触发（完整 TWAP 属于 Phase 2）。
+- **坏账封顶**：成交后若 taker equity < 0，其 equity 被钳到恰好 0
+  （collateral 吸收缺口），保险基金 collateral 等额扣减——守恒、且后续
+  成交不会重复触发。损失社会化到基金，绝不转嫁对手方。
+- **mark 双重防线**：notional ≥ 100 USD 才可更新 mark，且新价相对旧 mark
+  偏离不得超过 ±10%（未定价市场首笔合格成交无条件设定），
+  防止灰尘单与小额对敲操纵清算（完整 TWAP 属于 Phase 2）。
 
 ### 2.5 市场与存款白名单
 

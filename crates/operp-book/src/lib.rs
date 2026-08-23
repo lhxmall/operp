@@ -309,4 +309,143 @@ mod tests {
         assert_eq!(book.get(oid(m2, 1)).unwrap().remaining, QTY_SCALE);
         assert_eq!(book.best_ask().unwrap(), (px, QTY_SCALE));
     }
+
+    #[test]
+    fn full_fill_does_not_disturb_opposite_side() {
+        // Regression: maker completion must pop the MAKER's own queue, not the
+        // taker-side queue. Resting bid @99 must survive a market buy that
+        // fully fills an ask.
+        let mut book = OrderBook::new(BTC_USD);
+        book.submit(order(
+            acct(1),
+            1,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            99 * PRICE_SCALE,
+            QTY_SCALE,
+            1,
+        ))
+        .unwrap();
+        book.submit(order(
+            acct(2),
+            1,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            101 * PRICE_SCALE,
+            QTY_SCALE,
+            1,
+        ))
+        .unwrap();
+        book.submit(order(
+            acct(2),
+            2,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            100 * PRICE_SCALE,
+            QTY_SCALE,
+            2,
+        ))
+        .unwrap();
+        let r = book
+            .submit(order(
+                acct(3),
+                1,
+                Side::Bid,
+                OrderType::Market,
+                TimeInForce::Ioc,
+                0,
+                QTY_SCALE,
+                3,
+            ))
+            .unwrap();
+        assert_eq!(r.fills.len(), 1);
+        assert_eq!(r.fills[0].price, 100 * PRICE_SCALE);
+        // The resting bid @99 must still be live and matchable.
+        let r2 = book
+            .submit(order(
+                acct(4),
+                1,
+                Side::Ask,
+                OrderType::Market,
+                TimeInForce::Ioc,
+                0,
+                QTY_SCALE,
+                4,
+            ))
+            .unwrap();
+        assert_eq!(r2.fills.len(), 1);
+        assert_eq!(r2.fills[0].price, 99 * PRICE_SCALE);
+    }
+
+    #[test]
+    fn cancel_non_head_decrements_cache() {
+        let mut book = OrderBook::new(BTC_USD);
+        let a1 = order(
+            acct(1),
+            1,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            100 * PRICE_SCALE,
+            QTY_SCALE,
+            1,
+        );
+        let a2 = order(
+            acct(2),
+            1,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            100 * PRICE_SCALE,
+            QTY_SCALE * 3,
+            2,
+        );
+        book.submit(a1.clone()).unwrap();
+        book.submit(a2.clone()).unwrap();
+        assert_eq!(book.best_ask().unwrap(), (100 * PRICE_SCALE, QTY_SCALE * 4));
+        // Cancel the non-head order (acct2): visible qty must drop to X only.
+        book.cancel(a2.id).unwrap();
+        assert_eq!(book.best_ask().unwrap(), (100 * PRICE_SCALE, QTY_SCALE));
+        // Drain the head too: level disappears entirely (no phantom qty).
+        book.cancel(a1.id).unwrap();
+        assert_eq!(book.best_ask(), None);
+    }
+
+    #[test]
+    fn cancel_non_head_bid_side_mirror() {
+        let mut book = OrderBook::new(BTC_USD);
+        let b1 = order(
+            acct(1),
+            1,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            99 * PRICE_SCALE,
+            QTY_SCALE * 2,
+            1,
+        );
+        let b2 = order(
+            acct(2),
+            1,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            99 * PRICE_SCALE,
+            QTY_SCALE,
+            2,
+        );
+        book.submit(b1.clone()).unwrap();
+        book.submit(b2.clone()).unwrap();
+        assert_eq!(
+            book.best_bid().unwrap(),
+            (99 * PRICE_SCALE, QTY_SCALE * 3)
+        );
+        book.cancel(b2.id).unwrap();
+        assert_eq!(book.best_bid().unwrap(), (99 * PRICE_SCALE, QTY_SCALE * 2));
+        book.cancel(b1.id).unwrap();
+        assert_eq!(book.best_bid(), None);
+    }
 }
