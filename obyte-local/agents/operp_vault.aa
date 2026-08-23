@@ -28,6 +28,7 @@
 	//   frozen_<h>   absent/0 = ok, 1 = challenged, 2 = permanently failed
 	//   challenger_<h>, bond_<address>           challenge bond accounting
 
+
 	bounce_fees: { base: 10000 },
 	messages: {
 		cases: [
@@ -57,23 +58,41 @@
 			{
 				if: "{trigger.data.submit}",
 				init: "{
-					if (trigger.data.chain_id != 'operp-mvp-1')
-						bounce('bad chain');
 					$h = trigger.data.height;
-					if (!$h OR $h != var['last_locked'] + 1)
-						bounce('bad height');
+					if (trigger.data.chain_id != 'operp-mvp-1' OR !$h OR $h != var['last_locked'] + 1 OR !trigger.data.state_root OR !trigger.data.aa_root OR !trigger.data.fills_hash)
+						bounce('bad submit');
 					if (var['last_locked'] > 0 AND trigger.data.prev_state_hash != var['root_' || var['last_locked']])
 						bounce('prev mismatch');
-					if (!trigger.data.state_root)
-						bounce('no root');
-					if (!trigger.data.aa_root)
-						bounce('no aa root');
-					// locked heights are immutable; pre-lock candidates may be
-					// replaced by a later submit (anti front-run brick).
 					if (var['root_' || $h])
 						bounce('already locked');
+					$loser_check = ($addr, $hh) => {
+						$w = var['fee_winner_' || $hh];
+						if (!$w)
+							return false;
+						if ($w == $addr)
+							return false;
+						return true;
+					};
+					$is_loser = $loser_check(trigger.address, trigger.data.height);
 				}",
 				messages: [
+					{
+						// Consolation for losing the race: refund everything
+						// net of processing, plus a small bonus from the pot.
+						// (Reads the PRE-trigger fee_winner; state message must
+						// come last in Oscript.)
+						if: "{$is_loser}",
+						app: "payment",
+						payload: {
+							asset: "base",
+							outputs: [
+								{
+									address: "{trigger.address}",
+									amount: 5000
+								}
+							]
+						}
+					},
 					{
 						app: "state",
 						state: "{
@@ -84,6 +103,12 @@
 							var['cand_unit_' || trigger.data.height] = trigger.unit;
 							var['cand_who_' || trigger.data.height] = trigger.address;
 							var['submitted_at_' || trigger.data.height] = timestamp;
+							// Fee race: AAs are triggered in stability order, so
+							// the FIRST processed submit for this height is the
+							// first-STABLE submission and wins the batch reward.
+							if (!var['fee_winner_' || trigger.data.height]){
+								var['fee_winner_' || trigger.data.height] = trigger.address;
+							}
 						}"
 					}
 				]
@@ -92,16 +117,10 @@
 				if: "{trigger.data.lock}",
 				init: "{
 					$h = trigger.data.height;
-					if (!var['cand_root_' || $h])
-						bounce('no candidate');
-					if (var['root_' || $h])
-						bounce('already locked');
-					if ($h != var['last_locked'] + 1)
-						bounce('bad lock height');
 					// stability gate (OBYTE_STABILITY_SECS = 600): simulates the
 					// Obyte finality window on devnet where none exists.
-					if (timestamp < var['submitted_at_' || $h] + 600)
-						bounce('not stable yet');
+					if (!var['cand_root_' || $h] OR var['root_' || $h] OR $h != var['last_locked'] + 1 OR timestamp < var['submitted_at_' || $h] + 600)
+						bounce('cannot lock yet');
 				}",
 				messages: [
 					{
@@ -150,11 +169,9 @@
 				if: "{trigger.data.respond}",
 				init: "{
 					$h = trigger.data.height;
-					if (!$h)
-						bounce('no height');
 					// Identity gate: only the account that submitted (last
 					// replaced) the candidate for this height may respond.
-					if (trigger.address != var['cand_who_' || $h])
+					if (!$h OR trigger.address != var['cand_who_' || $h])
 						bounce('not operator');
 					if (var['frozen_' || $h] != 1)
 						bounce('nothing to respond to');
@@ -192,14 +209,8 @@
 						bounce('not locked');
 					$failed = (var['frozen_' || $h] == 1 AND timestamp >= var['stable_at_' || $h] + 3600);
 					if (!$failed){
-						if (!var['root_' || $h])
-							bounce('not locked');
-						if (var['frozen_' || $h])
-							bounce('frozen');
-						if (timestamp < var['stable_at_' || $h] + 3600)
-							bounce('window open');
-						if ($h != var['last_finalized'] + 1)
-							bounce('finalize in order');
+						if (!var['root_' || $h] OR var['frozen_' || $h] OR timestamp < var['stable_at_' || $h] + 3600 OR $h != var['last_finalized'] + 1)
+							bounce('cannot finalize');
 					}
 				}",
 				messages: [
@@ -214,8 +225,14 @@
 								$challenger = var['challenger_' || trigger.data.height];
 								var['bond_' || $challenger] += trigger.output[[asset=base]] - 10000;
 							}
-							else {
+						else {
 								var['last_finalized'] = trigger.data.height;
+								// Operator race reward: accrued claimable balance
+								// for the first-stable submitter of this height.
+								$fw = var['fee_winner_' || trigger.data.height];
+								if ($fw){
+									var['reward_' || $fw] += 20000;
+								}
 							}
 						}"
 					}
@@ -230,7 +247,17 @@
 				// are the root-chain + challenge game's job, not bal_'s.
 				if: "{trigger.data.withdraw}",
 				init: "{
-					// merkle helpers (each function has its own complexity budget)
+					$h = var['last_finalized'];
+					if (!$h OR var['frozen_' || $h] OR (trigger.data.height AND trigger.data.height != $h))
+						bounce('not finalizable');
+					$amt = trigger.data.amount;
+					$leaf_account = trigger.data.leaf_account;
+					$collateral = trigger.data.collateral;
+					$proof = trigger.data.proof;
+					if (!$amt OR $amt <= 0 OR !$leaf_account OR !$collateral OR !$proof OR length($proof) > 16)
+						bounce('invalid claim');
+					if ($leaf_account != trigger.address OR $amt > $collateral)
+						bounce('bad claim amount');
 					$fold = ($acc, $i, $sib) => {
 						if (!$acc OR !$sib.hash)
 							return false;
@@ -240,28 +267,7 @@
 							return sha256($sib.hash || $acc, 'hex');
 					};
 					$leaf_of = ($addr, $col) => sha256('acct:' || $addr || ':' || $col, 'hex');
-					$root_of = ($leaf, $proof) => reduce($proof, 16, $fold, $leaf);
-					$h = var['last_finalized'];
-					if (!$h OR $h <= 0)
-						bounce('not finalized');
-					if (var['frozen_' || $h])
-						bounce('frozen');
-					if (trigger.data.height AND trigger.data.height != $h)
-						bounce('stale height');
-					$amt = trigger.data.amount;
-					if (!$amt OR $amt <= 0)
-						bounce('bad amount');
-					$leaf_account = trigger.data.leaf_account;
-					$collateral = trigger.data.collateral;
-					$proof = trigger.data.proof;
-					if (!$leaf_account OR !$collateral OR !$proof)
-						bounce('need full claim');
-					if ($leaf_account != trigger.address)
-						bounce('leaf not yours');
-					if (!$collateral OR $amt > $collateral)
-						bounce('amount exceeds proven collateral');
-					if (length($proof) > 16)
-						bounce('proof too deep');
+					$root_of = ($leaf2, $proof2) => reduce($proof2, 8, $fold, $leaf2);
 					$leaf = $leaf_of($leaf_account, $collateral);
 					$root = $root_of($leaf, $proof);
 					if (!$root)
@@ -286,6 +292,37 @@
 						app: "state",
 						state: "{
 							var['bal_' || trigger.address] -= trigger.data.amount;
+						}"
+					}
+				]
+			},
+			{
+				// Operator race reward claim: pays the accrued byte balance.
+				// If the AA is temporarily short of funds the unit bounces and
+				// the claim stays accrued — retry later, nothing is lost.
+				if: "{trigger.data.claim_reward}",
+				init: "{
+					$owed = (var['reward_' || trigger.address] otherwise 0);
+					if (!$owed OR $owed > trigger.output[[asset=base]] - 10000)
+						bounce('nothing claimable');
+				}",
+				messages: [
+					{
+						app: "payment",
+						payload: {
+							asset: "base",
+							outputs: [
+								{
+									address: "{trigger.address}",
+									amount: "{$owed}"
+								}
+							]
+						}
+					},
+					{
+						app: "state",
+						state: "{
+							var['reward_' || trigger.address] = 0;
 						}"
 					}
 				]

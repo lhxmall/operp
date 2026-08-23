@@ -145,6 +145,22 @@ impl Engine {
                 target,
                 market,
             } => self.liquidate(id, seq, *caller, *target, *market),
+            Op::OracleSet {
+                oracle,
+                source,
+                market,
+                price,
+            } => {
+                // Trust gate: only whitelisted oracle accounts may set prices.
+                if !self.state.trusted_oracles.contains(oracle) {
+                    return Err(RejectReason::BadAccount);
+                }
+                if *source > 1 {
+                    return Err(RejectReason::Risk);
+                }
+                self.state.apply_oracle(*source, *market, *price);
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -867,5 +883,83 @@ mod tests {
         assert!(keeper_bal > 0, "keeper must be rewarded");
         let ins_after = eng.state.accounts.get(&INSURANCE_ACCOUNT).unwrap().collateral;
         assert!(ins_after < ins_before, "insurance pays the reward");
+    }
+    #[test]
+    fn unauthorized_oracle_rejected() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        // No trusted oracles injected: any OracleSet must bounce.
+        let o = sign_unit(
+            vec![genesis_id()],
+            Op::OracleSet {
+                oracle: acct_of(&sk(5)),
+                source: 0,
+                market: BTC_USD,
+                price: 100_000 * PRICE_SCALE,
+            },
+            &sk(5),
+        );
+        let evs = eng.ingest(o).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::BadAccount,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn dual_oracle_marks_averaged_and_fill_mark_gated() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let oa = acct_of(&sk(5));
+        let ob = acct_of(&sk(6));
+        eng.state.trusted_oracles.insert(oa);
+        eng.state.trusted_oracles.insert(ob);
+        let g = genesis_id();
+        let mk = |secret: &[u8; 32], src: u8, px: u64| {
+            sign_unit(
+                vec![g],
+                Op::OracleSet {
+                    oracle: acct_of(secret),
+                    source: src,
+                    market: BTC_USD,
+                    price: px,
+                },
+                secret,
+            )
+        };
+        eng.ingest(mk(&sk(5), 0, 100_000 * PRICE_SCALE)).unwrap();
+        eng.ingest(mk(&sk(6), 1, 110_000 * PRICE_SCALE)).unwrap();
+        // Effective mark = average of both sources.
+        assert_eq!(
+            eng.state.marks.get(&BTC_USD).copied().unwrap(),
+            105_000 * PRICE_SCALE
+        );
+        // Once an oracle has spoken, fills must NOT move the mark.
+        let alice = sk(1);
+        eng.state
+            .accounts
+            .entry(acct_of(&alice))
+            .or_insert_with(|| operp_account::Account::new(acct_of(&alice)))
+            .credit(10_000_000 * USD_SCALE as i128)
+            .unwrap();
+        let p = place(
+            vec![g],
+            &alice,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            150_000 * PRICE_SCALE,
+            QTY_SCALE,
+            1,
+        );
+        eng.ingest(p).unwrap();
+        assert_eq!(
+            eng.state.marks.get(&BTC_USD).copied().unwrap(),
+            105_000 * PRICE_SCALE,
+            "oracle-authoritative mark must ignore fills"
+        );
     }
 }

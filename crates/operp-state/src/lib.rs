@@ -11,7 +11,6 @@ pub struct Withdrawal {
     pub amount: Usd,
     pub pending: bool,
 }
-
 #[derive(Clone, Debug)]
 pub struct ChainState {
     pub height: Height,
@@ -20,6 +19,11 @@ pub struct ChainState {
     pub accounts: BTreeMap<AccountId, Account>,
     pub books: BTreeMap<MarketId, OrderBook>,
     pub marks: BTreeMap<MarketId, Price>,
+    /// Oracle price feeds, per source (0/1) and market. Two independent
+    /// sources; the effective mark is the average of available sources.
+    pub oracle_marks: BTreeMap<(u8, MarketId), Price>,
+    /// Accounts allowed to sign Op::OracleSet. Empty = no oracle accepted.
+    pub trusted_oracles: HashSet<AccountId>,
     pub withdrawals: BTreeMap<(AccountId, u64), Withdrawal>,
     pub seen_aa_units: HashSet<[u8; 32]>,
     pub seen_client_seq: HashMap<AccountId, u64>,
@@ -63,12 +67,43 @@ impl ChainState {
             accounts,
             books,
             marks,
+            oracle_marks: BTreeMap::new(),
+            trusted_oracles: HashSet::new(),
             withdrawals: BTreeMap::new(),
             seen_aa_units: HashSet::new(),
             seen_client_seq: HashMap::new(),
             deposits_allowed: HashSet::new(),
             allowed_markets: HashSet::new(),
         }
+    }
+
+    /// Apply a whitelisted oracle's price for `source` (0/1) and recompute the
+    /// effective mark as the average of available sources, subject to the
+    /// ±10% deviation cap vs the current mark. Fills no longer move the mark
+    /// for markets where any oracle source has spoken.
+    pub fn apply_oracle(&mut self, source: u8, market: MarketId, price: Price) {
+        if price == 0 {
+            return;
+        }
+        self.oracle_marks.insert((source, market), price);
+        let sources: Vec<Price> = [(0u8, market), (1u8, market)]
+            .iter()
+            .filter_map(|k| self.oracle_marks.get(k).copied())
+            .collect();
+        let candidate = if sources.len() == 2 {
+            // Average of two independent sources (rounds down; sub-tick dust).
+            ((sources[0] as u128 + sources[1] as u128) / 2) as Price
+        } else {
+            sources[0]
+        };
+        let capped = match self.marks.get(&market) {
+            Some(&old) if old > 0 => {
+                let dev = (candidate as i128 - old as i128).abs();
+                if dev <= old as i128 / 10 { candidate } else { old }
+            }
+            _ => candidate,
+        };
+        self.marks.insert(market, capped);
     }
 
     pub fn book_mut(&mut self, market: MarketId) -> &mut OrderBook {
@@ -133,11 +168,14 @@ impl ChainState {
                 ins.collateral -= shortfall;
             }
         }
-        // Mark oracle guards: only fills with notional >= 100 USD may move the
-        // mark, and then at most ±10% from the previous mark (first qualifying
-        // fill on an unmarked market sets it unconditionally). Minimal
-        // manipulation resistance until a TWAP oracle lands.
-        if notional_usd(fill.qty, fill.price) >= 100 * USD_SCALE as i128 {
+        // Mark oracle guards: fills move the mark only for markets where NO
+        // oracle source has spoken yet (oracles are authoritative once
+        // present), the notional is >= 100 USD, and the move is within ±10%
+        // of the previous mark (first qualifying fill sets unconditionally).
+        if notional_usd(fill.qty, fill.price) >= 100 * USD_SCALE as i128
+            && !self.oracle_marks.contains_key(&(0u8, fill.market))
+            && !self.oracle_marks.contains_key(&(1u8, fill.market))
+        {
             let capped = match self.marks.get(&fill.market) {
                 Some(&old) if old > 0 => {
                     let dev = (fill.price as i128 - old as i128).abs();

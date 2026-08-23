@@ -8,7 +8,7 @@ periodic state roots to the [Obyte](https://obyte.org) ledger through an
 autonomous agent (AA) vault. Withdrawals from the vault are **proof-gated**:
 users must present a Merkle proof of their balance against a finalized root.
 
-> **Status: testnet-ready MVP.** All 37 workspace tests pass; the full AA
+> **Status: testnet-ready MVP.** All 39 workspace tests pass; the full AA
 > lifecycle (deposit → submit → lock → challenge → finalize → proof withdrawal)
 > is verified end-to-end on an aa-testkit devnet. Mainnet deployment requires
 > closing the gaps listed in [Limitations](#limitations--mainnet-readiness).

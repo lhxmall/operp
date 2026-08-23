@@ -122,8 +122,8 @@ async function main() {
 
   // ---------- 3. early lock must bounce ----------
   const earlyLock = await triggerRaw(bob, { lock: 1, height: 1 });
-  if (!JSON.stringify(earlyLock).includes("not stable yet"))
-    throw new Error("early lock did not bounce with 'not stable yet': " + JSON.stringify(earlyLock).slice(0, 300));
+  if (!JSON.stringify(earlyLock).includes("cannot lock yet"))
+    throw new Error("early lock did not bounce: " + JSON.stringify(earlyLock).slice(0, 300));
   console.log("  early lock bounced as expected");
 
   // ---------- 4. stability window then lock ----------
@@ -137,7 +137,7 @@ async function main() {
 
   // ---------- 5. withdraw before finalize bounces ----------
   const earlyWd = await triggerRaw(alice, { withdraw: 1, amount: 1000 });
-  if (!JSON.stringify(earlyWd).includes("not finalized"))
+  if (!JSON.stringify(earlyWd).includes("not finalizable"))
     throw new Error("early withdraw did not bounce: " + JSON.stringify(earlyWd).slice(0, 300));
   console.log("  pre-finalize withdraw bounced as expected");
 
@@ -165,7 +165,7 @@ async function main() {
 
   // ---------- 7. finalize before window must bounce; then travel and finalize ----------
   const earlyFin = await triggerRaw(alice, { finalize: 1, height: 1 });
-  if (!JSON.stringify(earlyFin).includes("window open"))
+  if (!JSON.stringify(earlyFin).includes("cannot finalize"))
     throw new Error("early finalize did not bounce: " + JSON.stringify(earlyFin).slice(0, 200));
   console.log("  early finalize bounced as expected");
 

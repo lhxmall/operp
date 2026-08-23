@@ -32,6 +32,15 @@ pub enum Op {
         amount: Usd,
         nonce: u64,
     },
+    /// Oracle price set: must be signed by a whitelisted oracle account
+    /// (ChainState::trusted_oracles). Two independent sources feed the mark;
+    /// the effective mark is the average of available sources.
+    OracleSet {
+        oracle: AccountId,
+        source: u8,
+        market: MarketId,
+        price: Price,
+    },
     /// Keeper-initiated liquidation. `caller` is the keeper requesting it and
     /// receives the keeper reward; signature must belong to `caller`.
     Liquidate {
@@ -120,12 +129,24 @@ pub fn canonical_bytes(unit: &Unit) -> Vec<u8> {
             b.extend_from_slice(&amount.to_le_bytes());
             b.extend_from_slice(&nonce.to_le_bytes());
         }
+        Op::OracleSet {
+            oracle,
+            source,
+            market,
+            price,
+        } => {
+            b.push(6);
+            b.extend_from_slice(&oracle.0);
+            b.push(*source);
+            b.extend_from_slice(&market.0.to_le_bytes());
+            b.extend_from_slice(&price.to_le_bytes());
+        }
         Op::Liquidate {
             caller,
             target,
             market,
         } => {
-            b.push(5);
+            b.push(7);
             b.extend_from_slice(&caller.0);
             b.extend_from_slice(&target.0);
             b.extend_from_slice(&market.0.to_le_bytes());
@@ -159,6 +180,7 @@ fn account_matches(unit: &Unit) -> bool {
         | Op::Deposit { account, .. }
         | Op::Withdraw { account, .. } => *account == expected,
         Op::Liquidate { caller, .. } => *caller == expected,
+        Op::OracleSet { oracle, .. } => *oracle == expected,
     }
 }
 
