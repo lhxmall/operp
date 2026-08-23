@@ -1,0 +1,10 @@
+{
+  "network": "testnet",
+  "vault_aa_address": "JZMGB3RWMUFIXQ4DBPDGFRLNLJNQAREH",
+  "chain_id": "odex-mvp-1",
+  "stability_secs": 600,
+  "challenge_secs": 3600,
+  "bounce_fee_base": 10000,
+  "challenge_bond_min": 20000,
+  "deployed_at": "2026-08-23T01:53:48.663Z"
+}

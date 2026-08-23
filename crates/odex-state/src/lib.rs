@@ -1,8 +1,8 @@
 pub use odex_account::Account;
 use odex_book::{Fill, OrderBook};
 use odex_types::{
-    sha256, AccountId, Height, MarketId, Price, Seq, UnitId, Usd, BTC_USD, INSURANCE_ACCOUNT,
-    INSURANCE_SEED, PRICE_SCALE,
+    notional_usd, sha256, AccountId, Height, MarketId, Price, Seq, UnitId, Usd, BTC_USD,
+    INSURANCE_ACCOUNT, INSURANCE_SEED, PRICE_SCALE, USD_SCALE,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -112,7 +112,11 @@ impl ChainState {
                 ins.realized_pnl -= shortfall;
             }
         }
-        self.marks.insert(fill.market, fill.price);
+        // Mark oracle floor: only fills with notional >= 100 USD move the mark
+        // (minimal manipulation resistance; full TWAP is Phase 2).
+        if notional_usd(fill.qty, fill.price) >= 100 * USD_SCALE as i128 {
+            self.marks.insert(fill.market, fill.price);
+        }
     }
 
     pub fn leaves(&self) -> Vec<[u8; 32]> {
