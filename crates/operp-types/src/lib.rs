@@ -16,6 +16,9 @@ pub const IM_RATE_BPS: u64 = 1000;
 pub const MM_RATE_BPS: u64 = 500;
 pub const LIQ_RATIO_BPS: u64 = 10_500;
 pub const REDUCE_ONLY_RATIO_BPS: u64 = 12_000;
+/// Taker fee (bps of notional), routed to the insurance fund so it has
+/// income to offset bad-debt absorption and keeper payouts.
+pub const TAKER_FEE_BPS: u64 = 5;
 pub const CHALLENGE_SECS: u64 = 3600;
 pub const OBYTE_STABILITY_SECS: u64 = 600;
 pub const BATCH_INTERVAL_MS: u64 = 2000;

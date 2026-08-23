@@ -141,8 +141,18 @@ impl Account {
         let mut upnl: Usd = 0;
         let mut mm: Usd = 0;
         let mut im: Usd = 0;
+        // Positions in markets without a mark are excluded from equity/margin
+        // and force reduce-only: a zero mark would fabricate full-notional
+        // "losses" (longs) or "profits" (shorts) while zeroing margin needs.
+        let mut has_unmarked = false;
         for (m, pos) in &self.positions {
-            let mark = marks.get(m).copied().unwrap_or(0);
+            let mark = match marks.get(m).copied() {
+                Some(p) if p > 0 => p,
+                _ => {
+                    has_unmarked = true;
+                    continue;
+                }
+            };
             upnl += signed_notional_usd(pos.qty, mark) - signed_notional_usd(pos.qty, pos.entry_price);
             let abs_n = notional_usd(pos.qty.unsigned_abs() as u64, mark);
             mm += bps(abs_n, MM_RATE_BPS);
@@ -159,7 +169,8 @@ impl Account {
             Some((equity.saturating_mul(10_000) / mm) as u64)
         };
         let liquidatable = mm > 0 && equity * 10_000 <= mm * i128::from(LIQ_RATIO_BPS);
-        let reduce_only = mm > 0 && equity * 10_000 <= mm * i128::from(REDUCE_ONLY_RATIO_BPS);
+        let reduce_only =
+            has_unmarked || (mm > 0 && equity * 10_000 <= mm * i128::from(REDUCE_ONLY_RATIO_BPS));
         RiskSnapshot {
             equity,
             mm,
@@ -295,5 +306,21 @@ mod tests {
         let s = a.snapshot(&m);
         assert!(s.reduce_only);
         assert!(a.debit(1, &m).is_err());
+    }
+
+    #[test]
+    fn unmarked_position_forces_reduce_only() {
+        let mut a = Account::new(AccountId([1; 32]));
+        a.credit(10_000 * USD_SCALE as i128).unwrap();
+        a.apply_fill(Side::Bid, true, 100_000 * PRICE_SCALE, QTY_SCALE, BTC_USD)
+            .unwrap();
+        // Empty marks map: the position's market has no mark.
+        let empty = BTreeMap::new();
+        let s = a.snapshot(&empty);
+        // Equity undistorted (no phantom full-notional loss for the long).
+        assert_eq!(s.equity, 10_000 * USD_SCALE as i128);
+        assert_eq!(s.mm, 0);
+        // Risk-increasing ops and withdrawals are blocked.
+        assert!(s.reduce_only);
     }
 }

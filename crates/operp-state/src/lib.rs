@@ -1,8 +1,8 @@
 pub use operp_account::Account;
 use operp_book::{Fill, OrderBook};
 use operp_types::{
-    notional_usd, sha256, AccountId, Height, MarketId, Price, Seq, UnitId, Usd, BTC_USD,
-    INSURANCE_ACCOUNT, INSURANCE_SEED, PRICE_SCALE, USD_SCALE,
+    bps, notional_usd, sha256, AccountId, Height, MarketId, Price, Seq, UnitId, Usd, BTC_USD,
+    INSURANCE_ACCOUNT, INSURANCE_SEED, PRICE_SCALE, TAKER_FEE_BPS, USD_SCALE,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -96,12 +96,26 @@ impl ChainState {
                 fill.market,
             )?;
         }
+        // Taker fee: bps of notional debited from the taker's collateral and
+        // credited to the insurance fund — the fund's income leg, offsetting
+        // bad-debt absorption and keeper payouts. The fee flows through the
+        // same Account::apply_fill path the withdrawal-proof leaf commits.
+        if fill.taker != INSURANCE_ACCOUNT {
+            let fee = bps(notional_usd(fill.qty, fill.price), TAKER_FEE_BPS);
+            if fee > 0 {
+                if let Some(a) = self.accounts.get_mut(&fill.taker) {
+                    a.collateral -= fee;
+                }
+                self.account_mut(INSURANCE_ACCOUNT).collateral += fee;
+            }
+        }
         // Bad-debt cap: if the taker went bankrupt (equity < 0), its equity is
         // clamped to exactly 0 (collateral absorbs the hole — realized PnL is
         // settled into collateral since the settlement refactor) and the
-        // insurance fund takes an equal debit. Conservation holds; a repeat
-        // fill cannot re-trigger because equity is now 0. Insurance itself is
-        // exempt (never clamped).
+        // insurance fund takes an equal debit. A negative insurance balance is
+        // explicit socialized debt repaid by future fee income. Conservation
+        // holds; a repeat fill cannot re-trigger because equity is now 0.
+        // Insurance itself is exempt (never clamped).
         if fill.taker != INSURANCE_ACCOUNT {
             let shortfall = {
                 let marks = &self.marks;
@@ -391,5 +405,57 @@ mod tests {
         let other = AccountId([2; 32]);
         let p2 = s.account_proof(other);
         assert_ne!(p2.leaf, p.leaf);
+    }
+
+    #[test]
+    fn taker_fee_flows_to_insurance() {
+        let mut s = ChainState::new();
+        let taker = AccountId([9; 32]);
+        let maker = AccountId([8; 32]);
+        s.account_mut(taker).credit(1_000_000 * USD_SCALE as i128).unwrap();
+        s.account_mut(maker).credit(1_000_000 * USD_SCALE as i128).unwrap();
+        let px = 100_000 * operp_types::PRICE_SCALE;
+        let fill = Fill {
+            taker_id: operp_types::OrderId([0u8; 32]),
+            maker_id: operp_types::OrderId([0u8; 32]),
+            taker,
+            maker,
+            market: BTC_USD,
+            price: px,
+            qty: operp_types::QTY_SCALE,
+            seq: 1,
+            taker_side: operp_types::Side::Bid,
+        };
+        s.apply_fill_pair(&fill).unwrap();
+        // notional = 100_000 USD → fee @5bps = 50 USD credited to insurance.
+        let ins = &s.accounts[&INSURANCE_ACCOUNT];
+        assert_eq!(ins.collateral, INSURANCE_SEED + 50 * USD_SCALE as i128);
+    }
+
+    #[test]
+    fn mark_deviation_cap() {
+        let mut s = ChainState::new();
+        let taker = AccountId([9; 32]);
+        let maker = AccountId([8; 32]);
+        for id in [taker, maker] {
+            s.account_mut(id).credit(10_000_000 * USD_SCALE as i128).unwrap();
+        }
+        let mk_fill = |price| Fill {
+            taker_id: operp_types::OrderId([0u8; 32]),
+            maker_id: operp_types::OrderId([0u8; 32]),
+            taker,
+            maker,
+            market: BTC_USD,
+            price,
+            qty: operp_types::QTY_SCALE,
+            seq: 1,
+            taker_side: operp_types::Side::Bid,
+        };
+        // +200% spike: rejected by the ±10% cap — mark stays at genesis.
+        s.apply_fill_pair(&mk_fill(300_000 * operp_types::PRICE_SCALE)).unwrap();
+        assert_eq!(*s.marks.get(&BTC_USD).unwrap(), 100_000 * operp_types::PRICE_SCALE);
+        // +5% move: within the band — mark updates.
+        s.apply_fill_pair(&mk_fill(105_000 * operp_types::PRICE_SCALE)).unwrap();
+        assert_eq!(*s.marks.get(&BTC_USD).unwrap(), 105_000 * operp_types::PRICE_SCALE);
     }
 }

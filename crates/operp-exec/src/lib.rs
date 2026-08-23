@@ -188,7 +188,10 @@ impl Engine {
         {
             return Err(RejectReason::Risk);
         }
-
+        // Market whitelist: never lazily create books for arbitrary markets.
+        if !self.state.allowed_markets.contains(&market) {
+            return Err(RejectReason::Risk);
+        }
 
         let snap = {
             let acct = self.state.accounts.get(&account);

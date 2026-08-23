@@ -219,8 +219,11 @@
 			},
 			{
 				// PROOF-GATED withdrawal against the finalized aa_root.
-				// balance authority = the proven leaf's collateral, NOT bal_ vars;
-				// bal_ is additionally debited to keep the deposit ledger honest.
+				// balance authority = the proven leaf's collateral, NOT bal_ vars.
+				// bal_ is a diagnostic shadow ledger only (credited on deposit,
+				// debited here); it never gates withdrawals — AA native balance
+				// mechanically gates the payment, and stale/rolled-back roots
+				// are the root-chain + challenge game's job, not bal_'s.
 				if: "{trigger.data.withdraw}",
 				init: "{
 					// merkle helpers (each function has its own complexity budget)
@@ -261,8 +264,6 @@
 						bounce('bad sibling');
 					if ($root != var['aa_root_' || $h])
 						bounce('bad merkle root');
-					if ($amt > (var['bal_' || trigger.address] otherwise 0))
-						bounce('insufficient aa balance');
 				}",
 				messages: [
 					{
