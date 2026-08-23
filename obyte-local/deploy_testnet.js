@@ -1,8 +1,8 @@
 "use strict";
 
-// ODEX vault AA — Obyte TESTNET deployment script.
+// OPERP vault AA — Obyte TESTNET deployment script.
 //
-// Deploys the security-hardened odex_vault.aa to a testnet node, performs an
+// Deploys the security-hardened operp_vault.aa to a testnet node, performs an
 // initial smoke deposit, and prints the resulting AA address for operators.
 //
 // Prerequisites:
@@ -29,9 +29,9 @@ const { Network } = Testkit({
 });
 
 async function main() {
-  console.log("deploying odex_vault.aa to TESTNET ...");
+  console.log("deploying operp_vault.aa to TESTNET ...");
   const network = await Network.create()
-    .with.agent({ vault: path.join(__dirname, "agents/odex_vault.aa") })
+    .with.agent({ vault: path.join(__dirname, "agents/operp_vault.aa") })
     .with.wallet({ operator: 1e9 })
     .run();
 
@@ -54,7 +54,7 @@ async function main() {
   const vars_ = v.vars || v;
   const opAddr = await operator.getAddress();
   if (!(vars_["bal_" + opAddr] > 0)) throw new Error("smoke deposit not credited");
-  if (vars_.chain_id !== "odex-mvp-1") throw new Error("boot vars missing");
+  if (vars_.chain_id !== "operp-mvp-1") throw new Error("boot vars missing");
   if (Number(vars_.last_locked) !== 0 || Number(vars_.last_finalized) !== 0)
     throw new Error("boot heights wrong");
   console.log("smoke deposit OK; bal =", vars_["bal_" + opAddr]);
@@ -63,7 +63,7 @@ async function main() {
   const info = {
     network: "testnet",
     vault_aa_address: vault,
-    chain_id: "odex-mvp-1",
+    chain_id: "operp-mvp-1",
     stability_secs: 600,
     challenge_secs: 3600,
     bounce_fee_base: 10000,

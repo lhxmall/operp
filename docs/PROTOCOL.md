@@ -1,6 +1,6 @@
-# ODEX 协议原理
+# OPERP 协议原理
 
-本文深入说明 ODEX（乐观 DAG 侧链永续 DEX，结算到 Obyte）的设计原理与安全机制。
+本文深入说明 OPERP（乐观 DAG 侧链永续 DEX，结算到 Obyte）的设计原理与安全机制。
 README 是概览；这里是"为什么这样设计"。
 
 术语：

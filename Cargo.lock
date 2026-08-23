@@ -171,28 +171,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "odex-account"
+name = "operp-account"
 version = "0.1.0"
 dependencies = [
- "odex-types",
+ "operp-types",
  "thiserror",
 ]
 
 [[package]]
-name = "odex-book"
+name = "operp-book"
 version = "0.1.0"
 dependencies = [
- "odex-types",
+ "operp-types",
  "thiserror",
 ]
 
 [[package]]
-name = "odex-dag"
+name = "operp-dag"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
- "odex-types",
+ "operp-types",
  "serde",
  "serde_json",
  "sha2",
@@ -200,32 +200,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "odex-exec"
+name = "operp-exec"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
- "odex-account",
- "odex-book",
- "odex-dag",
- "odex-settle",
- "odex-state",
- "odex-types",
+ "operp-account",
+ "operp-book",
+ "operp-dag",
+ "operp-settle",
+ "operp-state",
+ "operp-types",
  "serde_json",
  "thiserror",
 ]
 
 [[package]]
-name = "odex-settle"
+name = "operp-settle"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
- "odex-book",
- "odex-dag",
- "odex-exec",
- "odex-state",
- "odex-types",
+ "operp-book",
+ "operp-dag",
+ "operp-exec",
+ "operp-state",
+ "operp-types",
  "serde",
  "serde_json",
  "sha2",
@@ -233,18 +233,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "odex-state"
+name = "operp-state"
 version = "0.1.0"
 dependencies = [
  "hex",
- "odex-account",
- "odex-book",
- "odex-types",
+ "operp-account",
+ "operp-book",
+ "operp-types",
  "sha2",
 ]
 
 [[package]]
-name = "odex-types"
+name = "operp-types"
 version = "0.1.0"
 dependencies = [
  "hex",

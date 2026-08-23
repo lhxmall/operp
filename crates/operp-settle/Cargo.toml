@@ -1,0 +1,20 @@
+[package]
+name = "operp-settle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+operp-types = { workspace = true }
+operp-dag = { workspace = true }
+operp-state = { workspace = true }
+operp-exec = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+operp-book = { version = "0.1.0", path = "../operp-book" }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }

@@ -1,11 +1,11 @@
 {
-	// ODEX MVP vault AA — security-hardened version.
+	// OPERP MVP vault AA — security-hardened version.
 	//
 	// Trust model: NO owner key. Upgrading = deploy a new AA and migrate funds
 	// through the same finalized-root withdrawal path. All protocol constants
-	// below mirror Rust constants in crates/odex-types/src/lib.rs (Rust is the
+	// below mirror Rust constants in crates/operp-types/src/lib.rs (Rust is the
 	// single source of truth; Oscript cannot include them):
-	//   'odex-mvp-1'  -> CHAIN_ID
+	//   'operp-mvp-1'  -> CHAIN_ID
 	//   600           -> OBYTE_STABILITY_SECS (lock stability window)
 	//   3600          -> CHALLENGE_SECS (challenge window before finalize)
 	//   10000         -> BOUNCE_FEES base (deducted from trigger outputs)
@@ -15,7 +15,7 @@
 	// a merkle tree over hex strings (Oscript sha256 hashes UTF-8 text):
 	//   leaf = sha256("acct:" + account_hex + ":" + collateral_decimal_string) -> hex
 	//   node = sha256(left_hex + right_hex) -> hex
-	// (built by odex_state::aa_account_leaf / aa_parent / aa_root_of).
+	// (built by operp_state::aa_account_leaf / aa_parent / aa_root_of).
 	// withdraw requires { height, amount, leaf_account, collateral, proof }
 	// where proof = [ {hash, right}, ... ] sibling list; the AA recomputes the
 	// root with string ops and compares to var['root_' || last_finalized].
@@ -45,7 +45,7 @@
 						state: "{
 							if (!var['boot']){
 								var['boot'] = 1;
-								var['chain_id'] = 'odex-mvp-1';
+								var['chain_id'] = 'operp-mvp-1';
 								var['last_locked'] = 0;
 								var['last_finalized'] = 0;
 							}
@@ -57,7 +57,7 @@
 			{
 				if: "{trigger.data.submit}",
 				init: "{
-					if (trigger.data.chain_id != 'odex-mvp-1')
+					if (trigger.data.chain_id != 'operp-mvp-1')
 						bounce('bad chain');
 					$h = trigger.data.height;
 					if (!$h OR $h != var['last_locked'] + 1)

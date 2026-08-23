@@ -1,0 +1,19 @@
+[package]
+name = "operp-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+operp-types = { workspace = true }
+operp-book = { workspace = true }
+operp-account = { workspace = true }
+operp-dag = { workspace = true }
+operp-state = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+operp-settle = { path = "../operp-settle" }

@@ -1,8 +1,8 @@
 {
-  "name": "odex-obyte-local",
+  "name": "operp-obyte-local",
   "private": true,
   "version": "0.1.0",
-  "description": "Local Obyte DAG + temp_data batch poster for odex",
+  "description": "Local Obyte DAG + temp_data batch poster for operp",
   "main": "post_temp_data.js",
   "scripts": {
     "post-batch": "node post_temp_data.js"

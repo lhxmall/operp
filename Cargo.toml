@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/odex-types",
-  "crates/odex-book",
-  "crates/odex-account",
-  "crates/odex-dag",
-  "crates/odex-state",
-  "crates/odex-exec",
-  "crates/odex-settle",
+  "crates/operp-types",
+  "crates/operp-book",
+  "crates/operp-account",
+  "crates/operp-dag",
+  "crates/operp-state",
+  "crates/operp-exec",
+  "crates/operp-settle",
 ]
 
 [workspace.package]
@@ -22,10 +22,10 @@ thiserror = "1"
 sha2 = "0.10"
 ed25519-dalek = "2"
 hex = "0.4"
-odex-types = { path = "crates/odex-types" }
-odex-book = { path = "crates/odex-book" }
-odex-account = { path = "crates/odex-account" }
-odex-dag = { path = "crates/odex-dag" }
-odex-state = { path = "crates/odex-state" }
-odex-exec = { path = "crates/odex-exec" }
-odex-settle = { path = "crates/odex-settle" }
+operp-types = { path = "crates/operp-types" }
+operp-book = { path = "crates/operp-book" }
+operp-account = { path = "crates/operp-account" }
+operp-dag = { path = "crates/operp-dag" }
+operp-state = { path = "crates/operp-state" }
+operp-exec = { path = "crates/operp-exec" }
+operp-settle = { path = "crates/operp-settle" }

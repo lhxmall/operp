@@ -1,0 +1,12 @@
+[package]
+name = "operp-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+operp-types = { workspace = true }
+operp-book = { workspace = true }
+operp-account = { workspace = true }
+sha2 = { workspace = true }
+hex.workspace = true

@@ -1,8 +1,8 @@
 English | [简体中文](README.zh-CN.md)
 
-# ODEX — Optimistic DAG Sidechain Perpetual DEX settling to Obyte
+# OPERP — Optimistic DAG Sidechain Perpetual DEX settling to Obyte
 
-ODEX is a research/MVP implementation of a **perpetual futures exchange** that
+OPERP is a research/MVP implementation of a **perpetual futures exchange** that
 executes trades on a high-throughput optimistic DAG sidechain and settles
 periodic state roots to the [Obyte](https://obyte.org) ledger through an
 autonomous agent (AA) vault. Withdrawals from the vault are **proof-gated**:
@@ -15,8 +15,8 @@ users must present a Merkle proof of their balance against a finalized root.
 
 ```
 cargo test --workspace          # 30 tests, all green
-cargo run --release -p odex-exec --example bench_raw        # ~5.5k ops/s
-cargo run --release -p odex-exec --example hft_onedag -- 20000 8 4   # ~9k TPS, 0 rejects
+cargo run --release -p operp-exec --example bench_raw        # ~5.5k ops/s
+cargo run --release -p operp-exec --example hft_onedag -- 20000 8 4   # ~9k TPS, 0 rejects
 cd obyte-local && node test_vault_aa.js    # full AA lifecycle on devnet
 cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
 ```
@@ -52,14 +52,14 @@ cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
 
 | Crate | Role |
 |---|---|
-| `odex-types` | Constants (single source of truth), ids (`AccountId = sha256(pubkey)`), fixed-point math |
-| `odex-book` | Central limit order book: price-time priority, partial fills, IOC/GTC, self-trade block |
-| `odex-account` | Per-account collateral/positions, VWAP entry price, realized PnL, risk snapshot |
+| `operp-types` | Constants (single source of truth), ids (`AccountId = sha256(pubkey)`), fixed-point math |
+| `operp-book` | Central limit order book: price-time priority, partial fills, IOC/GTC, self-trade block |
+| `operp-account` | Per-account collateral/positions, VWAP entry price, realized PnL, risk snapshot |
 | | `liquidatable` at equity·10000 ≤ mm·10500, `reduce_only` at ≤ 12000 |
-| `odex-state` | ChainState: accounts/books/marks/withdrawals, byte-level Merkle tree (`state_root`) + hex-string tree (`aa_root`) for the AA |
-| `odex-dag` | Unit DAG with signature verification (`verify_strict`), orphan buffer (4096 FIFO), deterministic linearization by unit id |
-| `odex-exec` | The engine: ingest → apply → events; place/cancel/deposit/withdraw/liquidate with full intake validation |
-| `odex-settle` | Batch checkpoints, `validate_against` replay verification, `temp_data` payloads, proof generation |
+| `operp-state` | ChainState: accounts/books/marks/withdrawals, byte-level Merkle tree (`state_root`) + hex-string tree (`aa_root`) for the AA |
+| `operp-dag` | Unit DAG with signature verification (`verify_strict`), orphan buffer (4096 FIFO), deterministic linearization by unit id |
+| `operp-exec` | The engine: ingest → apply → events; place/cancel/deposit/withdraw/liquidate with full intake validation |
+| `operp-settle` | Batch checkpoints, `validate_against` replay verification, `temp_data` payloads, proof generation |
 
 ## Protocol principles
 
@@ -154,7 +154,7 @@ Lifecycle per height *h*:
    Balance authority is the **proven leaf**, never mutable AA variables.
 
 Proofs are generated off-chain by
-`crates/odex-settle/examples/gen_withdraw_proof.rs` (JSON consumed by the JS
+`crates/operp-settle/examples/gen_withdraw_proof.rs` (JSON consumed by the JS
 tooling).
 
 There is deliberately **no owner key**: upgrading means deploying a new AA
@@ -168,10 +168,10 @@ single source of truth.
 ```
 crates/                  Rust workspace (7 crates, see table above)
 obyte-local/
-  agents/odex_vault.aa   the vault autonomous agent (security-hardened)
+  agents/operp_vault.aa   the vault autonomous agent (security-hardened)
   test_vault_aa.js       full lifecycle integration test (devnet via aa-testkit)
   deploy_testnet.js      testnet deployment script (+ smoke deposit)
-  gen_withdraw_proof     see crates/odex-settle/examples
+  gen_withdraw_proof     see crates/operp-settle/examples
 vendor/aa-testkit/       Obyte autonomous-agent testkit (vendored)
 docs/PROTOCOL.md         deeper protocol write-up
 ```
@@ -183,12 +183,12 @@ docs/PROTOCOL.md         deeper protocol write-up
 cargo test --workspace
 
 # single-node throughput probe
-cargo run --release -p odex-exec --example bench_raw
+cargo run --release -p operp-exec --example bench_raw
 # one-DAG multi-market stress: <run_ms> <markets> <generators>
-cargo run --release -p odex-exec --example hft_onedag -- 60000 8 4
+cargo run --release -p operp-exec --example hft_onedag -- 60000 8 4
 
 # export a real batch payload
-cargo run -p odex-settle --example export_batch
+cargo run -p operp-settle --example export_batch
 
 # AA lifecycle on local devnet (needs node; uses vendored aa-testkit)
 cd obyte-local && node test_vault_aa.js
