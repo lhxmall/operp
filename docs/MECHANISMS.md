@@ -620,7 +620,12 @@ ingest → Applied{status: Optimistic}     # 立即执行、立即成交
   造成停摆，配合 fee race 由诚实 operator 接管
 - 预言机为债券注册制（ORACLE_BOND_PERP = 50_000 PERP，无许可）；报价
   质量取决于质押者的诚实度——按债券计的多数仍可合谋偏置中位数
-- 无第三方安全审计；Oscript 复杂度预算迫使逻辑拆分为辅助函数
+- 挑战彻底失败后高度永久 `frozen = 2`，无跳过机制——后续 submit 全部
+  停摆（活性攻击面，任何人可故意触发）；恢复 = 重部署新 AA
+- 大载荷内联 temp_data 会触发 ocore 校验器双回调崩溃；E2E 跳过链上揭示，
+  operator 发布批次需先修复 ocore 或分块揭示
+- 无第三方安全审计；Oscript 复杂度预算已实质耗尽（99/100），改动须先
+  腾出等额预算
 
 ---
 

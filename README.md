@@ -243,11 +243,30 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    (a 50 000 PERP bond per reporter) but there is no slashing yet, so a
    bond-majority collusion can still bias the median mark; TWAP or external
    multi-source pricing remains future work.
-4. Failed heights roll back cleanly, but recovery depends on operators
+4. **A fully failed challenge permanently wedges the height chain.** When a
+   challenge succeeds (operator never responds), the height is marked
+   `frozen = 2` and `last_locked` rolls back — but `submit` requires
+   `h == last_locked + 1` and there is no skip mechanism, so every later
+   deposit/withdrawal stalls until a fresh AA is deployed. This is a
+   deliberate liveness attack anyone can trigger.
+5. **Large inline `temp_data` payloads crash ocore's validator** (double
+   callback in the inline-path check). The JS E2E skips the on-chain batch
+   reveal for this reason; operator publication needs an ocore fix or
+   chunked reveals first.
+6. **Governance vote weight is balance at vote time.** PERP deposited via
+   `GovDeposit` counts immediately, so a large holder can concentrate votes
+   shortly before the deadline; the only mitigation is the quorum snapshot
+   denominator taken at proposal creation.
+7. **Burned PERP stays stranded in the vault AA.** Burns decrement
+   `perp_supply` but the corresponding tokens remain escrowed (the AA is
+   permanently over-collateralized) — auditors must treat
+   `vault holdings − perp_supply` as the cumulative burn figure.
+8. Failed heights roll back cleanly, but recovery depends on operators
    resubmitting corrected batches; there is no trustless escape hatch if
    every operator disappears.
-5. The AA has had no formal security audit; Oscript's complexity budget
-   forced logic to be split across helper functions.
+9. The AA has had no formal security audit; Oscript's complexity budget is
+   effectively exhausted (99/100), so every further change must free equal
+   budget first.
 
 Recently closed: deposit whitelisting, overflow guards, market whitelist,
 strict signatures, orphan recovery with deterministic eviction, bounded
