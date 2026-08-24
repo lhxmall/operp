@@ -10,19 +10,16 @@
 	//   3600          -> CHALLENGE_SECS (challenge window before finalize)
 	//   10000         -> BOUNCE_FEES base (deducted from trigger outputs)
 	//   20000         -> challenge bond minimum incl. bounce fee headroom
-	//   'base' -> PERP_ASSET (crates/operp-types); deploy scripts
-	//     substitute the real asset id for this placeholder before deployment
 	//
 	// WITHDRAWALS ARE PROOF-GATED. The operator commits `aa_root` per batch:
 	// a merkle tree over hex strings (Oscript sha256 hashes UTF-8 text):
+	//   leaf = sha256("acct:" + account_hex + ":" + collateral_decimal_string) -> hex
 	//   node = sha256(left_hex + right_hex) -> hex
-	//   leaf = sha256("acct:" + account_hex + ":" + collateral_decimal_string + ":" + perp_decimal_string) -> hex
-	// withdraw requires { height, amount, leaf_account, collateral, perp,
-	// proof } where perp = proven PERP balance (may be "0"); optional
-	// `perp_amount` overrides the PERP amount claimed now (defaults to the
-	// full unclaimed remainder). proof = [ {hash, right}, ... ] sibling
-	// list; the AA recomputes the root with string ops and compares to
-	// var['root_' || last_finalized].
+	// (built by operp_state::aa_account_leaf / aa_parent / aa_root_of).
+	// withdraw requires { height, amount, leaf_account, collateral, proof }
+	// where proof = [ {hash, right}, ... ] sibling list; the AA recomputes the
+	// root with string ops and compares to var['root_' || last_finalized].
+	//
 	// State vars:
 	//   boot, chain_id, last_locked, last_finalized
 	//   submitted_at_<h>, cand_root_<h>, cand_prev_<h>, cand_fills_<h>,
@@ -39,11 +36,6 @@
 	//     proof replay
 
 
-	//   wp_<h>_<addr>                            cumulative PERP withdrawn
-	//     against finalized height <h> by <addr>; capped at the proven PERP
-	//     balance — exactly symmetric to wd_ (anti-replay)
-	//   pperp_<addr>                             diagnostic PERP shadow ledger
-	//     (mirror of bal_: credited on PERP deposit, debited on withdrawal)
 	bounce_fees: { base: 10000 },
 	messages: {
 		cases: [
@@ -59,25 +51,11 @@
 						state: "{
 							if (!var['boot']){
 								var['boot'] = 1;
+								var['chain_id'] = 'operp-mvp-1';
 								var['last_locked'] = 0;
 								var['last_finalized'] = 0;
 							}
 							var['bal_' || trigger.address] = (var['bal_' || trigger.address] otherwise 0) + trigger.output[[asset=base]] - 10000;
-						}"
-					}
-				]
-			},
-			{
-				// PERP governance asset deposit: credited to a diagnostic
-				// shadow ledger only (mirror of bal_). The sidechain's
-				// GovDeposit ops (keyed by aa_unit) are the actual credit
-				// path; pperp_ exists so watchers can reconcile inflows.
-				if: "{trigger.data.deposit_perp}",
-				messages: [
-					{
-						app: "state",
-						state: "{
-							var['pperp_' || trigger.address] = (var['pperp_' || trigger.address] otherwise 0) + trigger.output[[asset='base']];
 						}"
 					}
 				]
@@ -267,20 +245,30 @@
 					$h = var['last_finalized'];
 					if (!$h OR var['frozen_' || $h] OR (trigger.data.height AND trigger.data.height != $h))
 						bounce('not finalizable');
-					if (!trigger.data.amount OR trigger.data.amount <= 0 OR !trigger.data.leaf_account
-						OR !trigger.data.collateral OR !trigger.data.proof OR length(trigger.data.proof) > 16
-						OR !is_valid_amount(trigger.data.perp))
+					$amt = trigger.data.amount;
+					$leaf_account = trigger.data.leaf_account;
+					$collateral = trigger.data.collateral;
+					$proof = trigger.data.proof;
+					if (!$amt OR $amt <= 0 OR !$leaf_account OR !$collateral OR !$proof OR length($proof) > 16)
 						bounce('invalid claim');
-					// leaf must be the caller; per-height cumulative
-					// withdrawals (anti-replay) capped at proven collateral.
-					// PERP side exactly symmetric via wp_: every withdrawal
-					// claims the full unclaimed remainder of the proven
-					// balance ($perp may be "0").
-					$perp_claimed = trigger.data.perp - (var['wp_' || $h || '_' || trigger.address] otherwise 0);
-					if (trigger.data.leaf_account != trigger.address OR trigger.data.amount + (var['wd_' || $h || '_' || trigger.address] otherwise 0) > trigger.data.collateral OR $perp_claimed < 0)
+					// leaf must be the caller; per-height cumulative withdrawals
+					// (anti-replay) capped at proven collateral
+					if ($leaf_account != trigger.address OR $amt + (var['wd_' || $h || '_' || trigger.address] otherwise 0) > $collateral)
 						bounce('bad claim amount');
-					$fold = ($acc, $i, $sib) => (!$acc OR !$sib.hash) ? false
-						: ($sib.right ? sha256($acc || $sib.hash, 'hex') : sha256($sib.hash || $acc, 'hex'));
+					$fold = ($acc, $i, $sib) => {
+						if (!$acc OR !$sib.hash)
+							return false;
+						if ($sib.right)
+							return sha256($acc || $sib.hash, 'hex');
+						else
+							return sha256($sib.hash || $acc, 'hex');
+					};
+					$leaf = sha256('acct:' || $leaf_account || ':' || $collateral, 'hex');
+					$root = reduce($proof, 16, $fold, $leaf);
+					if (!$root)
+						bounce('bad sibling');
+					if ($root != var['aa_root_' || $h])
+						bounce('bad merkle root');
 				}",
 				messages: [
 					{
@@ -296,27 +284,10 @@
 						}
 					},
 					{
-						// Oscript forbids 0-amount outputs — emit the PERP
-						// payment only when something is actually claimed.
-						if: "{$perp_claimed > 0}",
-						app: "payment",
-						payload: {
-							asset: "base",
-							outputs: [
-								{
-									address: "{trigger.address}",
-									amount: "{$perp_claimed}"
-								}
-							]
-						}
-					},
-					{
 						app: "state",
 						state: "{
 							var['bal_' || trigger.address] -= trigger.data.amount;
 							var['wd_' || $h || '_' || trigger.address] += trigger.data.amount;
-							var['pperp_' || trigger.address] = (var['pperp_' || trigger.address] otherwise 0) - $perp_claimed;
-							var['wp_' || $h || '_' || trigger.address] += $perp_claimed;
 						}"
 					}
 				]
@@ -344,6 +315,12 @@
 							]
 						}
 					},
+					{
+						app: "state",
+						state: "{
+							var['reward_' || trigger.address] = 0;
+						}"
+					}
 				]
 			},
 			{

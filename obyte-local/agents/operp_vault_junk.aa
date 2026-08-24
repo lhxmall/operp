@@ -59,6 +59,7 @@
 						state: "{
 							if (!var['boot']){
 								var['boot'] = 1;
+								var['chain_id'] = 'operp-mvp-1';
 								var['last_locked'] = 0;
 								var['last_finalized'] = 0;
 							}
@@ -265,11 +266,11 @@
 				if: "{trigger.data.withdraw}",
 				init: "{
 					$h = var['last_finalized'];
-					if (!$h OR var['frozen_' || $h] OR (trigger.data.height AND trigger.data.height != $h))
+					if (!$h OR var['frozen_' || $h])
 						bounce('not finalizable');
-					if (!trigger.data.amount OR trigger.data.amount <= 0 OR !trigger.data.leaf_account
-						OR !trigger.data.collateral OR !trigger.data.proof OR length(trigger.data.proof) > 16
-						OR !is_valid_amount(trigger.data.perp))
+					$leaf_account = trigger.data.leaf_account;
+					$collateral = trigger.data.collateral;
+					if (!$amt OR !$leaf_account OR !$collateral)
 						bounce('invalid claim');
 					// leaf must be the caller; per-height cumulative
 					// withdrawals (anti-replay) capped at proven collateral.
@@ -277,10 +278,20 @@
 					// claims the full unclaimed remainder of the proven
 					// balance ($perp may be "0").
 					$perp_claimed = trigger.data.perp - (var['wp_' || $h || '_' || trigger.address] otherwise 0);
-					if (trigger.data.leaf_account != trigger.address OR trigger.data.amount + (var['wd_' || $h || '_' || trigger.address] otherwise 0) > trigger.data.collateral OR $perp_claimed < 0)
+					if ($leaf_account != trigger.address OR $amt + (var['wd_' || $h || '_' || trigger.address] otherwise 0) > $collateral OR $perp_claimed < 0)
 						bounce('bad claim amount');
-					$fold = ($acc, $i, $sib) => (!$acc OR !$sib.hash) ? false
-						: ($sib.right ? sha256($acc || $sib.hash, 'hex') : sha256($sib.hash || $acc, 'hex'));
+					$fold = ($acc, $i, $sib) => {
+						if (!$acc OR !$sib.hash)
+							return false;
+						if ($sib.right)
+							return sha256($acc || $sib.hash, 'hex');
+						else
+							return sha256($sib.hash || $acc, 'hex');
+					};
+					$root = reduce(trigger.data.proof, 16, $fold,
+						sha256('acct:' || $leaf_account || ':' || $collateral || ':' || trigger.data.perp, 'hex'));
+					if ($root != var['aa_root_' || $h])
+						bounce('bad merkle root');
 				}",
 				messages: [
 					{
@@ -315,7 +326,6 @@
 						state: "{
 							var['bal_' || trigger.address] -= trigger.data.amount;
 							var['wd_' || $h || '_' || trigger.address] += trigger.data.amount;
-							var['pperp_' || trigger.address] = (var['pperp_' || trigger.address] otherwise 0) - $perp_claimed;
 							var['wp_' || $h || '_' || trigger.address] += $perp_claimed;
 						}"
 					}
@@ -344,6 +354,12 @@
 							]
 						}
 					},
+					{
+						app: "state",
+						state: "{
+							var['reward_' || trigger.address] = 0;
+						}"
+					}
 				]
 			},
 			{

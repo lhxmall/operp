@@ -59,7 +59,6 @@
 						state: "{
 							if (!var['boot']){
 								var['boot'] = 1;
-								var['chain_id'] = 'operp-mvp-1';
 								var['last_locked'] = 0;
 								var['last_finalized'] = 0;
 							}
@@ -73,7 +72,7 @@
 				// shadow ledger only (mirror of bal_). The sidechain's
 				// GovDeposit ops (keyed by aa_unit) are the actual credit
 				// path; pperp_ exists so watchers can reconcile inflows.
-				if: "{trigger.data.deposit_perp AND trigger.output[[asset='PERP_ASSET_ID_HERE']] > 0}",
+				if: "{trigger.data.deposit_perp}",
 				messages: [
 					{
 						app: "state",
@@ -268,36 +267,20 @@
 					$h = var['last_finalized'];
 					if (!$h OR var['frozen_' || $h] OR (trigger.data.height AND trigger.data.height != $h))
 						bounce('not finalizable');
-					$amt = trigger.data.amount;
-					$leaf_account = trigger.data.leaf_account;
-					$collateral = trigger.data.collateral;
-					$perp = trigger.data.perp;
-					$proof = trigger.data.proof;
-					if (!$amt OR $amt <= 0 OR !$leaf_account OR !$collateral OR !$proof OR length($proof) > 16)
+					if (!trigger.data.amount OR trigger.data.amount <= 0 OR !trigger.data.leaf_account
+						OR !trigger.data.collateral OR !trigger.data.proof OR length(trigger.data.proof) > 16
+						OR !is_valid_amount(trigger.data.perp))
 						bounce('invalid claim');
 					// leaf must be the caller; per-height cumulative
 					// withdrawals (anti-replay) capped at proven collateral.
 					// PERP side exactly symmetric via wp_: every withdrawal
 					// claims the full unclaimed remainder of the proven
 					// balance ($perp may be "0").
-					$perp_wd = var['wp_' || $h || '_' || trigger.address] otherwise 0;
-					$perp_claimed = $perp - $perp_wd;
-					if ($leaf_account != trigger.address OR $amt + (var['wd_' || $h || '_' || trigger.address] otherwise 0) > $collateral OR $perp_claimed < 0)
+					$perp_claimed = trigger.data.perp - (var['wp_' || $h || '_' || trigger.address] otherwise 0);
+					if (trigger.data.leaf_account != trigger.address OR trigger.data.amount + (var['wd_' || $h || '_' || trigger.address] otherwise 0) > trigger.data.collateral OR $perp_claimed < 0)
 						bounce('bad claim amount');
-					$fold = ($acc, $i, $sib) => {
-						if (!$acc OR !$sib.hash)
-							return false;
-						if ($sib.right)
-							return sha256($acc || $sib.hash, 'hex');
-						else
-							return sha256($sib.hash || $acc, 'hex');
-					};
-					$leaf = sha256('acct:' || $leaf_account || ':' || $collateral || ':' || $perp, 'hex');
-					$root = reduce($proof, 16, $fold, $leaf);
-					if (!$root)
-						bounce('bad sibling');
-					if ($root != var['aa_root_' || $h])
-						bounce('bad merkle root');
+					$fold = ($acc, $i, $sib) => (!$acc OR !$sib.hash) ? false
+						: ($sib.right ? sha256($acc || $sib.hash, 'hex') : sha256($sib.hash || $acc, 'hex'));
 				}",
 				messages: [
 					{
@@ -361,12 +344,6 @@
 							]
 						}
 					},
-					{
-						app: "state",
-						state: "{
-							var['reward_' || trigger.address] = 0;
-						}"
-					}
 				]
 			},
 			{
