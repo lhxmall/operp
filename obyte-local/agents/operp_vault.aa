@@ -23,10 +23,17 @@
 	// State vars:
 	//   boot, chain_id, last_locked, last_finalized
 	//   submitted_at_<h>, cand_root_<h>, cand_prev_<h>, cand_fills_<h>,
-	//     cand_unit_<h>, cand_who_<h>            candidate (replaceable pre-lock)
-	//   root_<h>, winner_<h>, stable_at_<h>      locked root
+	//     cand_who_<h>                           candidate (replaceable pre-lock)
+	//   root_<h>, stable_at_<h>                  locked root
 	//   frozen_<h>   absent/0 = ok, 1 = challenged, 2 = permanently failed
-	//   challenger_<h>, bond_<address>           challenge bond accounting
+	//   challenger_<h>, bond_<address>           challenge bond accounting.
+	//     bond_<address> holds the challenger's deposited bond until either
+	//     the operator responds (full confiscation: zeroed) or the challenger
+	//     reclaims it via {claim_bond} (paid out and zeroed).
+	//   wd_<h>_<addr>                            cumulative bytes withdrawn
+	//     against finalized height <h> by <addr>; total withdrawals per
+	//     address are capped at its proven collateral, which also blocks
+	//     proof replay
 
 
 	bounce_fees: { base: 10000 },
@@ -35,10 +42,8 @@
 			{
 				if: "{trigger.data.deposit}",
 				init: "{
-					$paid = trigger.output[[asset=base]] - 10000;
-					if ($paid <= 0)
+					if (trigger.output[[asset=base]] - 10000 <= 0)
 						bounce('deposit too small');
-					$k = 'bal_' || trigger.address;
 				}",
 				messages: [
 					{
@@ -59,21 +64,17 @@
 				if: "{trigger.data.submit}",
 				init: "{
 					$h = trigger.data.height;
-					if (trigger.data.chain_id != 'operp-mvp-1' OR !$h OR $h != var['last_locked'] + 1 OR !trigger.data.state_root OR !trigger.data.aa_root OR !trigger.data.fills_hash)
+					$ll = var['last_locked'];
+					if (trigger.data.chain_id != 'operp-mvp-1' OR !$h OR $h != $ll + 1 OR !trigger.data.state_root OR !trigger.data.aa_root OR !trigger.data.fills_hash)
 						bounce('bad submit');
-					if (var['last_locked'] > 0 AND trigger.data.prev_state_hash != var['root_' || var['last_locked']])
+					if ($ll > 0 AND trigger.data.prev_state_hash != var['root_' || $ll])
 						bounce('prev mismatch');
 					if (var['root_' || $h])
 						bounce('already locked');
-					$loser_check = ($addr, $hh) => {
-						$w = var['fee_winner_' || $hh];
-						if (!$w)
-							return false;
-						if ($w == $addr)
-							return false;
-						return true;
-					};
-					$is_loser = $loser_check(trigger.address, trigger.data.height);
+					// consolation only for a DIFFERENT address than the
+					// first-stable winner of this height
+					$fw = var['fee_winner_' || trigger.data.height];
+					$is_loser = $fw AND $fw != trigger.address;
 				}",
 				messages: [
 					{
@@ -100,7 +101,6 @@
 							var['cand_aa_root_' || trigger.data.height] = trigger.data.aa_root;
 							var['cand_prev_' || trigger.data.height] = trigger.data.prev_state_hash;
 							var['cand_fills_' || trigger.data.height] = trigger.data.fills_hash;
-							var['cand_unit_' || trigger.data.height] = trigger.unit;
 							var['cand_who_' || trigger.data.height] = trigger.address;
 							var['submitted_at_' || trigger.data.height] = timestamp;
 							// Fee race: AAs are triggered in stability order, so
@@ -128,7 +128,6 @@
 						state: "{
 							var['root_' || trigger.data.height] = var['cand_root_' || trigger.data.height];
 							var['aa_root_' || trigger.data.height] = var['cand_aa_root_' || trigger.data.height];
-							var['winner_' || trigger.data.height] = var['cand_unit_' || trigger.data.height];
 							var['stable_at_' || trigger.data.height] = timestamp;
 							var['last_locked'] = trigger.data.height;
 						}"
@@ -143,10 +142,8 @@
 						bounce('bad height');
 					if (!var['root_' || $h])
 						bounce('not locked');
-					if (var['frozen_' || $h])
-						bounce('already frozen or failed');
-					if (timestamp >= var['stable_at_' || $h] + 3600)
-						bounce('challenge window closed');
+					if (var['frozen_' || $h] OR timestamp >= var['stable_at_' || $h] + 3600)
+						bounce('challenge not possible');
 					if (trigger.output[[asset=base]] - 10000 < 10000)
 						bounce('bond too small');
 				}",
@@ -156,7 +153,7 @@
 						state: "{
 							var['frozen_' || trigger.data.height] = 1;
 							var['challenger_' || trigger.data.height] = trigger.address;
-							var['bond_' || trigger.address] = (var['bond_' || trigger.address] otherwise 0) + trigger.output[[asset=base]] - 10000;
+							var['bond_' || trigger.address] += trigger.output[[asset=base]] - 10000;
 						}"
 					}
 				]
@@ -184,12 +181,12 @@
 					{
 						app: "state",
 						state: "{
-							// unfreeze; challenger bond is confiscated to the AA pot
+							// unfreeze; confiscate EXACTLY the recorded challenger
+							// bond (coins stay in the AA pot), regardless of the
+							// respond trigger's own output.
+							// frozen==1 implies a challenger is recorded.
 							var['frozen_' || trigger.data.height] = 0;
-							$challenger = var['challenger_' || trigger.data.height];
-							if ($challenger AND var['bond_' || $challenger]){
-								var['bond_' || $challenger] -= trigger.output[[asset=base]] - 10000;
-							}
+							var['bond_' || var['challenger_' || trigger.data.height]] = 0;
 						}"
 					}
 				]
@@ -198,7 +195,8 @@
 				// finalize timer, with the challenge-FAILURE sweep folded in:
 				//   frozen==1 and window over (operator never responded)
 				//     -> height fails: frozen=2 permanent, root cleared,
-				//        last_locked rolls back to h-1, challenger bond refunded.
+				//        last_locked rolls back to h-1; the challenger's
+				//        bond stays credited for {claim_bond}.
 				//   clean window -> root becomes the withdrawal basis for h.
 				if: "{trigger.data.finalize}",
 				init: "{
@@ -207,11 +205,10 @@
 						bounce('no height');
 					if ($h > var['last_locked'])
 						bounce('not locked');
-					$failed = (var['frozen_' || $h] == 1 AND timestamp >= var['stable_at_' || $h] + 3600);
-					if (!$failed){
-						if (!var['root_' || $h] OR var['frozen_' || $h] OR timestamp < var['stable_at_' || $h] + 3600 OR $h != var['last_finalized'] + 1)
-							bounce('cannot finalize');
-					}
+					$frozen = var['frozen_' || $h];
+					$failed = ($frozen == 1 AND timestamp >= var['stable_at_' || $h] + 3600);
+					if (!$failed AND ($frozen OR !var['root_' || $h] OR timestamp < var['stable_at_' || $h] + 3600 OR $h != var['last_finalized'] + 1))
+						bounce('cannot finalize');
 				}",
 				messages: [
 					{
@@ -222,8 +219,6 @@
 								var['root_' || trigger.data.height] = 0;
 								var['aa_root_' || trigger.data.height] = 0;
 								var['last_locked'] = trigger.data.height - 1;
-								$challenger = var['challenger_' || trigger.data.height];
-								var['bond_' || $challenger] += trigger.output[[asset=base]] - 10000;
 							}
 						else {
 								var['last_finalized'] = trigger.data.height;
@@ -256,7 +251,9 @@
 					$proof = trigger.data.proof;
 					if (!$amt OR $amt <= 0 OR !$leaf_account OR !$collateral OR !$proof OR length($proof) > 16)
 						bounce('invalid claim');
-					if ($leaf_account != trigger.address OR $amt > $collateral)
+					// leaf must be the caller; per-height cumulative withdrawals
+					// (anti-replay) capped at proven collateral
+					if ($leaf_account != trigger.address OR $amt + (var['wd_' || $h || '_' || trigger.address] otherwise 0) > $collateral)
 						bounce('bad claim amount');
 					$fold = ($acc, $i, $sib) => {
 						if (!$acc OR !$sib.hash)
@@ -266,10 +263,8 @@
 						else
 							return sha256($sib.hash || $acc, 'hex');
 					};
-					$leaf_of = ($addr, $col) => sha256('acct:' || $addr || ':' || $col, 'hex');
-					$root_of = ($leaf2, $proof2) => reduce($proof2, 8, $fold, $leaf2);
-					$leaf = $leaf_of($leaf_account, $collateral);
-					$root = $root_of($leaf, $proof);
+					$leaf = sha256('acct:' || $leaf_account || ':' || $collateral, 'hex');
+					$root = reduce($proof, 16, $fold, $leaf);
 					if (!$root)
 						bounce('bad sibling');
 					if ($root != var['aa_root_' || $h])
@@ -292,6 +287,7 @@
 						app: "state",
 						state: "{
 							var['bal_' || trigger.address] -= trigger.data.amount;
+							var['wd_' || $h || '_' || trigger.address] += trigger.data.amount;
 						}"
 					}
 				]
@@ -303,7 +299,7 @@
 				if: "{trigger.data.claim_reward}",
 				init: "{
 					$owed = (var['reward_' || trigger.address] otherwise 0);
-					if (!$owed OR $owed > trigger.output[[asset=base]] - 10000)
+					if (!$owed OR trigger.output[[asset=base]] < 10000)
 						bounce('nothing claimable');
 				}",
 				messages: [
@@ -323,6 +319,39 @@
 						app: "state",
 						state: "{
 							var['reward_' || trigger.address] = 0;
+						}"
+					}
+				]
+			},
+			{
+				// Challenger bond claim: any address may reclaim its own
+				// recorded bond (credited at challenge time; confiscated to
+				// zero only when the operator responds successfully).
+				// Requires fee headroom only — claiming must not cost more
+				// than the bond being reclaimed.
+				if: "{trigger.data.claim_bond}",
+				init: "{
+					$owed = (var['bond_' || trigger.address] otherwise 0);
+					if (!$owed OR trigger.output[[asset=base]] < 10000)
+						bounce('nothing claimable');
+				}",
+				messages: [
+					{
+						app: "payment",
+						payload: {
+							asset: "base",
+							outputs: [
+								{
+									address: "{trigger.address}",
+									amount: "{$owed}"
+								}
+							]
+						}
+					},
+					{
+						app: "state",
+						state: "{
+							var['bond_' || trigger.address] = 0;
 						}"
 					}
 				]

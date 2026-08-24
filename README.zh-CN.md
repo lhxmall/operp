@@ -7,13 +7,13 @@ OPERP 是一个**永续合约交易所**的研究/MVP 实现：交易在高吞�
 autonomous agent 金库）。金库提款受 **Merkle 证明门控**——必须出示针对
 已最终化根的余额证明才能取钱。
 
-> **状态：测试网就绪 MVP。** workspace 30 个测试全绿；AA 全生命周期
+> **状态：测试网就绪 MVP。** workspace 测试全绿；AA 全生命周期
 > （deposit → submit → lock → challenge → finalize → proof 提款）已在
 > aa-testkit devnet 上端到端验证。主网部署需先补齐
 > [局限与主网就绪度](#局限与主网就绪度)所列缺口。
 
 ```
-cargo test --workspace          # 30 个测试全绿
+cargo test --workspace          # 测试全绿
 cargo run --release -p operp-exec --example bench_raw        # ~5.5k ops/s
 cargo run --release -p operp-exec --example hft_onedag -- 20000 8 4   # ~9k TPS, 零拒绝
 cd obyte-local && node test_vault_aa.js    # devnet 上完整 AA 生命周期
@@ -56,7 +56,7 @@ cd obyte-local && node deploy_testnet.js   # 把 vault AA 部署到 Obyte 测试
 | `operp-account` | 每账户抵押/仓位、VWAP 入场价、已实现 PnL、风险快照 |
 | | `liquidatable`：equity·10000 ≤ mm·10500；`reduce_only`：≤ 12000 |
 | `operp-state` | ChainState：账户/簿/mark/提款记录，字节域 Merkle 树（`state_root`）+ 字符串域树（`aa_root`，供 AA 验证） |
-| `operp-dag` | unit DAG、签名严格校验（`verify_strict`）、orphan 缓冲（4096 FIFO）、按 unit id 确定性线性化 |
+| `operp-dag` | unit DAG、签名严格校验（`verify_strict`）、orphan 缓冲（4096，最小 unit id 确定性驱逐）、按 unit id 确定性线性化 |
 | `operp-exec` | 引擎本体：ingest → apply → 事件流；place/cancel/deposit/withdraw/liquidate 全量入口校验 |
 | `operp-settle` | 批次 checkpoint、`validate_against` 重放审计、`temp_data` 载荷、提款证明生成 |
 
@@ -118,8 +118,9 @@ cd obyte-local && node post_batch.js
 3. **无 TWAP/多源预言机。** mark 来自近期成交（有 100 USD 名义额下限），
    大额自成交仍可偏置 mark。
 4. **单一 operator** 提交批次 = 中心化排序者。
-5. `respond` 无身份门槛（任何人都可替 operator 应诉）；失败高度资金暂无
-   恢复路径。
+5. 失败高度回滚后，挑战者可通过 `claim_bond` 领回记录在案的 bond；但链
+   本身的恢复仍依赖 operator 重发正确批次——若所有 operator 消失，没有
+   无需信任的逃生通道。
 6. AA 未做正式安全审计；Oscript 复杂度预算迫使逻辑拆散为多个辅助函数。
 
 ## 许可证

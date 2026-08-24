@@ -132,7 +132,7 @@ fn main() {
             height += 1;
             let units = std::mem::take(&mut pending_units);
             let mut settled: Vec<UnitId> = Vec::new();
-            let batch_ok = match Batch::from_applied(&prev_state, &eng, &units) {
+            let batch_ok = match Batch::from_applied(&prev_state, &mut eng, &units) {
                 Ok(batch) => {
                     settled = units.clone();
                     let payload = batch.temp_data_payload();
@@ -181,7 +181,7 @@ fn main() {
     if !pending_units.is_empty() {
         height += 1;
         let units = std::mem::take(&mut pending_units);
-        if let Ok(batch) = Batch::from_applied(&prev_state, &eng, &units) {
+        if let Ok(batch) = Batch::from_applied(&prev_state, &mut eng, &units) {
             let payload = batch.temp_data_payload();
             let text = serde_json::to_string(&payload.data).unwrap();
             let _ = std::fs::write(cfg.out.join("batch.json"), &text);

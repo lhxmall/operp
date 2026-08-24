@@ -1,7 +1,3 @@
-mod aa;
-
-pub use aa::{AaStateNames, AA_STATE, BOUNCE_FEES, AA_CHALLENGE_SECS, AA_STABILITY_SECS};
-
 use operp_book::Fill;
 use operp_dag::Unit;
 use operp_exec::Engine;
@@ -97,7 +93,11 @@ pub fn fills_bytes(fills: &[Fill]) -> Vec<u8> {
 }
 
 impl Batch {
-    pub fn from_applied(prev: &operp_state::ChainState, engine: &Engine, applied: &[UnitId]) -> Result<Self, SettleError> {
+    pub fn from_applied(
+        prev: &operp_state::ChainState,
+        engine: &mut Engine,
+        applied: &[UnitId],
+    ) -> Result<Self, SettleError> {
         if applied.is_empty() {
             return Err(SettleError::Empty);
         }
@@ -121,11 +121,17 @@ impl Batch {
             }
         }
         let fills_hash = sha256(&fills_buf);
+        // Height binding: adopt the next height BEFORE hashing state, so
+        // meta_leaf commits the batch height and the checkpoint root is only
+        // reproducible by a replay that lands on that same height
+        // (validate_against enforces exactly that).
+        engine.state.height = prev.height + 1;
+        let height = engine.state.height;
         let last_unit = *applied.last().unwrap();
         Ok(Self {
             chain_id: CHAIN_ID.to_string(),
             checkpoint: Checkpoint {
-                height: prev.height + 1,
+                height,
                 prev_state_hash: prev.state_root(),
                 state_root: engine.state.state_root(),
                 aa_root: operp_state::aa_root_of_state(&engine.state),
@@ -216,6 +222,17 @@ impl Batch {
             || fill_count != self.checkpoint.fill_count
         {
             return Err(SettleError::FillsMismatch);
+        }
+        // Height + last-unit binding: the replay must land exactly one block
+        // below the claimed checkpoint height and end on the same last unit;
+        // then it adopts the checkpoint height so meta_leaf — which commits
+        // state.height — can match the producer's root.
+        if self.checkpoint.height != replay.state.height + 1 {
+            return Err(SettleError::RootMismatch);
+        }
+        replay.state.height = self.checkpoint.height;
+        if self.checkpoint.last_unit != replay.state.last_unit {
+            return Err(SettleError::RootMismatch);
         }
         if replay.state.state_root() != self.checkpoint.state_root {
             return Err(SettleError::RootMismatch);
@@ -344,16 +361,16 @@ mod tests {
 
     #[test]
     fn replay_batch_same_root() {
-        let (eng, mut pre, applied, prev_root) = seed_trade();
-        let batch = Batch::from_applied(&pre.state, &eng, &applied).unwrap();
+        let (mut eng, mut pre, applied, prev_root) = seed_trade();
+        let batch = Batch::from_applied(&pre.state, &mut eng, &applied).unwrap();
         batch.validate_against(prev_root, &mut pre).unwrap();
         assert_eq!(pre.state.state_root(), eng.state.state_root());
     }
 
     #[test]
     fn mutated_fill_price_mismatches() {
-        let (eng, mut pre, applied, prev_root) = seed_trade();
-        let mut batch = Batch::from_applied(&pre.state, &eng, &applied).unwrap();
+        let (mut eng, mut pre, applied, prev_root) = seed_trade();
+        let mut batch = Batch::from_applied(&pre.state, &mut eng, &applied).unwrap();
         batch.checkpoint.state_root[0] ^= 0xff;
         assert_eq!(
             batch.validate_against(prev_root, &mut pre),
@@ -397,8 +414,8 @@ mod tests {
 
     #[test]
     fn pick_stable_winner_rules() {
-        let (eng, pre, applied, _) = seed_trade();
-        let batch = Batch::from_applied(&pre.state, &eng, &applied).unwrap();
+        let (mut eng, pre, applied, _) = seed_trade();
+        let batch = Batch::from_applied(&pre.state, &mut eng, &applied).unwrap();
         let a = PostedBatch {
             batch: batch.clone(),
             obyte_unit: [1; 32],
@@ -449,7 +466,7 @@ mod tests {
 
     #[test]
     fn optimistic_then_checkpoint() {
-        let (eng, mut pre, applied, prev_root) = seed_trade();
+        let (mut eng, mut pre, applied, prev_root) = seed_trade();
         let alice = acct_of(&sk(1));
         let bob = acct_of(&sk(2));
         let qty = QTY_SCALE as i64;
@@ -471,7 +488,7 @@ mod tests {
             })
             .collect();
         assert_eq!(fills.iter().sum::<usize>(), 1);
-        let batch = Batch::from_applied(&pre.state, &eng, &applied).unwrap();
+        let batch = Batch::from_applied(&pre.state, &mut eng, &applied).unwrap();
         batch.validate_against(prev_root, &mut pre).unwrap();
     }
 }

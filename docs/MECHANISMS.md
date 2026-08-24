@@ -120,9 +120,10 @@ insert(unit):
   全部父母已知             → link 进 DAG，进 pending 集
 ```
 
-orphan 缓冲容量 4096，超出按 Instant 时间 FIFO 驱逐。mark_executed 时
-做不动点扫描：所有"父母已全部已知"的孤儿链式解锁。效果：乱序投递
-不丢单元，最终全部恢复执行。
+orphan 缓冲容量 4096，超出时驱逐 **UnitId 最小**的缓冲单元——驱逐决策
+只依赖缓冲内容（对同一内容集确定），但哪些单元进入缓冲仍取决于各副本
+的到达顺序。mark_executed 时做不动点扫描：所有"父母已全部已知"的孤儿
+链式解锁。效果：乱序投递不丢单元，最终全部恢复执行。
 
 ### 2.4 确定性线性化
 
@@ -219,6 +220,9 @@ realized_pnl 仅作统计累加。效果：赢利者立刻可提取全部利润�
 debit(amount)：amount>0；collateral 足额；debit 后快照落入 reduce-only
 带则回滚报 Insufficient。重复 nonce 返回 DuplicateNonce。
 
+引擎侧 withdrawals 映射（防重复 nonce 的提款记录）容量上限
+65 536 条目，防止无界状态增长。
+
 ---
 
 ## 5. 清算、keeper 与保险基金
@@ -269,16 +273,18 @@ taker.collateral −= fee；insurance.collateral += fee。
 走 Account 结算路径自动进入证明叶子承诺的 collateral。
 
 ### 6.2 资金费率（多空互付）
-
 每个双源预言机 tick 结算一次：
 index = (oracle₀ + oracle₁)/2
 diff_bps = clamp((spot−index)×10000/index, ±FUNDING_CAP_BPS=50)
 每账户 payment = signed_notional(pos.qty, oracle_a) × diff_bps / 10000
-collateral −= payment
+payer.collateral  −= payment（钳在上限 = 可用抵押内）   # 借记钳在可用抵押内
+receiver.credit   ≤ Σ 实际借记总额                      # 贷记以总借记封顶
 
 spot > index：正 payment → 多头付，空头收；反向镜像。
-Σ payment ≈ 0（多空互抵），截断残差为亚单位灰尘（设计允许）。
-保险基金绝不参与。±50bps 钳幅防极端偏差抽干一方。
+守恒语义：付款方借记先按其可用抵押钳住，收款方入账总额不超过实际扣减
+总额——严格守恒、不产生负余额，截断残差为亚单位灰尘（设计允许）。
+保险基金作为普通账户参与资金费（可持有清算对冲仓位）。±50bps 钳幅防
+极端偏差抽干一方。
 
 ### 6.3 dust 说明
 
@@ -360,7 +366,9 @@ replay 初始 root ≠ prev_root                 → PrevMismatch
 注入 deposits_allowed ← batch 内 Deposit ops 的 aa_unit 集
 逐 unit ingest（BadSig 等）                  → Replay
 重放事件聚合 fills_hash/fill_count 不符      → FillsMismatch
-replay 高度推进后 state_root 不符            → RootMismatch
+checkpoint.height ≠ replay.height + 1        → RootMismatch（高度绑定）
+engine.state.height 推进至 checkpoint.height 后
+last_unit 不符 ∨ state_root 不符             → RootMismatch
 ```
 
 ---
@@ -376,12 +384,17 @@ replay 高度推进后 state_root 不符            → RootMismatch
 ```
 account_leaf = sha256("acct" ‖ id32 ‖ collateral_i128le16
                       ‖ realized_i128le16 ‖ pos_count_u32le ‖ positions…)
-book_leaf    = sha256(b"book" ‖ market_le4 ‖ best_bid_le8 ‖ best_ask_le8 ‖ order_count_u64le)
-meta_leaf    = sha256(b"meta" ‖ height_le ‖ seq_le ‖ last_unit ‖ finalized_height_le)
+book_leaf    = sha256(b"book" ‖ market_le4 ‖ [price_le8 ‖ (order_id32 ‖
+               remaining_le8)*]*)
+               # 提交每一个价格档与每个活单（order_id + remaining），
+               # 非仅最优买卖价与单数——簿深度本身成为被承诺的共识状态
+meta_leaf    = sha256(b"meta" ‖ height_le ‖ seq_le ‖ last_unit)
 ```
 
-meta_leaf 同时包含 height 与 finalized_height：前者绑定批次链，
-后者使 Final 提升进度也成为被承诺的共识状态。
+meta_leaf 绑定 height（from_applied 先把 engine.state.height 推到
+checkpoint.height 再取根），使 state_root 跨批次成链：改历史高度必然断链。
+meta_leaf **不含** finalized_height——Final 提升只影响本地节点视图，
+不属于被承诺的共识状态（见 §12）。
 
 ### 9.2 hex 字符串域树（aa_root）
 
@@ -413,11 +426,12 @@ AA 地址上的状态变量（`<h>` 为高度数字后缀）：
 ```
 boot, chain_id='operp-mvp-1', last_locked, last_finalized
 submitted_at_h, cand_root_h, cand_aa_root_h, cand_prev_h,
-  cand_fills_h, cand_unit_h, cand_who_h      # 候选（lock 前可替换）
-root_h, aa_root_h, winner_h, stable_at_h     # 已锁定
+  cand_fills_h, cand_who_h                    # 候选（lock 前可替换）
+root_h, aa_root_h, stable_at_h               # 已锁定
 frozen_h ∈ {∅/0=正常, 1=已挑战, 2=永久失败}
 challenger_h, bond_<addr>, fee_winner_h,
-reward_<addr>, bal_<addr>(诊断影子账本)
+reward_<addr>, bal_<addr>(诊断影子账本),
+wd_<h>_<addr>                                # 提款累计标记（防证明重放）
 ```
 
 ### 10.1 submit(h)
@@ -443,7 +457,7 @@ root 已锁 ∧ 未冻结 ∧ now < stable_at_h + 3600 ∧ 输出 ≥ 20000 base
 
 身份门：`trigger.address == cand_who_h`（只有提交该候选的账户能应诉）
 ∧ frozen == 1 ∧ 窗口内 ∧ root_confirmed == root_h
-→ 解冻，挑战者 bond 没收归 AA 库。
+→ 解冻，没收 bond_<challenger> 记录的恰好数额并清零（归 AA 库）。
 
 已知边界：MVP 应诉只校验重发根一致，不能证明根正确——真欺诈 operator
 重复自己的假根即可通过。完整方案需要链上重放或有效性证明（README
@@ -456,7 +470,8 @@ Limitations #1）。
 ```
 失败路: frozen_h == 1 ∧ 已超窗（operator 未应诉）
         → frozen_h = 2（永久）、root_h/aa_root_h 清零、
-          last_locked 回退 h−1、bond 全额退挑战者
+          last_locked 回退 h−1；不自动退款——challenger 之后通过
+          新的 claim_bond 领回记录在案的 bond
 正常路: 根存在 ∧ 未冻结 ∧ 超窗 ∧ h == last_finalized+1
         → last_finalized = h；fee_winner 累加 20000 bytes 奖励（§11）
 ```
@@ -466,8 +481,10 @@ Limitations #1）。
 ```
 未冻结 ∧ (height 参数若给必须等于 last_finalized)
 amount > 0 ∧ leaf_account == trigger.address
-amount ≤ collateral（proof 叶子声明值）
-proof 深度 ≤ 8
+wd_ 累计上限：wd_<h>_<addr> 已提累计 + amount
+             ≤ 该高度证明叶子的 collateral（同一证明不可重放，
+               多次提款共享同一累计上限；映射上限 65 536 条目）
+proof 深度 ≤ 16（reduce(...,16,...)，覆盖 2^16 账户）
 leaf  = sha256('acct:'+address+':'+collateral, 'hex')
 fold proof[]: right ? sha256(acc‖sib,'hex') : sha256(sib‖acc,'hex')
 结果 == var['aa_root_' || h]   否则 bounce('bad merkle root')
@@ -478,10 +495,13 @@ fold proof[]: right ? sha256(acc‖sib,'hex') : sha256(sib‖acc,'hex')
 它与 aa_root 是永不严格同步的双账本（费扣口径、批次延迟、回滚都会漂移），
 只会产生错误拒付；支付本身由 AA 原生余额机械兜底。
 
-### 10.7 claim_reward
+### 10.7 claim_bond / claim_reward
 
-领取竞速累积奖励（§11）。AA 临时缺币时单元 bounce，奖励仍记账，
-稍后重试即可——finalize 流程不会因付款失败而卡死。
+claim_bond：失败高度（frozen = 2）的 challenger 领回记录在案的 bond
+——需随单元附带 ≥10000 bytes 支付费用。
+claim_reward：领取竞速累积奖励（§11），同样要求附带 ≥10000 bytes。
+AA 临时缺币时单元 bounce，记账保留，稍后重试即可——finalize 流程不会
+因付款失败而卡死。
 
 ---
 
@@ -534,12 +554,12 @@ ingest → Applied{status: Optimistic}     # 立即执行、立即成交
 | 攻击 | 防线 |
 |---|---|
 | 伪造成交 / 锁假根 | 双 Merkle 根 + validate_against 全量重放审计 + fills_hash |
-| 偷 AA 资金 | 提款只认 finalized aa_root 的 Merkle 证明；leaf 绑定提款人地址 |
+| 偷 AA 资金 | 提款只认 finalized aa_root 的 Merkle 证明；leaf 绑定提款人地址；wd_ 累计标记防证明重放 |
 | 冒名应诉挑战 | respond 身份门（cand_who 绑定） |
 | 存款凭空铸造 | deposits_allowed 白名单 + replay 注入交叉校验 |
 | qty/名义额溢出 DoS | 入口 checked-mul + i64 上限 |
 | 签名延展 | ed25519 verify_strict |
-| 乱序投递丢单元 | orphan 缓冲（4096 FIFO）+ 不动点解锁 |
+| 乱序投递丢单元 | orphan 缓冲（4096，最小 UnitId 确定性驱逐）+ 不动点解锁 |
 | 自我清算 | caller 密码学绑定 + BadAccount 拒绝 |
 | 灰尘单操纵 mark | 100 USD 名义额门槛 |
 | 单笔巨价操纵 mark | ±10% 偏离帽 |

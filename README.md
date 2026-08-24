@@ -8,13 +8,13 @@ periodic state roots to the [Obyte](https://obyte.org) ledger through an
 autonomous agent (AA) vault. Withdrawals from the vault are **proof-gated**:
 users must present a Merkle proof of their balance against a finalized root.
 
-> **Status: testnet-ready MVP.** All 39 workspace tests pass; the full AA
+> **Status: testnet-ready MVP.** All workspace tests pass; the full AA
 > lifecycle (deposit → submit → lock → challenge → finalize → proof withdrawal)
 > is verified end-to-end on an aa-testkit devnet. Mainnet deployment requires
 > closing the gaps listed in [Limitations](#limitations--mainnet-readiness).
 
 ```
-cargo test --workspace          # 30 tests, all green
+cargo test --workspace          # all green
 cargo run --release -p operp-exec --example bench_raw        # ~5.5k ops/s
 cargo run --release -p operp-exec --example hft_onedag -- 20000 8 4   # ~9k TPS, 0 rejects
 cd obyte-local && node test_vault_aa.js    # full AA lifecycle on devnet
@@ -42,7 +42,7 @@ cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
                     │  submit → candidate (replaceable pre-lock)  │
                     │  lock    → after 600 s stability window     │
                     │  challenge → freeze (bond ≥ 20000 bytes)    │
-                    │  respond  → operator defense, bond burned   │
+                    │  respond  → operator defense, bond confiscated│
                     │  finalize → root becomes withdrawal basis   │
                     │  withdraw → Merkle PROOF against aa_root    │
                     └─────────────────────────────────────────────┘
@@ -57,7 +57,7 @@ cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
 | `operp-account` | Per-account collateral/positions, VWAP entry price, realized PnL, risk snapshot |
 | | `liquidatable` at equity·10000 ≤ mm·10500, `reduce_only` at ≤ 12000 |
 | `operp-state` | ChainState: accounts/books/marks/withdrawals, byte-level Merkle tree (`state_root`) + hex-string tree (`aa_root`) for the AA |
-| `operp-dag` | Unit DAG with signature verification (`verify_strict`), orphan buffer (4096 FIFO), deterministic linearization by unit id |
+| `operp-dag` | Unit DAG with signature verification (`verify_strict`), orphan buffer (4096 cap, deterministic eviction), deterministic linearization by unit id |
 | `operp-exec` | The engine: ingest → apply → events; place/cancel/deposit/withdraw/liquidate with full intake validation |
 | `operp-settle` | Batch checkpoints, `validate_against` replay verification, `temp_data` payloads, proof generation |
 
@@ -69,8 +69,8 @@ Every user action is a signed **unit** referencing up to 2 parent units. The
 engine executes pending units in ascending `unit_id` order — a canonical,
 deterministic total order any replica can reproduce without consensus
 traffic. Out-of-order delivery is tolerated: units whose parents are unknown
-are buffered (cap 4096, FIFO eviction) and linked automatically once parents
-arrive.
+are buffered (cap 4096, evicted deterministically by smallest unit id) and
+linked automatically once parents arrive.
 
 Signatures use ed25519 **strict verification** (rejects malleable
 signatures). Every op binds its owner's key: deposits, orders and cancels
@@ -143,9 +143,11 @@ Lifecycle per height *h*:
 3. **challenge** — within 3600 s of locking, anyone can freeze height *h*
    with a ≥ 20 000 byte bond.
 4. **respond** — the operator defends inside the window; success unfreezes
-   and confiscates the challenger's bond. If nobody responds in time,
-   finalize marks the height permanently failed (`frozen = 2`), clears its
-   roots, rolls `last_locked` back to h−1, and refunds the challenger's bond.
+   and confiscates exactly the recorded challenger bond (zeroing it). If
+   nobody responds in time, finalize marks the height permanently failed
+   (`frozen = 2`), clears its roots, and rolls `last_locked` back to h−1;
+   no automatic refund happens — the challenger recovers the recorded bond
+   through a separate `claim_bond` claim.
 5. **finalize** — after a clean 3600 s window the root becomes the withdrawal
    basis (`last_finalized`), strictly in height order.
 6. **withdraw** — paid **only** against a Merkle proof:
@@ -153,7 +155,11 @@ Lifecycle per height *h*:
    - the AA recomputes `sha256("acct:"‖address‖":"‖collateral)` and folds the
      sibling path, requiring the result to equal `var['aa_root_' ‖ h]`;
    - `leaf_account == trigger.address` (you can only prove your own address);
-   - `amount ≤ proven collateral`.
+   - the sibling path folds via a fixed-depth `reduce(..., 16, ...)`, so
+     proofs cover trees of up to 2^16 accounts;
+   - withdrawals are **anti-replay**: a cumulative marker
+     `wd_<h>_<address>` caps the total withdrawn at height *h* across all
+     claims at the proven leaf collateral.
    
    Balance authority is the **proven leaf**, never mutable AA variables.
 
@@ -220,8 +226,9 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
 1. **Fraud response is freeze-and-rollback, not on-chain re-execution.**
    Full trade data IS posted on-chain (`post_batch.js` reveals every unit as
    `temp_data`, so any watcher can re-execute and detect a bad root), and a
-   detected fraud triggers challenge → freeze → height rollback with the
-   challenger's bond refunded — a lying operator cannot steal funds, only
+   detected fraud triggers challenge → freeze → height rollback, after
+   which the challenger recovers its recorded bond via `claim_bond` — a
+   lying operator cannot steal funds, only
    stall its own height while honest operators (fee race) resubmit correctly.
    What remains out of reach: Oscript cannot re-run the matcher on-chain, so
    there is no automatic slashing or validity proof; enforcement relies on
@@ -239,18 +246,18 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    forced logic to be split across helper functions.
 
 Recently closed: deposit whitelisting, overflow guards, market whitelist,
-strict signatures, orphan recovery, bounded logs, realized-PnL settlement
-into collateral, bad-debt clamp with conservation, taker-fee insurance
-income, dual-oracle averaged marks with deviation caps, peer-to-peer
-funding, multi-operator fee race with consolation payments, operator
-identity gate, Final-status promotion, on-chain batch data poster.
-
-Recently closed: deposit whitelisting, overflow guards, market whitelist,
-strict signatures, orphan recovery, bounded logs, realized-PnL settlement
-into collateral (profitable withdrawals), bad-debt clamp with conservation,
-mark deviation cap, taker-fee insurance income, non-head cancel depth
-correctness, maker-queue pop regression, operator identity gate on
-`respond`, proof-withdrawal decoupled from the diagnostic `bal_` ledger.
+strict signatures, orphan recovery with deterministic eviction, bounded
+logs, realized-PnL settlement into collateral (profitable withdrawals),
+bad-debt clamp with conservation, taker-fee insurance income, dual-oracle
+averaged marks with deviation caps, peer-to-peer funding with
+collateral-aware clamps, multi-operator fee race with consolation payments,
+operator identity gate on `respond`, Final-status promotion, on-chain
+batch data poster, non-head cancel depth correctness, maker-queue pop
+regression, proof-withdrawal decoupled from the diagnostic `bal_` ledger,
+height-bound `state_root` (meta leaf commits the batch height), full book
+commitment (every price level and resting order), withdraw anti-replay
+marker (`wd_<h>_<addr>`), bond recovery via `claim_bond`, and a bounded
+(65 536-entry) withdrawals map.
 
 See the commit history for the full security-audit remediation this repo
 went through (proof-gated withdrawals, deposit whitelisting, overflow

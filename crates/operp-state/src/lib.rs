@@ -107,10 +107,18 @@ impl ChainState {
         // Funding: every dual-source oracle tick settles peer-to-peer funding.
         // premium_bps = (spot − index)/index, clamped to ±FUNDING_CAP_BPS.
         // Signed per-position payment: longs (qty>0) pay when spot > index,
-        // shorts receive; mirrored when spot < index. Σ payments nets ~0
-        // (long/short notionals offset); truncation residue is sub-unit dust
-        // by design. Insurance never participates. BTreeMap order keeps this
-        // deterministic across replays.
+        // shorts receive; mirrored when spot < index. Two-phase so that
+        // payments can never drive an account's collateral negative and
+        // conservation holds exactly:
+        //   Phase 1 computes each account's signed payment (unchanged formula).
+        //   Phase 2a debits payers min(payment, collateral.max(0)) — no account
+        //     goes negative from funding; total debited forms the budget.
+        //   Phase 2b credits receivers their computed receipt, capped at the
+        //     budget, in ascending AccountId order (BTreeMap iteration order,
+        //     so fully deterministic across replays); the last receiver may be
+        //     paid partially. Integer arithmetic only, no rounding drift.
+        // Insurance participates like any other account (it can hold
+        // positions). Truncation residue is sub-unit dust by design.
         let (index_a, index_b) = (
             self.oracle_marks.get(&(0u8, market)).copied(),
             self.oracle_marks.get(&(1u8, market)).copied(),
@@ -119,25 +127,48 @@ impl ChainState {
             let index = ((ia as u128 + ib as u128) / 2) as i128;
             let spot = capped as i128;
             if index > 0 {
-                let diff_bps = ((spot - index) * 10_000 / index)
-                    .clamp(-(operp_types::FUNDING_CAP_BPS as i128), operp_types::FUNDING_CAP_BPS as i128);
+                let diff_bps = ((spot - index) * 10_000 / index).clamp(
+                    -(operp_types::FUNDING_CAP_BPS as i128),
+                    operp_types::FUNDING_CAP_BPS as i128,
+                );
                 if diff_bps != 0 {
-                    let ids: Vec<AccountId> = self.accounts.keys().copied().collect();
-                    for id in ids {
-                        let payment = match self.accounts.get(&id).and_then(|a| a.positions.get(&market)) {
-                            Some(pos) => {
-                                operp_types::signed_notional_usd(pos.qty, ia) * diff_bps / 10_000
-                            }
-                            None => continue,
-                        };
-                        if payment == 0 {
+                    // Phase 1: signed payments in ascending AccountId order.
+                    let payments: Vec<(AccountId, i128)> = self
+                        .accounts
+                        .iter()
+                        .filter_map(|(id, a)| {
+                            a.positions.get(&market).map(|pos| {
+                                (*id, operp_types::signed_notional_usd(pos.qty, ia) * diff_bps / 10_000)
+                            })
+                        })
+                        .filter(|(_, p)| *p != 0)
+                        .collect();
+                    // Phase 2a: debit payers, clamped at non-negative collateral.
+                    let mut budget: i128 = 0;
+                    for (id, payment) in &payments {
+                        if *payment <= 0 {
                             continue;
                         }
-                        // payment > 0: this account PAYS (long in premium);
-                        // payment < 0: it RECEIVES.
-                        if let Some(a) = self.accounts.get_mut(&id) {
-                            a.collateral -= payment;
+                        if let Some(a) = self.accounts.get_mut(id) {
+                            let debit = (*payment).min(a.collateral.max(0));
+                            a.collateral -= debit;
+                            budget += debit;
                         }
+                    }
+                    // Phase 2b: credit receivers until the budget is spent.
+                    for (id, payment) in &payments {
+                        if budget == 0 {
+                            break;
+                        }
+                        if *payment >= 0 {
+                            continue;
+                        }
+                        let want = -*payment;
+                        let credit = want.min(budget);
+                        if let Some(a) = self.accounts.get_mut(id) {
+                            a.collateral += credit;
+                        }
+                        budget -= credit;
                     }
                 }
             }
@@ -279,17 +310,10 @@ pub fn account_leaf(acct: &Account) -> [u8; 32] {
     }
     sha256(&b)
 }
-
 fn book_leaf(book: &OrderBook) -> [u8; 32] {
-    let mut b = Vec::new();
-    b.extend_from_slice(b"book");
-    b.extend_from_slice(&book.market().0.to_le_bytes());
-    let bb = book.best_bid().map(|(p, _)| p).unwrap_or(0);
-    let ba = book.best_ask().map(|(p, _)| p).unwrap_or(0);
-    b.extend_from_slice(&bb.to_le_bytes());
-    b.extend_from_slice(&ba.to_le_bytes());
-    b.extend_from_slice(&book.order_count().to_le_bytes());
-    sha256(&b)
+    // Full-book commitment: every level and every live order (see
+    // OrderBook::commitment_bytes), not just best bid/ask/count.
+    sha256(&book.commitment_bytes())
 }
 
 fn meta_leaf(state: &ChainState) -> [u8; 32] {

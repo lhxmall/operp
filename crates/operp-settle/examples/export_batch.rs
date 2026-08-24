@@ -91,7 +91,7 @@ fn main() {
     eng.ingest(bid).unwrap();
     let _ = tip;
 
-    let batch = Batch::from_applied(&prev, &eng, &applied).expect("batch");
+    let batch = Batch::from_applied(&prev, &mut eng, &applied).expect("batch");
     let payload = batch.temp_data_payload();
     let out: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../obyte-local/batch.json")

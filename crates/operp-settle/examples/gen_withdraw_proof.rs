@@ -10,7 +10,6 @@
 //! }
 //!
 //! Usage: cargo run -p operp-settle --example gen_withdraw_proof -- <account_hex> [collateral]
-use operp_state::{aa_proof_for, aa_root_of};
 use std::path::PathBuf;
 
 fn main() {

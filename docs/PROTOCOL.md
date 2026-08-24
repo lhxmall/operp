@@ -30,7 +30,8 @@ README 是概览；这里是"为什么这样设计"。
   签名者公钥绑定（`account_matches`），Deposit/Place/Cancel/Withdraw 必须由
   账户本人签名，Liquidate 由 keeper 签名——自我清算在密码学层就不可能。
 - **乱序容忍（orphan 缓冲）**：收到父母未知的子单元时不再丢弃，而是进入
-  orphan 缓冲（容量 4096，FIFO 驱逐）。父母到达后自动链接进 pending 集合，
+  orphan 缓冲（容量 4096，超出按最小 UnitId 确定性驱逐——驱逐结果只依赖
+  缓冲内容，与到达顺序无关）。父母到达后自动链接进 pending 集合，
   多级孤儿链按不动点迭代解锁。
 
 ### 1.2 执行语义
@@ -106,7 +107,9 @@ reduce_only      : equity·10000 ≤ mm·12000
 - **mark 三重防线**：① notional ≥ 100 USD 才可更新；② 新价相对旧 mark
   偏离不得超过 ±10%；③ 一旦市场有预言机报价（`Op::OracleSet`，双源均值，
   白名单账户签名），成交价即失去 mark 定价权。资金费率：每个双源 tick 按
-  (spot − index)/index（钳 ±50bps）在多空间对等转移，净零守恒。
+  (spot − index)/index（钳 ±50bps）在多空之间转移。付款方借记被钳在其
+  可用抵押内，收款方入账以实际扣减总额封顶——严格守恒、不产生负余额；
+  保险基金作为普通账户参与（可持有清算对冲仓位）。
 
 ### 2.5 市场与存款白名单
 
@@ -160,16 +163,14 @@ AA 侧用纯字符串拼接 + `sha256(x, 'hex')` 复算。两棵树承诺完全�
 `validate_against` 共享 `fills_bytes()`，replay 时重算比对——operator 漏报/
 谎报成交会被直接抓住。
 
-### 3.4 validate_against：任何人可审计
-
-```
 assert chain_id == CHAIN_ID          # ChainMismatch
 assert replay.state_root == prev     # PrevMismatch
 inject deposits_allowed ← batch 内 Deposit ops 的 aa_unit 集合
 ingest(units…)                       # BadSig → Replay
 recompute fills_hash/fill_count      # FillsMismatch
+assert checkpoint.height == replay.height + 1
 set replay.height = checkpoint.height
-assert replay.state_root == root     # RootMismatch
+assert last_unit 一致 ∧ replay.state_root == root   # RootMismatch
 ```
 
 TooManyUnits 上限（512）在 from_applied 就挡住超大批次。
@@ -181,10 +182,11 @@ TooManyUnits 上限（512）在 from_applied 就挡住超大批次。
 ```
 boot, chain_id, last_locked, last_finalized
 submitted_at_h, cand_root_h, cand_aa_root_h, cand_prev_h, cand_fills_h,
-  cand_unit_h, cand_who_h        # 候选（lock 前可被替换）
-root_h, aa_root_h, winner_h, stable_at_h   # 已锁定根
+  cand_who_h                     # 候选（lock 前可被替换）
+root_h, aa_root_h, stable_at_h  # 已锁定根
 frozen_h ∈ {∅/0=正常, 1=已挑战, 2=永久失败}
 challenger_h, bond_<address>               # 挑战 bond 记账
+wd_<h>_<addr>                              # 提款累计标记（防证明重放）
 ```
 
 ### 生命周期（高度 h）
@@ -203,20 +205,25 @@ challenge(h) root_h 锁定 ∧ 未冻结 ∧ now < stable_at_h + 3600s
              → frozen_h = 1，记 challenger，收 bond
 
 respond(h,r) frozen_h == 1 ∧ 窗口内 ∧ r == root_h
-             → 解冻；challenger bond 没收归 AA 库
+             → 解冻；没收 bond_<challenger> 记录的恰好数额并清零
 
 finalize(h)  分两条路：
              a) frozen_h == 1 且已超窗（operator 未应诉）
                 → frozen_h = 2（永久）、root_h/aa_root_h 清空、
-                  last_locked 回退 h−1、bond 全额退还 challenger
+                  last_locked 回退 h−1；finalize 不再自动退款——
+                  challenger 之后用新的 claim_bond 领回记录的 bond
+                  （需随单元附带 ≥10000 bytes 支付费用）
              b) 正常：!frozen ∧ 超窗 ∧ h == last_finalized+1
                 → last_finalized = h（该根成为提款依据，严格按序）
 
 withdraw     h = last_finalized；!frozen_h；
              leaf_account == trigger.address；
              amount ≤ collateral（proof 叶子声明值）∧ amount ≤ bal_;
+             累计标记 wd_<h>_<addr>：已提累计 + amount ≤ 该高度证明叶子
+             的 collateral——同一证明无法重放，多次提款共享同一上限；
              leaf = sha256('acct:'+address+':'+collateral, 'hex')
              fold proof[]: right ? sha256(acc‖sib) : sha256(sib‖acc)
+               （reduce(...,16,...)，深度上限 16，覆盖 2^16 账户）
              结果 == var['aa_root_' || h] 否则 bounce
              → 支付 trigger.address，bal_ 相应扣减
 ```
@@ -243,7 +250,7 @@ Oscript 实现细节（踩过的坑）：
 | 攻击 | 防线 |
 |---|---|
 | 伪造成交/假根 | 双 Merkle 根 + validate_against 重放审计 + fills_hash |
-| 偷 AA 资金 | 提款只认 finalized aa_root 的 Merkle 证明；leaf 绑定提款人地址 |
+| 偷 AA 资金 | 提款只认 finalized aa_root 的 Merkle 证明；leaf 绑定提款人地址；wd_ 累计标记防重放 |
 | operator 锁假根 | 600s 稳定窗 + 3600s 挑战窗 + bond 经济（见 README 局限节） |
 | 存款自铸 | deposits_allowed 白名单 + replay 交叉注入 |
 | 溢出 DoS | 入口 checked-mul + qty 上限；book 层零量/零价拒绝 |

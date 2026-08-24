@@ -160,7 +160,10 @@ pub fn unit_id(unit: &Unit) -> UnitId {
     UnitId(sha256(&canonical_bytes(unit)))
 }
 
-pub fn verify_sig(unit: &Unit) -> bool {
+/// Verify a unit's ed25519 signature against an ALREADY-COMPUTED unit id, so
+/// callers that hash once (e.g. `Engine::ingest`) never pay a second sha256.
+/// Also checks the op's account/caller/oracle field matches the signing key.
+pub fn verify_sig_by_id(unit: &Unit, id: &UnitId) -> bool {
     let vk = match VerifyingKey::from_bytes(&unit.pubkey) {
         Ok(v) => v,
         Err(_) => return false,
@@ -168,7 +171,6 @@ pub fn verify_sig(unit: &Unit) -> bool {
     // verify_strict rejects non-canonical s / small-order components
     // (signature malleability), satisfying strict r/s group-order checks.
     let sig = Signature::from_bytes(&unit.sig);
-    let id = unit_id(unit);
     vk.verify_strict(&id.0, &sig).is_ok() && account_matches(unit)
 }
 
@@ -207,11 +209,13 @@ pub struct Dag {
     executed: HashSet<UnitId>,
     /// non-executed units; keeps ready_linearized O(pending) not O(all units)
     pending: HashSet<UnitId>,
-    /// units whose parents are not (yet) known; FIFO-evicted past capacity
-    pending_orphans: HashMap<UnitId, (Unit, std::time::Instant)>,
+    /// units whose parents are not (yet) known; evicted by smallest UnitId
+    /// past capacity (see `insert_verified`)
+    pending_orphans: HashMap<UnitId, Unit>,
 }
 
-/// Max buffered orphan units. Beyond this the oldest orphans are dropped.
+/// Max buffered orphan units. Beyond this the orphan with the smallest
+/// UnitId is dropped.
 const ORPHAN_CAP: usize = 4096;
 
 impl Dag {
@@ -227,12 +231,25 @@ impl Dag {
         }
     }
 
-    /// Insert a unit. Unknown parents no longer drop the unit: on first sight
-    /// it is buffered as an orphan and `Err(MissingParent)` returned; a retry
-    /// of the same unit while still orphaned returns its id without error.
-    /// Buffered orphans are linked automatically once their parents arrive
-    /// (see `mark_executed` / `insert`), so out-of-order delivery recovers.
+    /// Insert a unit, hashing it to compute its id.
     pub fn insert(&mut self, unit: Unit) -> Result<UnitId, DagError> {
+        let id = unit_id(&unit);
+        self.insert_verified(unit, id)
+    }
+
+    /// Same as [`Dag::insert`] but the caller supplies the unit id, so an
+    /// ingest path that already hashed the unit (signature check) never
+    /// computes it twice. Unknown parents no longer drop the unit: on first
+    /// sight it is buffered as an orphan and `Err(MissingParent)` returned; a
+    /// retry of the same unit while still orphaned returns its id without
+    /// error. Buffered orphans are linked automatically once their parents
+    /// arrive (see `mark_executed`), so out-of-order delivery recovers.
+    ///
+    /// Note: arrival-order buffering itself remains replica-dependent (which
+    /// units sit in the buffer depends on delivery order), but the eviction
+    /// choice below is a pure function of buffer contents — smallest UnitId —
+    /// so all replicas evict deterministically.
+    pub fn insert_verified(&mut self, unit: Unit, id: UnitId) -> Result<UnitId, DagError> {
         if unit.parents.is_empty() {
             return Err(DagError::EmptyParents);
         }
@@ -245,7 +262,6 @@ impl Dag {
         if sorted != unit.parents {
             return Err(DagError::BadParents);
         }
-        let id = unit_id(&unit);
         if self.units.contains_key(&id) {
             return Err(DagError::Duplicate);
         }
@@ -261,17 +277,13 @@ impl Dag {
                 return Ok(id);
             }
             if self.pending_orphans.len() >= ORPHAN_CAP {
-                // FIFO eviction of the oldest orphan.
-                let oldest = self
-                    .pending_orphans
-                    .iter()
-                    .min_by_key(|(_, (_, t))| *t)
-                    .map(|(k, _)| *k);
-                if let Some(k) = oldest {
+                // Deterministic eviction: drop the smallest buffered UnitId
+                // (lexicographic min). No wall-clock ordering is tracked.
+                if let Some(k) = self.pending_orphans.keys().copied().min() {
                     self.pending_orphans.remove(&k);
                 }
             }
-            self.pending_orphans.insert(id, (unit, std::time::Instant::now()));
+            self.pending_orphans.insert(id, unit);
             return Err(DagError::MissingParent);
         }
         self.link(id, unit);
@@ -316,14 +328,14 @@ impl Dag {
             let ready: Vec<UnitId> = self
                 .pending_orphans
                 .iter()
-                .filter(|(_, (u, _))| u.parents.iter().all(|p| self.known(*p)))
+                .filter(|(_, u)| u.parents.iter().all(|p| self.known(*p)))
                 .map(|(k, _)| *k)
                 .collect();
             if ready.is_empty() {
                 break;
             }
             for oid in ready {
-                if let Some((unit, _)) = self.pending_orphans.remove(&oid) {
+                if let Some(unit) = self.pending_orphans.remove(&oid) {
                     self.link(oid, unit);
                 }
             }

@@ -1,6 +1,6 @@
 use operp_account::AccountError;
 use operp_book::{BookError, Fill, Order};
-use operp_dag::{verify_sig, Dag, DagError, Op, Unit};
+use operp_dag::{unit_id, verify_sig_by_id, Dag, DagError, Op, Unit};
 use operp_state::ChainState;
 use operp_types::{
     bps, liq_order_id, notional_usd, order_id, AccountId, ExecStatus, OrderId, OrderType,
@@ -8,6 +8,11 @@ use operp_types::{
     KEEPER_REWARD_BPS, BTC_USD,
 };
 use std::collections::HashSet;
+
+/// Withdrawal ledger bound: once this many (account, nonce) entries are
+/// pending, further withdrawals are rejected with Risk until entries clear.
+/// Keeps ChainState.withdrawals bounded.
+const WITHDRAWALS_CAP: usize = 65_536;
 
 #[derive(Clone, Debug)]
 pub struct Engine {
@@ -69,10 +74,13 @@ impl Engine {
     }
 
     pub fn ingest(&mut self, unit: Unit) -> Result<Vec<ExecEvent>, ExecError> {
-        if !verify_sig(&unit) {
+        // Hash exactly once: the signature is verified against this id and
+        // the same id is handed to the DAG, skipping its recomputation.
+        let id = unit_id(&unit);
+        if !verify_sig_by_id(&unit, &id) {
             return Err(ExecError::BadSig);
         }
-        self.dag.insert(unit)?;
+        self.dag.insert_verified(unit, id)?;
         Ok(self.apply_ready())
     }
 
@@ -282,6 +290,12 @@ impl Engine {
             .submit(order)
             .map_err(RejectReason::Book)?;
         for fill in &result.fills {
+            // Invariant: AccountError from apply_fill_pair is unreachable here
+            // by construction — intake guards above bound qty·price <
+            // i128::MAX and positions fit i64, so its checked arithmetic
+            // cannot overflow. Should it ever fire anyway, this unit would
+            // surface as Rejected with partially-applied state; that is a
+            // documented known limitation, not a handled case.
             self.state.apply_fill_pair(fill).map_err(map_acct)?;
         }
         self.state.seen_client_seq.insert(account, client_seq);
@@ -334,6 +348,9 @@ impl Engine {
     ) -> Result<Vec<Fill>, RejectReason> {
         if self.state.withdrawals.contains_key(&(account, nonce)) {
             return Err(RejectReason::DuplicateNonce);
+        }
+        if self.state.withdrawals.len() >= WITHDRAWALS_CAP {
+            return Err(RejectReason::Risk);
         }
         let marks = self.state.marks.clone();
         self.state
@@ -407,6 +424,13 @@ impl Engine {
             .map_err(RejectReason::Book)?;
         let mut fills = result.fills;
         for fill in &fills {
+            // Invariant: AccountError from apply_fill_pair is unreachable here
+            // by construction — the liquidation order's qty comes from the
+            // target's i64 position at a u64 price, so qty·price fits i128 and
+            // positions fit i64; its checked arithmetic cannot overflow.
+            // Should it ever fire anyway, this unit would surface as Rejected
+            // with partially-applied state; that is a documented known
+            // limitation, not a handled case.
             self.state.apply_fill_pair(fill).map_err(map_acct)?;
         }
         let still = self

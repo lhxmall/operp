@@ -38,6 +38,51 @@ impl OrderBook {
             .count() as u64
     }
 
+    /// Canonical commitment over the FULL resting book — every price level and
+    /// every live order, not just best bid/ask/count. Encoding:
+    ///   b"book" || market le4
+    ///   || for each ask level ascending by price, then each bid level
+    ///      descending by price:
+    ///        price le8 || live-order count u32le
+    ///        || per live order in deque order (ghost ids left behind by
+    ///           cancels, i.e. ids not in `orders`, are skipped):
+    ///            order_id 32B || remaining le8
+    /// BTreeMap iteration makes level order deterministic across replays.
+    /// O(book size) — fine for settlement-time commitment.
+    pub fn commitment_bytes(&self) -> Vec<u8> {
+        fn encode_level(
+            b: &mut Vec<u8>,
+            price: Price,
+            q: &VecDeque<OrderId>,
+            orders: &HashMap<OrderId, Order>,
+        ) {
+            let mut body = Vec::new();
+            let mut live = 0u32;
+            for id in q {
+                if let Some(o) = orders.get(id) {
+                    live += 1;
+                    body.extend_from_slice(&o.id.0);
+                    body.extend_from_slice(&o.remaining.to_le_bytes());
+                }
+            }
+            b.extend_from_slice(&price.to_le_bytes());
+            b.extend_from_slice(&live.to_le_bytes());
+            b.extend_from_slice(&body);
+        }
+        let mut b = Vec::new();
+        b.extend_from_slice(b"book");
+        b.extend_from_slice(&self.market.0.to_le_bytes());
+        // asks BTreeMap iterates ascending; bids keyed Reverse<Price> iterate
+        // descending — both canonical.
+        for (price, q) in &self.asks {
+            encode_level(&mut b, *price, q, &self.orders);
+        }
+        for (price, q) in &self.bids {
+            encode_level(&mut b, price.0, q, &self.orders);
+        }
+        b
+    }
+
     pub fn get(&self, id: OrderId) -> Option<&Order> {
         self.orders.get(&id)
     }
