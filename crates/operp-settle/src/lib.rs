@@ -51,6 +51,8 @@ pub struct PostedBatch {
 pub struct WithdrawClaim {
     pub account: AccountId,
     pub amount: Usd,
+    /// PERP withdrawal amount; 0 = collateral-only claim.
+    pub perp: u128,
     pub nonce: u64,
     pub height: Height,
     pub proof: MerkleProof,
@@ -76,6 +78,8 @@ pub enum SettleError {
     BadMerkle,
     #[error("amount exceeds collateral")]
     AmountExceedsCollateral,
+    #[error("perp exceeds proof")]
+    AmountExceedsPerp,
 }
 
 /// Canonical byte encoding of fills shared by batch construction and replay
@@ -198,8 +202,15 @@ impl Batch {
         // replay admits exactly the deposits the batch claims are on-chain.
         replay.state.deposits_allowed.clear();
         for u in &self.units {
-            if let operp_dag::Op::Deposit { aa_unit, .. } = &u.op {
-                replay.state.deposits_allowed.insert(*aa_unit);
+            match &u.op {
+                operp_dag::Op::Deposit { aa_unit, .. } => {
+                    replay.state.deposits_allowed.insert(*aa_unit);
+                }
+                // PERP deposits are backed by the same on-chain AA feed.
+                operp_dag::Op::GovDeposit { aa_unit, .. } => {
+                    replay.state.deposits_allowed.insert(*aa_unit);
+                }
+                _ => {}
             }
         }
         let pre_seq = replay.state.seq;
@@ -269,6 +280,11 @@ pub fn check_withdraw(claim: &WithdrawClaim, finalized_root: [u8; 32]) -> Result
     if claim.amount <= 0 {
         return Err(SettleError::AmountExceedsCollateral);
     }
+    // PERP claims are bounded by the proof's declared balance; perp == 0 is a
+    // valid collateral-only claim.
+    if claim.perp > claim.proof.perp {
+        return Err(SettleError::AmountExceedsPerp);
+    }
     Ok(())
 }
 
@@ -294,7 +310,7 @@ mod tests {
     fn seed_trade() -> (Engine, Engine, Vec<UnitId>, [u8; 32]) {
         let mut eng = Engine::new();
         eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
-        eng.state.allowed_markets.insert(BTC_USD);
+        eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
         let prev_root = eng.state.state_root();
         let pre = eng.clone();
         let g = genesis_id();
@@ -388,6 +404,7 @@ mod tests {
         let claim = WithdrawClaim {
             account: alice,
             amount: 1,
+            perp: 0,
             nonce: 1,
             height: 1,
             proof: proof.clone(),
@@ -405,6 +422,7 @@ mod tests {
         let fail = WithdrawClaim {
             account: other,
             amount: 1,
+            perp: 0,
             nonce: 1,
             height: 1,
             proof: proof.clone(),
@@ -490,5 +508,92 @@ mod tests {
         assert_eq!(fills.iter().sum::<usize>(), 1);
         let batch = Batch::from_applied(&pre.state, &mut eng, &applied).unwrap();
         batch.validate_against(prev_root, &mut pre).unwrap();
+    }
+
+    #[test]
+    fn unbacked_gov_deposit_bounces() {
+        // A GovDeposit whose aa_unit was never posted on-chain bounces exactly
+        // like a collateral Deposit instead of crediting PERP.
+        let mut eng = Engine::new();
+        eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+        eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
+        let g = genesis_id();
+        let alice = acct_of(&sk(1));
+        let d = sign_unit(
+            vec![g],
+            Op::Deposit {
+                account: alice,
+                amount: 10_000 * USD_SCALE as i128,
+                aa_unit: [1; 32],
+            },
+            &sk(1),
+        );
+        let did = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let gov = sign_unit(
+            vec![did],
+            Op::GovDeposit {
+                account: alice,
+                amount: 5_000,
+                aa_unit: [0; 32],
+            },
+            &sk(1),
+        );
+        let evs = eng.ingest(gov).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            operp_exec::ExecEvent::Rejected {
+                reason: operp_exec::RejectReason::UnbackedDeposit,
+                ..
+            }
+        )));
+        assert_eq!(eng.state.perp_balances.get(&alice), None);
+    }
+
+    #[test]
+    fn gov_deposit_replay_requires_carried_unit() {
+        // The validator injects aa_units ONLY from GovDeposit units the batch
+        // actually carries. Strip the unit and the claimed PERP credit is no
+        // longer reproducible: validate_against must fail.
+        let (mut eng, mut pre, mut applied, prev_root) = seed_trade();
+        let alice = acct_of(&sk(1));
+        let gov = sign_unit(
+            vec![*applied.last().unwrap()],
+            Op::GovDeposit {
+                account: alice,
+                amount: 5_000,
+                aa_unit: [77; 32],
+            },
+            &sk(1),
+        );
+        let gid = unit_id(&gov);
+        applied.push(gid);
+        eng.ingest(gov).unwrap();
+        let mut batch = Batch::from_applied(&pre.state, &mut eng, &applied).unwrap();
+        // validate_against consumes the replay engine, so prove the intact
+        // batch against a copy and the stripped batch against the original.
+        let mut intact = pre.clone();
+        batch.validate_against(prev_root, &mut intact).unwrap();
+        batch.units.retain(|u| unit_id(u) != gid);
+        assert!(batch.validate_against(prev_root, &mut pre).is_err());
+    }
+
+    #[test]
+    fn aa_root_triple_matches_hand_computed() {
+        let pairs: Vec<(String, Usd, u128)> = vec![
+            ("ADDRB".to_string(), 700, 30),
+            ("ADDRA".to_string(), 500, 20),
+        ];
+        let root = operp_state::aa_root_of(&pairs);
+        // Hand-compute over the same tree the AA reconstructs in Oscript:
+        // leaf = sha256_hex("acct:" || addr || ":" || col || ":" || perp),
+        // leaves sorted, parent = sha256_hex(left || right).
+        let mut leaves: Vec<String> = pairs
+            .iter()
+            .map(|(a, c, p)| hex::encode(sha256(format!("acct:{}:{}:{}", a, c, p).as_bytes())))
+            .collect();
+        leaves.sort();
+        let expected = hex::encode(sha256(format!("{}{}", leaves[0], leaves[1]).as_bytes()));
+        assert_eq!(root, expected);
     }
 }

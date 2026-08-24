@@ -1,11 +1,12 @@
 use operp_account::AccountError;
 use operp_book::{BookError, Fill, Order};
 use operp_dag::{unit_id, verify_sig_by_id, Dag, DagError, Op, Unit};
-use operp_state::ChainState;
+use operp_state::{ChainState, Proposal};
 use operp_types::{
-    bps, liq_order_id, notional_usd, order_id, AccountId, ExecStatus, OrderId, OrderType,
-    Qty, Seq, Side, TimeInForce, UnitId, Usd, IM_RATE_BPS, INSURANCE_ACCOUNT,
-    KEEPER_REWARD_BPS, BTC_USD,
+    bps, genesis_params, liq_order_id, notional_usd, order_id, AccountId, Bps, ExecStatus,
+    MarketId, MarketParams, OrderId, OrderType, ParamKey, Qty, Seq, Side, TimeInForce, UnitId,
+    Usd, BTC_USD, CREATE_MARKET_FEE_PERP, INSURANCE_ACCOUNT, ORACLE_BOND_PERP,
+    PROPOSAL_DURATION_SEQS, PROPOSAL_MIN_STAKE_PERP, PROPOSAL_QUORUM_DEN, PROPOSAL_QUORUM_NUM,
 };
 use std::collections::HashSet;
 
@@ -49,6 +50,8 @@ pub enum RejectReason {
     Insufficient,
     NotFound,
     NotLiquidatable,
+    /// Vote/FinalizeProposal referencing an unknown proposal id.
+    NoProposal,
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -172,22 +175,66 @@ impl Engine {
                 target,
                 market,
             } => self.liquidate(id, seq, *caller, *target, *market),
-            Op::OracleSet {
+            Op::ReportPrice {
                 oracle,
-                source,
                 market,
                 price,
             } => {
-                // Trust gate: only whitelisted oracle accounts may set prices.
-                if !self.state.trusted_oracles.contains(oracle) {
+                // Bond gate: only PERP-bonded accounts may report prices;
+                // unknown markets have no book to index either.
+                if !self.state.oracle_bonds.contains_key(oracle) {
                     return Err(RejectReason::BadAccount);
                 }
-                if *source > 1 {
-                    return Err(RejectReason::Risk);
+                if !self.state.markets.contains_key(market) {
+                    return Err(RejectReason::NotFound);
                 }
-                self.state.apply_oracle(*source, *market, *price);
+                self.state
+                    .apply_report(*oracle, *market, *price)
+                    .map_err(map_state)?;
                 Ok(Vec::new())
             }
+            Op::GovDeposit {
+                account,
+                amount,
+                aa_unit,
+            } => self.gov_deposit(*account, *amount, *aa_unit),
+            Op::GovWithdraw {
+                account,
+                amount,
+                nonce,
+            } => self.gov_withdraw(*account, *amount, *nonce),
+            Op::CreateMarket {
+                creator,
+                symbol,
+                tick_size,
+                im_bps,
+                mm_bps,
+                taker_fee_bps,
+                keeper_reward_bps,
+            } => self.create_market(
+                *creator,
+                *symbol,
+                *tick_size,
+                *im_bps,
+                *mm_bps,
+                *taker_fee_bps,
+                *keeper_reward_bps,
+            ),
+            Op::CreateProposal {
+                creator,
+                market,
+                key,
+                value,
+            } => self.create_proposal(*creator, *market, *key, *value, seq),
+            Op::Vote {
+                voter,
+                proposal_id,
+                approve,
+            } => self.vote(*voter, *proposal_id, *approve, seq),
+            Op::FinalizeProposal {
+                caller,
+                proposal_id,
+            } => self.finalize_proposal(*caller, *proposal_id, seq),
         }
     }
 
@@ -231,9 +278,11 @@ impl Engine {
         {
             return Err(RejectReason::Risk);
         }
-        // Market whitelist: never lazily create books for arbitrary markets.
-        if !self.state.allowed_markets.contains(&market) {
-            return Err(RejectReason::Risk);
+        // Governance-listed markets only: never lazily create books for
+        // arbitrary or delisted markets.
+        match self.state.markets.get(&market) {
+            Some(p) if !p.delisted => {}
+            _ => return Err(RejectReason::Risk),
         }
 
         let snap = {
@@ -265,7 +314,10 @@ impl Engine {
             Side::Ask => pos_qty <= 0,
         };
         if increasing {
-            let extra_im = bps(notional_usd(qty, px_for_notional), IM_RATE_BPS);
+            let extra_im = bps(
+                notional_usd(qty, px_for_notional),
+                self.state.market_params(market).im_bps,
+            );
             if snap.equity < snap.im + extra_im {
                 return Err(RejectReason::Risk);
             }
@@ -304,7 +356,7 @@ impl Engine {
 
     fn cancel(&mut self, account: AccountId, order_id: OrderId) -> Result<Vec<Fill>, RejectReason> {
         // Cross-market lookup: order ids bind account+market+client_seq, so the
-        // id alone identifies the market. books is bounded by allowed_markets.
+        // id alone identifies the market. books is bounded by listed markets.
         let market = self
             .state
             .books
@@ -468,7 +520,8 @@ impl Engine {
         }
         // Keeper reward: bps of filled notional, paid from the insurance fund.
         for f in &fills {
-            keeper_paid += bps(notional_usd(f.qty, f.price), KEEPER_REWARD_BPS);
+            let keeper_bps = self.state.market_params(market).keeper_reward_bps;
+            keeper_paid += bps(notional_usd(f.qty, f.price), keeper_bps);
         }
         if keeper_paid > 0 {
             // Realized PnL settles into collateral, so the fund's spendable
@@ -489,14 +542,243 @@ impl Engine {
         }
         Ok(fills)
     }
-}
 
+    fn gov_deposit(
+        &mut self,
+        account: AccountId,
+        amount: u128,
+        aa_unit: [u8; 32],
+    ) -> Result<Vec<Fill>, RejectReason> {
+        if self.state.seen_aa_units.contains(&aa_unit) {
+            return Err(RejectReason::DuplicateDeposit);
+        }
+        // PERP deposits are backed by the same on-chain AA feed as collateral.
+        if !self.state.deposits_allowed.contains(&aa_unit) {
+            return Err(RejectReason::UnbackedDeposit);
+        }
+        let new_bal = self
+            .state
+            .perp_balances
+            .get(&account)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(amount)
+            .ok_or(RejectReason::Risk)?;
+        let new_supply = self
+            .state
+            .perp_supply
+            .checked_add(amount)
+            .ok_or(RejectReason::Risk)?;
+        self.state.perp_balances.insert(account, new_bal);
+        self.state.perp_supply = new_supply;
+        self.state.seen_aa_units.insert(aa_unit);
+        Ok(Vec::new())
+    }
+
+    fn gov_withdraw(
+        &mut self,
+        account: AccountId,
+        amount: u128,
+        nonce: u64,
+    ) -> Result<Vec<Fill>, RejectReason> {
+        if self.state.seen_gov_nonces.contains(&(account, nonce)) {
+            return Err(RejectReason::DuplicateNonce);
+        }
+        let bal = self.state.perp_balances.get(&account).copied().unwrap_or(0);
+        if bal < amount {
+            return Err(RejectReason::Insufficient);
+        }
+        self.state.perp_balances.insert(account, bal - amount);
+        self.state.perp_supply -= amount;
+        self.state.seen_gov_nonces.insert((account, nonce));
+        Ok(Vec::new())
+    }
+
+    fn create_market(
+        &mut self,
+        creator: AccountId,
+        symbol: [u8; 16],
+        tick_size: operp_types::Price,
+        im_bps: Bps,
+        mm_bps: Bps,
+        taker_fee_bps: Bps,
+        keeper_reward_bps: Bps,
+    ) -> Result<Vec<Fill>, RejectReason> {
+        if tick_size == 0
+            || im_bps == 0
+            || mm_bps == 0
+            || taker_fee_bps == 0
+            || keeper_reward_bps == 0
+        {
+            return Err(RejectReason::Risk);
+        }
+        let bal = self.state.perp_balances.get(&creator).copied().unwrap_or(0);
+        if bal < CREATE_MARKET_FEE_PERP {
+            return Err(RejectReason::Insufficient);
+        }
+        // Listing fee is burned: debit the creator, shrink circulating supply,
+        // grow the cumulative burned counter (claimable deflation; no sweep).
+        self.state
+            .perp_balances
+            .insert(creator, bal - CREATE_MARKET_FEE_PERP);
+        self.state.perp_supply -= CREATE_MARKET_FEE_PERP;
+        self.state.perp_burned += CREATE_MARKET_FEE_PERP;
+        let id = MarketId(self.state.next_market_id);
+        self.state.next_market_id += 1;
+        self.state.markets.insert(
+            id,
+            MarketParams {
+                symbol,
+                tick_size,
+                im_bps,
+                mm_bps,
+                taker_fee_bps,
+                keeper_reward_bps,
+                delisted: false,
+            },
+        );
+        Ok(Vec::new())
+    }
+
+    fn create_proposal(
+        &mut self,
+        creator: AccountId,
+        market: MarketId,
+        key: u8,
+        value: u64,
+        seq: Seq,
+    ) -> Result<Vec<Fill>, RejectReason> {
+        let key = ParamKey::from_u8(key).ok_or(RejectReason::Risk)?;
+        match key {
+            // Delist carries no value; bps parameters are capped at 100%.
+            ParamKey::Delist => {
+                if value != 0 {
+                    return Err(RejectReason::Risk);
+                }
+            }
+            _ => {
+                if value > 10_000 {
+                    return Err(RejectReason::Risk);
+                }
+            }
+        }
+        if !self.state.markets.contains_key(&market) {
+            return Err(RejectReason::NotFound);
+        }
+        // Threshold check only — the stake is not locked or escrowed.
+        let bal = self.state.perp_balances.get(&creator).copied().unwrap_or(0);
+        if bal < PROPOSAL_MIN_STAKE_PERP {
+            return Err(RejectReason::Insufficient);
+        }
+        let id = self.state.next_proposal_id;
+        self.state.next_proposal_id += 1;
+        self.state.proposals.insert(
+            id,
+            Proposal {
+                creator,
+                market,
+                key,
+                value,
+                created_seq: seq,
+                deadline_seq: seq + PROPOSAL_DURATION_SEQS,
+                supply_at_create: self.state.perp_supply,
+                yes: 0,
+                no: 0,
+                voted: HashSet::new(),
+                finalized: None,
+            },
+        );
+        Ok(Vec::new())
+    }
+
+    fn vote(
+        &mut self,
+        voter: AccountId,
+        proposal_id: u64,
+        approve: bool,
+        seq: Seq,
+    ) -> Result<Vec<Fill>, RejectReason> {
+        let p = self
+            .state
+            .proposals
+            .get_mut(&proposal_id)
+            .ok_or(RejectReason::NoProposal)?;
+        if p.finalized.is_some() {
+            return Err(RejectReason::NoProposal);
+        }
+        if seq >= p.deadline_seq {
+            return Err(RejectReason::Risk);
+        }
+        if !p.voted.insert(voter) {
+            return Err(RejectReason::Risk);
+        }
+        // MVP weight semantics: the voter's PERP balance at vote execution.
+        let w = self.state.perp_balances.get(&voter).copied().unwrap_or(0);
+        if approve {
+            p.yes += w;
+        } else {
+            p.no += w;
+        }
+        Ok(Vec::new())
+    }
+
+    fn finalize_proposal(
+        &mut self,
+        caller: AccountId,
+        proposal_id: u64,
+        seq: Seq,
+    ) -> Result<Vec<Fill>, RejectReason> {
+        // Permissionless finalization: `caller` only signs the unit.
+        let _ = caller;
+        let pass = {
+            let p = self
+                .state
+                .proposals
+                .get_mut(&proposal_id)
+                .ok_or(RejectReason::NoProposal)?;
+            if p.finalized.is_some() {
+                return Err(RejectReason::NoProposal);
+            }
+            if seq < p.deadline_seq {
+                return Err(RejectReason::Risk);
+            }
+            let pass =
+                p.yes > p.no && p.yes * PROPOSAL_QUORUM_DEN >= p.supply_at_create * PROPOSAL_QUORUM_NUM;
+            p.finalized = Some(pass);
+            pass
+        };
+        if pass {
+            let (market, key, value) = {
+                let p = &self.state.proposals[&proposal_id];
+                (p.market, p.key, p.value)
+            };
+            if let Some(params) = self.state.markets.get_mut(&market) {
+                match key {
+                    ParamKey::ImBps => params.im_bps = value,
+                    ParamKey::MmBps => params.mm_bps = value,
+                    ParamKey::TakerFeeBps => params.taker_fee_bps = value,
+                    ParamKey::KeeperRewardBps => params.keeper_reward_bps = value,
+                    ParamKey::Delist => params.delisted = true,
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+}
 fn map_acct(e: AccountError) -> RejectReason {
     match e {
         AccountError::Insufficient | AccountError::NonPositive => RejectReason::Insufficient,
         AccountError::Overflow | AccountError::QtyTooLarge => RejectReason::Risk,
     }
 }
+
+fn map_state(e: operp_state::StateError) -> RejectReason {
+    match e {
+        operp_state::StateError::InsufficientPerp => RejectReason::Insufficient,
+        operp_state::StateError::UnknownMarket => RejectReason::NotFound,
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -508,13 +790,14 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     /// Tests/examples run standalone (no AA feed): admit every deposit and
-    /// the BTC_USD market. Production replay injects real sets via
-    /// `ChainState::deposits_allowed` / `allowed_markets`.
+    /// seed the BTC_USD market with genesis params. Production replay
+    /// injects real sets via `ChainState::deposits_allowed` and markets are
+    /// created permissionlessly via `Op::CreateMarket`.
     fn allow_all(eng: &mut Engine) {
         eng.state.deposits_allowed = (0u8..=255)
             .map(|b| [b; 32])
             .collect();
-        eng.state.allowed_markets.insert(BTC_USD);
+        eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
     }
 
     fn sk(n: u8) -> [u8; 32] {
@@ -955,12 +1238,11 @@ mod tests {
     fn unauthorized_oracle_rejected() {
         let mut eng = Engine::new();
         allow_all(&mut eng);
-        // No trusted oracles injected: any OracleSet must bounce.
+        // No bonds injected: any ReportPrice must bounce.
         let o = sign_unit(
             vec![genesis_id()],
-            Op::OracleSet {
+            Op::ReportPrice {
                 oracle: acct_of(&sk(5)),
-                source: 0,
                 market: BTC_USD,
                 price: 100_000 * PRICE_SCALE,
             },
@@ -977,32 +1259,33 @@ mod tests {
     }
 
     #[test]
-    fn dual_oracle_marks_averaged_and_fill_mark_gated() {
+    fn bonded_oracle_median_and_fill_mark_gated() {
         let mut eng = Engine::new();
         allow_all(&mut eng);
         let oa = acct_of(&sk(5));
         let ob = acct_of(&sk(6));
-        eng.state.trusted_oracles.insert(oa);
-        eng.state.trusted_oracles.insert(ob);
+        eng.state.oracle_bonds.insert(oa, operp_types::ORACLE_BOND_PERP);
+        eng.state.oracle_bonds.insert(ob, operp_types::ORACLE_BOND_PERP);
         let g = genesis_id();
-        let mk = |secret: &[u8; 32], src: u8, px: u64| {
+        let mk = |secret: &[u8; 32], px: u64| {
             sign_unit(
                 vec![g],
-                Op::OracleSet {
+                Op::ReportPrice {
                     oracle: acct_of(secret),
-                    source: src,
                     market: BTC_USD,
                     price: px,
                 },
                 secret,
             )
         };
-        eng.ingest(mk(&sk(5), 0, 100_000 * PRICE_SCALE)).unwrap();
-        eng.ingest(mk(&sk(6), 1, 110_000 * PRICE_SCALE)).unwrap();
-        // Effective mark = average of both sources.
+        eng.ingest(mk(&sk(5), 100_000 * PRICE_SCALE)).unwrap();
+        eng.ingest(mk(&sk(6), 110_000 * PRICE_SCALE)).unwrap();
+        // Effective mark = median across reporters; median of two is the
+        // lower middle, i.e. 100_000 (which equals the genesis mark, so the
+        // clamp keeps it).
         assert_eq!(
             eng.state.marks.get(&BTC_USD).copied().unwrap(),
-            105_000 * PRICE_SCALE
+            100_000 * PRICE_SCALE
         );
         // Once an oracle has spoken, fills must NOT move the mark.
         let alice = sk(1);
@@ -1025,8 +1308,327 @@ mod tests {
         eng.ingest(p).unwrap();
         assert_eq!(
             eng.state.marks.get(&BTC_USD).copied().unwrap(),
-            105_000 * PRICE_SCALE,
+            100_000 * PRICE_SCALE,
             "oracle-authoritative mark must ignore fills"
         );
     }
+
+
+    fn gov_dep(parents: Vec<UnitId>, secret: &[u8; 32], amount: u128, aa: u8) -> Unit {
+        sign_unit(
+            parents,
+            Op::GovDeposit {
+                account: acct_of(secret),
+                amount,
+                aa_unit: [aa; 32],
+            },
+            secret,
+        )
+    }
+
+    fn gov_with(parents: Vec<UnitId>, secret: &[u8; 32], amount: u128, nonce: u64) -> Unit {
+        sign_unit(
+            parents,
+            Op::GovWithdraw {
+                account: acct_of(secret),
+                amount,
+                nonce,
+            },
+            secret,
+        )
+    }
+
+    fn list_market(parents: Vec<UnitId>, secret: &[u8; 32]) -> Unit {
+        let mut symbol = [0u8; 16];
+        symbol[..6].copy_from_slice(b"ETHUSD");
+        sign_unit(
+            parents,
+            Op::CreateMarket {
+                creator: acct_of(secret),
+                symbol,
+                tick_size: 1,
+                im_bps: 1000,
+                mm_bps: 500,
+                taker_fee_bps: 5,
+                keeper_reward_bps: 100,
+            },
+            secret,
+        )
+    }
+
+    fn propose(parents: Vec<UnitId>, secret: &[u8; 32], key: u8, value: u64) -> Unit {
+        sign_unit(
+            parents,
+            Op::CreateProposal {
+                creator: acct_of(secret),
+                market: BTC_USD,
+                key,
+                value,
+            },
+            secret,
+        )
+    }
+
+    fn cast_vote(parents: Vec<UnitId>, secret: &[u8; 32], proposal_id: u64, approve: bool) -> Unit {
+        sign_unit(
+            parents,
+            Op::Vote {
+                voter: acct_of(secret),
+                proposal_id,
+                approve,
+            },
+            secret,
+        )
+    }
+
+    fn finalize(parents: Vec<UnitId>, secret: &[u8; 32], proposal_id: u64) -> Unit {
+        sign_unit(
+            parents,
+            Op::FinalizeProposal {
+                caller: acct_of(secret),
+                proposal_id,
+            },
+            secret,
+        )
+    }
+
+    #[test]
+    fn gov_perp_deposit_withdraw_roundtrip() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        let d = gov_dep(vec![g], &sk(1), 5_000, 7);
+        eng.ingest(d).unwrap();
+        assert_eq!(eng.state.perp_balances[&acct_of(&sk(1))], 5_000);
+        assert_eq!(eng.state.perp_supply, 5_000);
+        // Unbacked PERP deposits bounce like unbacked collateral ones.
+        eng.state.deposits_allowed.clear();
+        let bad = gov_dep(vec![g], &sk(2), 1, 9);
+        let evs = eng.ingest(bad).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::UnbackedDeposit,
+                ..
+            }
+        )));
+        eng.state.deposits_allowed = (0u8..=255).map(|b| [b; 32]).collect();
+        let w = gov_with(vec![g], &sk(1), 2_000, 1);
+        eng.ingest(w).unwrap();
+        assert_eq!(eng.state.perp_balances[&acct_of(&sk(1))], 3_000);
+        assert_eq!(eng.state.perp_supply, 3_000);
+        // A spent nonce cannot be replayed even with different amounts.
+        let replay = gov_with(vec![g], &sk(1), 1_000, 1);
+        let evs = eng.ingest(replay).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::DuplicateNonce,
+                ..
+            }
+        )));
+        // Over-withdrawal bounces.
+        let over = gov_with(vec![g], &sk(1), 9_999, 2);
+        let evs = eng.ingest(over).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::Insufficient,
+                ..
+            }
+        )));
+        assert_eq!(eng.state.perp_balances[&acct_of(&sk(1))], 3_000);
+    }
+
+    #[test]
+    fn create_market_burns_exact_fee_and_allocates_ids() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        let d = gov_dep(vec![g], &sk(1), CREATE_MARKET_FEE_PERP, 7);
+        let tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let cm = list_market(vec![tip], &sk(1));
+        let evs = eng.ingest(cm).unwrap();
+        assert!(evs.iter().all(|e| matches!(e, ExecEvent::Applied { .. })));
+        // Fee burned exactly: balance zeroed, supply shrunk, burned grown.
+        assert_eq!(eng.state.perp_balances[&acct_of(&sk(1))], 0);
+        assert_eq!(eng.state.perp_supply, 0);
+        assert_eq!(eng.state.perp_burned, CREATE_MARKET_FEE_PERP);
+        assert_eq!(eng.state.next_market_id, 3);
+        let params = eng.state.markets[&MarketId(2)];
+        assert_eq!(&params.symbol[..6], b"ETHUSD");
+        assert!(!params.delisted);
+        // Listing without balance fails and must not burn an id or fee.
+        let cm2 = list_market(vec![tip], &sk(2));
+        let evs = eng.ingest(cm2).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::Insufficient,
+                ..
+            }
+        )));
+        assert_eq!(eng.state.next_market_id, 3);
+        assert_eq!(eng.state.perp_burned, CREATE_MARKET_FEE_PERP);
+    }
+
+    #[test]
+    fn duplicate_vote_rejected() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        let d = gov_dep(vec![g], &sk(1), 2_000, 7);
+        let tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let p = propose(vec![tip], &sk(1), 2, 10);
+        let tip = unit_id(&p);
+        eng.ingest(p).unwrap();
+        let v1 = cast_vote(vec![tip], &sk(1), 1, true);
+        let tip = unit_id(&v1);
+        eng.ingest(v1).unwrap();
+        assert_eq!(eng.state.proposals[&1].yes, 2_000);
+        // Second ballot from the same voter flips to a rejection.
+        let v2 = cast_vote(vec![tip], &sk(1), 1, false);
+        let evs = eng.ingest(v2).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::Risk,
+                ..
+            }
+        )));
+        assert_eq!(eng.state.proposals[&1].yes, 2_000);
+        assert_eq!(eng.state.proposals[&1].no, 0);
+        assert_eq!(eng.state.proposals[&1].voted.len(), 1);
+    }
+
+    #[test]
+    fn pre_deadline_and_unknown_finalize_rejected() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        let d = gov_dep(vec![g], &sk(1), 2_000, 7);
+        let tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let p = propose(vec![tip], &sk(1), 2, 10);
+        eng.ingest(p).unwrap();
+        // Finalizing before the voting window closes bounces.
+        let early = finalize(vec![g], &sk(2), 1);
+        let evs = eng.ingest(early).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::Risk,
+                ..
+            }
+        )));
+        assert_eq!(eng.state.proposals[&1].finalized, None);
+        // Unknown proposal id bounces with NoProposal.
+        let ghost = finalize(vec![g], &sk(2), 99);
+        let evs = eng.ingest(ghost).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::NoProposal,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn quorum_fail_keeps_params_intact() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        // Supply 100_000; only 1_000 (1%) votes yes — below the 10% quorum.
+        let da = gov_dep(vec![g], &sk(1), 1_000, 7);
+        let db = gov_dep(vec![g], &sk(2), 99_000, 8);
+        eng.ingest(da).unwrap();
+        eng.ingest(db).unwrap();
+        let p = propose(vec![g], &sk(1), 0, 500);
+        eng.ingest(p).unwrap();
+        let v = cast_vote(vec![g], &sk(1), 1, true);
+        eng.ingest(v).unwrap();
+        eng.state.seq = eng.state.proposals[&1].deadline_seq;
+        let fin = finalize(vec![g], &sk(2), 1);
+        let evs = eng.ingest(fin).unwrap();
+        assert!(evs.iter().all(|e| matches!(e, ExecEvent::Applied { .. })));
+        assert_eq!(eng.state.proposals[&1].finalized, Some(false));
+        // Genesis im_bps untouched.
+        assert_eq!(eng.state.markets[&BTC_USD].im_bps, 1000);
+    }
+
+    #[test]
+    fn passed_delist_blocks_place_but_not_cancel() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        let alice = sk(1);
+        eng.state
+            .accounts
+            .entry(acct_of(&alice))
+            .or_insert_with(|| operp_account::Account::new(acct_of(&alice)))
+            .credit(1_000_000 * USD_SCALE as i128)
+            .unwrap();
+        // Resting limit bid far below the mark survives untouched.
+        eng.ingest(place(
+            vec![g],
+            &alice,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            50_000 * PRICE_SCALE,
+            QTY_SCALE,
+            1,
+        ))
+        .unwrap();
+        // Full-supply yes vote passes the delist proposal.
+        let d = gov_dep(vec![g], &alice, 100_000, 7);
+        let tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let p = propose(vec![tip], &alice, 4, 0);
+        let tip = unit_id(&p);
+        eng.ingest(p).unwrap();
+        let v = cast_vote(vec![tip], &alice, 1, true);
+        eng.ingest(v).unwrap();
+        assert_eq!(eng.state.proposals[&1].supply_at_create, 100_000);
+        eng.state.seq = eng.state.proposals[&1].deadline_seq;
+        let fin = finalize(vec![g], &alice, 1);
+        let evs = eng.ingest(fin).unwrap();
+        assert!(evs.iter().all(|e| matches!(e, ExecEvent::Applied { .. })));
+        assert_eq!(eng.state.proposals[&1].finalized, Some(true));
+        assert!(eng.state.markets[&BTC_USD].delisted);
+        // New orders on a delisted market bounce.
+        let reentry = place(
+            vec![g],
+            &alice,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            51_000 * PRICE_SCALE,
+            QTY_SCALE,
+            2,
+        );
+        let evs = eng.ingest(reentry).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::Risk,
+                ..
+            }
+        )));
+        // Cancelling the pre-delist order still works.
+        let c = sign_unit(
+            vec![g],
+            Op::Cancel {
+                account: acct_of(&alice),
+                order_id: order_id(acct_of(&alice), BTC_USD, 1),
+            },
+            &alice,
+        );
+        let evs = eng.ingest(c).unwrap();
+        assert!(evs.iter().all(|e| matches!(e, ExecEvent::Applied { ref fills, .. } if fills.is_empty())));
+    }
+
 }

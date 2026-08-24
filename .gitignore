@@ -23,3 +23,4 @@ testdata-testnet/
 /obyte-local/batch.json
 /obyte-local/withdraw_claim.json
 testdata-poster/
+agents/operp_vault_base.aa

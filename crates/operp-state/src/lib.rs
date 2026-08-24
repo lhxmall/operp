@@ -1,8 +1,8 @@
 pub use operp_account::Account;
 use operp_book::{Fill, OrderBook};
 use operp_types::{
-    bps, notional_usd, sha256, AccountId, Height, MarketId, Price, Seq, UnitId, Usd, BTC_USD,
-    INSURANCE_ACCOUNT, INSURANCE_SEED, PRICE_SCALE, TAKER_FEE_BPS, USD_SCALE,
+    bps, genesis_params, notional_usd, sha256, AccountId, Height, MarketId, MarketParams,
+    Price, Seq, UnitId, Usd, BTC_USD, INSURANCE_ACCOUNT, INSURANCE_SEED, PRICE_SCALE, USD_SCALE,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -17,21 +17,68 @@ pub struct ChainState {
     pub last_unit: UnitId,
     pub seq: Seq,
     pub accounts: BTreeMap<AccountId, Account>,
+    /// Per-market parameters (permissionless markets included). BTC_USD is
+    /// seeded at genesis; CreateMarket appends.
+    pub markets: BTreeMap<MarketId, MarketParams>,
+    /// Next market id to allocate (BTC_USD=1 is taken at genesis).
+    pub next_market_id: u32,
     pub books: BTreeMap<MarketId, OrderBook>,
     pub marks: BTreeMap<MarketId, Price>,
-    /// Oracle price feeds, per source (0/1) and market. Two independent
-    /// sources; the effective mark is the average of available sources.
-    pub oracle_marks: BTreeMap<(u8, MarketId), Price>,
-    /// Accounts allowed to sign Op::OracleSet. Empty = no oracle accepted.
-    pub trusted_oracles: HashSet<AccountId>,
+    /// Latest report per (market, reporter). Only bonded reporters get in
+    /// (apply_report ignores everyone else).
+    pub oracle_reports: BTreeMap<(MarketId, AccountId), Price>,
+    /// PERP oracle bonds currently staked. Presence = reporting eligibility.
+    pub oracle_bonds: BTreeMap<AccountId, u128>,
+    /// Unclamped median of current reports — the funding-rate index.
+    pub last_index: BTreeMap<MarketId, Price>,
+    /// Sidechain-mirrored PERP balances (governance token).
+    pub perp_balances: BTreeMap<AccountId, u128>,
+    /// Redeemable circulating PERP = Σ deposits − withdrawals − burns.
+    pub perp_supply: u128,
+    /// Cumulative PERP burned (market listing fees, future slashes). The
+    /// real tokens stay escrowed in the vault AA forever — claimable
+    /// deflation; no on-chain sweep.
+    pub perp_burned: u128,
+    /// On-chain governance proposals keyed by id.
+    pub proposals: BTreeMap<u64, Proposal>,
+    /// Next proposal id to allocate.
+    pub next_proposal_id: u64,
     pub withdrawals: BTreeMap<(AccountId, u64), Withdrawal>,
     pub seen_aa_units: HashSet<[u8; 32]>,
     pub seen_client_seq: HashMap<AccountId, u64>,
     /// AA deposit events observed on-chain for the pending batch window.
     /// Deposit ops referencing units outside this set are rejected.
     pub deposits_allowed: HashSet<[u8; 32]>,
-    /// Markets permitted for trading; place() rejects anything else.
-    pub allowed_markets: HashSet<MarketId>,
+    /// Consumed GovWithdraw nonces: replay protection for PERP withdrawals.
+    pub seen_gov_nonces: HashSet<(AccountId, u64)>,
+}
+
+/// An open governance proposal. `deadline_seq` and the quorum denominator
+/// snapshot (`supply_at_create`) are fixed at creation so replayed batches
+/// finalize identically. Voting weight is the voter's PERP balance at vote
+/// execution time (MVP semantics); `supply_at_create` shrinks with burns.
+#[derive(Clone, Debug)]
+pub struct Proposal {
+    pub creator: AccountId,
+    pub market: MarketId,
+    pub key: operp_types::ParamKey,
+    pub value: u64,
+    pub created_seq: Seq,
+    pub deadline_seq: Seq,
+    pub supply_at_create: u128,
+    pub yes: u128,
+    pub no: u128,
+    pub voted: HashSet<AccountId>,
+    /// None = open; Some(true) = passed & applied; Some(false) = rejected.
+    pub finalized: Option<bool>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StateError {
+    #[error("insufficient PERP balance")]
+    InsufficientPerp,
+    #[error("unknown market")]
+    UnknownMarket,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +88,8 @@ pub struct MerkleProof {
     pub root: [u8; 32],
     pub account: AccountId,
     pub collateral: Usd,
+    /// Mirrored PERP balance committed by the leaf.
+    pub perp: u128,
 }
 
 impl Default for ChainState {
@@ -48,7 +97,6 @@ impl Default for ChainState {
         Self::new()
     }
 }
-
 impl ChainState {
     pub fn new() -> Self {
         let mut books = BTreeMap::new();
@@ -60,51 +108,77 @@ impl ChainState {
         let mut insurance = Account::new(INSURANCE_ACCOUNT);
         insurance.collateral = INSURANCE_SEED;
         accounts.insert(INSURANCE_ACCOUNT, insurance);
+        let mut markets = BTreeMap::new();
+        markets.insert(BTC_USD, genesis_params());
         Self {
             height: 0,
             last_unit: operp_book_genesis(),
             seq: 0,
             accounts,
+            markets,
+            next_market_id: 2,
             books,
             marks,
-            oracle_marks: BTreeMap::new(),
-            trusted_oracles: HashSet::new(),
+            oracle_reports: BTreeMap::new(),
+            oracle_bonds: BTreeMap::new(),
+            last_index: BTreeMap::new(),
+            perp_balances: BTreeMap::new(),
+            perp_supply: 0,
+            perp_burned: 0,
+            proposals: BTreeMap::new(),
+            next_proposal_id: 1,
             withdrawals: BTreeMap::new(),
             seen_aa_units: HashSet::new(),
             seen_client_seq: HashMap::new(),
             deposits_allowed: HashSet::new(),
-            allowed_markets: HashSet::new(),
+            seen_gov_nonces: HashSet::new(),
         }
     }
 
-    /// Apply a whitelisted oracle's price for `source` (0/1) and recompute the
-    /// effective mark as the average of available sources, subject to the
-    /// ±10% deviation cap vs the current mark. Fills no longer move the mark
-    /// for markets where any oracle source has spoken.
-    pub fn apply_oracle(&mut self, source: u8, market: MarketId, price: Price) {
-        if price == 0 {
-            return;
+    /// Apply a bonded oracle's report for `market` and recompute the effective
+    /// mark as the median of all current bonded reporters, subject to the
+    /// ±10% deviation cap vs the previous mark (the first report for a market
+    /// sets the mark unconditionally). Fills no longer move the mark for
+    /// markets where any bonded reporter has spoken. Zero prices and unbonded
+    /// reporters are ignored defensively — the exec layer pre-validates bonds.
+    pub fn apply_report(
+        &mut self,
+        oracle: AccountId,
+        market: MarketId,
+        price: Price,
+    ) -> Result<(), StateError> {
+        if price == 0 || !self.oracle_bonds.contains_key(&oracle) {
+            return Ok(());
         }
-        self.oracle_marks.insert((source, market), price);
-        let sources: Vec<Price> = [(0u8, market), (1u8, market)]
+        self.oracle_reports.insert((market, oracle), price);
+        // Median over reporters that hold BOTH a bond and a current report
+        // for this market. sorted[(len-1)/2] is the exact middle when the
+        // count is odd and the smaller middle when even — deterministic in
+        // both cases, no rounding drift.
+        let mut prices: Vec<Price> = self
+            .oracle_reports
             .iter()
-            .filter_map(|k| self.oracle_marks.get(k).copied())
+            .filter(|((m, o), _)| *m == market && self.oracle_bonds.contains_key(o))
+            .map(|(_, p)| *p)
             .collect();
-        let candidate = if sources.len() == 2 {
-            // Average of two independent sources (rounds down; sub-tick dust).
-            ((sources[0] as u128 + sources[1] as u128) / 2) as Price
-        } else {
-            sources[0]
-        };
+        if prices.is_empty() {
+            return Ok(());
+        }
+        prices.sort();
+        let median = prices[(prices.len() - 1) / 2];
+        // Funding index: unclamped median, so the premium reflects true
+        // reporter consensus even while the spot mark lags behind the cap.
+        self.last_index.insert(market, median);
         let capped = match self.marks.get(&market) {
             Some(&old) if old > 0 => {
-                let dev = (candidate as i128 - old as i128).abs();
-                if dev <= old as i128 / 10 { candidate } else { old }
+                let dev = (median as i128 - old as i128).abs();
+                if dev <= old as i128 / 10 { median } else { old }
             }
-            _ => candidate,
+            _ => median,
         };
         self.marks.insert(market, capped);
-        // Funding: every dual-source oracle tick settles peer-to-peer funding.
+        // Funding: once at least two valid reports exist, every report tick
+        // settles peer-to-peer funding.
         // premium_bps = (spot − index)/index, clamped to ±FUNDING_CAP_BPS.
         // Signed per-position payment: longs (qty>0) pay when spot > index,
         // shorts receive; mirrored when spot < index. Two-phase so that
@@ -119,12 +193,8 @@ impl ChainState {
         //     paid partially. Integer arithmetic only, no rounding drift.
         // Insurance participates like any other account (it can hold
         // positions). Truncation residue is sub-unit dust by design.
-        let (index_a, index_b) = (
-            self.oracle_marks.get(&(0u8, market)).copied(),
-            self.oracle_marks.get(&(1u8, market)).copied(),
-        );
-        if let (Some(ia), Some(ib)) = (index_a, index_b) {
-            let index = ((ia as u128 + ib as u128) / 2) as i128;
+        if prices.len() >= 2 {
+            let index = median as i128;
             let spot = capped as i128;
             if index > 0 {
                 let diff_bps = ((spot - index) * 10_000 / index).clamp(
@@ -138,7 +208,7 @@ impl ChainState {
                         .iter()
                         .filter_map(|(id, a)| {
                             a.positions.get(&market).map(|pos| {
-                                (*id, operp_types::signed_notional_usd(pos.qty, ia) * diff_bps / 10_000)
+                                (*id, operp_types::signed_notional_usd(pos.qty, median) * diff_bps / 10_000)
                             })
                         })
                         .filter(|(_, p)| *p != 0)
@@ -173,6 +243,7 @@ impl ChainState {
                 }
             }
         }
+        Ok(())
     }
 
     pub fn book_mut(&mut self, market: MarketId) -> &mut OrderBook {
@@ -204,8 +275,10 @@ impl ChainState {
         // credited to the insurance fund — the fund's income leg, offsetting
         // bad-debt absorption and keeper payouts. The fee flows through the
         // same Account::apply_fill path the withdrawal-proof leaf commits.
+        // The rate is a per-market parameter since permissionless listing.
         if fill.taker != INSURANCE_ACCOUNT {
-            let fee = bps(notional_usd(fill.qty, fill.price), TAKER_FEE_BPS);
+            let fee_bps = self.market_params(fill.market).taker_fee_bps;
+            let fee = bps(notional_usd(fill.qty, fill.price), fee_bps);
             if fee > 0 {
                 if let Some(a) = self.accounts.get_mut(&fill.taker) {
                     a.collateral -= fee;
@@ -238,12 +311,14 @@ impl ChainState {
             }
         }
         // Mark oracle guards: fills move the mark only for markets where NO
-        // oracle source has spoken yet (oracles are authoritative once
+        // bonded reporter has spoken yet (oracles are authoritative once
         // present), the notional is >= 100 USD, and the move is within ±10%
         // of the previous mark (first qualifying fill sets unconditionally).
         if notional_usd(fill.qty, fill.price) >= 100 * USD_SCALE as i128
-            && !self.oracle_marks.contains_key(&(0u8, fill.market))
-            && !self.oracle_marks.contains_key(&(1u8, fill.market))
+            && !self
+                .oracle_reports
+                .keys()
+                .any(|(m, o)| *m == fill.market && self.oracle_bonds.contains_key(o))
         {
             let capped = match self.marks.get(&fill.market) {
                 Some(&old) if old > 0 => {
@@ -260,10 +335,15 @@ impl ChainState {
     pub fn leaves(&self) -> Vec<[u8; 32]> {
         let mut leaves = Vec::new();
         for acct in self.accounts.values() {
-            leaves.push(account_leaf(acct));
+            let perp = self
+                .perp_balances
+                .get(&acct.id)
+                .copied()
+                .unwrap_or(0);
+            leaves.push(account_leaf(acct, perp));
         }
         for book in self.books.values() {
-            leaves.push(book_leaf(book));
+            leaves.push(book_leaf(book, &self.markets));
         }
         leaves.push(meta_leaf(self));
         leaves
@@ -272,14 +352,14 @@ impl ChainState {
     pub fn state_root(&self) -> [u8; 32] {
         merkle_root(self.leaves())
     }
-
     pub fn account_proof(&self, id: AccountId) -> MerkleProof {
         let acct = self
             .accounts
             .get(&id)
             .cloned()
             .unwrap_or_else(|| Account::new(id));
-        let leaf = account_leaf(&acct);
+        let perp = self.perp_balances.get(&id).copied().unwrap_or(0);
+        let leaf = account_leaf(&acct, perp);
         let leaves = self.leaves();
         let (siblings, root) = merkle_proof_for(leaves, leaf);
         MerkleProof {
@@ -288,15 +368,24 @@ impl ChainState {
             root,
             account: id,
             collateral: acct.collateral,
+            perp,
         }
+    }
+
+    /// PERP balance of `who` (0 when the account never deposited).
+    pub fn perp_balance(&self, who: AccountId) -> u128 {
+        self.perp_balances.get(&who).copied().unwrap_or(0)
+    }
+
+    /// Params snapshot for `m`; panics on unknown markets, which cannot
+    /// exist for markets created at genesis or via CreateMarket, which exec
+    /// guarantees before reaching any state path that needs params.
+    pub fn market_params(&self, m: MarketId) -> MarketParams {
+        self.markets[&m].clone()
     }
 }
 
-fn operp_book_genesis() -> UnitId {
-    UnitId(sha256(b"operp-mvp-1-genesis"))
-}
-
-pub fn account_leaf(acct: &Account) -> [u8; 32] {
+pub fn account_leaf(acct: &Account, perp: u128) -> [u8; 32] {
     let mut b = Vec::new();
     b.extend_from_slice(b"acct");
     b.extend_from_slice(&acct.id.0);
@@ -308,12 +397,39 @@ pub fn account_leaf(acct: &Account) -> [u8; 32] {
         b.extend_from_slice(&p.qty.to_le_bytes());
         b.extend_from_slice(&p.entry_price.to_le_bytes());
     }
+    // Mirrored PERP balance: the vault AA's hex-domain leaf commits the same
+    // triple (address, collateral, perp), so both trees cover PERP claims.
+    b.extend_from_slice(&perp.to_le_bytes());
     sha256(&b)
 }
-fn book_leaf(book: &OrderBook) -> [u8; 32] {
+
+/// Fixed-width per-market params encoding committed by the book leaf:
+/// symbol[16] || tick le8 || im le8 || mm le8 || taker_fee le8 ||
+/// keeper_reward le8 || delisted byte — 57 bytes total. Books are created
+/// lazily only for markets that already have params.
+fn market_params_bytes(p: &MarketParams) -> [u8; 57] {
+    let mut b = [0u8; 57];
+    b[..16].copy_from_slice(&p.symbol);
+    b[16..24].copy_from_slice(&p.tick_size.to_le_bytes());
+    b[24..32].copy_from_slice(&p.im_bps.to_le_bytes());
+    b[32..40].copy_from_slice(&p.mm_bps.to_le_bytes());
+    b[40..48].copy_from_slice(&p.taker_fee_bps.to_le_bytes());
+    b[48..56].copy_from_slice(&p.keeper_reward_bps.to_le_bytes());
+    b[56] = p.delisted as u8;
+    b
+}
+
+fn book_leaf(book: &OrderBook, markets: &BTreeMap<MarketId, MarketParams>) -> [u8; 32] {
     // Full-book commitment: every level and every live order (see
-    // OrderBook::commitment_bytes), not just best bid/ask/count.
-    sha256(&book.commitment_bytes())
+    // OrderBook::commitment_bytes), not just best bid/ask/count — prefixed
+    // with the market's params so the root also commits governance state.
+    let p = markets
+        .get(&book.market())
+        .unwrap_or_else(|| panic!("book without params for market {}", book.market().0));
+    let mut b = Vec::with_capacity(57 + book.commitment_bytes().len());
+    b.extend_from_slice(&market_params_bytes(p));
+    b.extend_from_slice(&book.commitment_bytes());
+    sha256(&b)
 }
 
 fn meta_leaf(state: &ChainState) -> [u8; 32] {
@@ -322,8 +438,18 @@ fn meta_leaf(state: &ChainState) -> [u8; 32] {
     b.extend_from_slice(&state.height.to_le_bytes());
     b.extend_from_slice(&state.seq.to_le_bytes());
     b.extend_from_slice(&state.last_unit.0);
+    // Governance cursors: committing them removes replay ambiguity between
+    // batches that differ only in burn totals or id allocation.
+    b.extend_from_slice(&state.perp_burned.to_le_bytes());
+    b.extend_from_slice(&state.next_market_id.to_le_bytes());
+    b.extend_from_slice(&state.next_proposal_id.to_le_bytes());
     sha256(&b)
 }
+
+fn operp_book_genesis() -> UnitId {
+    UnitId(sha256(b"operp-mvp-1-genesis"))
+}
+
 
 pub fn merkle_root(mut leaves: Vec<[u8; 32]>) -> [u8; 32] {
     if leaves.is_empty() {
@@ -401,16 +527,15 @@ fn merkle_proof_for(mut leaves: Vec<[u8; 32]>, leaf: [u8; 32]) -> (Vec<([u8; 32]
 /// ---- AA-facing merkle tree (hex-string domain) ----
 ///
 /// Oscript's `sha256()` hashes the UTF-8 string of its argument, so the vault
-/// AA can only verify proofs whose nodes are hashes of concatenated hex
-/// strings. Leaves are keyed by the WITHDRAWAL ADDRESS (an Obyte address
-/// string — the same value the AA compares `leaf_account` against):
-///   leaf  = sha256_hex("acct:" || address || ":" || collateral_decimal)
+///   leaf  = sha256_hex("acct:" || address || ":" || collateral_decimal
+///                      || ":" || perp_decimal)
 ///   node  = sha256_hex(left_hex || right_hex)
 
-pub fn aa_account_leaf_str(addr: &str, collateral: Usd) -> String {
-    let s = format!("acct:{}:{}", addr, collateral);
+pub fn aa_account_leaf_str(addr: &str, collateral: Usd, perp: u128) -> String {
+    let s = format!("acct:{}:{}:{}", addr, collateral, perp);
     hex::encode(sha256(s.as_bytes()))
 }
+
 
 fn aa_parent(l: &str, r: &str) -> String {
     let mut buf = String::with_capacity(l.len() + r.len());
@@ -419,11 +544,11 @@ fn aa_parent(l: &str, r: &str) -> String {
     hex::encode(sha256(buf.as_bytes()))
 }
 
-/// Root of the hex-domain tree over (address, collateral) pairs.
-pub fn aa_root_of(pairs: &[(String, Usd)]) -> String {
+/// Root of the hex-domain tree over (address, collateral, perp) triples.
+pub fn aa_root_of(pairs: &[(String, Usd, u128)]) -> String {
     let mut level: Vec<String> = pairs
         .iter()
-        .map(|(addr, col)| aa_account_leaf_str(addr, *col))
+        .map(|(addr, col, perp)| aa_account_leaf_str(addr, *col, *perp))
         .collect();
     if level.is_empty() {
         return hex::encode(sha256(b"empty"));
@@ -441,14 +566,18 @@ pub fn aa_root_of(pairs: &[(String, Usd)]) -> String {
 
 /// Proof path for one address in the hex-domain tree over `pairs`.
 pub fn aa_proof_for(
-    pairs: &[(String, Usd)],
+    pairs: &[(String, Usd, u128)],
     addr: &str,
 ) -> Option<(Vec<(String, bool)>, String)> {
     let mut level: Vec<String> = pairs
         .iter()
-        .map(|(a, c)| aa_account_leaf_str(a, *c))
+        .map(|(a, c, p)| aa_account_leaf_str(a, *c, *p))
         .collect();
-    let leaf = aa_account_leaf_str(addr, pairs.iter().find(|(a, _)| a == addr)?.1);
+    let leaf = aa_account_leaf_str(
+        addr,
+        pairs.iter().find(|(a, _, _)| a == addr)?.1,
+        pairs.iter().find(|(a, _, _)| a == addr)?.2,
+    );
     level.sort();
     let mut idx = level.iter().position(|l| *l == leaf)?;
     let mut siblings = Vec::new();
@@ -468,23 +597,34 @@ pub fn aa_proof_for(
 /// Root of the hex-domain tree over the sidechain accounts, keyed by each
 /// account's id hex (engine-side convenience wrapper).
 pub fn aa_root_of_state(state: &ChainState) -> String {
-    let pairs: Vec<(String, Usd)> = state
+    let pairs: Vec<(String, Usd, u128)> = state
         .accounts
         .values()
-        .map(|a| (hex::encode(a.id.0), a.collateral))
+        .map(|a| {
+            (
+                hex::encode(a.id.0),
+                a.collateral,
+                state.perp_balances.get(&a.id).copied().unwrap_or(0),
+            )
+        })
         .collect();
     aa_root_of(&pairs)
 }
 
-/// Proof path for one sidechain account (id hex key).
 pub fn aa_proof_for_account(
     state: &ChainState,
     id: &AccountId,
 ) -> Option<(Vec<(String, bool)>, String)> {
-    let pairs: Vec<(String, Usd)> = state
+    let pairs: Vec<(String, Usd, u128)> = state
         .accounts
         .values()
-        .map(|a| (hex::encode(a.id.0), a.collateral))
+        .map(|a| {
+            (
+                hex::encode(a.id.0),
+                a.collateral,
+                state.perp_balances.get(&a.id).copied().unwrap_or(0),
+            )
+        })
         .collect();
     aa_proof_for(&pairs, &hex::encode(id.0))
 }
@@ -564,8 +704,6 @@ mod tests {
         let mut s = ChainState::new();
         let long = AccountId([9; 32]);
         let short = AccountId([8; 32]);
-        s.trusted_oracles.insert(AccountId([5; 32]));
-        s.trusted_oracles.insert(AccountId([6; 32]));
         s.account_mut(long).credit(1_000_000 * USD_SCALE as i128).unwrap();
         s.account_mut(short).credit(1_000_000 * USD_SCALE as i128).unwrap();
 
@@ -584,15 +722,34 @@ mod tests {
         };
         s.apply_fill_pair(&fill).unwrap();
 
-        // Oracles report index ABOVE spot: premium positive → long pays short.
-        // source0 = 105k (index avg with source1 = 103k → index ≈ 104k).
-        s.apply_oracle(0, BTC_USD, 105_000 * operp_types::PRICE_SCALE);
-        s.apply_oracle(1, BTC_USD, 103_000 * operp_types::PRICE_SCALE);
+        // Bonded oracles report; funding settles once >= 2 reports exist.
+        // Tick 1 at spot: single report → median 100k, mark unchanged,
+        // no funding yet.
+        let oa = AccountId([5; 32]);
+        let ob = AccountId([6; 32]);
+        s.oracle_bonds.insert(oa, operp_types::ORACLE_BOND_PERP);
+        s.oracle_bonds.insert(ob, operp_types::ORACLE_BOND_PERP);
+        s.apply_report(oa, BTC_USD, 100_000 * operp_types::PRICE_SCALE)
+            .unwrap();
+        let pre_funding =
+            s.accounts[&long].collateral + s.accounts[&short].collateral;
+
+        // Tick 2: reports {89k, 100k}; median = sorted[(len-1)/2] = 89k
+        // (the smaller middle when even). |89k − 100k| = 11k > 10k, so the
+        // ±10% cap holds the spot mark at 100k while the index drops to
+        // 89k: premium > 0 → long pays short.
+        s.apply_report(ob, BTC_USD, 89_000 * operp_types::PRICE_SCALE)
+            .unwrap();
 
         let long_bal = s.accounts[&long].collateral;
         let short_bal = s.accounts[&short].collateral;
-        // Long paid, short received (premium > 0), and the transfer is
-        // symmetric up to integer truncation dust (< 1 USD).
+        // Long paid, short received (premium > 0).
         assert!(long_bal < short_bal, "long must fund short in premium");
+        // Peer-to-peer funding must conserve collateral (sub-unit dust at
+        // most): nothing leaks to or from other accounts here.
+        assert!(
+            pre_funding - (long_bal + short_bal) < USD_SCALE as i128,
+            "funding must conserve total collateral"
+        );
     }
 }

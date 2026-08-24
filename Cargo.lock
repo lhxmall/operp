@@ -241,6 +241,7 @@ dependencies = [
  "operp-book",
  "operp-types",
  "sha2",
+ "thiserror",
 ]
 
 [[package]]

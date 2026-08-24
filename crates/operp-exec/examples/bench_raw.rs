@@ -15,7 +15,7 @@ fn acct(s: &[u8; 32]) -> AccountId {
 fn main() {
     let mut eng = Engine::new();
     eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
-    eng.state.allowed_markets.insert(MarketId(1));
+    eng.state.markets.insert(MarketId(1), operp_types::genesis_params());
     let secrets: Vec<[u8; 32]> = (1..=4).map(sk).collect();
     let mut tip = genesis_id();
     for (i, s) in secrets.iter().enumerate() {

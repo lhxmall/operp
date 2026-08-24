@@ -10,7 +10,7 @@
 	//   3600          -> CHALLENGE_SECS (challenge window before finalize)
 	//   10000         -> BOUNCE_FEES base (deducted from trigger outputs)
 	//   20000         -> challenge bond minimum incl. bounce fee headroom
-	//   'PERP_ASSET_ID_HERE' -> PERP_ASSET (crates/operp-types); deploy scripts
+	//   'base' -> PERP_ASSET (crates/operp-types); deploy scripts
 	//     substitute the real asset id for this placeholder before deployment
 	//
 	// WITHDRAWALS ARE PROOF-GATED. The operator commits `aa_root` per batch:
@@ -73,12 +73,12 @@
 				// shadow ledger only (mirror of bal_). The sidechain's
 				// GovDeposit ops (keyed by aa_unit) are the actual credit
 				// path; pperp_ exists so watchers can reconcile inflows.
-				if: "{trigger.data.deposit_perp AND trigger.output[[asset='PERP_ASSET_ID_HERE']] > 0}",
+				if: "{trigger.data.deposit_perp AND trigger.output[[asset='base']] > 0}",
 				messages: [
 					{
 						app: "state",
 						state: "{
-							var['pperp_' || trigger.address] = (var['pperp_' || trigger.address] otherwise 0) + trigger.output[[asset='PERP_ASSET_ID_HERE']];
+							var['pperp_' || trigger.address] = (var['pperp_' || trigger.address] otherwise 0) + trigger.output[[asset='base']];
 						}"
 					}
 				]
@@ -318,7 +318,7 @@
 						if: "{$perp_claimed > 0}",
 						app: "payment",
 						payload: {
-							asset: "PERP_ASSET_ID_HERE",
+							asset: "base",
 							outputs: [
 								{
 									address: "{trigger.address}",

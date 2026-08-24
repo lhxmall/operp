@@ -22,6 +22,8 @@
 11. [多 operator 手续费竞速](#11-multi-operator-手续费竞速)
 12. [Optimistic / Final 状态提升](#12-optimistic--final-状态提升)
 13. [威胁模型对照表](#13-威胁模型对照表)
+14. [明确的已知边界](#14-明确的已知边界)
+15. [PERP 治理](#15-perp-治理)
 
 ---
 
@@ -60,7 +62,7 @@ place() 在任何算术前拒绝：
 ```
 qty > i64::MAX                    → Risk（仓位以 i64 存储）
 price·qty 溢出 i128               → Risk（名义额计算前置校验）
-market ∉ allowed_markets          → Risk（市场白名单）
+market 不存在或已 delisted       → Risk（无许可市场，见 §15）
 client_seq ≠ last+1               → DuplicateClientSeq
 ```
 
@@ -93,9 +95,14 @@ Unit {
 | Cancel | 2 | account, order_id |
 | Deposit | 3 | account, amount_le16, aa_unit_32 |
 | Withdraw | 4 | account, amount_le16, nonce_le8 |
-| OracleSet | 6 | oracle, source_u8, market_le4, price_le8 |
+| ReportPrice | 6 | oracle, market_le4, price_le8 |
 | Liquidate | 7 | caller, target, market_le4 |
-
+| GovDeposit | 8 | account, amount_le16, aa_unit_32 |
+| GovWithdraw | 9 | account, amount_le16, nonce_le8 |
+| CreateMarket | 10 | creator, symbol16, tick_size_le8, im_bps_le8, mm_bps_le8, taker_fee_bps_le8, keeper_reward_bps_le8 |
+| CreateProposal | 11 | creator, market_le4, key_u8（ParamKey）, value_le8 |
+| Vote | 12 | voter, proposal_id_le8, approve_u8（0/1） |
+| FinalizeProposal | 13 | caller, proposal_id_le8 |
 canonical 尾部追加 pubkey。签名验证用 ed25519 **verify_strict**：
 拒绝可延展签名（非规范 s 值、小阶分量）。
 
@@ -106,7 +113,9 @@ canonical 尾部追加 pubkey。签名验证用 ed25519 **verify_strict**：
 - Place/Cancel/Deposit/Withdraw：account == sha256(pubkey)
 - Liquidate：caller == sha256(pubkey) —— keeper 身份密码学绑定，
   自我清算在验证层即被拒（caller == target → BadAccount）
-- OracleSet：oracle == sha256(pubkey)，执行时另验 trusted_oracles 白名单
+- ReportPrice/GovDeposit/GovWithdraw/CreateMarket/CreateProposal/Vote/
+  FinalizeProposal：首字段（oracle/account/creator/voter/caller）
+  == sha256(pubkey)
 
 ### 2.3 插入与乱序恢复
 
@@ -205,6 +214,8 @@ equity = collateral + upnl               # PnL 已结算进 collateral
 liquidatable : mm>0 ∧ equity×10000 ≤ mm×10500   # ≤1.05
 reduce_only  : has_unmarked ∨ (mm>0 ∧ equity×10000 ≤ mm×12000)  # ≤1.20
 ```
+IM/MM 为**每市场参数**（创世市场默认 500/1000 bps，新市场随 CreateMarket
+提交，§15.2）。
 
 无 mark 仓位：不计入 upnl/mm/im 且强制 reduce_only。否则 mark=0 给多头
 记全额虚亏（可提光）、给空头记全额虚利（可无限加仓）。
@@ -246,6 +257,8 @@ Liquidate { caller, target, market }（caller 签名绑定）:
 reward = Σ bps(每笔成交名义额, KEEPER_REWARD_BPS=100)
 pay    = min(reward, max(insurance.collateral, 0))
 基金枯竭时清算仍发生，keeper 暂无酬但不阻塞清算。
+keeper 奖励 bps 为**每市场参数**（创世市场默认 100，新市场随 CreateMarket
+提交，§15.2）。
 
 ### 5.3 坏账钳零
 
@@ -271,10 +284,13 @@ apply_fill_pair 后 taker snapshot.equity < 0:
 每笔成交后：fee = bps(notional, TAKER_FEE_BPS=5)  # 0.05%
 taker.collateral −= fee；insurance.collateral += fee。
 走 Account 结算路径自动进入证明叶子承诺的 collateral。
+taker fee bps 为**每市场参数**（创世市场默认 5，新市场随 CreateMarket 提交，
+§15.2）。
 
 ### 6.2 资金费率（多空互付）
-每个双源预言机 tick 结算一次：
-index = (oracle₀ + oracle₁)/2
+每次预言机报告触发结算（该市场有效报告数 ≥ 2 时，§7）：
+index = 该市场全部已质押报价者最新报价的**中位数**（未钳位）
+spot  = 钳位后的 marks[market]
 diff_bps = clamp((spot−index)×10000/index, ±FUNDING_CAP_BPS=50)
 每账户 payment = signed_notional(pos.qty, oracle_a) × diff_bps / 10000
 payer.collateral  −= payment（钳在上限 = 可用抵押内）   # 借记钳在可用抵押内
@@ -293,8 +309,6 @@ spot > index：正 payment → 多头付，空头收；反向镜像。
 
 ---
 
----
-
 ## 7. 预言机与 mark 价格
 
 ### 7.1 mark 的三重防线
@@ -303,25 +317,36 @@ spot > index：正 payment → 多头付，空头收；反向镜像。
 |---|---|---|
 | 名义额门槛 | notional ≥ 100 USD 的成交才有资格动 mark | 灰尘单无法操纵 |
 | 偏离帽 | 新价相对旧 mark 偏移 ≤ ±10%（旧价 > 0 时） | 单笔巨价无法跳变 |
-| 预言机权威 | 一旦市场有任一预言机源报价，成交永久失去 mark 定价权 | 撮合层与定价层解耦 |
+| 预言机权威 | 一旦市场有任一有效预言机报价，成交永久失去 mark 定价权 | 撮合层与定价层解耦 |
 
-### 7.2 双预言机源
+### 7.2 债券注册制 + 中位数定价
 
 ```
-Op::OracleSet { oracle, source: u8(0|1), market, price }
+Op::ReportPrice { oracle, market, price }        # canonical tag 6
 ```
 
-- `oracle` 必须在 `trusted_oracles` 白名单（空集 = 无预言机可用），
-  且与签名者一致
-- 报价存入 `oracle_marks[(source, market)]`
-- 有效 mark = 可用源均值；单源先到先用该源
-- 写入 marks 前过 ±10% 帽（首个报价无条件设定）
-- price = 0 的报价被忽略
+无许可注册：任何人向侧链质押 `ORACLE_BOND_PERP = 50_000` PERP 即成为
+报价者；债券记入 `oracle_bonds`，无白名单、无审批。
+
+规则：
+
+- `price == 0` 或 `(market, oracle)` 无债券的报价被忽略（exec 层前置
+  校验，state 层防御性忽略）
+- 最新报价存入 `oracle_reports[(market, oracle)]`——每记者每市场一价，
+  新报价覆盖旧报价
+- 有效报价者集合 = 有债券且有最新报价的账户；对同一市场取全部价格的
+  **中位数**：奇数取正中，偶数取较小中间值（确定性，任何副本一致）
+- `last_index[market] = 中位数`（未钳位，资金费率 index 用）
+- spot 写入 `marks[market]` 前过 ±10% 帽（首个报价无条件设定）
+- 该市场有效报告数 ≥ 2 时，每次 report 触发一次资金费结算（§6.2）
+
+解除资格 = 通过 GovWithdraw 提走债券；`(market, oracle)` 一旦无债券，
+其后续报价自动失效。MVP 不设解锁延迟。
 
 ### 7.3 无 TWAP 时的残余风险
 
-±10% 帽允许攻击者以每 tick 10% 步进逐渐走偏 mark（需真实成交或双源
-配合）。完整解法是 TWAP 或外部多源中位数——Phase 2。
+±10% 帽允许攻击者以每 tick 10% 步进逐渐走偏 mark；中位数要求腐化按
+债券计的多数报价者配合。完整解法是 TWAP 或外部多源——Phase 2。
 
 ---
 
@@ -383,12 +408,21 @@ last_unit 不符 ∨ state_root 不符             → RootMismatch
 
 ```
 account_leaf = sha256("acct" ‖ id32 ‖ collateral_i128le16
-                      ‖ realized_i128le16 ‖ pos_count_u32le ‖ positions…)
-book_leaf    = sha256(b"book" ‖ market_le4 ‖ [price_le8 ‖ (order_id32 ‖
-               remaining_le8)*]*)
-               # 提交每一个价格档与每个活单（order_id + remaining），
-               # 非仅最优买卖价与单数——簿深度本身成为被承诺的共识状态
-meta_leaf    = sha256(b"meta" ‖ height_le ‖ seq_le ‖ last_unit)
+                      ‖ realized_i128le16 ‖ pos_count_u32le ‖ positions…
+                      ‖ perp_u128le16)
+               # perp 取自 perp_balances（PERP 治理余额，§15），
+               # 与 collateral 并列进入承诺
+book_leaf    = sha256(params_57B ‖ b"book" ‖ market_le4 ‖ [price_le8 ‖
+               (order_id32 ‖ remaining_le8)*]*)
+               # params_57B = symbol16 ‖ tick_size_le8 ‖ im_bps_le8
+               #   ‖ mm_bps_le8 ‖ taker_fee_bps_le8 ‖ keeper_reward_bps_le8
+               #   ‖ delisted_u8（定宽 57 字节）——市场参数本身成为被承诺
+               #   的共识状态；同时提交每一个价格档与每个活单，
+               #   簿深度与参数都逃不过审计
+meta_leaf    = sha256(b"meta" ‖ height_le ‖ seq_le ‖ last_unit
+                      ‖ perp_burned_le16 ‖ next_market_id_le4
+                      ‖ next_proposal_id_le8)
+               # 新游标承诺治理计数器，防重放歧义
 ```
 
 meta_leaf 绑定 height（from_applied 先把 engine.state.height 推到
@@ -402,13 +436,13 @@ Oscript 的 `sha256()` 对参数 UTF-8 文本哈希且默认输出 base64——�
 无法在 AA 内复算。因此另建同构字符串树：
 
 ```
-leaf = sha256_hex("acct:" + address + ":" + collateral十进制串)
+leaf = sha256_hex("acct:" + address + ":" + collateral十进制串
+                  + ":" + perp十进制串)
 node = sha256_hex(left_hex + right_hex)
 ```
-
-Rust `aa_root_of(pairs)` / `aa_proof_for(pairs, addr)` 构造；
-AA 用 `sha256(x, 'hex')` 复算。两树承诺相同 (地址, 抵押) 集。
-经探针 AA 对拍验证 root 逐字节一致。
+Rust `aa_root_of(pairs)` / `aa_proof_for(pairs, addr)` 构造（pairs 三元组
+`(地址, 抵押, PERP 余额)`）；AA 用 `sha256(x, 'hex')` 复算。两树承诺相同
+(地址, 抵押, PERP) 集。经探针 AA 对拍验证 root 逐字节一致。
 
 ### 9.3 为什么提款用 aa_root
 
@@ -431,7 +465,9 @@ root_h, aa_root_h, stable_at_h               # 已锁定
 frozen_h ∈ {∅/0=正常, 1=已挑战, 2=永久失败}
 challenger_h, bond_<addr>, fee_winner_h,
 reward_<addr>, bal_<addr>(诊断影子账本),
-wd_<h>_<addr>                                # 提款累计标记（防证明重放）
+pperp_<addr>(PERP 影子账本，与 bal_ 同地位),
+wd_<h>_<addr>                                # 抵押提款累计标记（防证明重放）
+wp_<h>_<addr>                                # PERP 提款累计标记（语义与 wd_ 对称）
 ```
 
 ### 10.1 submit(h)
@@ -484,14 +520,19 @@ amount > 0 ∧ leaf_account == trigger.address
 wd_ 累计上限：wd_<h>_<addr> 已提累计 + amount
              ≤ 该高度证明叶子的 collateral（同一证明不可重放，
                多次提款共享同一累计上限；映射上限 65 536 条目）
+$perp 为必填 claim 字段（可为 0）；wp_ 累计上限与 wd_ 完全对称：
+             wp_<h>_<addr> 累计 + perp_claimed ≤ 叶子声明的 PERP，
+             超出 bounce('bad perp claim')；$perp_claimed > 0 才发
+             PERP asset 输出
 proof 深度 ≤ 16（reduce(...,16,...)，覆盖 2^16 账户）
-leaf  = sha256('acct:'+address+':'+collateral, 'hex')
+leaf  = sha256('acct:'+address+':'+collateral+':'+perp, 'hex')
 fold proof[]: right ? sha256(acc‖sib,'hex') : sha256(sib‖acc,'hex')
 结果 == var['aa_root_' || h]   否则 bounce('bad merkle root')
-→ 支付 trigger.address amount；bal_ 同步扣减（仅诊断）
+→ 支付 trigger.address amount（+ $perp_claimed 的 PERP）；
+  bal_/pperp_ 同步扣减（仅诊断）
 ```
 
-余额权威是 **证明叶子**，不是 bal_。bal_ 移除门控的原因：
+余额权威是 **证明叶子**，不是 bal_/pperp_。bal_ 移除门控的原因：
 它与 aa_root 是永不严格同步的双账本（费扣口径、批次延迟、回滚都会漂移），
 只会产生错误拒付；支付本身由 AA 原生余额机械兜底。
 
@@ -570,10 +611,101 @@ ingest → Applied{status: Optimistic}     # 立即执行、立即成交
 | 无 mark 市场风险失真 | 无 mark 仓位强制 reduce_only 且剔除出快照 |
 | 乱序投递 | orphan 缓冲自动恢复 |
 | 日志无限增长 | prune_below 按批裁剪 |
+| 伪造提案操纵市场参数 | 法定人数 = 流通量快照（supply_at_create）的 10% 且 yes > no 多数 + 提案期限（20 000 seqs） |
+| 女巫账户刷投票 | 投票权重 = 投票执行时刻的 PERP 余额，拆分账户不放大总权重 |
 
 ## 14. 明确的已知边界
 
 - respond 不能证明根正确（Oscript 无法重放撮合）；作恶 operator 只能
   造成停摆，配合 fee race 由诚实 operator 接管
-- 预言机为白名单账户制，增减源属链下治理
+- 预言机为债券注册制（ORACLE_BOND_PERP = 50_000 PERP，无许可）；报价
+  质量取决于质押者的诚实度——按债券计的多数仍可合谋偏置中位数
 - 无第三方安全审计；Oscript 复杂度预算迫使逻辑拆分为辅助函数
+
+---
+
+## 15. PERP 治理
+
+PERP 是 Obyte 原生治理资产，围绕它实现三件事：无许可市场上架、债券
+注册制预言机（§7）、链上提案投票改参。资产 ID 在发币前未知，全部以
+占位常量落地：Rust 侧 `PERP_ASSET: AssetId = [0u8; 32]`，Oscript/JS 侧
+字面量 `'PERP_ASSET_ID_HERE'`，部署脚本加载 .aa 后做字符串替换写入真实
+asset id。发币时只需改一个常量并重新部署 AA。
+
+### 15.1 记账模型：侧链镜像
+
+不新建第二个 AA——扩展现有 vault AA 接收 PERP 充值：
+
+- **GovDeposit**（tag 8）：镜像现有 deposit——`seen_aa_units` 去重、
+  `deposits_allowed` 白名单（同一集合，replay 时由批次内 GovDeposit ops
+  注入交叉校验），入账 `perp_balances[account] += amount`，
+  `perp_supply += amount`
+- **GovWithdraw**（tag 9）：共享 withdrawals 表与 65 536 条目上限；
+  无 reduce-only 检查；AA 侧走扩展后的双币种 Merkle 证明提款
+  （§10.6，叶子含 perp 字段）
+
+`perp_supply` 定义为可赎回流通量：Σ 充值 − 提款 − 烧毁。
+
+### 15.2 无许可市场上架
+
+**CreateMarket**（tag 10）：任何人可上架，代价是烧毁
+`CREATE_MARKET_FEE_PERP = 10_000` PERP 上架费。市场参数随 op 提交
+（symbol、tick_size、im_bps、mm_bps、taker_fee_bps、keeper_reward_bps），
+存入 `markets[market_id]`——IM/MM/taker fee/keeper 奖励从全局常量变为
+**每市场参数**（§4.2/§5.2/§6.1 相应改为读参数）。tick_size 或任一 bps
+为 0 → Risk 拒绝。簿不预建，沿用 `book_mut` 惰性创建。
+
+delisted 市场（见 15.3 Delist 提案）拒绝新挂单；撤单与清算平仓仍允许
+(清算路径不经 place 校验)。MVP 不做强制拍卖：存量仓位只能平仓或被清算。
+
+### 15.3 提案投票
+
+**CreateProposal**（tag 11）：创建者对指定市场提交参数修改提案，`key` 取
+`ParamKey`（ImBps/MmBps/TakerFeeBps/KeeperRewardBps/Delist）；bps 键的
+value ≤ 10 000、Delist 键的 value 必须为 0，否则 Risk 拒绝。创建门槛：
+创建者 PERP 余额 ≥ `PROPOSAL_MIN_STAKE_PERP = 1_000`（仅门槛检查，
+质押不锁定）。提案登记即固定两个快照：`created_seq` 与 quorum 分母
+`supply_at_create = perp_supply`——期限与法定人数在创建时刻确定，任何副本
+重放得出相同的通过判定。
+
+**Vote**（tag 12）：权重 = **投票 unit 执行时刻**的 PERP 余额。MVP 不存
+创建时的余额快照映射——余额随充值/提款/烧毁实时变化，文档如实表述；
+拆分账户不放大总权重（§13）。每账户一票（`voted` 集合去重）；期限
+`seq < deadline_seq = created_seq + PROPOSAL_DURATION_SEQS
+= created_seq + 20_000 seqs`。
+
+**FinalizeProposal**（tag 13）：任何人可触发，须 `seq ≥ deadline_seq` 且
+未 finalized。通过条件：
+
+```
+yes > no  ∧  yes × PROPOSAL_QUORUM_DEN(100)
+              ≥ supply_at_create × PROPOSAL_QUORUM_NUM(10)
+```
+
+即赞成票超过流通量快照的 **10%**。分母用创建时快照而非当前 supply：
+烧毁/提款导致的后续流通量变化不会改写历史提案的通过判定（重放确定性的
+另一面）。通过后立即应用：bps 键写回 `markets[m]` 对应字段；Delist 键置
+`delisted = true`——delisted 市场拒绝新挂单，存量仓位只能平仓或被清算
+（§15.2）。
+
+### 15.4 烧毁语义
+
+烧毁统一走 `burn_perp`：目前唯一入口是 CreateMarket 的上架费
+`CREATE_MARKET_FEE_PERP = 10_000`（预言机罚没为规划项，MVP 未实现）。
+烧毁 = 从 `perp_balances` 扣除并累计 `perp_burned` 统计量，**同时等额扣减
+`perp_supply`**：supply 定义为可赎回流通量，通缩使后续提案的 quorum
+分母随之收缩。
+
+审计对账口径：侧链烧毁只动镜像账本，对应的真实 PERP **永久滞留在 vault
+AA 中、不做链上销毁 sweep**——AA 对 PERP 处于超抵押状态。这是有意设计：
+可赎回总量按 `perp_supply` 通缩，而链上 AA 余额不减少。对账时切勿把
+"AA 持有 > Σ 可赎回"误判为资损缺口；差额恰等于 `perp_burned`。
+
+### 15.5 债券解锁
+
+预言机债券记入 `oracle_bonds`，与可自由支配的 `perp_balances` 分离：进入
+债券的 PERP 不计投票权重、不可直接提款。解锁 = 通过 GovWithdraw 提走债券
+金额，走与其他 PERP 完全相同的双币种 Merkle 证明出金路径（§10.6）。
+`(market, oracle)` 一旦无债券，其最新报价立即退出中位数集合、后续报价被
+防御性忽略（§7.2）。MVP 不设解锁延迟/退出排队：撤债即时生效，报价者抽走
+债券即同时放弃全部市场的报价资格。

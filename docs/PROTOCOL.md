@@ -105,16 +105,19 @@ reduce_only      : equity·10000 ≤ mm·12000
   （collateral 吸收缺口），保险基金 collateral 等额扣减——守恒、且后续
   成交不会重复触发。损失社会化到基金，绝不转嫁对手方。
 - **mark 三重防线**：① notional ≥ 100 USD 才可更新；② 新价相对旧 mark
-  偏离不得超过 ±10%；③ 一旦市场有预言机报价（`Op::OracleSet`，双源均值，
-  白名单账户签名），成交价即失去 mark 定价权。资金费率：每个双源 tick 按
+  偏离不得超过 ±10%；③ 一旦市场有债券注册报价者的报价（`Op::ReportPrice`，
+  全部已质押报价者最新价的**中位数**，§7），成交价即失去 mark 定价权。
+  资金费率：有效报告数 ≥ 2 时每次 report 触发一次结算，按
   (spot − index)/index（钳 ±50bps）在多空之间转移。付款方借记被钳在其
   可用抵押内，收款方入账以实际扣减总额封顶——严格守恒、不产生负余额；
   保险基金作为普通账户参与（可持有清算对冲仓位）。
 
-### 2.5 市场与存款白名单
+### 2.5 市场准入与存款白名单
 
-- `allowed_markets: HashSet<MarketId>` 默认仅 BTC_USD；place() 在惰性建簿之前
-  校验，任意 `MarketId(u32)` 无法撑爆 books / Merkle 叶子集合。
+- 市场无许可上架：`markets: BTreeMap<MarketId, MarketParams>` 创世仅含
+  BTC_USD，其余任何人可经 CreateMarket 烧毁 `CREATE_MARKET_FEE_PERP` 上架费
+  创建（IM/MM/费率成为每市场参数）——上架有真实成本，任意 `MarketId(u32)`
+  无法撑爆 books / Merkle 叶子集合。
 - `deposits_allowed: HashSet<aa_unit>`：deposit op 引用的 AA 存款事件必须出现在
   本批次窗口的白名单里，否则 `UnbackedDeposit` 拒绝——存款不能凭空铸造。
   生产路径中该集合来自真实 Obyte AA 存款事件；replay 时由
@@ -134,9 +137,17 @@ reduce_only      : equity·10000 ≤ mm·12000
 叶子 = 账户叶 ∥ 订单簿叶 ∥ meta 叶，排序后两两合并（奇数复制末位）：
 
 ```
-account_leaf = sha256("acct" ‖ id32 ‖ collateral_le16 ‖ realized_le16
-                      ‖ pos_count_u32 ‖ [market_le4 qty_le8 entry_le8]*)
-meta_leaf    = sha256("meta" ‖ height_le ‖ seq_le ‖ last_unit)
+account_leaf = sha256("acct" ‖ id32 ‖ collateral_i128le16 ‖ realized_i128le16
+                      ‖ pos_count_u32 ‖ [market_le4 qty_le8 entry_le8]*
+                      ‖ perp_u128le16)
+               # perp = PERP 治理余额（§7），与抵押并列进入承诺
+book_leaf    = sha256(params_57B ‖ 簿承诺)
+               # params_57B = symbol16‖tick_le8‖im_le8‖mm_le8‖taker_le8
+               #   ‖keeper_le8‖delisted1B——市场参数本身成为被承诺状态
+meta_leaf    = sha256("meta" ‖ height_le ‖ seq_le ‖ last_unit
+                      ‖ perp_burned_le16 ‖ next_market_id_le4
+                      ‖ next_proposal_id_le8)
+               # 治理游标一并承诺，防重放歧义
 ```
 
 **meta_leaf 包含 height**，且 `from_applied` 执行后会把 `engine.state.height`
@@ -149,13 +160,14 @@ Oscript 的 `sha256()` 对参数的 UTF-8 文本做哈希（默认输出 base64�
 字节级树无法在 AA 内复算，因此另建一棵**同构但键为字符串**的树：
 
 ```
-leaf = sha256_hex("acct:" ++ address ++ ":" ++ collateral十进制串)
+leaf = sha256_hex("acct:" ++ address ++ ":" ++ collateral十进制串
+                  ++ ":" ++ perp十进制串)
 node = sha256_hex(left ++ right)
 ```
 
 Rust 侧 `aa_root_of(pairs)` / `aa_proof_for(pairs, addr)` 构造与证明；
 AA 侧用纯字符串拼接 + `sha256(x, 'hex')` 复算。两棵树承诺完全相同的
-(地址, 抵押) 集合。这个设计经过探针 AA 对拍验证：两边 root 逐字节一致。
+(地址, 抵押, PERP) 集合。这个设计经过探针 AA 对拍验证：两边 root 逐字节一致。
 
 ### 3.3 fills_hash / fill_count
 
@@ -188,6 +200,19 @@ frozen_h ∈ {∅/0=正常, 1=已挑战, 2=永久失败}
 challenger_h, bond_<address>               # 挑战 bond 记账
 wd_<h>_<addr>                              # 提款累计标记（防证明重放）
 ```
+
+侧链 ChainState 新增（PERP 治理，§7）：
+
+```
+markets, next_market_id                     # 无许可市场表与上架游标
+perp_balances, perp_supply, perp_burned     # PERP 镜像账本与烧毁统计
+proposals, next_proposal_id                 # 提案表与提案游标
+oracle_reports, oracle_bonds, last_index    # 债券注册报价与中位数 index
+```
+
+AA 侧同步新增：`pperp_<addr>`（PERP 影子账本）、`wp_<h>_<addr>`
+（PERP 提款累计标记，语义与 `wd_` 对称）。生命周期伪代码不变——
+PERP 提款复用同一 withdraw 分支，仅叶子多一段 `:perp`。
 
 ### 生命周期（高度 h）
 
@@ -260,5 +285,28 @@ Oscript 实现细节（踩过的坑）：
 ## 6. 已知局限
 
 见 README「Limitations & mainnet readiness」。核心三条：respond 只校验
-operator 重发的根（真欺诈证明缺失）、无费用/资金费率模型、mark 来自近期成交
-（TWAP 缺位）。主网部署前需解决并做正式 oscript 审计。
+operator 重发的根（真欺诈证明缺失）、无费用模型、报价质量取决于债券质押者
+（TWAP 缺位，按债券计的多数可合谋偏置中位数）。主网部署前需解决并做正式
+oscript 审计。
+
+## 7. 治理动机：PERP
+
+把白名单换成资产。协议最初的三处中心化硬编码——市场准入
+（`allowed_markets`）、预言机来源（`trusted_oracles`）、风险费率——分别由
+PERP 的三个机制接管：
+
+- **无许可市场上架**：上架成本 = 烧毁 10 000 PERP。烧毁而非收费，意味着
+  上架费不流向任何受益人（没有"收钱上架"的寻租空间），而是让全体持有者
+  的流通量通缩；同时给垃圾市场一个真实价格门槛。
+- **债券注册制预言机**：报价资格 = 质押 50 000 PERP 债券。债券是皮肤在
+  游戏里的押金——为未来的罚没路径预留；中位数聚合让单点操纵无效，腐化
+  必须收买按债券计的多数。
+- **链上提案投票**：参数修改（IM/MM/费率/Delist）走 CreateProposal → Vote →
+  FinalizeProposal，全部是普通签名 unit、按 DAG 确定性线性化执行——治理
+  不需要新的共识机制，重放即审计。投票权重取投票执行时刻的余额（MVP
+  语义，避免存整份快照映射）；quorum 分母用创建时的 `supply_at_create`
+  快照，保证通过判定与重放时刻的流通量无关。
+
+记账上 PERP 走侧链镜像（复用 vault AA 与双 Merkle 树，叶子各加一段 perp
+字段），烧毁只在镜像账本进行——对应真实 PERP 永久滞留 AA，协议整体对
+PERP 超抵押。精确规则见 [MECHANISMS.md](MECHANISMS.md) §15。

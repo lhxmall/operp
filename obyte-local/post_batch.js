@@ -17,6 +17,20 @@
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+// ===== CONFIG: PERP governance asset ================================
+// Set to the real PERP asset id once issued; must match deploy_testnet.js.
+const PERP_ASSET_ID = "PERP_ASSET_ID_HERE";
+// ====================================================================
+
+// The .aa source carries the PERP_ASSET_ID_HERE placeholder; aa-testkit
+// reads agent definitions from disk, so materialize a substituted copy
+// and deploy that instead of the raw source.
+function resolveVaultAa() {
+  const src = fs.readFileSync(path.join(__dirname, "agents/operp_vault.aa"), "utf8");
+  const out = path.join(__dirname, "agents", ".operp_vault.resolved.aa");
+  fs.writeFileSync(out, src.replace(/PERP_ASSET_ID_HERE/g, PERP_ASSET_ID));
+  return out;
+}
 
 const aaRoot = path.join(__dirname, "..", "vendor", "aa-testkit");
 const nm = path.join(aaRoot, "node_modules");
@@ -89,7 +103,7 @@ async function main() {
     "units", (batchData.unit_ids || []).length);
 
   network = await Network.create()
-    .with.agent({ vault: path.join(__dirname, "agents/operp_vault.aa") })
+    .with.agent({ vault: resolveVaultAa() })
     .with.wallet({ poster: 5e9 })
     .run();
   const vault = network.agent.vault;

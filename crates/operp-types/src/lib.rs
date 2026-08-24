@@ -47,6 +47,92 @@ pub const KEEPER_REWARD_BPS: u64 = 100;
 /// Genesis seed collateral of the insurance fund: 10_000 USD.
 pub const INSURANCE_SEED: Usd = 10_000 * USD_SCALE as Usd;
 
+// ---------------------------------------------------------------------------
+// PERP governance asset
+//
+// The real Obyte asset id is unknown until issuance. Everything below keys off
+// `PERP_ASSET`; at issuance time the deploy flow writes the actual id into
+// this constant and substitutes `PERP_ASSET_PLACEHOLDER` inside the vault AA.
+pub type AssetId = [u8; 32];
+/// Placeholder until the PERP asset is issued; replaced by the deploy flow.
+pub const PERP_ASSET: AssetId = [0u8; 32];
+/// Literal marker embedded in `.aa` sources / deploy scripts, swapped for the
+/// real asset id string when PERP is issued.
+pub const PERP_ASSET_PLACEHOLDER: &str = "PERP_ASSET_ID_HERE";
+/// Permissionless market-listing fee, burned from the creator's PERP balance.
+pub const CREATE_MARKET_FEE_PERP: u128 = 10_000;
+/// Bond staked in PERP by a price reporter; forfeited bonds fund future slashing.
+pub const ORACLE_BOND_PERP: u128 = 50_000;
+/// Proposal voting window measured in global op-count seqs (deterministic,
+/// independent of batch boundaries).
+pub const PROPOSAL_DURATION_SEQS: Seq = 20_000;
+/// Quorum fraction: yes-votes * DEN >= supply_at_create * NUM.
+pub const PROPOSAL_QUORUM_NUM: u128 = 10;
+pub const PROPOSAL_QUORUM_DEN: u128 = 100;
+/// Minimum PERP balance to open a proposal (threshold check only, not locked).
+pub const PROPOSAL_MIN_STAKE_PERP: u128 = 1_000;
+
+/// Which per-market parameter a proposal mutates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ParamKey {
+    ImBps,
+    MmBps,
+    TakerFeeBps,
+    KeeperRewardBps,
+    Delist,
+}
+
+impl ParamKey {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            ParamKey::ImBps => 0,
+            ParamKey::MmBps => 1,
+            ParamKey::TakerFeeBps => 2,
+            ParamKey::KeeperRewardBps => 3,
+            ParamKey::Delist => 4,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(ParamKey::ImBps),
+            1 => Some(ParamKey::MmBps),
+            2 => Some(ParamKey::TakerFeeBps),
+            3 => Some(ParamKey::KeeperRewardBps),
+            4 => Some(ParamKey::Delist),
+            _ => None,
+        }
+    }
+}
+
+/// Per-market risk/fee parameters, mutable via governance proposals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarketParams {
+    /// Right-zero-padded ASCII symbol.
+    pub symbol: [u8; 16],
+    pub tick_size: Price,
+    pub im_bps: Bps,
+    pub mm_bps: Bps,
+    pub taker_fee_bps: Bps,
+    pub keeper_reward_bps: Bps,
+    pub delisted: bool,
+}
+
+/// Genesis market BTC_USD: same values as the pre-governance globals.
+pub fn genesis_params() -> MarketParams {
+    let mut symbol = [0u8; 16];
+    symbol[..7].copy_from_slice(b"BTC_USD");
+    MarketParams {
+        symbol,
+        tick_size: 1,
+        im_bps: IM_RATE_BPS,
+        mm_bps: MM_RATE_BPS,
+        taker_fee_bps: TAKER_FEE_BPS,
+        keeper_reward_bps: KEEPER_REWARD_BPS,
+        delisted: false,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TypesError {
     #[error("invalid hex")]

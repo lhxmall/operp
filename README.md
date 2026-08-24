@@ -120,10 +120,11 @@ Every batch (~512 units / 2 s) produces a `Checkpoint`:
   (which includes `height`, so roots chain across batches and reorgs break
   the hash chain visibly).
 - `aa_root` — a second tree over hex strings,
-  `leaf = sha256("acct:" + address + ":" + collateral)`,
+  `leaf = sha256("acct:" + address + ":" + collateral + ":" + perp)`,
   `node = sha256(left ‖ right)`. This exists because Oscript's `sha256()`
-  hashes UTF-8 text; it lets the vault AA verify withdrawals with pure string
-  operations while committing exactly the same balances.
+  hashes UTF-8 text; it lets the vault AA verify withdrawals (collateral and
+  PERP governance asset alike) with pure string operations while committing
+  exactly the same balances.
 - `fills_hash`/`fill_count` — commitment to executed trade flow.
 
 `Batch::validate_against` replays the posted units through a fresh engine and
@@ -150,10 +151,10 @@ Lifecycle per height *h*:
    through a separate `claim_bond` claim.
 5. **finalize** — after a clean 3600 s window the root becomes the withdrawal
    basis (`last_finalized`), strictly in height order.
-6. **withdraw** — paid **only** against a Merkle proof:
-   - claim carries `{amount, leaf_account, collateral, proof[]}`;
-   - the AA recomputes `sha256("acct:"‖address‖":"‖collateral)` and folds the
-     sibling path, requiring the result to equal `var['aa_root_' ‖ h]`;
+   - claim carries `{amount, leaf_account, collateral, perp, proof[]}`;
+   - the AA recomputes `sha256("acct:"‖address‖":"‖collateral‖":"‖perp)` and
+     folds the sibling path, requiring the result to equal
+     `var['aa_root_' ‖ h]`;
    - `leaf_account == trigger.address` (you can only prove your own address);
    - the sibling path folds via a fixed-depth `reduce(..., 16, ...)`, so
      proofs cover trees of up to 2^16 accounts;
@@ -234,11 +235,14 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    there is no automatic slashing or validity proof; enforcement relies on
    live watchers plus competing operators.
 2. **Funding rate is mark-premium based.** Longs pay shorts when the trade
-   mark runs above the dual-oracle index and vice versa (capped at ±50 bps
-   per tick), but the index is our own two-oracle average, not an external
-   exchange price — oracle quality bounds funding quality.
-3. **Oracles are whitelisted accounts**, not permissionless reporters;
-   adding/removing sources is an off-chain governance act for now.
+   mark runs above the funding index and vice versa (capped at ±50 bps
+   per tick), but the index is the **median of bonded reporters' latest
+   prices**, not an external exchange price — oracle quality bounds funding
+   quality.
+3. **Oracle quality depends on bonded reporters.** Reporting is permissionless
+   (a 50 000 PERP bond per reporter) but there is no slashing yet, so a
+   bond-majority collusion can still bias the median mark; TWAP or external
+   multi-source pricing remains future work.
 4. Failed heights roll back cleanly, but recovery depends on operators
    resubmitting corrected batches; there is no trustless escape hatch if
    every operator disappears.
@@ -248,16 +252,19 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
 Recently closed: deposit whitelisting, overflow guards, market whitelist,
 strict signatures, orphan recovery with deterministic eviction, bounded
 logs, realized-PnL settlement into collateral (profitable withdrawals),
-bad-debt clamp with conservation, taker-fee insurance income, dual-oracle
-averaged marks with deviation caps, peer-to-peer funding with
+bond-registered oracle medians with deviation caps, peer-to-peer funding with
 collateral-aware clamps, multi-operator fee race with consolation payments,
 operator identity gate on `respond`, Final-status promotion, on-chain
 batch data poster, non-head cancel depth correctness, maker-queue pop
 regression, proof-withdrawal decoupled from the diagnostic `bal_` ledger,
 height-bound `state_root` (meta leaf commits the batch height), full book
 commitment (every price level and resting order), withdraw anti-replay
-marker (`wd_<h>_<addr>`), bond recovery via `claim_bond`, and a bounded
-(65 536-entry) withdrawals map.
+marker (`wd_<h>_<addr>`), bond recovery via `claim_bond`, a bounded
+(65 536-entry) withdrawals map, and PERP governance — sidechain-mirrored
+PERP deposits/withdrawals (perp fields in both Merkle leaves), permissionless
+market listing with burned listing fees (per-market risk params), and
+on-chain parameter proposals with balance-weighted voting, snapshot quorum,
+and bond-registered oracle reporting.
 
 See the commit history for the full security-audit remediation this repo
 went through (proof-gated withdrawals, deposit whitelisting, overflow

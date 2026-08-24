@@ -1,7 +1,7 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use operp_types::{
-    account_id_from_pubkey, sha256, AccountId, MarketId, OrderId, OrderType, Price, Qty, Side,
-    TimeInForce, UnitId, Usd, MAX_PARENTS,
+    account_id_from_pubkey, sha256, AccountId, Bps, MarketId, OrderId, OrderType, Price, Qty,
+    Side, TimeInForce, UnitId, Usd, MAX_PARENTS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -32,14 +32,54 @@ pub enum Op {
         amount: Usd,
         nonce: u64,
     },
-    /// Oracle price set: must be signed by a whitelisted oracle account
-    /// (ChainState::trusted_oracles). Two independent sources feed the mark;
-    /// the effective mark is the average of available sources.
-    OracleSet {
+    /// Bonded-oracle price report: writes/updates the reporter's latest quote
+    /// for `market`; the effective mark is the median across reporters.
+    ReportPrice {
         oracle: AccountId,
-        source: u8,
         market: MarketId,
         price: Price,
+    },
+    /// Deposit of the PERP governance asset, mirrored from the vault AA.
+    /// `aa_unit` is the AA unit that paid the asset; replay-protected.
+    GovDeposit {
+        account: AccountId,
+        amount: u128,
+        aa_unit: [u8; 32],
+    },
+    /// Merkle-proof withdrawal of PERP via the vault AA.
+    GovWithdraw {
+        account: AccountId,
+        amount: u128,
+        nonce: u64,
+    },
+    /// Permissionless market creation. Burns `CREATE_MARKET_FEE_PERP` from
+    /// the creator's PERP balance and registers per-market risk parameters.
+    CreateMarket {
+        creator: AccountId,
+        symbol: [u8; 16],
+        tick_size: Price,
+        im_bps: Bps,
+        mm_bps: Bps,
+        taker_fee_bps: Bps,
+        keeper_reward_bps: Bps,
+    },
+    /// On-chain parameter proposal for `market`; `key` is a `ParamKey` u8.
+    CreateProposal {
+        creator: AccountId,
+        market: MarketId,
+        key: u8,
+        value: u64,
+    },
+    /// Vote on an open proposal; weight = voter's PERP balance at execution.
+    Vote {
+        voter: AccountId,
+        proposal_id: u64,
+        approve: bool,
+    },
+    /// Finalize a proposal once past its deadline; anyone may call.
+    FinalizeProposal {
+        caller: AccountId,
+        proposal_id: u64,
     },
     /// Keeper-initiated liquidation. `caller` is the keeper requesting it and
     /// receives the keeper reward; signature must belong to `caller`.
@@ -129,17 +169,80 @@ pub fn canonical_bytes(unit: &Unit) -> Vec<u8> {
             b.extend_from_slice(&amount.to_le_bytes());
             b.extend_from_slice(&nonce.to_le_bytes());
         }
-        Op::OracleSet {
+        Op::ReportPrice {
             oracle,
-            source,
             market,
             price,
         } => {
             b.push(6);
             b.extend_from_slice(&oracle.0);
-            b.push(*source);
             b.extend_from_slice(&market.0.to_le_bytes());
             b.extend_from_slice(&price.to_le_bytes());
+        }
+        Op::GovDeposit {
+            account,
+            amount,
+            aa_unit,
+        } => {
+            b.push(8);
+            b.extend_from_slice(&account.0);
+            b.extend_from_slice(&amount.to_le_bytes());
+            b.extend_from_slice(aa_unit);
+        }
+        Op::GovWithdraw {
+            account,
+            amount,
+            nonce,
+        } => {
+            b.push(9);
+            b.extend_from_slice(&account.0);
+            b.extend_from_slice(&amount.to_le_bytes());
+            b.extend_from_slice(&nonce.to_le_bytes());
+        }
+        Op::CreateMarket {
+            creator,
+            symbol,
+            tick_size,
+            im_bps,
+            mm_bps,
+            taker_fee_bps,
+            keeper_reward_bps,
+        } => {
+            b.push(10);
+            b.extend_from_slice(&creator.0);
+            b.extend_from_slice(symbol);
+            b.extend_from_slice(&tick_size.to_le_bytes());
+            b.extend_from_slice(&im_bps.to_le_bytes());
+            b.extend_from_slice(&mm_bps.to_le_bytes());
+            b.extend_from_slice(&taker_fee_bps.to_le_bytes());
+            b.extend_from_slice(&keeper_reward_bps.to_le_bytes());
+        }
+        Op::CreateProposal {
+            creator,
+            market,
+            key,
+            value,
+        } => {
+            b.push(11);
+            b.extend_from_slice(&creator.0);
+            b.extend_from_slice(&market.0.to_le_bytes());
+            b.push(*key);
+            b.extend_from_slice(&value.to_le_bytes());
+        }
+        Op::Vote {
+            voter,
+            proposal_id,
+            approve,
+        } => {
+            b.push(12);
+            b.extend_from_slice(&voter.0);
+            b.extend_from_slice(&proposal_id.to_le_bytes());
+            b.push(u8::from(*approve));
+        }
+        Op::FinalizeProposal { caller, proposal_id } => {
+            b.push(13);
+            b.extend_from_slice(&caller.0);
+            b.extend_from_slice(&proposal_id.to_le_bytes());
         }
         Op::Liquidate {
             caller,
@@ -161,8 +264,8 @@ pub fn unit_id(unit: &Unit) -> UnitId {
 }
 
 /// Verify a unit's ed25519 signature against an ALREADY-COMPUTED unit id, so
-/// callers that hash once (e.g. `Engine::ingest`) never pay a second sha256.
-/// Also checks the op's account/caller/oracle field matches the signing key.
+/// Also checks the op's signing-account field (account/caller/oracle/creator/
+/// voter) matches the signing key.
 pub fn verify_sig_by_id(unit: &Unit, id: &UnitId) -> bool {
     let vk = match VerifyingKey::from_bytes(&unit.pubkey) {
         Ok(v) => v,
@@ -180,9 +283,14 @@ fn account_matches(unit: &Unit) -> bool {
         Op::Place { account, .. }
         | Op::Cancel { account, .. }
         | Op::Deposit { account, .. }
-        | Op::Withdraw { account, .. } => *account == expected,
-        Op::Liquidate { caller, .. } => *caller == expected,
-        Op::OracleSet { oracle, .. } => *oracle == expected,
+        | Op::Withdraw { account, .. }
+        | Op::GovDeposit { account, .. }
+        | Op::GovWithdraw { account, .. } => *account == expected,
+        Op::Liquidate { caller, .. } | Op::FinalizeProposal { caller, .. } => *caller == expected,
+        Op::ReportPrice { oracle, .. } => *oracle == expected,
+        Op::CreateMarket { creator, .. } => *creator == expected,
+        Op::CreateProposal { creator, .. } => *creator == expected,
+        Op::Vote { voter, .. } => *voter == expected,
     }
 }
 

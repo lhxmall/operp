@@ -40,7 +40,7 @@ fn run_shard(shard_idx: usize, cfg: &Cfg) -> (u64, u64, u64) {
     let market = MarketId(shard_idx as u32 + 1);
     let mut eng = Engine::new();
     eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
-    eng.state.allowed_markets.insert(market);
+    eng.state.markets.insert(market, operp_types::genesis_params());
 
     // seed mark for this market via first trade: place resting ask before bids.
     // ChainState::new() only seeds BTC_USD mark; other markets get mark from

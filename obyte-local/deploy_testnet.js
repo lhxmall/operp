@@ -16,6 +16,20 @@
 const path = require("path");
 const fs = require("fs");
 
+// ===== CONFIG: PERP governance asset ================================
+// Set to the real PERP asset id once issued, then redeploy the AA.
+const PERP_ASSET_ID = "PERP_ASSET_ID_HERE";
+// ====================================================================
+
+// The .aa source carries the PERP_ASSET_ID_HERE placeholder; aa-testkit
+// reads agent definitions from disk, so materialize a substituted copy
+// and deploy that instead of the raw source.
+function resolveVaultAa() {
+  const src = fs.readFileSync(path.join(__dirname, "agents/operp_vault.aa"), "utf8");
+  const out = path.join(__dirname, "agents", ".operp_vault.resolved.aa");
+  fs.writeFileSync(out, src.replace(/PERP_ASSET_ID_HERE/g, PERP_ASSET_ID));
+  return out;
+}
 const aaRoot = path.join(__dirname, "..", "vendor", "aa-testkit");
 const nm = path.join(aaRoot, "node_modules");
 process.env.NODE_PATH = [nm, process.env.NODE_PATH].filter(Boolean).join(path.delimiter);
@@ -31,7 +45,7 @@ const { Network } = Testkit({
 async function main() {
   console.log("deploying operp_vault.aa to TESTNET ...");
   const network = await Network.create()
-    .with.agent({ vault: path.join(__dirname, "agents/operp_vault.aa") })
+    .with.agent({ vault: resolveVaultAa() })
     .with.wallet({ operator: 1e9 })
     .run();
 
@@ -65,6 +79,7 @@ async function main() {
     vault_aa_address: vault,
     chain_id: "operp-mvp-1",
     stability_secs: 600,
+    perp_asset_id: PERP_ASSET_ID,
     challenge_secs: 3600,
     bounce_fee_base: 10000,
     challenge_bond_min: 20000,

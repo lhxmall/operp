@@ -54,7 +54,9 @@ fn main() {
     // and all markets the generators will use.
     eng0.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
     for m in 1..=16u32 {
-        eng0.state.allowed_markets.insert(MarketId(m));
+        eng0.state
+            .markets
+            .insert(MarketId(m), operp_types::genesis_params());
     }
     let eng = std::sync::Arc::new(std::sync::Mutex::new(eng0));
     let executed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
