@@ -329,6 +329,17 @@ plus PERP governance: sidechain-mirrored PERP deposits/withdrawals (perp
 fields in both Merkle leaves), permissionless market listing with burned
 listing fees (per-market risk params), and on-chain parameter proposals with
 snapshot quorum and snapshot-weighted voting.
+## Mainnet Roadmap (designs ready)
+
+The 11 gaps above each have a concrete design in [`docs/mainnet/`](docs/mainnet/) (516–591 lines each, 5.2k lines total) — no code edits yet, staged as v1 boring + v2 extensions:
+
+- **Ordering & gossip:** salted ordering `sha256(salt‖unit_id)` per epoch + salted eviction `argmin(sha256(root‖id))` — zero wire change, fully deterministic
+- **Deposits & fraud:** Obyte joint-carrying `deposit_evidences` verified in `validate_against` (0 AA ops) + slashing split + `validity_proof_hash` plug
+- **Oracle & funding:** 50k PERP TWAP ring (256 batches) with 3-streak deviation slashing + external-anchored funding index
+- **Liveness & accounting:** 7-day `escape_finalize`/`escape_withdraw`, `perp_burned` cumulative in `meta_leaf`, depth 16→18 (262k) now / sharded forest 1M later, 256→2048 replay window
+- **Audit:** per-branch op-count reclaimed −27 → 68/100 (+32 headroom) + 9-section checklist
+
+See [`docs/mainnet/README.md`](docs/mainnet/README.md) for the 11-doc index and staging plan. Next: implement per doc in isolated worktrees, gated by the same `cargo test` + `test_vault_aa.js` + `bench_raw` as the security-fix batch (`53106c2`).
 
 See the commit history for the full security-audit remediation this repo
 went through (proof-gated withdrawals, deposit whitelisting, overflow
