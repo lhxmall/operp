@@ -34,6 +34,33 @@ pub const MAX_PARENTS: usize = 2;
 /// proofs deeper than this cannot be evaluated on-chain, so proof generation
 /// refuses them instead of emitting an unusable path.
 pub const MAX_AA_TREE_DEPTH: usize = 16;
+// ---------------------------------------------------------------------------
+// Mainnet readiness — window & activation gates (Step 0)
+// Keep legacy constants unchanged for deterministic replay pre-activation.
+// New paths gate on `state.height >= ACTIVATION_HEIGHT`.
+pub const REPLAY_WINDOW: u64 = 2048;
+pub const REPLAY_WINDOW_LEGACY: u64 = 256;
+/// Height at which replay window expands 256→2048. Set high so existing
+/// tests (height 0..few hundred) keep legacy behavior; deployment sets to
+/// `tip+1000` or `next_finalized+1`.
+pub const REPLAY_ACTIVATION_HEIGHT: Height = 1_000_000;
+pub const ORDERING_EPOCH_UNITS: u64 = 512;
+pub const ORDERING_SALT_DOMAIN: &[u8] = b"operp-order-v1";
+pub const ORACLE_SLASH_ACTIVATION_HEIGHT: Height = 1_000_000;
+pub const FUNDING_TWAP_ACTIVATION_HEIGHT: Height = 1_000_000;
+pub const STAKE_ORACLE_TAG: u8 = 14;
+pub const UNSTAKE_ORACLE_TAG: u8 = 15;
+pub const SLASH_ORACLE_TAG: u8 = 16;
+pub const ORACLE_UNBOND_HEIGHTS: Height = 256;
+pub const ORACLE_TWAP_WINDOW: Height = 256;
+pub const ORACLE_TWAP_MAX: Height = 1800;
+pub const SLASH_DEVIATION_BPS: u64 = 500;
+pub const SLASH_TWAP_STREAK: u64 = 3;
+pub const SLASH_REWARD_BPS: u64 = 5000;
+pub const FUNDING_TWAP_WINDOW: Height = 256;
+pub const ESCAPE_STALL_SECS: u64 = 604800;
+pub const ESCAPE_STALL_SECS_TESTNET: u64 = 3600;
+pub const VAULT_AA_ADDRESS: &str = "";
 
 pub type Price = u64;
 pub type Qty = u64;

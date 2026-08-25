@@ -126,6 +126,15 @@ impl Engine {
         n
     }
 
+    pub fn note_finalized(&mut self, root: [u8; 32], height: operp_types::Height) {
+        self.state.note_finalized(root, height);
+        // Dag salt wired in Gate3 Step9; keep compile when Dag lacks setter
+        // by cfg-gating or direct call if present. For now, try to set if method exists.
+        #[allow(unused)]
+        {
+            // dag.set_eviction_salt(root) will be added in Step9
+        }
+    }
 
     fn apply_one(&mut self, id: UnitId) -> ExecEvent {
         let unit = self.dag.get(id).cloned().expect("unit in dag");
@@ -279,15 +288,14 @@ impl Engine {
         } else {
             *self.state.marks.get(&market).unwrap_or(&0)
         };
-        // Ask worst-case bound: a sell can fill at any bid up to its limit,
-        // so estimate notional at max(limit price, mark) instead of the mark
-        // alone. Checked chain; overflow is an intake DoS → Risk. Bids keep
-        // the plain limit/mark estimate (their fill price is bounded by it).
-        let px_est = if side == Side::Ask {
-            px_for_notional.max(*self.state.marks.get(&market).unwrap_or(&0))
-        } else {
-            px_for_notional
-        };
+        // Worst-case bound: estimate notional at max(limit/mark, mark) for
+        // both sides. Previously Ask used max but Bid used mark alone, under-
+        // estimating margin for Market Bids. Also gate unknown market.
+        if !self.state.markets.contains_key(&market) {
+            return Err(RejectReason::Risk);
+        }
+        let mark = *self.state.marks.get(&market).unwrap_or(&0);
+        let px_est = px_for_notional.max(mark);
         if (px_est as u128)
             .checked_mul(qty as u128)
             .map(|n| n > i128::MAX as u128)
@@ -351,7 +359,7 @@ impl Engine {
         };
         if open_qty != 0 {
             let extra_im = bps(
-                notional_usd(open_qty.unsigned_abs(), px_for_notional),
+                notional_usd(open_qty.unsigned_abs(), px_est),
                 self.state.market_params(market).im_bps,
             );
             if snap.equity < snap.im + extra_im {
@@ -688,6 +696,9 @@ impl Engine {
         // A bps parameter above 100% is nonsensical and lets a market creator
         // set, say, an unbounded keeper reward drained from the insurance fund.
         if im_bps > 10_000 || mm_bps > 10_000 || taker_fee_bps > 10_000 || keeper_reward_bps > 10_000 {
+            return Err(RejectReason::Risk);
+        }
+        if im_bps <= mm_bps || mm_bps < 500 || im_bps > 5000 || taker_fee_bps > 200 || keeper_reward_bps > 500 {
             return Err(RejectReason::Risk);
         }
         let bal = self.state.perp_balances.get(&creator).copied().unwrap_or(0);

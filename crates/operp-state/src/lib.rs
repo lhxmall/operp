@@ -66,6 +66,9 @@ pub struct ChainState {
     /// match Usd). Committed inside the binary account leaf as `W` so the
     /// vault AA can enforce "this claim + prior claims <= W".
     pub withdrawn_total: BTreeMap<AccountId, i128>,
+    /// Last finalized AA root (for salted ordering). Genesis = sha256(b"operp-mvp-1-genesis").
+    pub last_finalized_root: [u8; 32],
+    pub last_finalized_height: Height,
 }
 
 /// An open governance proposal. `deadline_seq` and the quorum denominator
@@ -159,20 +162,58 @@ impl ChainState {
             seen_gov_nonces: HashMap::new(),
             aa_addresses: BTreeMap::new(),
             withdrawn_total: BTreeMap::new(),
+            last_finalized_root: sha256(b"operp-mvp-1-genesis"),
+            last_finalized_height: 0,
         }
     }
-    /// Drop withdrawal-ledger entries outside the 256-height replay window:
-    /// an entry signed in at height `h` still blocks replay while
-    /// `h + 256 > min_height`. Called once per committed batch, so
-    /// duplicate-withdrawal protection spans a rolling 256-height window.
-    pub fn prune_withdrawals(&mut self, min_height: Height) {
-        self.withdrawals.retain(|_, w| w.height + 256 > min_height);
+    /// General window prune (new path, activation-gated). Legacy wrappers below.
+    pub fn prune_withdrawals_at(&mut self, min_height: Height, window: u64) {
+        self.withdrawals.retain(|_, w| w.height + window > min_height);
     }
-
+    pub fn prune_aa_units_at(&mut self, min_height: Height, window: u64) {
+        self.seen_aa_units.retain(|_, h| *h + window > min_height);
+    }
+    pub fn prune_deposits_allowed_at(&mut self, min_height: Height, window: u64) {
+        let seen = &self.seen_aa_units;
+        self.deposits_allowed.retain(|(unit, _)| {
+            if let Some(h) = seen.get(unit) {
+                *h + window > min_height
+            } else {
+                false
+            }
+        });
+    }
+    /// Legacy wrappers for replay determinism pre-activation (window=256)
+    pub fn prune_withdrawals(&mut self, min_height: Height) {
+        let window = if self.height >= operp_types::REPLAY_ACTIVATION_HEIGHT {
+            operp_types::REPLAY_WINDOW
+        } else {
+            operp_types::REPLAY_WINDOW_LEGACY
+        };
+        self.prune_withdrawals_at(min_height, window);
+    }
     /// Bounded-window cleanup for AA unit dedup: units observed at height
-    /// `h` expire once `min_height >= h + 256`. Called at batch commit.
+    /// `h` expire once `min_height >= h + window`. Called at batch commit.
     pub fn prune_aa_units(&mut self, min_height: Height) {
-        self.seen_aa_units.retain(|_, h| *h + 256 > min_height);
+        let window = if self.height >= operp_types::REPLAY_ACTIVATION_HEIGHT {
+            operp_types::REPLAY_WINDOW
+        } else {
+            operp_types::REPLAY_WINDOW_LEGACY
+        };
+        self.prune_aa_units_at(min_height, window);
+    }
+    pub fn prune_deposits_allowed(&mut self, min_height: Height) {
+        let window = if self.height >= operp_types::REPLAY_ACTIVATION_HEIGHT {
+            operp_types::REPLAY_WINDOW
+        } else {
+            operp_types::REPLAY_WINDOW_LEGACY
+        };
+        // Ensure aa_units pruned first so missing-seen means expired
+        self.prune_deposits_allowed_at(min_height, window);
+    }
+    pub fn note_finalized(&mut self, root: [u8; 32], height: Height) {
+        self.last_finalized_root = root;
+        self.last_finalized_height = height;
     }
 
 

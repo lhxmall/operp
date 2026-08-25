@@ -130,10 +130,11 @@ impl Batch {
         engine.state.height = prev.height + 1;
         let height = engine.state.height;
         // Batch-commit ledger hygiene: withdrawal entries and AA-unit dedup
-        // marks only need to block replay across the 256-height challenge
-        // window; older entries are dropped so the ledgers stay bounded.
+        // marks only need to block replay across the challenge window
+        // (256 legacy, 2048 post-activation); older entries are dropped.
         engine.state.prune_withdrawals(height);
         engine.state.prune_aa_units(height);
+        engine.state.prune_deposits_allowed(height);
         let last_unit = *applied.last().unwrap();
         Ok(Self {
             chain_id: CHAIN_ID.to_string(),
@@ -215,7 +216,7 @@ impl Batch {
                 _ => {}
             }
         }
-        let pre_seq = replay.state.seq;
+        let pre_len = replay.log.len();
         for u in &self.units {
             replay.ingest(u.clone()).map_err(|_| SettleError::Replay)?;
         }
@@ -223,7 +224,7 @@ impl Batch {
         let applied_set: HashSet<&UnitId> = self.checkpoint.unit_ids.iter().collect();
         let mut fills_buf = Vec::new();
         let mut fill_count = 0u32;
-        for ev in replay.log.iter().skip(pre_seq as usize) {
+        for ev in replay.log.iter().skip(pre_len) {
             if let operp_exec::ExecEvent::Applied { unit, fills, .. } = ev {
                 if applied_set.contains(unit) {
                     fill_count += fills.len() as u32;
@@ -247,13 +248,11 @@ impl Batch {
         if self.checkpoint.last_unit != replay.state.last_unit {
             return Err(SettleError::RootMismatch);
         }
-        if replay.state.state_root() != self.checkpoint.state_root {
+        // AA root before state_root to catch W divergence (ScoutDeposit)
+        if operp_state::aa_root_of_state(&replay.state) != self.checkpoint.aa_root {
             return Err(SettleError::RootMismatch);
         }
-        // The AA-facing hex-domain tree (bound-address keyed, W committed)
-        // must also match: this catches divergence invisible to the binary
-        // root, e.g. a different address binding or withdrawn ledger.
-        if operp_state::aa_root_of_state(&replay.state) != self.checkpoint.aa_root {
+        if replay.state.state_root() != self.checkpoint.state_root {
             return Err(SettleError::RootMismatch);
         }
         Ok(())

@@ -71,24 +71,7 @@
 								var['last_locked'] = 0;
 								var['last_finalized'] = 0;
 							}
-							var['bal_' || trigger.address] = (var['bal_' || trigger.address] otherwise 0) + trigger.output[[asset=base]] - 10000;
 						}"
-					}
-				]
-			},
-			{
-				// PERP governance asset deposit: credited to a diagnostic
-				// shadow ledger only (mirror of bal_). The sidechain's
-				// GovDeposit ops (keyed by aa_unit) are the actual credit
-				// path; pperp_ exists so watchers can reconcile inflows.
-				if: "{trigger.data.deposit_perp}",
-				messages: [
-					{
-						app: "state",
-						state: "{
-							var['pperp_' || trigger.address] = (var['pperp_' || trigger.address] otherwise 0) + trigger.output[[asset='PERP_ASSET_ID_HERE']];
-						}"
-					}
 				]
 			},
 			{
@@ -317,7 +300,7 @@
 						OR $perp_claimed < 0)
 						bounce('bad claim amount');
 					$fold = ($acc, $i, $sib) => (!$acc OR !$sib.hash) ? false
-						: ($sib.right ? sha256($acc || $sib.hash, 'hex') : sha256($sib.hash || $acc, 'hex'));
+						: sha256(($sib.right ? $acc || $sib.hash : $sib.hash || $acc), 'hex');
 					$root = reduce(trigger.data.proof, 16, $fold,
 						sha256('acct:' || trigger.data.leaf_account || ':' || trigger.data.collateral || ':' || trigger.data.perp || ':' || trigger.data.withdrawn, 'hex'));
 					if ($root != var['aa_root_' || $h])
@@ -357,95 +340,29 @@
 					{
 						app: "state",
 						state: "{
-							var['bal_' || trigger.address] -= trigger.data.amount;
 							var['wd_' || trigger.address] += trigger.data.amount;
-							if ($perp_claimed > 0)
-								var['pperp_' || trigger.address] -= $perp_claimed;
 							var['wp_' || trigger.address] += $perp_claimed;
 						}"
 					}
 				]
 			},
 			{
-				// Operator race reward claim: pays the accrued byte balance.
-				// If the AA is temporarily short of funds the unit bounces and
-				// the claim stays accrued — retry later, nothing is lost.
-				if: "{trigger.data.claim_reward}",
+				if: "{trigger.data.claim OR trigger.data.claim_reward OR trigger.data.claim_bond OR trigger.data.claim_submit_bond}",
 				init: "{
-					$owed = (var['reward_' || trigger.address] otherwise 0);
-					if (!$owed OR trigger.output[[asset=base]] < 10000)
-						bounce('nothing claimable');
-				}",
-				messages: [
-					{
-						app: "payment",
-						payload: {
-							asset: "base",
-							outputs: [
-								{
-									address: "{trigger.address}",
-									amount: "{$owed}"
-								}
-							]
-						}
-					},
-					{
-						app: "state",
-						state: "{
-							var['reward_' || trigger.address] = 0;
-						}"
-					},
-				]
-			},
-			{
-				// Challenger bond claim: any address may reclaim its own
-				// recorded bond (credited at challenge time; confiscated to
-				// zero only when the operator responds successfully).
-				// Requires fee headroom only — claiming must not cost more
-				// than the bond being reclaimed.
-				if: "{trigger.data.claim_bond}",
-				init: "{
-					$owed = (var['bond_' || trigger.address] otherwise 0);
-					if (!$owed OR trigger.output[[asset=base]] < 10000)
-						bounce('nothing claimable');
-					$bh = (var['bond_height_' || trigger.address] otherwise 0);
-					if ($bh AND (var['frozen_' || $bh] otherwise 0) == 1)
-						bounce('challenge unresolved');
-				}",
-				messages: [
-					{
-						app: "payment",
-						payload: {
-							asset: "base",
-							outputs: [
-								{
-									address: "{trigger.address}",
-									amount: "{$owed}"
-								}
-							]
-						}
-					},
-					{
-						app: "state",
-						state: "{
-							var['bond_' || trigger.address] = 0;
-							var['bond_height_' || trigger.address] = 0;
-						}"
+					$kind = trigger.data.claim;
+					if (!$kind){
+						if (trigger.data.claim_reward) $kind='reward';
+						else if (trigger.data.claim_bond) $kind='bond';
+						else if (trigger.data.claim_submit_bond) $kind='sbond';
+						else bounce('bad claim kind');
 					}
-				]
-			}
-			,
-			{
-				// Released submit-bond claim: pays bonds freed by candidate
-				// replacement or successful finalization (failed heights
-				// confiscate — nothing accrues for them). If the AA is
-				// temporarily short of funds the unit bounces and the claim
-				// stays accrued — retry later, nothing is lost.
-				if: "{trigger.data.claim_submit_bond}",
-				init: "{
-					$owed = (var['sbond_' || trigger.address] otherwise 0);
-					if (!$owed OR trigger.output[[asset=base]] < 10000)
-						bounce('nothing claimable');
+					if ($kind != 'reward' AND $kind != 'bond' AND $kind != 'sbond' AND $kind != 'slash') bounce('bad claim kind');
+					$owed = ($kind=='reward' ? (var['reward_'||trigger.address] otherwise 0) : $kind=='bond' ? (var['bond_'||trigger.address] otherwise 0) : $kind=='sbond' ? (var['sbond_'||trigger.address] otherwise 0) : (var['slash_reward_'||trigger.address] otherwise 0));
+					if (!$owed OR trigger.output[[asset=base]] < 10000) bounce('nothing claimable');
+					if ($kind=='bond'){
+						$bh = (var['bond_height_'||trigger.address] otherwise 0);
+						if ($bh AND (var['frozen_'||$bh] otherwise 0) == 1) bounce('challenge unresolved');
+					}
 				}",
 				messages: [
 					{
@@ -463,7 +380,10 @@
 					{
 						app: "state",
 						state: "{
-							var['sbond_' || trigger.address] = 0;
+							if ($kind=='reward') var['reward_'||trigger.address]=0;
+							else if ($kind=='bond'){ var['bond_'||trigger.address]=0; var['bond_height_'||trigger.address]=0; }
+							else if ($kind=='sbond') var['sbond_'||trigger.address]=0;
+							else var['slash_reward_'||trigger.address]=0;
 						}"
 					}
 				]
