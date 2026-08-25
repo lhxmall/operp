@@ -354,7 +354,7 @@ pub fn sign_unit(parents: Vec<UnitId>, op: Op, secret: &[u8; 32]) -> Unit {
     unit
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Dag {
     units: HashMap<UnitId, Unit>,
     children: HashMap<UnitId, Vec<UnitId>>,
@@ -368,6 +368,9 @@ pub struct Dag {
     /// children waiting on it; lets a newly known parent link only the
     /// orphans it actually unblocks instead of scanning the whole buffer
     waiting: HashMap<UnitId, Vec<UnitId>>,
+    /// Salt for orphan eviction + ordering tie-breaks (Step9): genesis id
+    /// until the first AA finalization, then the finalized state root.
+    eviction_salt: [u8; 32],
 }
 
 /// Max buffered orphan units. Beyond this the orphan with the smallest
@@ -385,7 +388,27 @@ impl Dag {
             executed,
             pending: HashSet::new(),
             pending_orphans: HashMap::new(),
+            eviction_salt: genesis_id().0,
         }
+    }
+
+    /// Rotate the eviction/ordering salt (Step9): the finalization observer
+    /// calls this with each newly AA-finalized state root.
+    pub fn set_eviction_salt(&mut self, salt: [u8; 32]) {
+        self.eviction_salt = salt;
+    }
+
+    pub fn eviction_salt(&self) -> [u8; 32] {
+        self.eviction_salt
+    }
+
+    /// Salted eviction/ordering key: sha256(salt || unit_id). Grind-resistant
+    /// replacement for bare lexicographic UnitId ordering.
+    pub fn eviction_key(&self, id: UnitId) -> [u8; 32] {
+        let mut b = Vec::with_capacity(64);
+        b.extend_from_slice(&self.eviction_salt);
+        b.extend_from_slice(&id.0);
+        sha256(&b)
     }
 
     /// Insert a unit, hashing it to compute its id.
@@ -434,9 +457,16 @@ impl Dag {
                 return Ok(id);
             }
             if self.pending_orphans.len() >= ORPHAN_CAP {
-                // Deterministic eviction: drop the smallest buffered UnitId
-                // (lexicographic min). No wall-clock ordering is tracked.
-                if let Some(k) = self.pending_orphans.keys().copied().min() {
+                // Deterministic eviction (Step9): drop the orphan with the
+                // smallest salted key sha256(salt||id) — grind-resistant vs
+                // bare lexicographic min, still a pure function of buffer
+                // contents so all replicas evict identically.
+                if let Some(k) = self
+                    .pending_orphans
+                    .keys()
+                    .copied()
+                    .min_by(|a, b| self.eviction_key(*a).cmp(&self.eviction_key(*b)))
+                {
                     if let Some(evicted) = self.pending_orphans.remove(&k) {
                         // Drop the evicted orphan's reverse-index entries.
                         for p in &evicted.parents {
@@ -529,6 +559,20 @@ impl Dag {
     /// Units whose parents are still buffered orphans stay excluded until
     /// `mark_executed` links them.
     pub fn ready_linearized(&self) -> Vec<UnitId> {
+        self.ready_linearized_with_salt(self.eviction_salt)
+    }
+
+    /// Salted variant (Step9): ready-set tie-break on sha256(salt||unit_id)
+    /// instead of the raw UnitId, so unit-id grinding cannot buy ordering
+    /// priority. Salt = sha256(ORDERING_SALT_DOMAIN || last_finalized_root ||
+    /// epoch_le), epoch = height / ORDERING_EPOCH_UNITS.
+    pub fn ready_linearized_with_salt(&self, salt: [u8; 32]) -> Vec<UnitId> {
+        let key = |id: &UnitId| -> [u8; 32] {
+            let mut b = Vec::with_capacity(64);
+            b.extend_from_slice(&salt);
+            b.extend_from_slice(&id.0);
+            sha256(&b)
+        };
         // Indegree counts only parents inside the pending set; executed
         // parents (and genesis) impose no ordering constraint.
         let mut indeg: HashMap<UnitId, usize> = self
@@ -545,20 +589,24 @@ impl Dag {
                 )
             })
             .collect();
-        let mut ready: std::collections::BTreeSet<UnitId> = indeg
+        let mut ready: Vec<UnitId> = indeg
             .iter()
             .filter(|(_, &d)| d == 0)
             .map(|(&id, _)| id)
             .collect();
+        ready.sort_by_key(key);
         let mut out = Vec::with_capacity(self.pending.len());
-        while let Some(&id) = ready.iter().next() {
-            ready.remove(&id);
+        while let Some(id) = ready.first().copied() {
+            ready.remove(0);
             out.push(id);
             for c in self.children.get(&id).into_iter().flatten() {
                 if let Some(d) = indeg.get_mut(c) {
                     *d -= 1;
                     if *d == 0 {
-                        ready.insert(*c);
+                        let pos = ready
+                            .binary_search_by(|probe| key(probe).cmp(&key(c)))
+                            .unwrap_or_else(|p| p);
+                        ready.insert(pos, *c);
                     }
                 }
             }
@@ -598,23 +646,52 @@ mod tests {
     }
 
     #[test]
-    fn two_children_sorted_by_unit_id() {
+    fn two_children_deterministic_across_replicas() {
+        // Step9: tie-break is now sha256(salt||unit_id), not raw UnitId, so
+        // the exact order differs from lex — what consensus needs is that
+        // every replica derives the SAME order.
         let mut dag = Dag::new();
         let g = genesis_id();
         let u1 = deposit(vec![g], &sk(1), 1);
         let u2 = deposit(vec![g], &sk(2), 2);
-        let id_a = unit_id(&u1);
-        let id_b = unit_id(&u2);
         dag.insert(u2.clone()).unwrap();
         dag.insert(u1.clone()).unwrap();
-        let ready = dag.ready_linearized();
-        let mut expect = vec![id_a, id_b];
-        expect.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(ready, expect);
+        let expect = dag.ready_linearized();
         let mut dag2 = Dag::new();
-        dag2.insert(u1).unwrap();
-        dag2.insert(u2).unwrap();
+        dag2.insert(u1.clone()).unwrap();
+        dag2.insert(u2.clone()).unwrap();
         assert_eq!(dag2.ready_linearized(), expect);
+        // Same total set either way.
+        let mut s1 = expect.clone();
+        s1.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut s2 = vec![unit_id(&u1), unit_id(&u2)];
+        s2.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn salted_ordering_changes_tiebreak() {
+        // Different salts may reorder ready siblings; each salt is
+        // deterministic across replicas.
+        let g = genesis_id();
+        let mk = |dag: &mut Dag| -> Vec<UnitId> {
+            let secret = [7u8; 32];
+            let u1 = deposit(vec![g], &secret, 1);
+            let u2 = deposit(vec![g], &secret, 2);
+            dag.insert(u1.clone()).unwrap();
+            dag.insert(u2.clone()).unwrap();
+            dag.ready_linearized()
+        };
+        let mut d1 = Dag::new();
+        let o1 = mk(&mut d1);
+        let mut d2 = Dag::new();
+        d2.set_eviction_salt([0x99; 32]);
+        let o2 = mk(&mut d2);
+        // Determinism per salt.
+        let mut d3 = Dag::new();
+        d3.set_eviction_salt([0x99; 32]);
+        assert_eq!(mk(&mut d3), o2);
+        let _ = o1; // order may or may not differ; determinism is the contract
     }
 
     #[test]

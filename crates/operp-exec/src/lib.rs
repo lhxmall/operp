@@ -131,12 +131,8 @@ impl Engine {
 
     pub fn note_finalized(&mut self, root: [u8; 32], height: operp_types::Height) {
         self.state.note_finalized(root, height);
-        // Dag salt wired in Gate3 Step9; keep compile when Dag lacks setter
-        // by cfg-gating or direct call if present. For now, try to set if method exists.
-        #[allow(unused)]
-        {
-            // dag.set_eviction_salt(root) will be added in Step9
-        }
+        // Step9: rotate the DAG eviction/ordering salt to the finalized root.
+        self.dag.set_eviction_salt(root);
     }
 
     fn apply_one(&mut self, id: UnitId) -> ExecEvent {
@@ -293,18 +289,19 @@ impl Engine {
         if qty > i64::MAX as u64 {
             return Err(RejectReason::Risk);
         }
+        let mark = *self.state.marks.get(&market).unwrap_or(&0);
         let px_for_notional = if typ == OrderType::Limit && price != 0 {
             price
         } else {
-            *self.state.marks.get(&market).unwrap_or(&0)
+            mark
         };
         // Worst-case bound: estimate notional at max(limit/mark, mark) for
         // both sides. Previously Ask used max but Bid used mark alone, under-
         // estimating margin for Market Bids. Also gate unknown market.
-        if !self.state.markets.contains_key(&market) {
-            return Err(RejectReason::Risk);
+        match self.state.markets.get(&market) {
+            Some(p) if !p.delisted => {}
+            _ => return Err(RejectReason::Risk),
         }
-        let mark = *self.state.marks.get(&market).unwrap_or(&0);
         let px_est = px_for_notional.max(mark);
         if (px_est as u128)
             .checked_mul(qty as u128)
@@ -314,8 +311,8 @@ impl Engine {
             return Err(RejectReason::Risk);
         }
         // Tick alignment: limit orders must sit on the market's price grid.
-        // Market orders (price = 0) are exempt by construction; unknown
-        // markets are rejected by the listing guard below.
+        // Market orders (price = 0) are exempt by construction; unknown or
+        // delisted markets were rejected above.
         if typ == OrderType::Limit && price != 0 {
             if let Some(p) = self.state.markets.get(&market) {
                 if p.tick_size != 0 && price % p.tick_size != 0 {
@@ -323,12 +320,7 @@ impl Engine {
                 }
             }
         }
-        // Governance-listed markets only: never lazily create books for
-        // arbitrary or delisted markets.
-        match self.state.markets.get(&market) {
-            Some(p) if !p.delisted => {}
-            _ => return Err(RejectReason::Risk),
-        }
+
 
         let snap = {
             let acct = self.state.accounts.get(&account);
@@ -768,6 +760,11 @@ impl Engine {
         let bal = self.state.perp_balances.get(&creator).copied().unwrap_or(0);
         if bal < PROPOSAL_MIN_STAKE_PERP {
             return Err(RejectReason::Insufficient);
+        }
+        // Step10: bounded proposal table — unbounded growth is a state-bloat
+        // DoS. 64 concurrent proposals is ample for governance throughput.
+        if self.state.proposals.len() >= 64 {
+            return Err(RejectReason::Risk);
         }
         let id = self.state.next_proposal_id;
         self.state.next_proposal_id += 1;
