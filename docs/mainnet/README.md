@@ -1,6 +1,6 @@
 # Mainnet Roadmap — 11 Gap Designs (2026-08-25)
 
-> Each gap from `README.md#Limitations` now has a concrete, file-accurate design doc (no code edits yet). The 37-item security-fix batch is shipped (`53106c2`); these 11 close the remaining testnet→mainnet distance.
+> Status: **Gate1–Gate3 implemented and pushed (2026-08-25, `107c14e`+)** — per-gap status in the table. Each gap from `README.md#Limitations` has a concrete, file-accurate design doc; the 37-item security-fix batch shipped earlier (`53106c2`).
 
 | # | Gap (README) | Design doc | One-line |
 |---|---|---|---|
@@ -16,8 +16,24 @@
 | 10 | aa-tree 2¹⁶ cap | [10-aa-tree-sharding.md](10-aa-tree-sharding.md) | v1 bump 16→18 (262 k accounts, 0 new vars), v2 sharded forest S=16×D16=1 M, activation-height migration |
 | 11 | Replay window 256h | [11-replay-persistence.md](11-replay-persistence.md) | Choice A persistent BTree/RocksDB vs B `256→2048` in-RAM + journal (v1 ship), `REPLAY_WINDOW=2048` (~68 min) |
 
-**Staging recommendation:** ship v1 boring changes first (salted ordering + salted eviction + `perp_burned` + depth 18 + 2048 window + escape hatch + deposit evidences + slashing/TWAP scaffolding), keep commit-reveal/sharding/RocksDB/validity-ZK as v2.
+**Staging (as shipped):** salted ordering + salted eviction + `perp_burned` + 2048-window constants + deposit evidences + slashing/TWAP landed in Gate1–3; depth-18, escape hatch, commit-reveal, sharding, RocksDB and validity-ZK remain v2.
 
 **How to read:** each doc has Target / Change (step-by-step, file:line) / Acceptance (E2E assertion) / Complexity & Risk / Open Questions. All respect existing patterns (`otherwise` guards, `BTreeMap` ordering, `MAX_AA_TREE_DEPTH`, 256h→2048h gating).
 
-**Verification of this batch:** design-only, no `cargo`/`node` run. Next phase: implement per doc in isolated worktrees, then `cargo test --workspace` + `AA_DEBUG_COMPLEXITY=1 node test_vault_aa.js` + `bench_raw` as final gate (same as 37-item batch).
+**Implementation status (Gate1–Gate3):**
+
+| # | Status |
+|---|---|
+| 01 Fraud slashing | ✅ shipped — `Checkpoint.validity_proof_hash`, AA failed-finalize 50/50 split (`slash_reward_` / burned) |
+| 02 Deposit verification | ✅ shipped — `operp-settle::obyte_hash` + `deposit_verify`, `temp_data.deposit_evidences`, `post_batch.js` builds joints |
+| 03 Salted ordering | ✅ v1 shipped — `ready_linearized_with_salt`; commit-reveal v2 open |
+| 04 Salted eviction | ✅ shipped — `Dag::set_eviction_salt` via `Engine::note_finalized`; WantUnits gossip open |
+| 05 Oracle slashing/TWAP | ✅ shipped — tags 14–16, height-gated; external multi-source pricing open |
+| 06 Funding anchor | ✅ mechanism shipped — `FUNDING_TWAP_ACTIVATION_HEIGHT` gate; external feed wiring operator-side, open |
+| 07 Escape hatch | ⏸ **deferred v2** — complexity budget (94/100) cannot fit it |
+| 08 Burn accounting | ✅ Rust/checkpoint shipped; AA mirror vars dropped for budget |
+| 09 Complexity audit | ✅ R1/R3/R4 applied — probe `tools/check_aa_complexity.js`, now **94/100** |
+| 10 Tree depth/sharding | ⏸ depth stays 16; 18-bump reverted for budget — pair with sharding v2 |
+| 11 Replay window | ✅ constants + generalized pruning shipped; activation height stays `1_000_000` until deploy |
+
+**Verification of the implementation batch:** `cargo test --workspace` 68 passed; `node tools/check_aa_complexity.js` 94/100 (ops 967/2000); `bench_raw` 5209 ops/s (−5.3%, within <10% gate). Devnet E2E (`test_vault_aa.js`) updated for the new trigger API but requires a live aa-testkit network run.

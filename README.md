@@ -42,7 +42,7 @@ cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
                     │  submit → candidate (replaceable pre-lock)  │
                     │  lock    → after 600 s stability window     │
                     │  challenge → freeze (bond ≥ 20000 bytes)    │
-                    │  respond  → operator defense, bond confiscated│
+                    │  resubmit → operator answers a challenge (unfreeze)│
                     │  finalize → root becomes withdrawal basis   │
                     │  withdraw → Merkle PROOF against aa_root    │
                     └─────────────────────────────────────────────┘
@@ -57,7 +57,7 @@ cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
 | `operp-account` | Per-account collateral/positions, VWAP entry price, realized PnL, risk snapshot |
 | | `liquidatable` at equity·10000 ≤ mm·10500, `reduce_only` at ≤ 12000 |
 | `operp-state` | ChainState: accounts/books/marks/withdrawals, byte-level Merkle tree (`state_root`) + hex-string tree (`aa_root`) for the AA |
-| `operp-dag` | Unit DAG with signature verification (`verify_strict`), orphan buffer (4096 cap, deterministic eviction), deterministic linearization by unit id |
+| `operp-dag` | Unit DAG with signature verification (`verify_strict`), orphan buffer (4096 cap, salted eviction), salted deterministic linearization (`ready_linearized_with_salt`) |
 | `operp-exec` | The engine: ingest → apply → events; place/cancel/deposit/withdraw/liquidate with full intake validation |
 | `operp-settle` | Batch checkpoints, `validate_against` replay verification, `temp_data` payloads, proof generation |
 
@@ -153,30 +153,39 @@ Lifecycle per height *h*:
    fields must be exactly 64 hex chars. Candidates are **replaceable until
    locked**: a replacing submitter takes the height over and the displaced
    candidate's bond moves to `sbond_<addr>` for reclaim via
-   `{claim_submit_bond}` (failed finalizations confiscate it instead). The
-   stability timer restarts only when the presented root differs from the
-   stored candidate, so identical-root spam cannot extend the window.
+   `{claim: "sbond"}` (failed finalizations confiscate it instead). The
+   sitting operator re-submitting keeps its bond (no double charge) and the
+   stability timer restarts on every submit — identical-root spam only
+   costs the attacker a fresh bond each round.
 2. **lock** — allowed only after the 600 s stability window
    (`OBYTE_STABILITY_SECS`). Locking clears a previous permanent-failure
    mark, so a challenge-failed (`frozen = 2`) height recovers by fresh
    submission instead of wedging the chain. Locked roots are immutable.
 3. **challenge** — within 3600 s of locking, anyone can freeze height *h*
    with a ≥ 20 000 byte bond; a sender with an outstanding bond cannot open
-   a second challenge, and `{claim_bond}` refuses payout while the
+   a second challenge, and `{claim: "bond"}` refuses payout while the
    challenged height is still frozen.
-4. **respond** — the operator defends inside the window; success unfreezes
-   and confiscates exactly the recorded challenger bond (zeroing both its
-   ledger keys). If nobody responds in time, finalize marks the height
-   permanently failed (`frozen = 2`), clears its roots, rolls `last_locked`
-   back to h−1, confiscates the submit bond, and restarts the stability
-   clock; the challenger recovers the recorded bond through `claim_bond`.
+4. **respond (by resubmit)** — there is no separate respond trigger: the
+   operator answers a challenge by re-submitting the identical root inside
+   the window (bond waived for the sitting candidate owner). Success
+   unfreezes and confiscates exactly the recorded challenger bond (zeroing
+   both its ledger keys); an impostor resubmit bounces `not operator`. If
+   nobody responds in time, finalize marks the height permanently failed
+   (`frozen = 2`), clears its roots, rolls `last_locked` back to h−1,
+   confiscates the submit bond — split **50/50**: half accrues to the
+   challenger as `{claim: "slash"}`, half stays burned in the pot — and
+   restarts the stability clock; the challenger also recovers its own bond
+   through `{claim: "bond"}`.
 5. **finalize** — after a clean 3600 s window the root becomes the withdrawal
    basis (`last_finalized`), strictly in height order; the submit bond is
    released to its holder and a 20 000-byte race reward accrues to the
-   first-stable submitter (`{claim_reward}` pays once and zeroes the
+   first-stable submitter (`{claim: "reward"}` pays once and zeroes the
    ledger).
-   - a claim carries `{amount, withdrawn, leaf_account, collateral, perp,
-     proof[]}`;
+   - a withdrawal carries `{amount, withdrawn, leaf_account, collateral,
+     perp, proof[], perp_amount?}`;
+   - `perp_amount` (optional) claims LESS than the full unclaimed PERP
+     remainder — collateral-only exits no longer force-drain the proven
+     balance; default remains the full remainder;
    - the AA recomputes
      `sha256("acct:"‖address‖":"‖collateral‖":"‖perp‖":"‖withdrawn)` and
      folds the sibling path, requiring the result to equal
@@ -254,7 +263,7 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    Full trade data IS posted on-chain (`post_batch.js` reveals every unit as
    `temp_data`, so any watcher can re-execute and detect a bad root), and a
    detected fraud triggers challenge → freeze → height rollback, after
-   which the challenger recovers its recorded bond via `claim_bond` — a
+   which the challenger recovers its recorded bond via `{claim: "bond"}` — a
    lying operator cannot steal funds, only
    stall its own height while honest operators (fee race) resubmit correctly.
    What remains out of reach: Oscript cannot re-run the matcher on-chain, so
@@ -316,7 +325,7 @@ ghost removal**, maker-queue pop regression, proof-withdrawal decoupled from
 the diagnostic `bal_` ledger, height-bound `state_root` (meta leaf commits
 the batch height, marks and funding indices), full book commitment, global
 cumulative withdraw anti-replay (`W` committed inside every aa-tree leaf),
-bond recovery via `claim_bond` with frozen-height gating, bounded withdrawals/
+bond recovery via claim (frozen-height gating), bounded withdrawals/
 AA-unit/gov-nonce ledgers (256-height replay window), flip-order initial-margin
 gate on open quantity, create-market bps ceilings, tick-size enforcement,
 applied-only `seq` accounting, self-trade cancel-maker continuation,
