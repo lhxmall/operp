@@ -92,6 +92,20 @@ pub enum Op {
         target: AccountId,
         market: MarketId,
     },
+    /// Stake PERP bond to become a price reporter.
+    StakeOracle {
+        account: AccountId,
+    },
+    /// Begin unbonding of a reporter; unlocks after 256 heights.
+    UnstakeOracle {
+        account: AccountId,
+    },
+    /// Slash a reporter whose reports deviate >500bps from TWAP for 3 consecutive heights.
+    SlashOracle {
+        challenger: AccountId,
+        target: AccountId,
+        market: MarketId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,6 +278,24 @@ pub fn canonical_bytes(unit: &Unit) -> Vec<u8> {
             b.extend_from_slice(&target.0);
             b.extend_from_slice(&market.0.to_le_bytes());
         }
+        Op::StakeOracle { account } => {
+            b.push(14);
+            b.extend_from_slice(&account.0);
+        }
+        Op::UnstakeOracle { account } => {
+            b.push(15);
+            b.extend_from_slice(&account.0);
+        }
+        Op::SlashOracle {
+            challenger,
+            target,
+            market,
+        } => {
+            b.push(16);
+            b.extend_from_slice(&challenger.0);
+            b.extend_from_slice(&target.0);
+            b.extend_from_slice(&market.0.to_le_bytes());
+        }
     }
     b.extend_from_slice(&unit.pubkey);
     b
@@ -296,6 +328,8 @@ fn account_matches(unit: &Unit) -> bool {
         | Op::Withdraw { account, .. }
         | Op::GovDeposit { account, .. }
         | Op::GovWithdraw { account, .. } => *account == expected,
+        Op::StakeOracle { account } | Op::UnstakeOracle { account } => *account == expected,
+        Op::SlashOracle { challenger, .. } => *challenger == expected,
         Op::Liquidate { caller, .. } | Op::FinalizeProposal { caller, .. } => *caller == expected,
         Op::ReportPrice { oracle, .. } => *oracle == expected,
         Op::CreateMarket { creator, .. } => *creator == expected,

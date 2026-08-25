@@ -4,11 +4,28 @@ use operp_exec::Engine;
 use operp_state::{verify_proof, MerkleProof};
 use operp_types::{
     sha256, AccountId, Height, Seq, UnitId, Usd, BATCH_MAX_UNITS, CHAIN_ID,
+    DEPOSIT_VERIFY_ACTIVATION_HEIGHT,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
+pub mod deposit_verify;
+pub mod obyte_hash;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepositEvidence {
+    /// Hex 64 — must equal unit_hash(joint).
+    pub aa_unit: String,
+    /// false = base deposit, true = PERP deposit. Must match Op kind.
+    pub is_perp: bool,
+    /// Decimal string as it appears in vault ledger.
+    pub amount: String,
+    /// Obyte vault AA address that must be the payee.
+    pub vault_address: String,
+    /// Full Obyte joint as returned by hub getJoint (unit + messages + authors).
+    pub joint: serde_json::Value,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub height: Height,
@@ -22,6 +39,13 @@ pub struct Checkpoint {
     pub unit_ids: Vec<UnitId>,
     pub fills_hash: [u8; 32],
     pub fill_count: u32,
+    /// Optional 64-hex validity proof hash (sha256 of validate_against trace).
+    /// None on legacy batches; Some(64 hex) when fraud-provable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validity_proof_hash: Option<String>,
+    /// Optional perp burned total audit field (mirrors ChainState.perp_burned).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perp_burned: Option<u128>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +53,8 @@ pub struct Batch {
     pub chain_id: String,
     pub checkpoint: Checkpoint,
     pub units: Vec<Unit>,
+    #[allow(dead_code)]
+    pub deposit_evidences: Vec<DepositEvidence>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -78,6 +104,16 @@ pub enum SettleError {
     AmountExceedsCollateral,
     #[error("perp exceeds proof")]
     AmountExceedsPerp,
+    #[error("deposit anchor missing")]
+    DepositAnchorMissing,
+    #[error("deposit content mismatch")]
+    DepositContentMismatch,
+    #[error("deposit kind mismatch")]
+    DepositKindMismatch,
+    #[error("deposit duplicate anchor")]
+    DepositDuplicateAnchor,
+    #[error("deposit evidence too large")]
+    DepositEvidenceTooLarge,
 }
 
 /// Canonical byte encoding of fills shared by batch construction and replay
@@ -148,11 +184,13 @@ impl Batch {
                 unit_ids: applied.to_vec(),
                 fills_hash,
                 fill_count,
+                validity_proof_hash: None,
+                perp_burned: Some(engine.state.perp_burned),
             },
             units,
+            deposit_evidences: Vec::new(),
         })
     }
-
     pub fn temp_data_payload(&self) -> TempDataPayload {
         let units_json: Vec<serde_json::Value> = self
             .units
@@ -166,7 +204,7 @@ impl Batch {
                 })
             })
             .collect();
-        let data = serde_json::json!({
+        let mut data = serde_json::json!({
             "chain_id": self.chain_id,
             "height": self.checkpoint.height,
             "prev_state_hash": hex::encode(self.checkpoint.prev_state_hash),
@@ -179,6 +217,17 @@ impl Batch {
             "fills_hash": hex::encode(self.checkpoint.fills_hash),
             "units": units_json,
         });
+        if !self.deposit_evidences.is_empty() {
+            let mut evidences = self.deposit_evidences.clone();
+            evidences.sort_by(|a, b| a.aa_unit.cmp(&b.aa_unit));
+            data["deposit_evidences"] = serde_json::to_value(&evidences).unwrap();
+        }
+        if let Some(v) = &self.checkpoint.validity_proof_hash {
+            data["validity_proof_hash"] = serde_json::Value::String(v.clone());
+        }
+        if let Some(v) = self.checkpoint.perp_burned {
+            data["perp_burned"] = serde_json::json!(v);
+        }
         let bytes = serde_json::to_vec(&data).expect("json");
         let hash = Sha256::digest(&bytes);
         TempDataPayload {

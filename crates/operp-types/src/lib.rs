@@ -29,7 +29,7 @@ pub const BATCH_INTERVAL_MS: u64 = 2000;
 pub const BATCH_MAX_UNITS: u32 = 512;
 pub const MAX_PARENTS: usize = 2;
 /// Hard depth cap for the AA-facing hex-domain merkle tree. Mirrors the
-/// vault AA's `reduce(..., 16, ...)` and ocore's fatal behavior on arrays
+/// vault AA's `reduce(..., 18, ...)` and ocore's fatal behavior on arrays
 /// longer than the formula's fixed unroll (vendor/ocore/formula/evaluation.js:2374):
 /// proofs deeper than this cannot be evaluated on-chain, so proof generation
 /// refuses them instead of emitting an unusable path.
@@ -61,6 +61,62 @@ pub const FUNDING_TWAP_WINDOW: Height = 256;
 pub const ESCAPE_STALL_SECS: u64 = 604800;
 pub const ESCAPE_STALL_SECS_TESTNET: u64 = 3600;
 pub const VAULT_AA_ADDRESS: &str = "";
+pub const DEPOSIT_EVIDENCE_MAX_BYTES: usize = 1_048_576;
+pub const DEPOSIT_VERIFY_ACTIVATION_HEIGHT: Height = 1_000_000;
+/// Funding source selector for funding index anchoring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum FundingSourceKind {
+    BondedMedianTwap = 0,
+    AggregatedExternal = 1,
+}
+
+impl Default for FundingSourceKind {
+    fn default() -> Self {
+        Self::BondedMedianTwap
+    }
+}
+
+/// Per-market oracle governance config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OracleConfig {
+    pub deviation_bps: u64,
+    pub twap_window: u64,
+    pub slash_reward_bps: u64,
+}
+
+impl Default for OracleConfig {
+    fn default() -> Self {
+        Self {
+            deviation_bps: SLASH_DEVIATION_BPS,
+            twap_window: ORACLE_TWAP_WINDOW,
+            slash_reward_bps: SLASH_REWARD_BPS,
+        }
+    }
+}
+
+pub fn default_oracle_config() -> OracleConfig {
+    OracleConfig::default()
+}
+
+/// TWAP sample: median at a given height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwapSample {
+    pub height: Height,
+    pub median: Price,
+}
+
+/// Per-reporter price history sample for streak detection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportSample {
+    pub height: Height,
+    pub price: Price,
+    pub seq: Seq,
+}
+
+/// Funding TWAP sample (alias to TwapSample for now).
+pub type FundingTwapSample = TwapSample;
+
 
 pub type Price = u64;
 pub type Qty = u64;

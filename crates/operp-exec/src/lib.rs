@@ -52,8 +52,11 @@ pub enum RejectReason {
     NotLiquidatable,
     /// Vote/FinalizeProposal referencing an unknown proposal id.
     NoProposal,
+    NotBonded,
+    AlreadyBonded,
+    Unbonding,
+    SlashNotEligible,
 }
-
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ExecError {
     #[error("bad signature")]
@@ -252,6 +255,13 @@ impl Engine {
                 caller,
                 proposal_id,
             } => self.finalize_proposal(*caller, *proposal_id, seq),
+            Op::StakeOracle { account } => self.stake_oracle(*account),
+            Op::UnstakeOracle { account } => self.unstake_oracle(*account),
+            Op::SlashOracle {
+                challenger,
+                target,
+                market,
+            } => self.slash_oracle(*challenger, *target, *market),
         }
     }
 
@@ -851,6 +861,38 @@ impl Engine {
         self.state.proposals.remove(&proposal_id);
         Ok(Vec::new())
     }
+
+    fn stake_oracle(&mut self, account: AccountId) -> Result<Vec<Fill>, RejectReason> {
+        // Height-gated: before activation, treat as unknown op -> BadAccount
+        if self.state.height < operp_types::ORACLE_SLASH_ACTIVATION_HEIGHT {
+            return Err(RejectReason::BadAccount);
+        }
+        self.state.apply_stake(account).map_err(map_state)?;
+        Ok(Vec::new())
+    }
+
+    fn unstake_oracle(&mut self, account: AccountId) -> Result<Vec<Fill>, RejectReason> {
+        if self.state.height < operp_types::ORACLE_SLASH_ACTIVATION_HEIGHT {
+            return Err(RejectReason::BadAccount);
+        }
+        self.state.apply_unstake(account).map_err(map_state)?;
+        Ok(Vec::new())
+    }
+
+    fn slash_oracle(
+        &mut self,
+        challenger: AccountId,
+        target: AccountId,
+        market: MarketId,
+    ) -> Result<Vec<Fill>, RejectReason> {
+        if self.state.height < operp_types::ORACLE_SLASH_ACTIVATION_HEIGHT {
+            return Err(RejectReason::BadAccount);
+        }
+        self.state
+            .apply_slash(challenger, target, market)
+            .map_err(map_state)?;
+        Ok(Vec::new())
+    }
 }
 fn map_acct(e: AccountError) -> RejectReason {
     match e {
@@ -863,9 +905,13 @@ fn map_state(e: operp_state::StateError) -> RejectReason {
     match e {
         operp_state::StateError::InsufficientPerp => RejectReason::Insufficient,
         operp_state::StateError::UnknownMarket => RejectReason::NotFound,
+        operp_state::StateError::AlreadyBonded => RejectReason::AlreadyBonded,
+        operp_state::StateError::NotBonded => RejectReason::NotBonded,
+        operp_state::StateError::Unbonding => RejectReason::Unbonding,
+        operp_state::StateError::SlashNotEligible => RejectReason::SlashNotEligible,
+        operp_state::StateError::NotFound => RejectReason::NotFound,
     }
 }
-
 
 #[cfg(test)]
 mod tests {

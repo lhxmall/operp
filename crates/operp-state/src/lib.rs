@@ -1,11 +1,11 @@
 pub use operp_account::Account;
 use operp_book::{Fill, OrderBook};
 use operp_types::{
-    bps, genesis_params, notional_usd, sha256, AccountId, Height, MarketId, MarketParams,
-    Price, Seq, UnitId, Usd, BTC_USD, INSURANCE_ACCOUNT, INSURANCE_SEED, PRICE_SCALE, USD_SCALE,
+    bps, genesis_params, notional_usd, sha256, AccountId, FundingSourceKind, Height, MarketId,
+    MarketParams, OracleConfig, Price, ReportSample, Seq, TwapSample, UnitId, Usd, BTC_USD,
+    INSURANCE_ACCOUNT, INSURANCE_SEED, PRICE_SCALE, USD_SCALE,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
-
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[derive(Clone, Debug)]
 pub struct Withdrawal {
     pub amount: Usd,
@@ -69,6 +69,24 @@ pub struct ChainState {
     /// Last finalized AA root (for salted ordering). Genesis = sha256(b"operp-mvp-1-genesis").
     pub last_finalized_root: [u8; 32],
     pub last_finalized_height: Height,
+    // -----------------------------------------------------------------------
+    // Oracle bonding / TWAP / funding extension (Step5)
+    /// Per-market oracle config (empty = default).
+    pub oracle_configs: BTreeMap<MarketId, OracleConfig>,
+    /// Per (market, reporter) last-K price history for streak detection. Bounded at 8.
+    pub oracle_report_history: BTreeMap<(MarketId, AccountId), VecDeque<ReportSample>>,
+    /// Per-market median TWAP ring (oracle TWAP).
+    pub oracle_twap: BTreeMap<MarketId, VecDeque<TwapSample>>,
+    /// Per-market funding TWAP ring (funding index anchor) — v1 mirrors oracle_twap.
+    pub funding_twap: BTreeMap<MarketId, VecDeque<TwapSample>>,
+    /// Cached funding TWAP per market (mean of funding_twap).
+    pub funding_index_twap: BTreeMap<MarketId, Price>,
+    /// Funding source selector.
+    pub funding_source: FundingSourceKind,
+    /// Unbonding queue: reporter -> unlock height.
+    pub oracle_unbonding: BTreeMap<AccountId, Height>,
+    /// Slash nonce counter for replay/debug (committed in meta leaf).
+    pub oracle_slash_nonce: u64,
 }
 
 /// An open governance proposal. `deadline_seq` and the quorum denominator
@@ -99,6 +117,16 @@ pub enum StateError {
     InsufficientPerp,
     #[error("unknown market")]
     UnknownMarket,
+    #[error("already bonded")]
+    AlreadyBonded,
+    #[error("not bonded")]
+    NotBonded,
+    #[error("unbonding")]
+    Unbonding,
+    #[error("slash not eligible")]
+    SlashNotEligible,
+    #[error("not found")]
+    NotFound,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,6 +192,14 @@ impl ChainState {
             withdrawn_total: BTreeMap::new(),
             last_finalized_root: sha256(b"operp-mvp-1-genesis"),
             last_finalized_height: 0,
+            oracle_configs: BTreeMap::new(),
+            oracle_report_history: BTreeMap::new(),
+            oracle_twap: BTreeMap::new(),
+            funding_twap: BTreeMap::new(),
+            funding_index_twap: BTreeMap::new(),
+            funding_source: FundingSourceKind::default(),
+            oracle_unbonding: BTreeMap::new(),
+            oracle_slash_nonce: 0,
         }
     }
     /// General window prune (new path, activation-gated). Legacy wrappers below.
@@ -216,6 +252,221 @@ impl ChainState {
         self.last_finalized_height = height;
     }
 
+    // -----------------------------------------------------------------------
+    // Oracle config / TWAP helpers
+    pub fn oracle_config(&self, market: MarketId) -> OracleConfig {
+        self.oracle_configs.get(&market).copied().unwrap_or_default()
+    }
+
+    fn record_twap_sample(&mut self, market: MarketId, median: Price) {
+        let cfg = self.oracle_config(market);
+        let window_len = cfg.twap_window as usize;
+        // Cap window_len to max to avoid unbounded growth if governance mis-sets
+        let cap = window_len.min(operp_types::ORACLE_TWAP_MAX as usize).max(2);
+        let q = self.oracle_twap.entry(market).or_default();
+        if q.back().map(|s| s.height == self.height).unwrap_or(false) {
+            // Same height: overwrite median if different (multiple reporters same batch)
+            if q.back().unwrap().median != median {
+                q.back_mut().unwrap().median = median;
+            } else {
+                return;
+            }
+        } else {
+            q.push_back(TwapSample { height: self.height, median });
+            while q.len() > cap {
+                q.pop_front();
+            }
+        }
+        // Mirror into funding_twap and cache funding_index_twap for effective_funding_index
+        let fq = self.funding_twap.entry(market).or_default();
+        if fq.back().map(|s| s.height == self.height).unwrap_or(false) {
+            if fq.back().unwrap().median != median {
+                fq.back_mut().unwrap().median = median;
+            }
+        } else {
+            fq.push_back(TwapSample { height: self.height, median });
+            while fq.len() > operp_types::FUNDING_TWAP_WINDOW as usize {
+                fq.pop_front();
+            }
+        }
+        if let Some(twap) = self.compute_twap(market) {
+            self.funding_index_twap.insert(market, twap);
+        }
+        if let Some(ftwap) = self.compute_funding_twap(market) {
+            self.funding_index_twap.insert(market, ftwap);
+        }
+    }
+
+    pub fn compute_twap(&self, market: MarketId) -> Option<Price> {
+        let q = self.oracle_twap.get(&market)?;
+        if q.len() < 2 {
+            return None;
+        }
+        let sum: u128 = q.iter().map(|s| s.median as u128).sum();
+        Some((sum / q.len() as u128) as Price)
+    }
+
+    pub fn compute_funding_twap(&self, market: MarketId) -> Option<Price> {
+        let q = self.funding_twap.get(&market)?;
+        if q.len() < 2 {
+            return None;
+        }
+        let sum: u128 = q.iter().map(|s| s.median as u128).sum();
+        Some((sum / q.len() as u128) as Price)
+    }
+
+    pub fn effective_funding_index(&self, market: MarketId, median: Price) -> Price {
+        if self.height < operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT {
+            return median;
+        }
+        match self.funding_source {
+            FundingSourceKind::BondedMedianTwap => {
+                self.funding_index_twap.get(&market).copied().unwrap_or(median)
+            }
+            FundingSourceKind::AggregatedExternal => {
+                // v1: no external feed, fallback to funding twap then median
+                self.funding_index_twap.get(&market).copied().unwrap_or(median)
+            }
+        }
+    }
+
+    pub fn recompute_median(&self, market: MarketId) -> Option<Price> {
+        let mut prices: Vec<Price> = self
+            .oracle_reports
+            .iter()
+            .filter(|((m, o), _)| *m == market && self.oracle_bonds.contains_key(o))
+            .map(|(_, p)| *p)
+            .collect();
+        if prices.is_empty() {
+            return None;
+        }
+        prices.sort();
+        Some(prices[(prices.len() - 1) / 2])
+    }
+
+    // -----------------------------------------------------------------------
+    // Bonding / unbonding / slashing (height-gated by caller; state helpers assume bonded checks passed)
+    pub fn apply_stake(&mut self, account: AccountId) -> Result<(), StateError> {
+        // Caller gates height; here enforce bond invariants
+        if self.oracle_bonds.contains_key(&account) {
+            return Err(StateError::AlreadyBonded);
+        }
+        if self.oracle_unbonding.contains_key(&account) {
+            return Err(StateError::Unbonding);
+        }
+        let bal = self.perp_balances.get(&account).copied().unwrap_or(0);
+        if bal < operp_types::ORACLE_BOND_PERP {
+            return Err(StateError::InsufficientPerp);
+        }
+        self.perp_balances.insert(account, bal - operp_types::ORACLE_BOND_PERP);
+        self.perp_supply = self.perp_supply.saturating_sub(0); // supply unchanged: bond locked, not burned
+        self.oracle_bonds.insert(account, operp_types::ORACLE_BOND_PERP);
+        Ok(())
+    }
+
+    pub fn apply_unstake(&mut self, account: AccountId) -> Result<(), StateError> {
+        if !self.oracle_bonds.contains_key(&account) {
+            return Err(StateError::NotBonded);
+        }
+        if self.oracle_unbonding.contains_key(&account) {
+            return Err(StateError::Unbonding);
+        }
+        let unlock = self.height.saturating_add(operp_types::ORACLE_UNBOND_HEIGHTS);
+        self.oracle_unbonding.insert(account, unlock);
+        Ok(())
+    }
+
+    pub fn apply_slash(
+        &mut self,
+        challenger: AccountId,
+        target: AccountId,
+        market: MarketId,
+    ) -> Result<(), StateError> {
+        if !self.markets.contains_key(&market) {
+            return Err(StateError::NotFound);
+        }
+        if !self.oracle_bonds.contains_key(&target) {
+            return Err(StateError::NotBonded);
+        }
+        // Need TWAP - use compute_twap or funding twap
+        let twap = self
+            .compute_twap(market)
+            .or_else(|| self.compute_funding_twap(market))
+            .ok_or(StateError::SlashNotEligible)?;
+        if twap == 0 {
+            return Err(StateError::SlashNotEligible);
+        }
+        let hist = self
+            .oracle_report_history
+            .get(&(market, target))
+            .ok_or(StateError::SlashNotEligible)?;
+        if hist.len() < operp_types::SLASH_TWAP_STREAK as usize {
+            return Err(StateError::SlashNotEligible);
+        }
+        // Check last N reports are consecutive heights and all deviate > threshold
+        let n = operp_types::SLASH_TWAP_STREAK as usize;
+        let start = hist.len() - n;
+        let cfg = self.oracle_config(market);
+        let deviation_bps = cfg.deviation_bps;
+        // Also enforce window 256: last report height within window
+        let latest_height = hist.back().map(|s| s.height).unwrap_or(0);
+        if self.height.saturating_sub(latest_height) > 256 {
+            return Err(StateError::SlashNotEligible);
+        }
+        for i in 0..n {
+            let idx = start + i;
+            let sample = hist[idx];
+            if i > 0 {
+                let prev = hist[idx - 1];
+                if sample.height != prev.height + 1 {
+                    // Require consecutive heights; gaps make streak invalid
+                    return Err(StateError::SlashNotEligible);
+                }
+            }
+            let dev = ((sample.price as i128 - twap as i128).abs() * 10_000 / twap as i128) as u64;
+            if dev < deviation_bps {
+                return Err(StateError::SlashNotEligible);
+            }
+        }
+        // Eligible: execute slash — burn half, reward half
+        let bond = self.oracle_bonds.remove(&target).unwrap_or(operp_types::ORACLE_BOND_PERP);
+        self.oracle_unbonding.remove(&target);
+        self.oracle_reports.remove(&(market, target));
+        self.oracle_report_history.remove(&(market, target));
+        let burn = bond * (operp_types::SLASH_REWARD_BPS as u128) / 10_000;
+        let reward = bond.saturating_sub(burn);
+        self.perp_burned = self.perp_burned.saturating_add(burn);
+        if self.perp_supply >= burn {
+            self.perp_supply = self.perp_supply.saturating_sub(burn);
+        }
+        let challenger_bal = self.perp_balances.get(&challenger).copied().unwrap_or(0);
+        self.perp_balances
+            .insert(challenger, challenger_bal.saturating_add(reward));
+        self.oracle_slash_nonce = self.oracle_slash_nonce.wrapping_add(1);
+        Ok(())
+    }
+
+    pub fn prune_oracle_unbonding(&mut self, current_height: Height) {
+        let mut to_release = Vec::new();
+        for (acct, unlock) in &self.oracle_unbonding {
+            if *unlock <= current_height {
+                to_release.push(*acct);
+            }
+        }
+        for acct in to_release {
+            self.oracle_unbonding.remove(&acct);
+            if let Some(bond) = self.oracle_bonds.remove(&acct) {
+                let bal = self.perp_balances.get(&acct).copied().unwrap_or(0);
+                self.perp_balances.insert(acct, bal.saturating_add(bond));
+                self.oracle_reports.retain(|(_, o), _| *o != acct);
+                self.oracle_report_history.retain(|(_, o), _| *o != acct);
+            }
+        }
+    }
+
+    pub fn prune_oracle_twap(&mut self, _min_height: Height) {
+        // TWAP is bounded by VecDeque length cap, not height expiry; no-op for v1
+    }
 
     /// Apply a bonded oracle's report for `market` and recompute the effective
     /// mark as the median of all current bonded reporters, subject to the
@@ -233,6 +484,29 @@ impl ChainState {
             return Ok(());
         }
         self.oracle_reports.insert((market, oracle), price);
+        // Record per-reporter history for slash streak detection (depth 8)
+        {
+            let q = self
+                .oracle_report_history
+                .entry((market, oracle))
+                .or_insert_with(VecDeque::new);
+            // Push new sample; dedup same height by overwriting last
+            if q.back().map(|s| s.height == self.height).unwrap_or(false) {
+                if let Some(back) = q.back_mut() {
+                    back.price = price;
+                    back.seq = self.seq;
+                }
+            } else {
+                q.push_back(ReportSample {
+                    height: self.height,
+                    price,
+                    seq: self.seq,
+                });
+                while q.len() > 8 {
+                    q.pop_front();
+                }
+            }
+        }
         // Median over reporters that hold BOTH a bond and a current report
         // for this market. sorted[(len-1)/2] is the exact middle when the
         // count is odd and the smaller middle when even — deterministic in
@@ -259,24 +533,16 @@ impl ChainState {
             _ => median,
         };
         self.marks.insert(market, capped);
+        // Record TWAP sample after median update
+        self.record_twap_sample(market, median);
         // Funding: once at least two valid reports exist, every report tick
         // settles peer-to-peer funding.
-        // premium_bps = (spot − index)/index, clamped to ±FUNDING_CAP_BPS.
-        // Signed per-position payment: longs (qty>0) pay when spot > index,
-        // shorts receive; mirrored when spot < index. Two-phase so that
-        // payments can never drive an account's collateral negative and
-        // conservation holds exactly:
-        //   Phase 1 computes each account's signed payment (unchanged formula).
-        //   Phase 2a debits payers min(payment, collateral.max(0)) — no account
-        //     goes negative from funding; total debited forms the budget.
-        //   Phase 2b credits receivers their computed receipt, capped at the
-        //     budget, in ascending AccountId order (BTreeMap iteration order,
-        //     so fully deterministic across replays); the last receiver may be
-        //     paid partially. Integer arithmetic only, no rounding drift.
-        // Insurance participates like any other account (it can hold
-        // positions). Truncation residue is sub-unit dust by design.
+        // premium_bps = (spot − funding_index)/funding_index, clamped to ±FUNDING_CAP_BPS.
+        // funding_index = twap when height >= activation else median.
+        // notional = signed_notional_usd(qty, funding_index)
         if prices.len() >= 2 {
-            let index = median as i128;
+            let funding_index = self.effective_funding_index(market, median);
+            let index = funding_index as i128;
             let spot = capped as i128;
             if index > 0 {
                 let diff_bps = ((spot - index) * 10_000 / index).clamp(
@@ -290,7 +556,7 @@ impl ChainState {
                         .iter()
                         .filter_map(|(id, a)| {
                             a.positions.get(&market).map(|pos| {
-                                (*id, operp_types::signed_notional_usd(pos.qty, median) * diff_bps / 10_000)
+                                (*id, operp_types::signed_notional_usd(pos.qty, funding_index) * diff_bps / 10_000)
                             })
                         })
                         .filter(|(_, p)| *p != 0)
@@ -553,6 +819,50 @@ fn meta_leaf(state: &ChainState) -> [u8; 32] {
         b.extend_from_slice(
             &state.last_index.get(m).copied().unwrap_or(0).to_le_bytes(),
         );
+    }
+    // Oracle bonding / TWAP state committed for replay determinism
+    b.extend_from_slice(&(state.oracle_bonds.len() as u32).to_le_bytes());
+    for (acct, bond) in &state.oracle_bonds {
+        b.extend_from_slice(&acct.0);
+        b.extend_from_slice(&bond.to_le_bytes());
+    }
+    b.extend_from_slice(&(state.oracle_unbonding.len() as u32).to_le_bytes());
+    for (acct, h) in &state.oracle_unbonding {
+        b.extend_from_slice(&acct.0);
+        b.extend_from_slice(&h.to_le_bytes());
+    }
+    b.extend_from_slice(&state.oracle_slash_nonce.to_le_bytes());
+    b.extend_from_slice(&(state.oracle_twap.len() as u32).to_le_bytes());
+    for (m, window) in &state.oracle_twap {
+        b.extend_from_slice(&m.0.to_le_bytes());
+        b.extend_from_slice(&(window.len() as u32).to_le_bytes());
+        for s in window {
+            b.extend_from_slice(&s.height.to_le_bytes());
+            b.extend_from_slice(&s.median.to_le_bytes());
+        }
+    }
+    b.extend_from_slice(&(state.funding_twap.len() as u32).to_le_bytes());
+    for (m, window) in &state.funding_twap {
+        b.extend_from_slice(&m.0.to_le_bytes());
+        b.extend_from_slice(&(window.len() as u32).to_le_bytes());
+        for s in window {
+            b.extend_from_slice(&s.height.to_le_bytes());
+            b.extend_from_slice(&s.median.to_le_bytes());
+        }
+    }
+    b.extend_from_slice(&(state.funding_index_twap.len() as u32).to_le_bytes());
+    for (m, v) in &state.funding_index_twap {
+        b.extend_from_slice(&m.0.to_le_bytes());
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b.extend_from_slice(&[state.funding_source as u8]);
+    // oracle_configs
+    b.extend_from_slice(&(state.oracle_configs.len() as u32).to_le_bytes());
+    for (m, cfg) in &state.oracle_configs {
+        b.extend_from_slice(&m.0.to_le_bytes());
+        b.extend_from_slice(&cfg.deviation_bps.to_le_bytes());
+        b.extend_from_slice(&cfg.twap_window.to_le_bytes());
+        b.extend_from_slice(&cfg.slash_reward_bps.to_le_bytes());
     }
     sha256(&b)
 }

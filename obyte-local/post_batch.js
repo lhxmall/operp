@@ -83,6 +83,45 @@ function tempDataMessage(data) {
   };
 }
 
+// Step4 — deposit independent verification: for every Deposit/GovDeposit
+// op in the batch, fetch the endorsing Obyte joint and build a
+// DepositEvidence sorted lexicographically by aa_unit. Watchers re-derive
+// unit_hash(joint) and compare against the sidechain deposit's aa_unit, so
+// a deposit endorsement is verifiable without trusting the operator.
+const { hub } = require(path.join(aaRoot, "node_modules", "ocore", "network.js"));
+async function buildDepositEvidences(batchData, vaultAddress) {
+  const evidences = [];
+  const seen = new Set();
+  const units = batchData.units || [];
+  for (const u of units) {
+    const op = u.op || {};
+    const isPerp = op.GovDeposit !== undefined;
+    const dep = isPerp ? op.GovDeposit : op.Deposit;
+    if (!dep) continue;
+    const aaUnit = dep.aa_unit;
+    if (typeof aaUnit !== "string" || aaUnit.length !== 64) continue;
+    if (seen.has(aaUnit)) continue;
+    seen.add(aaUnit);
+    let joint;
+    try {
+      joint = await new Promise((resolve, reject) => {
+        hub.getJoint(aaUnit, (err, j) => (err ? reject(err) : resolve(j)));
+      });
+    } catch (e) {
+      throw new Error("deposit anchor missing on Obyte: " + aaUnit.slice(0, 16));
+    }
+    if (!joint || !joint.unit) throw new Error("no joint for " + aaUnit.slice(0, 16));
+    evidences.push({
+      aa_unit: aaUnit,
+      is_perp: isPerp,
+      amount: String(dep.amount),
+      vault_address: vaultAddress,
+      joint: { unit: joint.unit, unit_hash: joint.unitHash },
+    });
+  }
+  evidences.sort((a, b) => (a.aa_unit < b.aa_unit ? -1 : 1));
+  return evidences;
+}
 async function trigger(wallet, data, amount) {
   const r = await wallet.triggerAaWithData({
     toAddress: network.agent.vault,
@@ -110,6 +149,13 @@ async function main() {
   const poster = network.wallet.poster;
   console.log("vault", vault);
 
+  // Step4: build deposit_evidences BEFORE posting so the temp_data reveal
+  // carries them (watchers verify unit_hash(joint) == aa_unit independently).
+  batchData.deposit_evidences = await buildDepositEvidences(batchData, vault);
+  if (batchData.deposit_evidences.length) {
+    console.log("deposit_evidences:", batchData.deposit_evidences.length);
+  }
+
   // 1. data availability: full batch reveal as temp_data
   const { unit: tdUnit, error: tdErr } = await poster.sendMulti({
     messages: [tempDataMessage(batchData)],
@@ -119,7 +165,8 @@ async function main() {
   console.log("temp_data posted & stable:", tdUnit);
 
   // 2. join the submit race — 50000 SUBMIT_BOND_NET + >=10000 fee headroom
-  await trigger(poster, {
+  // Step6/8: carry optional validity_proof_hash and perp_burned audit mirror.
+  const submitData = {
     submit: 1,
     chain_id: batchData.chain_id || "operp-mvp-1",
     height: batchData.height,
@@ -127,8 +174,10 @@ async function main() {
     state_root: batchData.state_root,
     aa_root: batchData.aa_root,
     fills_hash: batchData.fills_hash,
-  }, 60000);
-
+  };
+  if (batchData.validity_proof_hash) submitData.validity_proof_hash = batchData.validity_proof_hash;
+  if (batchData.perp_burned !== undefined) submitData.perp_burned = batchData.perp_burned;
+  await trigger(poster, submitData, 60000);
   // 3. stability window then lock
   await network.timetravel({ shift: "700s" });
   await trigger(poster, { lock: 1, height: batchData.height });
@@ -141,7 +190,7 @@ async function main() {
   const claim = await poster.triggerAaWithData({
     toAddress: vault,
     amount: 20000,
-    data: { claim_reward: 1 },
+    data: { claim: "reward" },
   });
   if (claim.error) throw new Error("claim failed: " + claim.error);
   await network.witnessUntilStable(claim.unit);

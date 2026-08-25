@@ -505,13 +505,13 @@ async function main() {
   if (st["cand_root_1"] !== ROOT_FINAL1 || st["cand_aa_root_1"] !== claim.aa_root)
     throw new Error("candidate replacement failed");
   // the replaced submitter reclaims his bond via {claim_submit_bond}
-  const sbondClaim = await triggerRaw(bob, { claim_submit_bond: 1 }, 30000);
+  const sbondClaim = await triggerRaw(bob, { claim: "sbond" }, 30000);
   if (!(sbondClaim.response && sbondClaim.response.bounced === false))
-    throw new Error("claim_submit_bond bounced: " + JSON.stringify(sbondClaim).slice(0, 400));
+    throw new Error("claim sbond bounced: " + JSON.stringify(sbondClaim).slice(0, 400));
   const bobAddr = await bob.getAddress();
   st = await vars();
   if (Number(st["sbond_" + bobAddr]) !== 0)
-    throw new Error("sbond_ not zeroed after claim_submit_bond");
+    throw new Error("sbond_ not zeroed after claim");
   console.log("replaced submitter reclaimed his 50000-byte bond");
 
   // ---------- 3. early lock must bounce ----------
@@ -543,20 +543,24 @@ async function main() {
   if (Number(st["frozen_1"]) !== 1) throw new Error("challenge did not freeze");
   console.log("  frozen_1 =", st.frozen_1, "bond_bob =", st["bond_" + (await bob.getAddress())]);
   // while a challenge is live its height stays frozen -> {claim_bond} refuses
-  const earlyBondClaim = await triggerRaw(bob, { claim_bond: 1 }, 30000);
+  const earlyBondClaim = await triggerRaw(bob, { claim: "bond" }, 30000);
   if (!JSON.stringify(earlyBondClaim).includes("challenge unresolved"))
     throw new Error("claim_bond during live challenge did not bounce: " + JSON.stringify(earlyBondClaim).slice(0, 400));
   console.log("  early claim_bond bounced as expected ('challenge unresolved')");
 
   await network.timetravel({ shift: '100s' });
-  // identity gate: a non-operator (bob here — alice owns the final candidate)
-  // must be rejected even with the correct root.
-  const impostor = await triggerRaw(bob, { respond: 1, height: 1, root_confirmed: ROOT_FINAL1 }, 20000);
+  // RESPOND-BY-RESUBMIT: the operator answers a challenge by re-submitting
+  // the identical root. Identity gate: a non-operator (bob — alice owns the
+  // final candidate) must be rejected even with the correct root.
+  const impostor = await triggerRaw(bob, { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_FINAL1, aa_root: claim.aa_root }, 20000);
   if (!JSON.stringify(impostor).includes("not operator"))
-    throw new Error("impostor respond not rejected: " + JSON.stringify(impostor).slice(0, 300));
-  await trigger(alice, { respond: 1, height: 1, root_confirmed: ROOT_FINAL1 }, 20000);
+    throw new Error("impostor resubmit not rejected: " + JSON.stringify(impostor).slice(0, 300));
+  // alice (the sitting candidate owner) responds with a small top-up — her
+  // original bond is still held, so no double charge.
+  const respondData = { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_FINAL1, aa_root: claim.aa_root };
+  await trigger(alice, respondData, 20000);
   st = await vars();
-  if (Number(st["frozen_1"]) !== 0) throw new Error("respond did not unfreeze");
+  if (Number(st["frozen_1"]) !== 0) throw new Error("resubmit did not unfreeze");
   const bobBondAfterConfiscation = st["bond_" + (await bob.getAddress())];
   console.log("  unfrozen; bob bond after confiscation =", bobBondAfterConfiscation);
   if (Number(bobBondAfterConfiscation) !== 0) throw new Error("respond did not confiscate the full recorded bond");
@@ -590,7 +594,7 @@ async function main() {
   // the payment message succeeded, so "did not bounce AND bond zeroed" proves
   // the bond was paid. Wallet-balance deltas are unreliable on devnet because
   // earlier payments settle asynchronously between the two getBalance calls.
-  const bondClaim = await triggerRaw(alice, { claim_bond: 1 }, 30000);
+  const bondClaim = await triggerRaw(alice, { claim: "bond" }, 30000);
   if (!bondClaim.response || bondClaim.response.bounced !== false)
     throw new Error("claim_bond bounced: " + JSON.stringify(bondClaim).slice(0, 400));
   st = await vars();
@@ -604,11 +608,11 @@ async function main() {
   console.log("height 1 finalized");
   // operator race reward: bob was the FIRST stable submitter of height 1
   // (alice replaced him pre-lock, but the fee win was already recorded)
-  await trigger(bob, { claim_reward: 1 }, 20000);
+  await trigger(bob, { claim: "reward" }, 20000);
   st = await vars();
   if (Number(st["reward_" + bobAddr]) !== 0)
     throw new Error("claim_reward did not zero the accrued reward");
-  const rewReplay = await triggerRaw(bob, { claim_reward: 1 }, 20000);
+  const rewReplay = await triggerRaw(bob, { claim: "reward" }, 20000);
   if (!JSON.stringify(rewReplay).includes("nothing claimable"))
     throw new Error("claim_reward replay did not bounce: " + JSON.stringify(rewReplay).slice(0, 400));
   console.log("RACE REWARD PAID ONCE (replay bounced)");

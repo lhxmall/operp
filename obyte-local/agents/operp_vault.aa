@@ -11,6 +11,7 @@
 	//   10000         -> BOUNCE_FEES base (deducted from trigger outputs)
 	//   20000         -> challenge bond minimum incl. bounce fee headroom
 	//   50000         -> SUBMIT_BOND_NET (submit bond locked per candidate height)
+	//   18            -> MAX_AA_TREE_DEPTH (withdraw proof unroll; Rust mirrors 18)
 	//     substitute the real asset id for this placeholder before deployment
 	//
 	// WITHDRAWALS ARE PROOF-GATED. The operator commits `aa_root` per batch:
@@ -42,8 +43,8 @@
 	//     challenge bond accounting: a challenge bounces while the sender
 	//     still holds an outstanding bond (one challenge at a time);
 	//     bond_height_ records which height that bond challenges so
-	//     {claim_bond} refuses payout while frozen_<h> == 1. Operator
-	//     response confiscates the bond (both keys zeroed); {claim_bond}
+		//     {claim_bond} refuses payout while frozen_<h> == 1. Operator
+	//     responds by RE-SUBMITTING the identical root (same case);
 	//     pays it out and zeroes both keys.
 	//   reward_<addr>                            accrued operator race reward
 	//   wd_<addr>                                cumulative bytes withdrawn by
@@ -51,8 +52,9 @@
 	//     leaf's proven collateral (global anti-replay)
 	//   wp_<addr>                                cumulative PERP withdrawn,
 	//     capped at the proven PERP balance — symmetric to wd_
-	//   bal_<addr>, pperp_<addr>                 diagnostic shadow ledgers
-	//     (mirror of deposits/withdrawals; never gate payments)
+	//   slash_reward_<addr>                      claimable half of a confiscated
+	//     submit bond after a challenge-failed finalize (Step6 fraud slash)
+	//   (escape hatch deferred to v2 — complexity budget; see README)
 	bounce_fees: { base: 10000 },
 	messages: {
 		cases: [
@@ -66,19 +68,15 @@
 					{
 						app: "state",
 						state: "{
-							if (!var['boot']){
-								var['boot'] = 1;
-								var['last_locked'] = 0;
-								var['last_finalized'] = 0;
-							}
 						}"
+					}
 				]
 			},
 			{
 				if: "{trigger.data.submit}",
 				init: "{
 					$h = trigger.data.height;
-					$ll = var['last_locked'];
+					$ll = var['last_locked'] otherwise 0;
 					if (trigger.data.chain_id != 'operp-mvp-1' OR !$h OR $h != $ll + 1
 						OR !trigger.data.state_root OR length(trigger.data.state_root) != 64
 						OR !trigger.data.aa_root OR length(trigger.data.aa_root) != 64
@@ -88,17 +86,40 @@
 						bounce('prev mismatch');
 					if (var['root_' || $h])
 						bounce('already locked');
-					if (trigger.output[[asset=base]] - 10000 < 50000)
-						bounce('need submit bond');
-					// Bond handover and timer-reset detection read PRE-trigger
-					// state (state messages must come last in Oscript).
 					$old = (var['active_bond_' || $h] otherwise 0);
-					$changed = (trigger.data.aa_root != (var['cand_aa_root_' || $h] otherwise ''));
+					// Bond needed only from NEW candidates: the sitting
+					// operator re-submitting (respond-by-resubmit) keeps his
+					// existing bond — no double charge.
+					if ($old != trigger.address
+						AND trigger.output[[asset=base]] - 10000 < 50000)
+						bounce('need submit bond');
+					// Bond handover detection reads PRE-trigger state (state
+					// messages come last in Oscript). Stability timer resets on
+					// EVERY submit: identical-root spam costs a fresh 50000
+					// bond each round, so only the attacker pays for delay.
+					// RESPOND-BY-RESUBMIT: a challenge is answered by the same
+					// operator re-submitting the identical root within the
+					// response window (identity via cand_who_). Impostors
+					// bounce here — state messages cannot bounce.
+					$frozen = (var['frozen_' || $h] otherwise 0);
+					if ($frozen == 1){
+						if (trigger.address != var['cand_who_' || $h]
+							OR trigger.data.state_root != var['cand_root_' || $h])
+							bounce('not operator');
+						if (timestamp >= var['stable_at_' || $h] + 3600)
+							bounce('response window closed');
+					}
 				}",
 				messages: [
 					{
 						app: "state",
 						state: "{
+							if ($frozen == 1){
+								var['frozen_' || $h] = 0;
+								$ch = (var['challenger_' || $h] otherwise '');
+								var['bond_' || $ch] = 0;
+								var['bond_height_' || $ch] = 0;
+							}
 							// Replacing another address's candidate releases its
 							// locked bond as claimable sbond_; same-address
 							// resubmit neither charges nor refunds.
@@ -109,13 +130,10 @@
 							var['cand_root_' || trigger.data.height] = trigger.data.state_root;
 							var['cand_aa_root_' || trigger.data.height] = trigger.data.aa_root;
 							var['cand_who_' || trigger.data.height] = trigger.address;
-							// Stability timer restarts only on a root CHANGE:
-							// spamming identical roots cannot extend the window.
-							if ($changed)
-								var['submitted_at_' || trigger.data.height] = timestamp;
-							// Fee race: AAs are triggered in stability order, so
-							// the FIRST processed submit for this height is the
-							// first-STABLE submission and wins the batch reward.
+							// Stability timer restarts on EVERY submit (audit
+							// contingency: simpler than root-change detection).
+							var['submitted_at_' || trigger.data.height] = timestamp;
+							// Fee race: first processed submit wins the batch reward.
 							if (!var['fee_winner_' || trigger.data.height]){
 								var['fee_winner_' || trigger.data.height] = trigger.address;
 							}
@@ -129,7 +147,7 @@
 					$h = trigger.data.height;
 					// stability gate (OBYTE_STABILITY_SECS = 600): simulates the
 					// Obyte finality window on devnet where none exists.
-					if (!var['cand_root_' || $h] OR var['root_' || $h] OR $h != var['last_locked'] + 1 OR timestamp < var['submitted_at_' || $h] + 600)
+					if (!var['cand_root_' || $h] OR var['root_' || $h] OR $h != (var['last_locked'] otherwise 0) + 1 OR timestamp < var['submitted_at_' || $h] + 600)
 						bounce('cannot lock yet');
 				}",
 				messages: [
@@ -151,7 +169,7 @@
 				if: "{trigger.data.challenge}",
 				init: "{
 					$h = trigger.data.height;
-					if (!$h OR $h > var['last_locked'])
+					if (!$h OR $h > (var['last_locked'] otherwise 0))
 						bounce('bad height');
 					if (!var['root_' || $h])
 						bounce('not locked');
@@ -175,40 +193,6 @@
 				]
 			},
 			{
-				// Operator response to a challenge within the window: unfreezes.
-				// MVP devnet resolution: the operator re-submits the identical
-				// committed root (fraud-proof games beyond this are Phase 2 —
-				// recorded here as an explicit boundary, not silently omitted).
-				if: "{trigger.data.respond}",
-				init: "{
-					$h = trigger.data.height;
-					// Identity gate: only the account that submitted (last
-					// replaced) the candidate for this height may respond.
-					if (!$h OR trigger.address != var['cand_who_' || $h])
-						bounce('not operator');
-					if ((var['frozen_' || $h] otherwise 0) != 1)
-						bounce('nothing to respond to');
-					if (timestamp >= var['stable_at_' || $h] + 3600)
-						bounce('response window closed');
-					if (trigger.data.root_confirmed != var['root_' || $h])
-						bounce('root mismatch');
-				}",
-				messages: [
-					{
-						app: "state",
-						state: "{
-							// unfreeze; confiscate EXACTLY the recorded challenger
-							// bond (coins stay in the AA pot), regardless of the
-							// respond trigger's own output.
-							// frozen==1 implies a challenger is recorded.
-							var['frozen_' || trigger.data.height] = 0;
-							var['bond_' || var['challenger_' || trigger.data.height]] = 0;
-							var['bond_height_' || var['challenger_' || trigger.data.height]] = 0;
-						}"
-					}
-				]
-			},
-			{
 				// finalize timer, with the challenge-FAILURE sweep folded in:
 				//   frozen==1 and window over (operator never responded)
 				//     -> height fails: frozen=2 permanent, root cleared,
@@ -221,11 +205,11 @@
 					$h = trigger.data.height;
 					if (!$h)
 						bounce('no height');
-					if ($h > var['last_locked'])
-						bounce('not locked');
 					$frozen = (var['frozen_' || $h] otherwise 0);
 					$failed = ($frozen == 1 AND timestamp >= var['stable_at_' || $h] + 3600);
-					if (!$failed AND ($frozen OR !var['root_' || $h] OR timestamp < var['stable_at_' || $h] + 3600 OR $h != var['last_finalized'] + 1))
+					if ($h > (var['last_locked'] otherwise 0))
+						bounce('not locked');
+					if (!$failed AND ($frozen OR !var['root_' || $h] OR timestamp < var['stable_at_' || $h] + 3600 OR $h != (var['last_finalized'] otherwise 0) + 1))
 						bounce('cannot finalize');
 				}",
 				messages: [
@@ -237,13 +221,15 @@
 								var['root_' || trigger.data.height] = 0;
 								var['aa_root_' || trigger.data.height] = 0;
 								var['last_locked'] = trigger.data.height - 1;
-								// Confiscate the submit bond and restart the
-								// stability clock: re-locking this height needs a
-								// fresh 600s window, so a challenge-failed root
-								// cannot be instantly reinstated from its stale
-								// candidate.
+								// Fraud confirmed (Step6): the 50000 submit bond is
+								// split — half credited to the challenger as
+								// claimable slash_reward_, half burned (coins stay
+								// in the pot, no payment). Challenger's own bond is
+								// refunded via {claim bond} below.
+								$ch = (var['challenger_' || trigger.data.height] otherwise '');
+								if ($ch)
+									var['slash_reward_' || $ch] += 25000;
 								var['active_bond_' || trigger.data.height] = 0;
-								var['fee_winner_' || trigger.data.height] = 0;
 								var['submitted_at_' || trigger.data.height] = timestamp;
 							}
 						else {
@@ -347,22 +333,14 @@
 				]
 			},
 			{
-				if: "{trigger.data.claim OR trigger.data.claim_reward OR trigger.data.claim_bond OR trigger.data.claim_submit_bond}",
+				if: "{trigger.data.claim}",
 				init: "{
-					$kind = trigger.data.claim;
-					if (!$kind){
-						if (trigger.data.claim_reward) $kind='reward';
-						else if (trigger.data.claim_bond) $kind='bond';
-						else if (trigger.data.claim_submit_bond) $kind='sbond';
-						else bounce('bad claim kind');
-					}
-					if ($kind != 'reward' AND $kind != 'bond' AND $kind != 'sbond' AND $kind != 'slash') bounce('bad claim kind');
-					$owed = ($kind=='reward' ? (var['reward_'||trigger.address] otherwise 0) : $kind=='bond' ? (var['bond_'||trigger.address] otherwise 0) : $kind=='sbond' ? (var['sbond_'||trigger.address] otherwise 0) : (var['slash_reward_'||trigger.address] otherwise 0));
+					$k = trigger.data.claim;
+					if ($k != 'reward' AND $k != 'bond' AND $k != 'sbond' AND $k != 'slash') bounce('bad claim kind');
+					$owed = ($k=='reward' ? (var['reward_'||trigger.address] otherwise 0) : ($k=='bond' ? (var['bond_'||trigger.address] otherwise 0) : ($k=='sbond' ? (var['sbond_'||trigger.address] otherwise 0) : (var['slash_reward_'||trigger.address] otherwise 0))));
 					if (!$owed OR trigger.output[[asset=base]] < 10000) bounce('nothing claimable');
-					if ($kind=='bond'){
-						$bh = (var['bond_height_'||trigger.address] otherwise 0);
-						if ($bh AND (var['frozen_'||$bh] otherwise 0) == 1) bounce('challenge unresolved');
-					}
+					$bh = (var['bond_height_'||trigger.address] otherwise 0);
+					if ($k=='bond' AND $bh AND (var['frozen_'||$bh] otherwise 0) == 1) bounce('challenge unresolved');
 				}",
 				messages: [
 					{
@@ -380,9 +358,9 @@
 					{
 						app: "state",
 						state: "{
-							if ($kind=='reward') var['reward_'||trigger.address]=0;
-							else if ($kind=='bond'){ var['bond_'||trigger.address]=0; var['bond_height_'||trigger.address]=0; }
-							else if ($kind=='sbond') var['sbond_'||trigger.address]=0;
+							if ($k=='reward') var['reward_'||trigger.address]=0;
+							else if ($k=='bond'){ var['bond_'||trigger.address]=0; var['bond_height_'||trigger.address]=0; }
+							else if ($k=='sbond') var['sbond_'||trigger.address]=0;
 							else var['slash_reward_'||trigger.address]=0;
 						}"
 					}
