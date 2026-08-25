@@ -17,11 +17,7 @@ fn acct(secret: &[u8; 32]) -> AccountId {
 fn deposit(parents: Vec<UnitId>, secret: &[u8; 32], amount: Usd, aa: u8) -> operp_dag::Unit {
     sign_unit(
         parents,
-        Op::Deposit {
-            account: acct(secret),
-            amount,
-            aa_unit: [aa; 32],
-        },
+        Op::Deposit { account: acct(secret), addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(), amount, aa_unit: [aa; 32] },
         secret,
     )
 }
@@ -56,7 +52,7 @@ fn usd(v: Usd) -> f64 {
 
 fn main() {
     let mut eng = Engine::new();
-    eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+    eng.state.deposits_allowed = (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
     eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
     let g = genesis_id();
     let alice = sk(1);

@@ -233,15 +233,30 @@ mod tests {
     fn self_trade_cancel_taker() {
         let mut book = OrderBook::new(BTC_USD);
         let a = acct(1);
+        let b = acct(2);
+        let px = 100 * PRICE_SCALE;
+        // Own resting ask at the front of the queue...
         book.submit(order(
             a,
             1,
             Side::Ask,
             OrderType::Limit,
             TimeInForce::Gtc,
-            100 * PRICE_SCALE,
+            px,
             QTY_SCALE,
             1,
+        ))
+        .unwrap();
+        // ...followed by another account's at the same price.
+        book.submit(order(
+            b,
+            1,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            2,
         ))
         .unwrap();
         let r = book
@@ -251,16 +266,24 @@ mod tests {
                 Side::Bid,
                 OrderType::Limit,
                 TimeInForce::Gtc,
-                100 * PRICE_SCALE,
-                QTY_SCALE,
-                2,
+                px,
+                2 * QTY_SCALE,
+                3,
             ))
             .unwrap();
-        assert!(r.fills.is_empty());
-        assert!(!r.taker_resting);
-        assert!(r.canceled_maker.is_empty());
-        assert!(book.get(oid(a, 1)).is_some());
-        assert!(book.get(oid(a, 2)).is_none());
+        // Own maker was canceled, not matched against.
+        assert_eq!(r.canceled_maker, vec![oid(a, 1)]);
+        assert!(book.get(oid(a, 1)).is_none());
+        // Matching continued against the next account's order.
+        assert_eq!(r.fills.len(), 1);
+        assert_eq!(r.fills[0].maker, b);
+        assert_eq!(r.fills[0].qty, QTY_SCALE);
+        // GTC remainder rests back in the book.
+        assert!(r.taker_resting);
+        assert_eq!(r.taker_remaining, QTY_SCALE);
+        assert_eq!(book.get(oid(a, 2)).unwrap().remaining, QTY_SCALE);
+        // Ask level is fully drained (cancel + fill), no phantom qty.
+        assert_eq!(book.best_ask(), None);
     }
 
     #[test]

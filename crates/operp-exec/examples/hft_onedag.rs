@@ -52,7 +52,7 @@ fn main() {
     let mut eng0 = Engine::new();
     // Standalone example: no real AA feed — admit all synthetic deposit units
     // and all markets the generators will use.
-    eng0.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+    eng0.state.deposits_allowed = (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
     for m in 1..=16u32 {
         eng0.state
             .markets
@@ -130,11 +130,7 @@ fn main() {
                 let s = &secrets[0];
                 let u = sign_unit(
                     vec![dep_tip],
-                    Op::Deposit {
-                        account: acct(s),
-                        amount: 10_000_000 * USD_SCALE as i128,
-                        aa_unit: [((g * 13 + 7) % 250 + 1) as u8; 32],
-                    },
+                    Op::Deposit { account: acct(s), addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(), amount: 10_000_000 * USD_SCALE as i128, aa_unit: [((g * 13 + 7) % 250 + 1) as u8; 32] },
                     s,
                 );
                 dep_tip = unit_id(&u);
@@ -143,11 +139,7 @@ fn main() {
                 for (ti, s) in secrets.iter().enumerate().skip(1) {
                     let u = sign_unit(
                         vec![dep_tip],
-                        Op::Deposit {
-                            account: acct(s),
-                            amount: 10_000_000 * USD_SCALE as i128,
-                            aa_unit: [((g * 31 + ti * 7 + 11) % 250 + 1) as u8; 32],
-                        },
+                        Op::Deposit { account: acct(s), addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(), amount: 10_000_000 * USD_SCALE as i128, aa_unit: [((g * 31 + ti * 7 + 11) % 250 + 1) as u8; 32] },
                         s,
                     );
                     dep_tip = unit_id(&u);

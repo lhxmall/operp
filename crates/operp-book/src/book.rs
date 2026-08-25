@@ -44,8 +44,8 @@ impl OrderBook {
     ///   || for each ask level ascending by price, then each bid level
     ///      descending by price:
     ///        price le8 || live-order count u32le
-    ///        || per live order in deque order (ghost ids left behind by
-    ///           cancels, i.e. ids not in `orders`, are skipped):
+    ///        || per live order in deque order (stale ids not present in
+    ///           `orders`, if any, are skipped):
     ///            order_id 32B || remaining le8
     /// BTreeMap iteration makes level order deterministic across replays.
     /// O(book size) — fine for settlement-time commitment.
@@ -133,8 +133,7 @@ impl OrderBook {
         }
 
         let mut fills = Vec::new();
-        let canceled_maker = Vec::new();
-        let mut self_trade = false;
+        let mut canceled_maker = Vec::new();
 
         while order.remaining > 0 {
             let head = match order.side {
@@ -160,16 +159,23 @@ impl OrderBook {
                 break;
             }
 
-            let maker_account = match self.orders.get(&maker_id) {
-                Some(m) => m.account,
+            let (maker_account, maker_side, maker_remaining) = match self.orders.get(&maker_id)
+            {
+                Some(m) => (m.account, m.side, m.remaining),
                 None => {
                     self.pop_head(order.side.opposite());
                     continue;
                 }
             };
             if maker_account == order.account {
-                self_trade = true;
-                break;
+                // STP (cancel-maker-continue): the taker hit its own resting
+                // order; cancel that maker and keep matching the queue.
+                // Cache: canceled maker's visible qty leaves the level.
+                self.level_add(maker_side, maker_price, -(maker_remaining as i64));
+                canceled_maker.push(maker_id);
+                self.orders.remove(&maker_id);
+                self.pop_head(maker_side);
+                continue;
             }
 
             let (fill_qty, maker_side, maker_acct, maker_done) = {
@@ -201,14 +207,6 @@ impl OrderBook {
             }
         }
 
-        if self_trade {
-            return Ok(MatchResult {
-                fills,
-                taker_remaining: 0,
-                taker_resting: false,
-                canceled_maker,
-            });
-        }
 
         let rest = order.typ == OrderType::Limit
             && order.tif == TimeInForce::Gtc
@@ -240,29 +238,27 @@ impl OrderBook {
         let side = order.side;
         let mut order = self.orders.remove(&id).ok_or(BookError::NotFound)?;
 
-        let at_front = {
+        let removed = {
             let dq = match side {
                 Side::Bid => self.bids.get_mut(&Reverse(price)),
                 Side::Ask => self.asks.get_mut(&price),
             };
             match dq {
-                Some(dq) => {
-                    if dq.front() == Some(&id) {
-                        dq.pop_front();
+                Some(dq) => match dq.iter().position(|x| x == &id) {
+                    Some(pos) => {
+                        dq.remove(pos);
                         true
-                    } else {
-                        false
                     }
-                }
+                    None => false,
+                },
                 None => false,
             }
         };
         // Visible qty is defined by order existence, not queue position: the
-        // cache decrements for EVERY cancel. A non-head order leaves its id in
-        // the deque as a ghost; next_*_head lazily skips ids missing from
-        // `orders`, so correctness is preserved with O(1) cancel.
+        // cache decrements for EVERY cancel, and the id is removed from its
+        // level deque so no ghost ids linger.
         self.level_add(side, price, -(order.remaining as i64));
-        if at_front {
+        if removed {
             self.drop_empty_level(side, price);
         }
         order.remaining = 0;

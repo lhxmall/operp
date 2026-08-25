@@ -28,6 +28,12 @@ pub const OBYTE_STABILITY_SECS: u64 = 600;
 pub const BATCH_INTERVAL_MS: u64 = 2000;
 pub const BATCH_MAX_UNITS: u32 = 512;
 pub const MAX_PARENTS: usize = 2;
+/// Hard depth cap for the AA-facing hex-domain merkle tree. Mirrors the
+/// vault AA's `reduce(..., 16, ...)` and ocore's fatal behavior on arrays
+/// longer than the formula's fixed unroll (vendor/ocore/formula/evaluation.js:2374):
+/// proofs deeper than this cannot be evaluated on-chain, so proof generation
+/// refuses them instead of emitting an unusable path.
+pub const MAX_AA_TREE_DEPTH: usize = 16;
 
 pub type Price = u64;
 pub type Qty = u64;
@@ -143,6 +149,18 @@ pub fn parse_hex32(s: &str) -> Result<[u8; 32], TypesError> {
     let v = hex::decode(s).map_err(|_| TypesError::InvalidHex)?;
     let a: [u8; 32] = v.try_into().map_err(|_| TypesError::InvalidHex)?;
     Ok(a)
+}
+
+
+/// Obyte address validity: 32 chars from the base32 alphabet used by
+/// `isValidAddress` in vendor/ocore/validation_utils.js (`/^[A-Z2-7]{32}$/`).
+/// The trailing chash160 checksum those validators also check is not
+/// replicated here — the sidechain only needs the charset/length shape to
+/// bind deposit addresses to the AA leaf-key domain.
+pub fn valid_obyte_addr(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|c| c.is_ascii_uppercase() || (b'2'..=b'7').contains(&c))
 }
 
 pub fn parse_hex64(s: &str) -> Result<[u8; 64], TypesError> {

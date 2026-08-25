@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub struct Withdrawal {
     pub amount: Usd,
     pub pending: bool,
+    /// Batch height at which this withdrawal was signed in; drives the
+    /// 256-height replay-protection window enforced by `prune_withdrawals`.
+    pub height: Height,
 }
 #[derive(Clone, Debug)]
 pub struct ChainState {
@@ -44,19 +47,32 @@ pub struct ChainState {
     /// Next proposal id to allocate.
     pub next_proposal_id: u64,
     pub withdrawals: BTreeMap<(AccountId, u64), Withdrawal>,
-    pub seen_aa_units: HashSet<[u8; 32]>,
+    pub seen_aa_units: HashMap<[u8; 32], Height>,
     pub seen_client_seq: HashMap<AccountId, u64>,
-    /// AA deposit events observed on-chain for the pending batch window.
-    /// Deposit ops referencing units outside this set are rejected.
-    pub deposits_allowed: HashSet<[u8; 32]>,
-    /// Consumed GovWithdraw nonces: replay protection for PERP withdrawals.
-    pub seen_gov_nonces: HashSet<(AccountId, u64)>,
+    /// AA deposit events observed on-chain for the pending batch window,
+    /// keyed by (unit, is_perp): a unit endorsing USDC collateral and one
+    /// endorsing PERP are distinct entries. Deposit ops referencing units
+    /// outside this set are rejected.
+    pub deposits_allowed: HashSet<([u8; 32], bool)>,
+    /// Highest consumed GovWithdraw nonce per account: strict watermark —
+    /// nonces must be strictly increasing per account (`nonce <= watermark`
+    /// bounces). Bounded by the account count, unlike a spent-nonce set.
+    pub seen_gov_nonces: HashMap<AccountId, u64>,
+    /// Obyte withdrawal address bound to each account at its first deposit.
+    /// The AA-facing tree keys leaves by this address; unbound accounts are
+    /// not representable on the AA side and are excluded from it.
+    pub aa_addresses: BTreeMap<AccountId, String>,
+    /// Cumulative sidechain-signed withdrawal amount per account (i128 to
+    /// match Usd). Committed inside the binary account leaf as `W` so the
+    /// vault AA can enforce "this claim + prior claims <= W".
+    pub withdrawn_total: BTreeMap<AccountId, i128>,
 }
 
 /// An open governance proposal. `deadline_seq` and the quorum denominator
 /// snapshot (`supply_at_create`) are fixed at creation so replayed batches
-/// finalize identically. Voting weight is the voter's PERP balance at vote
-/// execution time (MVP semantics); `supply_at_create` shrinks with burns.
+/// finalize identically. Voting weight is the voter's PERP balance snapshotted
+/// at proposal creation (`weight_snapshot`); burning after creation cannot
+/// shrink a committed vote or dodge quorum.
 #[derive(Clone, Debug)]
 pub struct Proposal {
     pub creator: AccountId,
@@ -69,8 +85,9 @@ pub struct Proposal {
     pub yes: u128,
     pub no: u128,
     pub voted: HashSet<AccountId>,
-    /// None = open; Some(true) = passed & applied; Some(false) = rejected.
-    pub finalized: Option<bool>,
+    /// PERP balances cloned when the proposal was created; vote weights read
+    /// from here, never from live balances.
+    pub weight_snapshot: BTreeMap<AccountId, u128>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -90,6 +107,14 @@ pub struct MerkleProof {
     pub collateral: Usd,
     /// Mirrored PERP balance committed by the leaf.
     pub perp: u128,
+    /// Cumulative withdrawn amount committed by the leaf (the AA-side `W`).
+    pub withdrawn: i128,
+    /// Realized PnL committed by the leaf; carried so `check_withdraw` can
+    /// recompute the exact leaf preimage from the proof alone.
+    pub realized_pnl: Usd,
+    /// Open positions committed by the leaf (qty, entry_price per market);
+    /// carried for the same leaf-preimage recomputation.
+    pub positions: BTreeMap<MarketId, (i64, Price)>,
 }
 
 impl Default for ChainState {
@@ -111,6 +136,7 @@ impl ChainState {
         let mut markets = BTreeMap::new();
         markets.insert(BTC_USD, genesis_params());
         Self {
+            withdrawals: BTreeMap::new(),
             height: 0,
             last_unit: operp_book_genesis(),
             seq: 0,
@@ -127,13 +153,28 @@ impl ChainState {
             perp_burned: 0,
             proposals: BTreeMap::new(),
             next_proposal_id: 1,
-            withdrawals: BTreeMap::new(),
-            seen_aa_units: HashSet::new(),
+            seen_aa_units: HashMap::new(),
             seen_client_seq: HashMap::new(),
             deposits_allowed: HashSet::new(),
-            seen_gov_nonces: HashSet::new(),
+            seen_gov_nonces: HashMap::new(),
+            aa_addresses: BTreeMap::new(),
+            withdrawn_total: BTreeMap::new(),
         }
     }
+    /// Drop withdrawal-ledger entries outside the 256-height replay window:
+    /// an entry signed in at height `h` still blocks replay while
+    /// `h + 256 > min_height`. Called once per committed batch, so
+    /// duplicate-withdrawal protection spans a rolling 256-height window.
+    pub fn prune_withdrawals(&mut self, min_height: Height) {
+        self.withdrawals.retain(|_, w| w.height + 256 > min_height);
+    }
+
+    /// Bounded-window cleanup for AA unit dedup: units observed at height
+    /// `h` expire once `min_height >= h + 256`. Called at batch commit.
+    pub fn prune_aa_units(&mut self, min_height: Height) {
+        self.seen_aa_units.retain(|_, h| *h + 256 > min_height);
+    }
+
 
     /// Apply a bonded oracle's report for `market` and recompute the effective
     /// mark as the median of all current bonded reporters, subject to the
@@ -286,25 +327,32 @@ impl ChainState {
                 self.account_mut(INSURANCE_ACCOUNT).collateral += fee;
             }
         }
-        // Bad-debt cap: if the taker went bankrupt (equity < 0), its equity is
-        // clamped to exactly 0 (collateral absorbs the hole — realized PnL is
-        // settled into collateral since the settlement refactor) and the
-        // insurance fund takes an equal debit. A negative insurance balance is
-        // explicit socialized debt repaid by future fee income. Conservation
-        // holds; a repeat fill cannot re-trigger because equity is now 0.
+        // Bad-debt cap: if either side went bankrupt (equity < 0), its equity
+        // is clamped to exactly 0 (collateral absorbs the hole — realized PnL
+        // is settled into collateral since the settlement refactor) and the
+        // insurance fund takes an equal debit. Applied to BOTH fill parties:
+        // a maker resting at a stale price can go underwater exactly like a
+        // taker crossing. A negative insurance balance is explicit socialized
+        // debt repaid by future fee income. Conservation holds; a repeat fill
+        // cannot re-trigger because equity is now 0.
         // Insurance itself is exempt (never clamped).
-        if fill.taker != INSURANCE_ACCOUNT {
+        for party in [fill.taker, fill.maker] {
+            if party == INSURANCE_ACCOUNT {
+                continue;
+            }
             let shortfall = {
-                let marks = &self.marks;
-                let s = match self.accounts.get(&fill.taker) {
-                    Some(a) => a.snapshot(marks),
-                    None => return Ok(()),
+                let s = match self.accounts.get(&party) {
+                    Some(a) => a.snapshot(&self.marks),
+                    None => continue,
                 };
                 if s.equity < 0 { -s.equity } else { 0 }
             };
             if shortfall > 0 {
-                if let Some(a) = self.accounts.get_mut(&fill.taker) {
-                    a.collateral -= shortfall;
+                if let Some(a) = self.accounts.get_mut(&party) {
+                    // equity = collateral + upnl < 0 ⇒ collateral := -upnl,
+                    // i.e. credit back |equity| so equity lands on exactly 0
+                    // and the insurance debit equals the socialized loss.
+                    a.collateral += shortfall;
                 }
                 let ins = self.account_mut(INSURANCE_ACCOUNT);
                 ins.collateral -= shortfall;
@@ -340,7 +388,8 @@ impl ChainState {
                 .get(&acct.id)
                 .copied()
                 .unwrap_or(0);
-            leaves.push(account_leaf(acct, perp));
+            let withdrawn = self.withdrawn_total.get(&acct.id).copied().unwrap_or(0);
+            leaves.push(account_leaf(acct, perp, withdrawn));
         }
         for book in self.books.values() {
             leaves.push(book_leaf(book, &self.markets));
@@ -359,7 +408,8 @@ impl ChainState {
             .cloned()
             .unwrap_or_else(|| Account::new(id));
         let perp = self.perp_balances.get(&id).copied().unwrap_or(0);
-        let leaf = account_leaf(&acct, perp);
+        let withdrawn = self.withdrawn_total.get(&id).copied().unwrap_or(0);
+        let leaf = account_leaf(&acct, perp, withdrawn);
         let leaves = self.leaves();
         let (siblings, root) = merkle_proof_for(leaves, leaf);
         MerkleProof {
@@ -369,6 +419,13 @@ impl ChainState {
             account: id,
             collateral: acct.collateral,
             perp,
+            withdrawn,
+            realized_pnl: acct.realized_pnl,
+            positions: acct
+                .positions
+                .values()
+                .map(|p| (p.market, (p.qty, p.entry_price)))
+                .collect(),
         }
     }
 
@@ -385,7 +442,7 @@ impl ChainState {
     }
 }
 
-pub fn account_leaf(acct: &Account, perp: u128) -> [u8; 32] {
+pub fn account_leaf(acct: &Account, perp: u128, withdrawn: i128) -> [u8; 32] {
     let mut b = Vec::new();
     b.extend_from_slice(b"acct");
     b.extend_from_slice(&acct.id.0);
@@ -400,6 +457,9 @@ pub fn account_leaf(acct: &Account, perp: u128) -> [u8; 32] {
     // Mirrored PERP balance: the vault AA's hex-domain leaf commits the same
     // triple (address, collateral, perp), so both trees cover PERP claims.
     b.extend_from_slice(&perp.to_le_bytes());
+    // Cumulative sidechain-signed withdrawals (W): committing it lets the
+    // vault AA enforce "this claim + prior claims <= W" against replay.
+    b.extend_from_slice(&withdrawn.to_le_bytes());
     sha256(&b)
 }
 
@@ -443,6 +503,16 @@ fn meta_leaf(state: &ChainState) -> [u8; 32] {
     b.extend_from_slice(&state.perp_burned.to_le_bytes());
     b.extend_from_slice(&state.next_market_id.to_le_bytes());
     b.extend_from_slice(&state.next_proposal_id.to_le_bytes());
+    // Per-market price state: every market's mark and oracle funding index
+    // (last_index) are committed in marks' BTreeMap order, so replays cannot
+    // diverge on price/funding state outside the account tree.
+    for (m, mark) in &state.marks {
+        b.extend_from_slice(&m.0.to_le_bytes());
+        b.extend_from_slice(&mark.to_le_bytes());
+        b.extend_from_slice(
+            &state.last_index.get(m).copied().unwrap_or(0).to_le_bytes(),
+        );
+    }
     sha256(&b)
 }
 
@@ -528,11 +598,11 @@ fn merkle_proof_for(mut leaves: Vec<[u8; 32]>, leaf: [u8; 32]) -> (Vec<([u8; 32]
 ///
 /// Oscript's `sha256()` hashes the UTF-8 string of its argument, so the vault
 ///   leaf  = sha256_hex("acct:" || address || ":" || collateral_decimal
-///                      || ":" || perp_decimal)
+///                      || ":" || perp_decimal || ":" || withdrawn_decimal)
 ///   node  = sha256_hex(left_hex || right_hex)
 
-pub fn aa_account_leaf_str(addr: &str, collateral: Usd, perp: u128) -> String {
-    let s = format!("acct:{}:{}:{}", addr, collateral, perp);
+pub fn aa_account_leaf_str(addr: &str, collateral: Usd, perp: u128, withdrawn: i128) -> String {
+    let s = format!("acct:{}:{}:{}:{}", addr, collateral, perp, withdrawn);
     hex::encode(sha256(s.as_bytes()))
 }
 
@@ -544,11 +614,12 @@ fn aa_parent(l: &str, r: &str) -> String {
     hex::encode(sha256(buf.as_bytes()))
 }
 
-/// Root of the hex-domain tree over (address, collateral, perp) triples.
-pub fn aa_root_of(pairs: &[(String, Usd, u128)]) -> String {
+/// Root of the hex-domain tree over (address, collateral, perp, withdrawn)
+/// quads.
+pub fn aa_root_of(pairs: &[(String, Usd, u128, i128)]) -> String {
     let mut level: Vec<String> = pairs
         .iter()
-        .map(|(addr, col, perp)| aa_account_leaf_str(addr, *col, *perp))
+        .map(|(addr, col, perp, w)| aa_account_leaf_str(addr, *col, *perp, *w))
         .collect();
     if level.is_empty() {
         return hex::encode(sha256(b"empty"));
@@ -564,24 +635,27 @@ pub fn aa_root_of(pairs: &[(String, Usd, u128)]) -> String {
     level[0].clone()
 }
 
-/// Proof path for one address in the hex-domain tree over `pairs`.
+/// Proof path for one address in the hex-domain tree over `pairs`. Returns
+/// `None` when the path would need more than `MAX_AA_TREE_DEPTH` siblings:
+/// the vault AA unrolls exactly 16 reduction steps (and ocore fatally errors
+/// on over-long arrays), so a deeper proof could never be evaluated on-chain.
 pub fn aa_proof_for(
-    pairs: &[(String, Usd, u128)],
+    pairs: &[(String, Usd, u128, i128)],
     addr: &str,
 ) -> Option<(Vec<(String, bool)>, String)> {
     let mut level: Vec<String> = pairs
         .iter()
-        .map(|(a, c, p)| aa_account_leaf_str(a, *c, *p))
+        .map(|(a, c, p, w)| aa_account_leaf_str(a, *c, *p, *w))
         .collect();
-    let leaf = aa_account_leaf_str(
-        addr,
-        pairs.iter().find(|(a, _, _)| a == addr)?.1,
-        pairs.iter().find(|(a, _, _)| a == addr)?.2,
-    );
+    let entry = pairs.iter().find(|(a, ..)| a == addr)?;
+    let leaf = aa_account_leaf_str(addr, entry.1, entry.2, entry.3);
     level.sort();
     let mut idx = level.iter().position(|l| *l == leaf)?;
     let mut siblings = Vec::new();
     while level.len() > 1 {
+        if siblings.len() >= operp_types::MAX_AA_TREE_DEPTH {
+            return None;
+        }
         if level.len() % 2 == 1 {
             let last = level.last().unwrap().clone();
             level.push(last);
@@ -594,39 +668,38 @@ pub fn aa_proof_for(
     Some((siblings, level[0].clone()))
 }
 
-/// Root of the hex-domain tree over the sidechain accounts, keyed by each
-/// account's id hex (engine-side convenience wrapper).
+/// Root of the hex-domain tree over the sidechain accounts that are bound to
+/// an Obyte address in `aa_addresses`, keyed by the bound address string.
+/// Unbound accounts are excluded — they cannot prove identity on the AA
+/// side, so their leaves would be claimable by nobody. The withdrawn leg is
+/// the account's cumulative signed withdrawals (0 when never withdrawn).
 pub fn aa_root_of_state(state: &ChainState) -> String {
-    let pairs: Vec<(String, Usd, u128)> = state
-        .accounts
-        .values()
-        .map(|a| {
-            (
-                hex::encode(a.id.0),
-                a.collateral,
-                state.perp_balances.get(&a.id).copied().unwrap_or(0),
-            )
-        })
-        .collect();
-    aa_root_of(&pairs)
+    aa_root_of(&aa_pairs_of(state))
 }
 
 pub fn aa_proof_for_account(
     state: &ChainState,
     id: &AccountId,
 ) -> Option<(Vec<(String, bool)>, String)> {
-    let pairs: Vec<(String, Usd, u128)> = state
+    let addr = state.aa_addresses.get(id)?;
+    aa_proof_for(&aa_pairs_of(state), addr)
+}
+
+/// Hex-domain tree entries for every AA-bound account, in account-id order.
+fn aa_pairs_of(state: &ChainState) -> Vec<(String, Usd, u128, i128)> {
+    state
         .accounts
         .values()
-        .map(|a| {
-            (
-                hex::encode(a.id.0),
+        .filter_map(|a| {
+            let addr = state.aa_addresses.get(&a.id)?;
+            Some((
+                addr.clone(),
                 a.collateral,
                 state.perp_balances.get(&a.id).copied().unwrap_or(0),
-            )
+                state.withdrawn_total.get(&a.id).copied().unwrap_or(0),
+            ))
         })
-        .collect();
-    aa_proof_for(&pairs, &hex::encode(id.0))
+        .collect()
 }
 
 #[cfg(test)]
@@ -752,4 +825,64 @@ mod tests {
             "funding must conserve total collateral"
         );
     }
+    #[test]
+    fn maker_bad_debt_clamped_to_insurance() {
+        let mut s = ChainState::new();
+        let taker = AccountId([9; 32]);
+        let maker = AccountId([8; 32]);
+        s.account_mut(taker)
+            .credit(1_000_000 * USD_SCALE as i128)
+            .unwrap();
+        s.account_mut(maker)
+            .credit(50_000 * USD_SCALE as i128)
+            .unwrap();
+        // Maker is long 1 BTC @ 100k.
+        s.account_mut(maker)
+            .apply_fill(
+                operp_types::Side::Bid,
+                false,
+                100_000 * operp_types::PRICE_SCALE,
+                operp_types::QTY_SCALE,
+                BTC_USD,
+            )
+            .unwrap();
+        // Taker dumps at 10k: the maker closes with a 90k realized loss
+        // settled into only 50k of collateral → bankrupt.
+        s.marks.insert(BTC_USD, 10_000 * operp_types::PRICE_SCALE);
+        let fill = Fill {
+            taker_id: operp_types::OrderId([0u8; 32]),
+            maker_id: operp_types::OrderId([0u8; 32]),
+            taker,
+            maker,
+            market: BTC_USD,
+            price: 10_000 * operp_types::PRICE_SCALE,
+            qty: operp_types::QTY_SCALE,
+            seq: 1,
+            taker_side: operp_types::Side::Bid,
+        };
+        s.apply_fill_pair(&fill).unwrap();
+        // Maker clamped to exactly 0. The maker's own 50k collateral absorbs
+        // the first leg of the 90k loss; insurance takes only the residual
+        // 40k shortfall (plus the taker fee credit).
+        assert_eq!(s.accounts[&maker].collateral, 0);
+        let fee = bps(notional_usd(fill.qty, fill.price), 5);
+        let expected_ins = INSURANCE_SEED + fee - 40_000 * USD_SCALE as i128;
+        assert_eq!(s.accounts[&INSURANCE_ACCOUNT].collateral, expected_ins);
+    }
+
+    #[test]
+    fn aa_proof_for_refuses_over_deep_trees() {
+        // 2^16 leaves need exactly MAX_AA_TREE_DEPTH siblings; one more leaf
+        // pushes past the AA's fixed 16-step reduce and must yield None.
+        let mk = |n: usize| -> Vec<(String, Usd, u128, i128)> {
+            (0..n)
+                .map(|i| (format!("A{:031}", i), 1, 0u128, 0i128))
+                .collect()
+        };
+        let ok = mk(1 << operp_types::MAX_AA_TREE_DEPTH);
+        assert!(aa_proof_for(&ok, &format!("A{:031}", 1)).is_some());
+        let too_deep = mk((1 << operp_types::MAX_AA_TREE_DEPTH) + 1);
+        assert!(aa_proof_for(&too_deep, &format!("A{:031}", 1)).is_none());
+    }
 }
+

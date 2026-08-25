@@ -53,8 +53,6 @@ pub struct WithdrawClaim {
     pub amount: Usd,
     /// PERP withdrawal amount; 0 = collateral-only claim.
     pub perp: u128,
-    pub nonce: u64,
-    pub height: Height,
     pub proof: MerkleProof,
 }
 
@@ -131,6 +129,11 @@ impl Batch {
         // (validate_against enforces exactly that).
         engine.state.height = prev.height + 1;
         let height = engine.state.height;
+        // Batch-commit ledger hygiene: withdrawal entries and AA-unit dedup
+        // marks only need to block replay across the 256-height challenge
+        // window; older entries are dropped so the ledgers stay bounded.
+        engine.state.prune_withdrawals(height);
+        engine.state.prune_aa_units(height);
         let last_unit = *applied.last().unwrap();
         Ok(Self {
             chain_id: CHAIN_ID.to_string(),
@@ -198,17 +201,16 @@ impl Batch {
         if replay.state.state_root() != prev_root {
             return Err(SettleError::PrevMismatch);
         }
-        // Inject the AA deposit set implied by this batch's deposit ops so the
-        // replay admits exactly the deposits the batch claims are on-chain.
-        replay.state.deposits_allowed.clear();
         for u in &self.units {
             match &u.op {
                 operp_dag::Op::Deposit { aa_unit, .. } => {
-                    replay.state.deposits_allowed.insert(*aa_unit);
+                    replay.state.deposits_allowed.insert((*aa_unit, false));
                 }
-                // PERP deposits are backed by the same on-chain AA feed.
+                // PERP deposits are backed by the same on-chain AA feed; the
+                // bool kind keeps a collateral endorsement from crediting
+                // PERP (and vice versa).
                 operp_dag::Op::GovDeposit { aa_unit, .. } => {
-                    replay.state.deposits_allowed.insert(*aa_unit);
+                    replay.state.deposits_allowed.insert((*aa_unit, true));
                 }
                 _ => {}
             }
@@ -248,6 +250,12 @@ impl Batch {
         if replay.state.state_root() != self.checkpoint.state_root {
             return Err(SettleError::RootMismatch);
         }
+        // The AA-facing hex-domain tree (bound-address keyed, W committed)
+        // must also match: this catches divergence invisible to the binary
+        // root, e.g. a different address binding or withdrawn ledger.
+        if operp_state::aa_root_of_state(&replay.state) != self.checkpoint.aa_root {
+            return Err(SettleError::RootMismatch);
+        }
         Ok(())
     }
 }
@@ -272,6 +280,32 @@ pub fn check_withdraw(claim: &WithdrawClaim, finalized_root: [u8; 32]) -> Result
         return Err(SettleError::BadMerkle);
     }
     if claim.proof.account != claim.account {
+        return Err(SettleError::BadMerkle);
+    }
+    // Bind the claimed amounts to the committed leaf preimage: rebuild the
+    // binary account leaf from the proof's own fields and require it to hash
+    // to proof.leaf. Without this, a forged-but-internally-consistent proof
+    // (e.g. inflated collateral with matching siblings) would verify.
+    let mut acct = operp_account::Account::new(claim.proof.account);
+    acct.collateral = claim.proof.collateral;
+    acct.realized_pnl = claim.proof.realized_pnl;
+    acct.positions = claim
+        .proof
+        .positions
+        .iter()
+        .map(|(m, (qty, entry))| {
+            (
+                *m,
+                operp_account::Position {
+                    market: *m,
+                    qty: *qty,
+                    entry_price: *entry,
+                },
+            )
+        })
+        .collect();
+    let leaf = operp_state::account_leaf(&acct, claim.proof.perp, claim.proof.withdrawn);
+    if leaf != claim.proof.leaf {
         return Err(SettleError::BadMerkle);
     }
     if claim.amount > claim.proof.collateral {
@@ -307,9 +341,17 @@ mod tests {
         account_id_from_pubkey(&pk)
     }
 
+    /// 32-char uppercase [A-Z2-7] Obyte-style test address, varied by `n`.
+    fn test_addr(n: u8) -> String {
+        let mut bytes = vec![b'A'; 32];
+        bytes[0] = b'A' + (n % 26);
+        String::from_utf8(bytes).unwrap()
+    }
+
     fn seed_trade() -> (Engine, Engine, Vec<UnitId>, [u8; 32]) {
         let mut eng = Engine::new();
-        eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+        eng.state.deposits_allowed =
+            (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
         eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
         let prev_root = eng.state.state_root();
         let pre = eng.clone();
@@ -321,6 +363,7 @@ mod tests {
             vec![g],
             Op::Deposit {
                 account: acct_of(&alice),
+                addr: test_addr(1),
                 amount: 10_000 * USD_SCALE as i128,
                 aa_unit: [1; 32],
             },
@@ -332,6 +375,7 @@ mod tests {
             vec![applied[0]],
             Op::Deposit {
                 account: acct_of(&bob),
+                addr: test_addr(2),
                 amount: 10_000 * USD_SCALE as i128,
                 aa_unit: [2; 32],
             },
@@ -405,8 +449,6 @@ mod tests {
             account: alice,
             amount: 1,
             perp: 0,
-            nonce: 1,
-            height: 1,
             proof: proof.clone(),
         };
         check_withdraw(&claim, root).unwrap();
@@ -423,8 +465,6 @@ mod tests {
             account: other,
             amount: 1,
             perp: 0,
-            nonce: 1,
-            height: 1,
             proof: proof.clone(),
         };
         assert!(check_withdraw(&fail, root).is_err());
@@ -515,7 +555,8 @@ mod tests {
         // A GovDeposit whose aa_unit was never posted on-chain bounces exactly
         // like a collateral Deposit instead of crediting PERP.
         let mut eng = Engine::new();
-        eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+        eng.state.deposits_allowed =
+            (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
         eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
         let g = genesis_id();
         let alice = acct_of(&sk(1));
@@ -523,6 +564,7 @@ mod tests {
             vec![g],
             Op::Deposit {
                 account: alice,
+                addr: test_addr(1),
                 amount: 10_000 * USD_SCALE as i128,
                 aa_unit: [1; 32],
             },
@@ -534,6 +576,7 @@ mod tests {
             vec![did],
             Op::GovDeposit {
                 account: alice,
+                addr: test_addr(1),
                 amount: 5_000,
                 aa_unit: [0; 32],
             },
@@ -561,6 +604,7 @@ mod tests {
             vec![*applied.last().unwrap()],
             Op::GovDeposit {
                 account: alice,
+                addr: test_addr(1),
                 amount: 5_000,
                 aa_unit: [77; 32],
             },
@@ -579,21 +623,69 @@ mod tests {
     }
 
     #[test]
-    fn aa_root_triple_matches_hand_computed() {
-        let pairs: Vec<(String, Usd, u128)> = vec![
-            ("ADDRB".to_string(), 700, 30),
-            ("ADDRA".to_string(), 500, 20),
+    fn aa_root_quad_matches_hand_computed() {
+        let pairs: Vec<(String, Usd, u128, i128)> = vec![
+            ("ADDRB".to_string(), 700, 30, 5),
+            ("ADDRA".to_string(), 500, 20, 0),
         ];
         let root = operp_state::aa_root_of(&pairs);
         // Hand-compute over the same tree the AA reconstructs in Oscript:
-        // leaf = sha256_hex("acct:" || addr || ":" || col || ":" || perp),
+        // leaf = sha256_hex("acct:" || addr || ":" || col || ":" || perp
+        //                    || ":" || withdrawn),
         // leaves sorted, parent = sha256_hex(left || right).
         let mut leaves: Vec<String> = pairs
             .iter()
-            .map(|(a, c, p)| hex::encode(sha256(format!("acct:{}:{}:{}", a, c, p).as_bytes())))
+            .map(|(a, c, p, w)| {
+                hex::encode(sha256(format!("acct:{}:{}:{}:{}", a, c, p, w).as_bytes()))
+            })
             .collect();
         leaves.sort();
         let expected = hex::encode(sha256(format!("{}{}", leaves[0], leaves[1]).as_bytes()));
         assert_eq!(root, expected);
+    }
+
+    #[test]
+    fn tampered_aa_root_is_root_mismatch() {
+        let (mut eng, mut pre, applied, prev_root) = seed_trade();
+        let mut batch = Batch::from_applied(&pre.state, &mut eng, &applied).unwrap();
+        batch.checkpoint.aa_root.push('0');
+        assert_eq!(
+            batch.validate_against(prev_root, &mut pre),
+            Err(SettleError::RootMismatch)
+        );
+    }
+
+    #[test]
+    fn forged_proof_fields_fail_leaf_recompute() {
+        // A proof whose declared collateral was inflated no longer hashes to
+        // its own committed leaf: check_withdraw must reject it before any
+        // amount check can pass.
+        let (eng, _, _, _) = seed_trade();
+        // Bind an address so the account enters the AA tree.
+        let alice = acct_of(&sk(1));
+        assert!(eng.state.aa_addresses.contains_key(&alice));
+        let proof = eng.state.account_proof(alice);
+        let claim = WithdrawClaim {
+            account: alice,
+            amount: 1,
+            perp: 0,
+            proof,
+        };
+        check_withdraw(&claim, claim.proof.root).unwrap();
+
+        let (eng2, _, _, _) = seed_trade();
+        let alice2 = acct_of(&sk(1));
+        let mut bad_proof = eng2.state.account_proof(alice2);
+        bad_proof.collateral += 1; // forge one extra USD of collateral
+        let forged = WithdrawClaim {
+            account: alice2,
+            amount: 1,
+            perp: 0,
+            proof: bad_proof,
+        };
+        assert_eq!(
+            check_withdraw(&forged, forged.proof.root),
+            Err(SettleError::BadMerkle)
+        );
     }
 }

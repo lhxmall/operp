@@ -53,7 +53,7 @@ cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
 | Crate | Role |
 |---|---|
 | `operp-types` | Constants (single source of truth), ids (`AccountId = sha256(pubkey)`), fixed-point math |
-| `operp-book` | Central limit order book: price-time priority, partial fills, IOC/GTC, self-trade block |
+| `operp-book` | Central limit order book: price-time priority, partial fills, IOC/GTC, self-trade cancel-maker protection |
 | `operp-account` | Per-account collateral/positions, VWAP entry price, realized PnL, risk snapshot |
 | | `liquidatable` at equity·10000 ≤ mm·10500, `reduce_only` at ≤ 12000 |
 | `operp-state` | ChainState: accounts/books/marks/withdrawals, byte-level Merkle tree (`state_root`) + hex-string tree (`aa_root`) for the AA |
@@ -89,6 +89,9 @@ is integer fixed-point:
 Intake guards reject before any arithmetic can wrap: `qty > i64::MAX` or
 `qty·price` overflowing i128 → rejected as `Risk`. A per-price-level
 incremental `visible_qty` cache keeps best-bid/best-ask at O(log depth).
+Self-trades never fill: when a taker meets its own resting order, the maker
+order is canceled (`canceled_maker`) and matching continues against the
+next order with the remaining taker quantity.
 
 ### 3. Risk model (cross margin)
 
@@ -116,15 +119,23 @@ Every batch (~512 units / 2 s) produces a `Checkpoint`:
   unit_ids, fills_hash, fill_count }
 ```
 
-- `state_root` — Merkle tree over account leaves, book leaves and a meta leaf
-  (which includes `height`, so roots chain across batches and reorgs break
+  - `state_root` — Merkle tree over account leaves, book leaves and a meta leaf
+  (which includes `height`, every market's `(mark, last funding index)` and the
+  oracle's last index, so roots chain across batches and reorgs break
   the hash chain visibly).
-- `aa_root` — a second tree over hex strings,
-  `leaf = sha256("acct:" + address + ":" + collateral + ":" + perp)`,
+  Only *applied* units advance the global `seq`; rejected ops do not consume
+  sequence numbers.
+  - `aa_root` — a second tree over hex strings,
+  `leaf = sha256("acct:" + address + ":" + collateral + ":" + perp + ":" + withdrawn)`,
   `node = sha256(left ‖ right)`. This exists because Oscript's `sha256()`
-  hashes UTF-8 text; it lets the vault AA verify withdrawals (collateral and
-  PERP governance asset alike) with pure string operations while committing
-  exactly the same balances.
+  hashes UTF-8 text; it lets the vault AA verify withdrawals with pure string
+  operations while committing exactly the same balances — including `W`, the
+  account's cumulative sidechain-withdrawal total that backs the AA-side
+  anti-replay cap. Only accounts bound to an Obyte address (via
+  `Op::Deposit { addr }` / `Op::GovDeposit { addr }`) enter this tree; the
+  binding is first-seen-wins and enforced at intake.
+  `Batch::validate_against` additionally verifies the recomputed `aa_root`
+  against the checkpoint.
 - `fills_hash`/`fill_count` — commitment to executed trade flow.
 
 `Batch::validate_against` replays the posted units through a fresh engine and
@@ -136,32 +147,47 @@ any honest replica can audit the operator.
 Lifecycle per height *h*:
 
 1. **submit** — operator posts `{height: h, prev_state_hash, state_root,
-   aa_root, fills_hash}`. Height must equal `last_locked + 1`; the previous
-   root must match. Candidates are **replaceable until locked**, so a
-   front-run broken submission cannot brick the chain.
+   aa_root}` with ≥ 60 000 bytes attached: 10 000 bounce headroom plus a
+   **50 000-byte `SUBMIT_BOND_NET`** locked per live candidate. Height must
+   equal `last_locked + 1`; the previous root must match; all three hash
+   fields must be exactly 64 hex chars. Candidates are **replaceable until
+   locked**: a replacing submitter takes the height over and the displaced
+   candidate's bond moves to `sbond_<addr>` for reclaim via
+   `{claim_submit_bond}` (failed finalizations confiscate it instead). The
+   stability timer restarts only when the presented root differs from the
+   stored candidate, so identical-root spam cannot extend the window.
 2. **lock** — allowed only after the 600 s stability window
-   (`OBYTE_STABILITY_SECS`). Locks are immutable.
+   (`OBYTE_STABILITY_SECS`). Locking clears a previous permanent-failure
+   mark, so a challenge-failed (`frozen = 2`) height recovers by fresh
+   submission instead of wedging the chain. Locked roots are immutable.
 3. **challenge** — within 3600 s of locking, anyone can freeze height *h*
-   with a ≥ 20 000 byte bond.
+   with a ≥ 20 000 byte bond; a sender with an outstanding bond cannot open
+   a second challenge, and `{claim_bond}` refuses payout while the
+   challenged height is still frozen.
 4. **respond** — the operator defends inside the window; success unfreezes
-   and confiscates exactly the recorded challenger bond (zeroing it). If
-   nobody responds in time, finalize marks the height permanently failed
-   (`frozen = 2`), clears its roots, and rolls `last_locked` back to h−1;
-   no automatic refund happens — the challenger recovers the recorded bond
-   through a separate `claim_bond` claim.
+   and confiscates exactly the recorded challenger bond (zeroing both its
+   ledger keys). If nobody responds in time, finalize marks the height
+   permanently failed (`frozen = 2`), clears its roots, rolls `last_locked`
+   back to h−1, confiscates the submit bond, and restarts the stability
+   clock; the challenger recovers the recorded bond through `claim_bond`.
 5. **finalize** — after a clean 3600 s window the root becomes the withdrawal
-   basis (`last_finalized`), strictly in height order.
-   - claim carries `{amount, leaf_account, collateral, perp, proof[]}`;
-   - the AA recomputes `sha256("acct:"‖address‖":"‖collateral‖":"‖perp)` and
+   basis (`last_finalized`), strictly in height order; the submit bond is
+   released to its holder and a 20 000-byte race reward accrues to the
+   first-stable submitter (`{claim_reward}` pays once and zeroes the
+   ledger).
+   - a claim carries `{amount, withdrawn, leaf_account, collateral, perp,
+     proof[]}`;
+   - the AA recomputes
+     `sha256("acct:"‖address‖":"‖collateral‖":"‖perp‖":"‖withdrawn)` and
      folds the sibling path, requiring the result to equal
-     `var['aa_root_' ‖ h]`;
+     `var['aa_root_' ‖ last_finalized]`;
    - `leaf_account == trigger.address` (you can only prove your own address);
    - the sibling path folds via a fixed-depth `reduce(..., 16, ...)`, so
      proofs cover trees of up to 2^16 accounts;
-   - withdrawals are **anti-replay**: a cumulative marker
-     `wd_<h>_<address>` caps the total withdrawn at height *h* across all
-     claims at the proven leaf collateral.
-   
+   - withdrawals are **anti-replay via the proven W**: global cumulative
+     markers `wd_<addr>` / `wp_<addr>` cap total collateral / PERP ever
+     withdrawn (across ALL heights) at the leaf's committed `W` /
+     `perp` balance — replays at any height bounce.
    Balance authority is the **proven leaf**, never mutable AA variables.
 
 Proofs are generated off-chain by
@@ -243,47 +269,66 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    (a 50 000 PERP bond per reporter) but there is no slashing yet, so a
    bond-majority collusion can still bias the median mark; TWAP or external
    multi-source pricing remains future work.
-4. **A fully failed challenge permanently wedges the height chain.** When a
-   challenge succeeds (operator never responds), the height is marked
-   `frozen = 2` and `last_locked` rolls back — but `submit` requires
-   `h == last_locked + 1` and there is no skip mechanism, so every later
-   deposit/withdrawal stalls until a fresh AA is deployed. This is a
-   deliberate liveness attack anyone can trigger.
-5. **Large inline `temp_data` payloads crash ocore's validator** (double
-   callback in the inline-path check). The JS E2E skips the on-chain batch
-   reveal for this reason; operator publication needs an ocore fix or
-   chunked reveals first.
-6. **Governance vote weight is balance at vote time.** PERP deposited via
-   `GovDeposit` counts immediately, so a large holder can concentrate votes
-   shortly before the deadline; the only mitigation is the quorum snapshot
-   denominator taken at proposal creation.
+4. **Deposit endorsements are self-attested on the replay path.** The
+   operator's batch replay injects `deposits_allowed` entries keyed by the
+   Obyte deposit unit; a watcher replaying `temp_data` cannot independently
+   verify that each credited unit actually paid the vault AA. A lying
+   operator can mint fake deposits, but this is detectable by watchers (the
+   unit ids are on-chain) and punishable through challenge — detection
+   relies on live watchers, not cryptography.
+5. **Execution order is UnitId-lexicographic, hence grindable.** Users can
+   sign many candidate units and pick the id that lands first in the total
+   order (queue-jumping MEV). Commit-reveal ordering is future work; the
+   fee race and deterministic matching bound but do not eliminate it.
+6. **Orphan eviction is arrival-order sensitive under open gossip.** The
+   smallest-id eviction rule is deterministic per replica, but a future
+   permissionless P2P layer should switch to salted eviction
+   (`argmin(sha256(last_finalized_root ‖ id))`) or cross-node orphan sync;
+   today's single-operator deployment has no orphan-storm attack surface.
 7. **Burned PERP stays stranded in the vault AA.** Burns decrement
    `perp_supply` but the corresponding tokens remain escrowed (the AA is
    permanently over-collateralized) — auditors must treat
    `vault holdings − perp_supply` as the cumulative burn figure.
-8. Failed heights roll back cleanly, but recovery depends on operators
-   resubmitting corrected batches; there is no trustless escape hatch if
-   every operator disappears.
+8. Failed heights roll back cleanly and are re-lockable (`frozen = 2`
+   recovery), but recovery depends on operators resubmitting corrected
+   batches; there is no trustless escape hatch if every operator disappears.
 9. The AA has had no formal security audit; Oscript's complexity budget is
-   effectively exhausted (99/100), so every further change must free equal
-   budget first.
+   effectively exhausted, so every further change must free equal budget
+   first.
+10. **The aa-tree depth cap bounds withdrawals to 2^16 accounts** per tree
+   (`MAX_AA_TREE_DEPTH = 16`, mirroring the AA's `reduce(..., 16, ...)`);
+   beyond that, proof generation refuses rather than truncate silently.
+11. **Replay-dedup windows are bounded at 256 heights.** Withdrawal-ledger,
+   seen-AA-unit and gov-nonce pruning keep memory bounded; a duplicate op
+   arriving more than 256 heights after its original escapes sidechain dedup
+   (AA-side global `wd_`/`wp_` caps still hold). Gov nonces additionally use
+   a strict watermark: an out-of-order lower nonce is rejected permanently.
 
 Recently closed: deposit whitelisting, overflow guards, market whitelist,
-strict signatures, orphan recovery with deterministic eviction, bounded
-logs, realized-PnL settlement into collateral (profitable withdrawals),
-bond-registered oracle medians with deviation caps, peer-to-peer funding with
-collateral-aware clamps, multi-operator fee race with consolation payments,
-operator identity gate on `respond`, Final-status promotion, on-chain
-batch data poster, non-head cancel depth correctness, maker-queue pop
-regression, proof-withdrawal decoupled from the diagnostic `bal_` ledger,
-height-bound `state_root` (meta leaf commits the batch height), full book
-commitment (every price level and resting order), withdraw anti-replay
-marker (`wd_<h>_<addr>`), bond recovery via `claim_bond`, a bounded
-(65 536-entry) withdrawals map, and PERP governance — sidechain-mirrored
-PERP deposits/withdrawals (perp fields in both Merkle leaves), permissionless
-market listing with burned listing fees (per-market risk params), and
-on-chain parameter proposals with balance-weighted voting, snapshot quorum,
-and bond-registered oracle reporting.
+strict signatures, orphan recovery with deterministic eviction plus a
+missing-parent reverse index, bounded logs, realized-PnL settlement into
+collateral (profitable withdrawals), bond-registered oracle medians with
+deviation caps, peer-to-peer funding with collateral-aware clamps,
+multi-operator fee race hardened with transferable submit bonds (consolation
+prizes removed), operator identity gate on `respond`, Final-status promotion,
+on-chain batch data poster, non-head cancel depth correctness **and deque
+ghost removal**, maker-queue pop regression, proof-withdrawal decoupled from
+the diagnostic `bal_` ledger, height-bound `state_root` (meta leaf commits
+the batch height, marks and funding indices), full book commitment, global
+cumulative withdraw anti-replay (`W` committed inside every aa-tree leaf),
+bond recovery via `claim_bond` with frozen-height gating, bounded withdrawals/
+AA-unit/gov-nonce ledgers (256-height replay window), flip-order initial-margin
+gate on open quantity, create-market bps ceilings, tick-size enforcement,
+applied-only `seq` accounting, self-trade cancel-maker continuation,
+taker AND maker bad-debt clamping into the insurance fund, proposal cleanup
+with creation-time voting-weight snapshots, Obyte-address binding on
+deposits (`addr` field, first-seen-wins), asset-kind-bound deposit
+endorsements, `MAX_AA_TREE_DEPTH` proof cap, AA-side claim-reward zeroing,
+single-outstanding challenge bonds, and `frozen == 2` height recovery —
+plus PERP governance: sidechain-mirrored PERP deposits/withdrawals (perp
+fields in both Merkle leaves), permissionless market listing with burned
+listing fees (per-market risk params), and on-chain parameter proposals with
+snapshot quorum and snapshot-weighted voting.
 
 See the commit history for the full security-audit remediation this repo
 went through (proof-gated withdrawals, deposit whitelisting, overflow

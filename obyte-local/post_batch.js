@@ -118,7 +118,7 @@ async function main() {
   await network.witnessUntilStable(tdUnit);
   console.log("temp_data posted & stable:", tdUnit);
 
-  // 2. join the fee race
+  // 2. join the submit race — 50000 SUBMIT_BOND_NET + >=10000 fee headroom
   await trigger(poster, {
     submit: 1,
     chain_id: batchData.chain_id || "operp-mvp-1",
@@ -127,7 +127,7 @@ async function main() {
     state_root: batchData.state_root,
     aa_root: batchData.aa_root,
     fills_hash: batchData.fills_hash,
-  });
+  }, 60000);
 
   // 3. stability window then lock
   await network.timetravel({ shift: "700s" });
@@ -149,8 +149,10 @@ async function main() {
   const v = await poster.readAAStateVars(vault);
   const vars_ = v.vars || v;
   const owed = vars_["reward_" + (await poster.getAddress())];
-  console.log("post-claim accrued reward remaining:", owed === undefined ? "0 (paid out)" : owed);
-
+  if (owed !== undefined && Number(owed) !== 0) {
+    throw new Error("reward_ not zeroed after claim: " + owed);
+  }
+  console.log("post-claim accrued reward remaining: 0 (paid out, var cleared)");
   console.log("\nOK: batch posted, locked, finalized, reward claimed.");
   console.log("Watchers re-executing this temp_data within 1 day can detect any");
   console.log("root mismatch and freeze/rollback the height via challenge.");

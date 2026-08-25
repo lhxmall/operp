@@ -49,7 +49,7 @@ fn ingest_place(
 
 fn main() {
     let mut eng = Engine::new();
-    eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+    eng.state.deposits_allowed = (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
     eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
     let mut secrets: Vec<[u8; 32]> = (1..=N as u8).map(sk).collect();
     let mut seqs = vec![1u64; N];
@@ -60,11 +60,7 @@ fn main() {
     for (i, s) in secrets.iter().enumerate() {
         let u = sign_unit(
             vec![tip],
-            Op::Deposit {
-                account: acct(s),
-                amount: 1_000_000 * USD_SCALE as i128,
-                aa_unit: [i as u8 + 1; 32],
-            },
+            Op::Deposit { account: acct(s), addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(), amount: 1_000_000 * USD_SCALE as i128, aa_unit: [i as u8 + 1; 32] },
             s,
         );
         tip = unit_id(&u);

@@ -15,9 +15,17 @@ fn acct(secret: &[u8; 32]) -> AccountId {
     account_id_from_pubkey(&SigningKey::from_bytes(secret).verifying_key().to_bytes())
 }
 
+/// 32-char uppercase [A-Z2-7] Obyte-style test address, varied by `n`.
+fn test_addr(n: u8) -> String {
+    let mut bytes = vec![b'A'; 32];
+    bytes[0] = b'A' + (n % 26);
+    String::from_utf8(bytes).unwrap()
+}
+
 fn main() {
     let mut eng = Engine::new();
-    eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+    eng.state.deposits_allowed =
+        (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
     eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
     let prev = eng.state.clone();
     let g = genesis_id();
@@ -29,9 +37,10 @@ fn main() {
     let d1 = sign_unit(
         vec![tip],
         Op::Deposit {
-            account: acct(&alice),
-            amount: 10_000 * USD_SCALE as i128,
             aa_unit: [1; 32],
+            account: acct(&alice),
+            addr: test_addr(1),
+            amount: 10_000 * USD_SCALE as i128,
         },
         &alice,
     );
@@ -42,9 +51,10 @@ fn main() {
     let d2 = sign_unit(
         vec![tip],
         Op::Deposit {
-            account: acct(&bob),
-            amount: 10_000 * USD_SCALE as i128,
             aa_unit: [2; 32],
+            account: acct(&bob),
+            addr: test_addr(2),
+            amount: 10_000 * USD_SCALE as i128,
         },
         &bob,
     );

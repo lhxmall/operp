@@ -9,6 +9,7 @@ operp-types = { workspace = true }
 operp-dag = { workspace = true }
 operp-state = { workspace = true }
 operp-exec = { workspace = true }
+operp-account = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

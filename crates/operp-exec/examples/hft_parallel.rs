@@ -50,11 +50,7 @@ fn generator(idx: usize, n_engines: usize, cfg: &Cfg, tx: Sender<(usize, Unit)>,
     for (i, s) in secrets.iter().enumerate() {
         let u = sign_unit(
             vec![tip],
-            Op::Deposit {
-                account: acct(s),
-                amount: 10_000_000 * USD_SCALE as i128,
-                aa_unit: [((idx * 100 + i) % 250 + 1) as u8; 32],
-            },
+            Op::Deposit { account: acct(s), addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(), amount: 10_000_000 * USD_SCALE as i128, aa_unit: [((idx * 100 + i) % 250 + 1) as u8; 32] },
             s,
         );
         tip = unit_id(&u);
@@ -105,7 +101,7 @@ fn main() {
     println!("PIPELINE HFT: {} signers -> 1 executor, {}ms", cfg.engines, cfg.run_ms);
 
     let mut eng0 = Engine::new();
-    eng0.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+    eng0.state.deposits_allowed = (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
     eng0.state.markets.insert(BTC_USD, operp_types::genesis_params());
     let eng = Arc::new(Mutex::new(eng0));
     let executed = Arc::new(AtomicU64::new(0));

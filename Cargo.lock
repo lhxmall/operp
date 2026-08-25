@@ -221,6 +221,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
+ "operp-account",
  "operp-book",
  "operp-dag",
  "operp-exec",

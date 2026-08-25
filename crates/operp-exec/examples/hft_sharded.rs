@@ -39,7 +39,7 @@ fn parse_args() -> Cfg {
 fn run_shard(shard_idx: usize, cfg: &Cfg) -> (u64, u64, u64) {
     let market = MarketId(shard_idx as u32 + 1);
     let mut eng = Engine::new();
-    eng.state.deposits_allowed = (1u8..=255).map(|b| [b; 32]).collect();
+    eng.state.deposits_allowed = (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
     eng.state.markets.insert(market, operp_types::genesis_params());
 
     // seed mark for this market via first trade: place resting ask before bids.
@@ -57,11 +57,7 @@ fn run_shard(shard_idx: usize, cfg: &Cfg) -> (u64, u64, u64) {
     for (i, s) in secrets.iter().enumerate() {
         let u = sign_unit(
             vec![tip],
-            Op::Deposit {
-                account: acct(s),
-                amount: 10_000_000 * USD_SCALE as i128,
-                aa_unit: [((shard_idx * TRADERS + i) % 250 + 1) as u8; 32],
-            },
+            Op::Deposit { account: acct(s), addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(), amount: 10_000_000 * USD_SCALE as i128, aa_unit: [((shard_idx * TRADERS + i) % 250 + 1) as u8; 32] },
             s,
         );
         tip = unit_id(&u);

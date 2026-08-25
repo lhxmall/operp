@@ -24,6 +24,8 @@ pub enum Op {
     },
     Deposit {
         account: AccountId,
+        /// Obyte withdrawal address bound to this deposit (leaf-key domain).
+        addr: String,
         amount: Usd,
         aa_unit: [u8; 32],
     },
@@ -43,6 +45,8 @@ pub enum Op {
     /// `aa_unit` is the AA unit that paid the asset; replay-protected.
     GovDeposit {
         account: AccountId,
+        /// Obyte withdrawal address bound to this deposit (leaf-key domain).
+        addr: String,
         amount: u128,
         aa_unit: [u8; 32],
     },
@@ -151,6 +155,7 @@ pub fn canonical_bytes(unit: &Unit) -> Vec<u8> {
         }
         Op::Deposit {
             account,
+            addr,
             amount,
             aa_unit,
         } => {
@@ -158,6 +163,8 @@ pub fn canonical_bytes(unit: &Unit) -> Vec<u8> {
             b.extend_from_slice(&account.0);
             b.extend_from_slice(&amount.to_le_bytes());
             b.extend_from_slice(aa_unit);
+            b.extend_from_slice(&(addr.len() as u32).to_le_bytes());
+            b.extend_from_slice(addr.as_bytes());
         }
         Op::Withdraw {
             account,
@@ -181,6 +188,7 @@ pub fn canonical_bytes(unit: &Unit) -> Vec<u8> {
         }
         Op::GovDeposit {
             account,
+            addr,
             amount,
             aa_unit,
         } => {
@@ -188,6 +196,8 @@ pub fn canonical_bytes(unit: &Unit) -> Vec<u8> {
             b.extend_from_slice(&account.0);
             b.extend_from_slice(&amount.to_le_bytes());
             b.extend_from_slice(aa_unit);
+            b.extend_from_slice(&(addr.len() as u32).to_le_bytes());
+            b.extend_from_slice(addr.as_bytes());
         }
         Op::GovWithdraw {
             account,
@@ -320,6 +330,10 @@ pub struct Dag {
     /// units whose parents are not (yet) known; evicted by smallest UnitId
     /// past capacity (see `insert_verified`)
     pending_orphans: HashMap<UnitId, Unit>,
+    /// reverse index over `pending_orphans`: missing parent -> buffered
+    /// children waiting on it; lets a newly known parent link only the
+    /// orphans it actually unblocks instead of scanning the whole buffer
+    waiting: HashMap<UnitId, Vec<UnitId>>,
 }
 
 /// Max buffered orphan units. Beyond this the orphan with the smallest
@@ -333,6 +347,7 @@ impl Dag {
         Self {
             units: HashMap::new(),
             children: HashMap::new(),
+            waiting: HashMap::new(),
             executed,
             pending: HashSet::new(),
             pending_orphans: HashMap::new(),
@@ -388,8 +403,23 @@ impl Dag {
                 // Deterministic eviction: drop the smallest buffered UnitId
                 // (lexicographic min). No wall-clock ordering is tracked.
                 if let Some(k) = self.pending_orphans.keys().copied().min() {
-                    self.pending_orphans.remove(&k);
+                    if let Some(evicted) = self.pending_orphans.remove(&k) {
+                        // Drop the evicted orphan's reverse-index entries.
+                        for p in &evicted.parents {
+                            if let Some(v) = self.waiting.get_mut(p) {
+                                v.retain(|c| *c != k);
+                                if v.is_empty() {
+                                    self.waiting.remove(p);
+                                }
+                            }
+                        }
+                    }
                 }
+            }
+            // Register the orphan under each of its missing parents so the
+            // parent's arrival can find it without a full-buffer scan.
+            for p in &missing {
+                self.waiting.entry(*p).or_default().push(id);
             }
             self.pending_orphans.insert(id, unit);
             return Err(DagError::MissingParent);
@@ -411,41 +441,42 @@ impl Dag {
         id == genesis_id() || self.units.contains_key(&id)
     }
 
-    pub fn ready_linearized(&self) -> Vec<UnitId> {
-        let mut ready: Vec<UnitId> = self
-            .pending
-            .iter()
-            .copied()
-            .filter(|id| {
-                self.units
-                    .get(id)
-                    .map(|u| u.parents.iter().all(|p| self.executed.contains(p)))
-                    .unwrap_or(false)
-            })
-            .collect();
-        ready.sort_by(|a, b| a.0.cmp(&b.0));
-        ready
-    }
-
     pub fn mark_executed(&mut self, id: UnitId) {
         self.executed.insert(id);
         self.pending.remove(&id);
-        // Newly known parent: link any buffered orphans whose parents are now
-        // all present. Repeat until fixpoint (orphans may chain).
-        loop {
-            let ready: Vec<UnitId> = self
-                .pending_orphans
-                .iter()
-                .filter(|(_, u)| u.parents.iter().all(|p| self.known(*p)))
-                .map(|(k, _)| *k)
-                .collect();
-            if ready.is_empty() {
-                break;
+        // Newly known parent: link the buffered orphans indexed as waiting on
+        // it. Linking an orphan makes it a known parent too, so keep walking
+        // until fixpoint (orphans may chain).
+        let mut frontier = match self.waiting.remove(&id) {
+            Some(w) => w,
+            None => return,
+        };
+        while let Some(oid) = frontier.pop() {
+            let unit = match self.pending_orphans.remove(&oid) {
+                Some(u) => u,
+                None => continue,
+            };
+            if !unit.parents.iter().all(|p| self.known(*p)) {
+                // Still missing another parent: leave it buffered; its
+                // remaining waiting-index entries stay intact.
+                self.pending_orphans.insert(oid, unit);
+                continue;
             }
-            for oid in ready {
-                if let Some(unit) = self.pending_orphans.remove(&oid) {
-                    self.link(oid, unit);
+            // Drop this orphan's stale entries under its other parents.
+            for p in &unit.parents {
+                if *p == id {
+                    continue;
                 }
+                if let Some(v) = self.waiting.get_mut(p) {
+                    v.retain(|c| *c != oid);
+                    if v.is_empty() {
+                        self.waiting.remove(p);
+                    }
+                }
+            }
+            self.link(oid, unit);
+            if let Some(waiters) = self.waiting.remove(&oid) {
+                frontier.extend(waiters);
             }
         }
     }
@@ -457,12 +488,62 @@ impl Dag {
     pub fn is_executed(&self, id: UnitId) -> bool {
         self.executed.contains(&id)
     }
+
+    /// Deterministic execution order over all known-but-unexecuted units:
+    /// Kahn's topological sort with a smallest-UnitId tie-break, so any
+    /// replica derives the identical total order without consensus traffic.
+    /// Units whose parents are still buffered orphans stay excluded until
+    /// `mark_executed` links them.
+    pub fn ready_linearized(&self) -> Vec<UnitId> {
+        // Indegree counts only parents inside the pending set; executed
+        // parents (and genesis) impose no ordering constraint.
+        let mut indeg: HashMap<UnitId, usize> = self
+            .pending
+            .iter()
+            .map(|&id| {
+                (
+                    id,
+                    self.units[&id]
+                        .parents
+                        .iter()
+                        .filter(|p| self.pending.contains(p))
+                        .count(),
+                )
+            })
+            .collect();
+        let mut ready: std::collections::BTreeSet<UnitId> = indeg
+            .iter()
+            .filter(|(_, &d)| d == 0)
+            .map(|(&id, _)| id)
+            .collect();
+        let mut out = Vec::with_capacity(self.pending.len());
+        while let Some(&id) = ready.iter().next() {
+            ready.remove(&id);
+            out.push(id);
+            for c in self.children.get(&id).into_iter().flatten() {
+                if let Some(d) = indeg.get_mut(c) {
+                    *d -= 1;
+                    if *d == 0 {
+                        ready.insert(*c);
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use operp_types::USD_SCALE;
+
+    /// 32-char uppercase [A-Z0-9] Obyte-style test address, varied by `n`.
+    fn test_addr(n: u8) -> String {
+        let mut bytes = vec![b'A'; 32];
+        bytes[0] = b'A' + (n % 26);
+        String::from_utf8(bytes).unwrap()
+    }
 
     fn sk(n: u8) -> [u8; 32] {
         [n; 32]
@@ -474,6 +555,7 @@ mod tests {
             parents,
             Op::Deposit {
                 account,
+                addr: test_addr(aa),
                 amount: 1 * USD_SCALE as i128,
                 aa_unit: [aa; 32],
             },
@@ -522,6 +604,7 @@ mod tests {
             vec![g, g, g],
             Op::Deposit {
                 account,
+                addr: test_addr(1),
                 amount: 1,
                 aa_unit: [1; 32],
             },
@@ -535,6 +618,7 @@ mod tests {
             vec![],
             Op::Deposit {
                 account,
+                addr: test_addr(2),
                 amount: 1,
                 aa_unit: [2; 32],
             },
@@ -561,5 +645,62 @@ mod tests {
         dag.mark_executed(pid);
         let ready = dag.ready_linearized();
         assert!(ready.contains(&unit_id(&child)), "orphan must be recovered");
+    }
+
+    #[test]
+    fn orphan_reverse_index_links_multi_and_chained() {
+        let mut dag = Dag::new();
+        let g = genesis_id();
+        // Two missing parents, then a child waiting on the first child.
+        let p1 = deposit(vec![g], &sk(1), 1);
+        let id1 = unit_id(&p1);
+        let p2 = deposit(vec![g], &sk(2), 2);
+        let id2 = unit_id(&p2);
+        let mut mparents = vec![id1, id2];
+        mparents.sort();
+        let mid = deposit(mparents, &sk(3), 3);
+        let mid_id = unit_id(&mid);
+        let leaf = deposit(vec![mid_id], &sk(4), 4);
+        let leaf_id = unit_id(&leaf);
+        assert_eq!(dag.insert(leaf.clone()), Err(DagError::MissingParent));
+        assert_eq!(dag.insert(mid.clone()), Err(DagError::MissingParent));
+        // First parent alone must not link `mid` (second parent still missing).
+        dag.insert(p1).unwrap();
+        dag.mark_executed(id1);
+        assert!(dag.get(mid_id).is_none(), "mid still misses a parent");
+        // Second parent arrives: mid links via the reverse index, which in
+        // turn unblocks leaf (chained fixpoint).
+        dag.insert(p2).unwrap();
+        dag.mark_executed(id2);
+        assert!(dag.get(mid_id).is_some(), "indexed orphan must link");
+        assert!(dag.get(leaf_id).is_some(), "chained orphan must link");
+        assert!(dag.waiting.is_empty(), "index must not leak entries");
+    }
+
+    #[test]
+    fn gov_deposit_addr_in_canonical_bytes() {
+        let account = account_id_from_pubkey(
+            &ed25519_dalek::SigningKey::from_bytes(&sk(5))
+                .verifying_key()
+                .to_bytes(),
+        );
+        let mk = |addr: String| {
+            sign_unit(
+                vec![genesis_id()],
+                Op::GovDeposit {
+                    account,
+                    addr,
+                    amount: 7,
+                    aa_unit: [9; 32],
+                },
+                &sk(5),
+            )
+        };
+        let u1 = mk(test_addr(6));
+        let u2 = mk(test_addr(7));
+        // Distinct addresses must yield distinct unit ids (addr is covered
+        // by the signature preimage).
+        assert_ne!(unit_id(&u1), unit_id(&u2));
+        assert_ne!(u1.sig, u2.sig);
     }
 }
