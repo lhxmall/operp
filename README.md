@@ -333,17 +333,33 @@ snapshot quorum and snapshot-weighted voting.
 
 The 11 gaps above each have a concrete design in [`docs/mainnet/`](docs/mainnet/) (516–591 lines each, 5.2k lines total) — no code edits yet, staged as v1 boring + v2 extensions:
 
- - [ ] **01 Fraud slashing** — `01-fraud-slashing.md`: 50%/50% burn/reward split + `validity_proof_hash` plug, no matcher re-execution in Oscript
- - [ ] **02 Deposit independent verification** — `02-deposit-independent-verification.md`: `temp_data.deposit_evidences` carries Obyte joints, `object_hash.js` recomputed in `validate_against` (0 AA ops v1)
- - [ ] **03 Commit-reveal ordering** — `03-commit-reveal-ordering.md`: v1 `sha256(salt‖unit_id)` per epoch (`last_finalized_root/512`), v2 commit-reveal additive
- - [ ] **04 Salted orphan eviction** — `04-salted-orphan-eviction.md`: `argmin sha256(salt‖unit_id)` + `note_finalized` mirroring `last_finalized_root`, optional `WantUnits` gossip
- - [ ] **05 Oracle slashing + TWAP** — `05-oracle-slashing-twap.md`: 50k PERP TWAP ring 256 batches, 500 bps ×3-streak double condition, `SlashOracle` tag 16
- - [ ] **06 Funding external anchor** — `06-funding-external-anchor.md`: index = TWAP(external) vs mark premium, `FundingSourceKind` abstraction, caps preserved
- - [ ] **07 Escape hatch** — `07-escape-hatch.md`: 7-day `escape_finalize`/`escape_withdraw` (`stable_at`/`submitted_at` + `progress_ts`), permissionless
- - [ ] **08 Burn accounting** — `08-burn-accounting.md`: `perp_burned`/`burned_PERP` cumulative in `meta_leaf`, invariant `holdings−supply==burned`
- - [ ] **09 Complexity audit** — `09-complexity-audit.md`: per-branch ~95/100 (withdraw 36), R1 single-sha256 fold saves 16, total −27 → 68/100 (+32 headroom) + 9-section checklist
+ - [x] **01 Fraud slashing** — `01-fraud-slashing.md`: 50%/50% burn/reward split + `validity_proof_hash` plug, no matcher re-execution in Oscript *(Gate2: `Checkpoint.validity_proof_hash`, AA failed-finalize splits the submit bond into `slash_reward_` + burned half)*
+ - [x] **02 Deposit independent verification** — `02-deposit-independent-verification.md`: `temp_data.deposit_evidences` carries Obyte joints, `object_hash.js` recomputed in `validate_against` via `operp-settle::obyte_hash` (`getUnitHash` port) *(Gate2)*
+ - [x] **03 Commit-reveal ordering (v1)** — salted ordering `sha256(salt‖unit_id)` shipped; v2 commit-reveal additive remains open *(Gate3: `ready_linearized_with_salt`)*
+ - [x] **04 Salted orphan eviction** — `argmin sha256(salt‖unit_id)` + `Engine::note_finalized` rotating `Dag::set_eviction_salt`; WantUnits gossip deferred *(Gate3)*
+ - [x] **05 Oracle slashing + TWAP** — 50k PERP stake/unstake(256-height unbond)/slash, TWAP rings, 500 bps ×3-streak double condition, `SlashOracle` tag 16, height-gated *(Gate2)*
+ - [x] **06 Funding external anchor (mechanism)** — funding-index abstraction with activation gate (`FUNDING_TWAP_ACTIVATION_HEIGHT`); external source feed wiring is operator-side and remains open *(Gate2)*
+ - [ ] **07 Escape hatch** — **deferred to v2**: Oscript complexity budget (94/100 after Steps 6–8) cannot fit `escape_finalize`/`escape_withdraw`; requires the lock-merge refactor below first
+ - [x] **08 Burn accounting (Rust + checkpoint)** — `perp_burned` in `meta_leaf`, emitted via `Checkpoint.perp_burned` / `temp_data`; AA-side mirror vars dropped for budget, `holdings−supply==burned` stays watcher-verifiable
+ - [x] **09 Complexity audit** — R1 single-sha256 fold, unified claim dispatcher (`claim:'kind'`), `bal_`/`pperp_` ledgers deleted; probe: `node tools/check_aa_complexity.js`. Current **94/100** (ops 967/2000)
  - [ ] **10 AA-tree sharding** — `10-aa-tree-sharding.md`: v1 16→18 (262k accounts, 0 new vars), v2 S=16×D16=1M sharded forest
  - [ ] **11 Replay persistence** — `11-replay-persistence.md`: `256→2048` (`~68 min`) + persistent BTree/RocksDB vs journal, `gov watermark` durable
+
+**Gate2/3 known deviations (v2 backlog):**
+- **Replay window 256→2048**: constants shipped (`REPLAY_WINDOW`,
+  `REPLAY_ACTIVATION_HEIGHT`) and pruning generalized to `prune_*_at(window)`;
+  activation height stays at `1_000_000` so existing tests replay legacy
+  determinism. Flip the constant at deploy.
+- **Escape hatch**: deferred (see gap 07). The respond path is now
+  *respond-by-resubmit* — the operator answers a challenge by re-submitting
+  the identical root; impostors bounce `not operator` in submit init.
+- **Claim API break**: `{claim_reward|claim_bond|claim_submit_bond}` booleans
+  are replaced by a single `{claim: "reward"|"bond"|"sbond"|"slash"}` field;
+  `post_batch.js` / `test_vault_aa.js` migrated in-tree.
+- **AA tree depth stays 16** (65k accounts/tree); the planned 16→18 bump was
+  reverted to fit the complexity budget — pair it with sharding (10-v2).
+- **Proposal table capped at 64 concurrent** (`create_proposal` → `Risk`),
+  closing the unbounded-state DoS.
 
 See [`docs/mainnet/README.md`](docs/mainnet/README.md) for the 11-doc index and staging plan. Next: implement per doc in isolated worktrees, gated by the same `cargo test` + `test_vault_aa.js` + `bench_raw` as the security-fix batch (`53106c2`).
 
@@ -351,6 +367,7 @@ See the commit history for the full security-audit remediation this repo
 went through (proof-gated withdrawals, deposit whitelisting, overflow
 guards, market whitelist, strict signatures, orphan recovery, bounded logs,
 keeper rewards, bad-debt socialization).
+
 
 ## License
 
