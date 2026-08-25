@@ -279,8 +279,16 @@
 						bounce('bad claim');
 					// Single gate for leaf ownership and the GLOBAL cumulative
 					// caps wd_/wp_ (anti-replay across heights; every withdrawal
-					// claims the full unclaimed wp_ remainder).
-					$perp_claimed = trigger.data.perp - (var['wp_' || trigger.address] otherwise 0);
+					// caps the claim; perp_amount optionally claims less).
+					$unclaimed = trigger.data.perp - (var['wp_' || trigger.address] otherwise 0);
+					// Optional partial PERP claim: default claims the FULL
+					// unclaimed remainder; `perp_amount` (0 <= x < unclaimed)
+					// claims less so a collateral-only withdrawal cannot be
+					// forced to drain the proven PERP balance.
+					$perp_claimed = (typeof(trigger.data.perp_amount) == 'number'
+						AND trigger.data.perp_amount >= 0
+						AND trigger.data.perp_amount < $unclaimed)
+						? trigger.data.perp_amount : $unclaimed;
 					if (trigger.data.leaf_account != trigger.address
 						OR trigger.data.amount + (var['wd_' || trigger.address] otherwise 0) > trigger.data.collateral
 						OR $perp_claimed < 0)
