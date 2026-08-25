@@ -333,11 +333,17 @@ snapshot quorum and snapshot-weighted voting.
 
 The 11 gaps above each have a concrete design in [`docs/mainnet/`](docs/mainnet/) (516–591 lines each, 5.2k lines total) — no code edits yet, staged as v1 boring + v2 extensions:
 
-- **Ordering & gossip:** salted ordering `sha256(salt‖unit_id)` per epoch + salted eviction `argmin(sha256(root‖id))` — zero wire change, fully deterministic
-- **Deposits & fraud:** Obyte joint-carrying `deposit_evidences` verified in `validate_against` (0 AA ops) + slashing split + `validity_proof_hash` plug
-- **Oracle & funding:** 50k PERP TWAP ring (256 batches) with 3-streak deviation slashing + external-anchored funding index
-- **Liveness & accounting:** 7-day `escape_finalize`/`escape_withdraw`, `perp_burned` cumulative in `meta_leaf`, depth 16→18 (262k) now / sharded forest 1M later, 256→2048 replay window
-- **Audit:** per-branch op-count reclaimed −27 → 68/100 (+32 headroom) + 9-section checklist
+ - [ ] **01 Fraud slashing** — `01-fraud-slashing.md`: 50%/50% burn/reward split + `validity_proof_hash` plug, no matcher re-execution in Oscript
+ - [ ] **02 Deposit independent verification** — `02-deposit-independent-verification.md`: `temp_data.deposit_evidences` carries Obyte joints, `object_hash.js` recomputed in `validate_against` (0 AA ops v1)
+ - [ ] **03 Commit-reveal ordering** — `03-commit-reveal-ordering.md`: v1 `sha256(salt‖unit_id)` per epoch (`last_finalized_root/512`), v2 commit-reveal additive
+ - [ ] **04 Salted orphan eviction** — `04-salted-orphan-eviction.md`: `argmin sha256(salt‖unit_id)` + `note_finalized` mirroring `last_finalized_root`, optional `WantUnits` gossip
+ - [ ] **05 Oracle slashing + TWAP** — `05-oracle-slashing-twap.md`: 50k PERP TWAP ring 256 batches, 500 bps ×3-streak double condition, `SlashOracle` tag 16
+ - [ ] **06 Funding external anchor** — `06-funding-external-anchor.md`: index = TWAP(external) vs mark premium, `FundingSourceKind` abstraction, caps preserved
+ - [ ] **07 Escape hatch** — `07-escape-hatch.md`: 7-day `escape_finalize`/`escape_withdraw` (`stable_at`/`submitted_at` + `progress_ts`), permissionless
+ - [ ] **08 Burn accounting** — `08-burn-accounting.md`: `perp_burned`/`burned_PERP` cumulative in `meta_leaf`, invariant `holdings−supply==burned`
+ - [ ] **09 Complexity audit** — `09-complexity-audit.md`: per-branch ~95/100 (withdraw 36), R1 single-sha256 fold saves 16, total −27 → 68/100 (+32 headroom) + 9-section checklist
+ - [ ] **10 AA-tree sharding** — `10-aa-tree-sharding.md`: v1 16→18 (262k accounts, 0 new vars), v2 S=16×D16=1M sharded forest
+ - [ ] **11 Replay persistence** — `11-replay-persistence.md`: `256→2048` (`~68 min`) + persistent BTree/RocksDB vs journal, `gov watermark` durable
 
 See [`docs/mainnet/README.md`](docs/mainnet/README.md) for the 11-doc index and staging plan. Next: implement per doc in isolated worktrees, gated by the same `cargo test` + `test_vault_aa.js` + `bench_raw` as the security-fix batch (`53106c2`).
 
