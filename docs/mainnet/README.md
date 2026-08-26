@@ -26,14 +26,14 @@
 |---|---|
 | 01 Fraud slashing | ✅ shipped — `Checkpoint.validity_proof_hash`, AA failed-finalize 50/50 split (`slash_reward_` / burned) |
 | 02 Deposit verification | ✅ shipped — `operp-settle::obyte_hash` + `deposit_verify`, `temp_data.deposit_evidences`, `post_batch.js` builds joints |
-| 03 Salted ordering | ✅ v1 shipped — `ready_linearized_with_salt`; commit-reveal v2 open |
-| 04 Salted eviction | ✅ shipped — `Dag::set_eviction_salt` via `Engine::note_finalized`; WantUnits gossip open |
+| 03 Ordering | ✅ shipped, **desalted** — deterministic lex `Dag::ready_linearized` (salt kept for orphan eviction only, README Limitations #13); commit-reveal v2 open |
+| 04 Salted eviction + gossip | ✅ shipped — `Dag::set_eviction_salt` via `Engine::note_finalized` (epoch-rotated); WantUnits gossip landed (`crates/operp-gossip`) |
 | 05 Oracle slashing/TWAP | ✅ shipped — tags 14–16, height-gated; external multi-source pricing open |
 | 06 Funding anchor | ✅ mechanism shipped — `FUNDING_TWAP_ACTIVATION_HEIGHT` gate; external feed wiring operator-side, open |
-| 07 Escape hatch | ⏸ **deferred v2** — complexity budget (94/100) cannot fit it |
+| 07 Escape hatch | ✅ shipped — folded into existing finalize/withdraw cases (`{escape_finalize}`, `{escape_withdraw}`, ESCAPE_STALL_SECS 604800/3600) |
 | 08 Burn accounting | ✅ Rust/checkpoint shipped; AA mirror vars dropped for budget |
-| 09 Complexity audit | ✅ R1/R3/R4 applied — probe `tools/check_aa_complexity.js`, now **94/100** |
+| 09 Complexity audit | ✅ applied — probe `tools/check_aa_complexity.js`, now **85/100** (ops 1086/2000) |
 | 10 Tree depth/sharding | ⏸ depth stays 16; 18-bump reverted for budget — pair with sharding v2 |
-| 11 Replay window | ✅ v1 shipped — constants + generalized pruning + `GovNonceJournal` WAL (fsync-before-watermark in `gov_withdraw`) + bincode snapshots (`Engine::load_or_genesis`/`flush_snapshot`); RocksDB v1.1 open |
+| 11 Replay window | ✅ v1 shipped — constants + generalized pruning + `GovNonceJournal` WAL (flushed at batch commit, `Batch::from_applied`) + versioned bincode snapshots (`Engine::load_or_genesis`/`flush_snapshot`); RocksDB v1.1 open |
 
-**Verification of the implementation batch:** `cargo test --workspace` 68 passed; `node tools/check_aa_complexity.js` 94/100 (ops 967/2000); `bench_raw` 5209 ops/s (−5.3%, within <10% gate). Devnet E2E (`test_vault_aa.js`) updated for the new trigger API but requires a live aa-testkit network run.
+**Verification of the implementation batch:** `cargo test --workspace` 124 passed; `node tools/check_aa_complexity.js` 85/100 (ops 1086/2000). Devnet E2E (`test_vault_aa.js`) updated for the new trigger API and W-gate negatives but requires a live aa-testkit network run (native rocksdb/sqlite3 build; not run on Windows dev hosts lacking VS Build Tools).

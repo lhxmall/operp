@@ -147,13 +147,14 @@ orphan 缓冲容量 4096。驱逐按**盐化序**执行：对缓冲单元取
 缺失单元，WantUnits gossip（`crates/operp-gossip`，§2.6）可按需向同伴
 索取。
 
-### 2.4 确定性线性化（盐化）
+### 2.4 确定性线性化（去盐）
 
-ready_linearized_with_salt()：收集 pending 中父母均已执行的单元，按
-`sha256(salt ‖ unit_id)` 升序返回（盐即 §2.3 的 epoch 盐）。这是唯一
-公开全序——任何副本对同一 (单元集, 根, epoch) 算出同一执行顺序，无需
-通信。该排序即撮合"价格时间优先"中的时间；激活高度之前退化为 unit_id
-字典序。
+`Dag::ready_linearized()`：收集 pending 中父母均已执行的单元，按
+`unit_id` 字典序升序返回（审计修复后已**去盐**——盐不再参与执行序，
+仅用于 §2.3 的孤儿驱逐；原因：观测 finalize 时刻不同的副本会派生不同
+排序盐而互不认同执行序，盐化执行序待 finalize 批内确定性设计落地后
+回归）。这是唯一公开全序——任何副本对同一 pending 集算出同一执行
+顺序，无需通信。该排序即撮合"价格时间优先"中的时间。
 
 ### 2.5 v2 commit-reveal 排序（additive，激活门控）
 
@@ -168,8 +169,8 @@ ready_linearized_with_salt()：收集 pending 中父母均已执行的单元，�
   Commit 单元为父，重算哈希一致后才执行内层 op；TTL 过期未揭示的
   commit 作废并剪枝。
 
-与盐化排序叠加：Commit 阶段外界看不到 op 内容，揭示后按既有全序执行。
-`COMMIT_REVEAL_ACTIVATION_HEIGHT = 1_000_000`，部署期翻转。
+与确定性字典序叠加：Commit 阶段外界看不到 op 内容，揭示后按既有全序
+执行。`COMMIT_REVEAL_ACTIVATION_HEIGHT = 1_000_000`，部署期翻转。
 
 ### 2.6 WantUnits gossip（纯 P2P 层）
 
@@ -738,7 +739,7 @@ ingest → Applied{status: Optimistic}     # 立即执行、立即成交
   链上信封字段已直接委托 ocore，但 devnet E2E（test_vault_aa.js）仍跳过
   内联揭示；数据可用性正确性由 Rust 侧 settle 测试覆盖
 - 无第三方安全审计；Oscript 复杂度门恰在上限 **85/100**
-  （ops 1038/2000，`node tools/check_aa_complexity.js`），后续任何 AA
+  （ops 1086/2000，`node tools/check_aa_complexity.js`），后续任何 AA
   改动必须先腾出等额预算
 
 ---

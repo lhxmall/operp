@@ -42,7 +42,7 @@ engine.state.prune_aa_units(height);
 | `operp-state` | `crates/operp-state/src/lib.rs:49` | `withdrawals: BTreeMap<(AccountId,u64), Withdrawal>` | keep type, add height-indexed secondary index for O(k log n) prune instead of O(n) scan (optional) |
 | `operp-state` | `crates/operp-state/src/lib.rs:60` | `seen_gov_nonces` | add `persist_gov_nonce_log` module; no type change |
 | `operp-exec` | `crates/operp-exec/src/lib.rs:13-16` | `WITHDRAWALS_CAP` | unchanged, but document interaction with window |
-| `operp-exec` | `crates/operp-exec/src/lib.rs:648-667` | `gov_withdraw` watermark check | add `GovNonceJournal` write-ahead before `insert` |
+| `operp-exec` | `crates/operp-exec/src/lib.rs:648-667` | `gov_withdraw` watermark check | *(Update: shipped as buffered `pending_gov_wal`, flushed by `Batch::from_applied` — no per-op fsync; uncommitted batches never burn nonces.)* |
 | `operp-settle` | `crates/operp-settle/src/lib.rs:98-153` | `Batch::from_applied` | add `prune_cadence` parameter; wire snapshot / journal flush |
 | `operp-settle` | `crates/operp-settle/src/lib.rs:190-260` | `Batch::validate_against` | inject `replay_window` param for determinism; no AA interaction |
 | new | `crates/operp-state/src/persist.rs` | `DedupStore`, `RocksColumnFamily` enum, `Snapshot` trait | **new file** (or `crates/operp-exec/src/persist.rs`) — abstraction over storage backend |
@@ -101,7 +101,7 @@ Two implementations:
 | `MemoryWithSnapshot` (default, zero new deps) | validators, tests, light operators; replay from snapshot file every N heights | snapshot file `chainstate.<height>.snap` (bincode/serde_json) fsynced; WAL for nonces (see 2.4) | ~150 lines, no native deps |
 | `RocksDbStore` (feature `persist-rocksdb`) | production operator that cannot afford full replay from genesis after crash | RocksDB column families `withdrawals`, `aa_units`, `gov_nonces`, `meta` | adds `rocksdb` crate, ~200 lines |
 
-Snapshot cadence: every **64 heights** (~128 s at 2 s/batch) or on every `Batch::from_applied` if `--fsync-every-batch` is set. Snapshots are content-addressed by `state_root`; on restart the engine loads the **latest snapshot whose `height <= last_finalized`** (finalized heights are immutable), then replays `temp_data` batches forward via `validate_against`. This matches the existing `prev.height + 1` binding in `Batch::from_applied:130`.
+Snapshot cadence: every **64 heights** (~128 s at 2 s/batch) or on every `Batch::from_applied` if `--fsync-every-batch` is set. Snapshots carry a format-version header (v1) and are tried newest-height-first, falling back to the previous snapshot on corruption; on restart the engine loads the latest readable snapshot, then replays `temp_data` batches forward via `validate_against`. This matches the existing `prev.height + 1` binding in `Batch::from_applied:130`.
 
 **Prune cadence under persistence:** unchanged call site — `Batch::from_applied` still calls `prune_withdrawals(height)` and `prune_aa_units(height)` exactly once per committed batch, now routed through the store trait so pruning also deletes from disk. No background thread. No periodic compaction beyond RocksDB's own. The window predicate becomes parametric:
 

@@ -556,7 +556,7 @@ fn e2e_report_price_funding_pays_via_twap() {
 ### 4.5 Interaction with sibling gaps
 
 * **Gap 3 (Oracle slash / TWAP):** this design's `funding_twap` is *read-only* for funding; Gap 3's `oracle_twap` is *write-checked* for slashing. They can share one ring buffer (deduplicate) or keep separate — recommended **share**: both `funding_index_twap` and slash TWAP derive from same `VecDeque<TwapSample>` to keep `meta_leaf` small. Document shared ownership if both gaps land together (merge step must coalesce `FundingSourceKind` vs `OracleConfig`).
-* **Gap 5 (ordering salt):** no interaction — ordering decides `seq` linearization; funding consumes `seq` after ordering via `apply_report(seq)`. Salted ordering does not change `seq` values, only order.
+* **Gap 5 (ordering salt):** no interaction — ordering decides `seq` linearization; funding consumes `seq` after ordering via `apply_report(seq)`. *(Update: ordering was desalted — `Dag::ready_linearized` is plain lex — so there is no salted-order interaction at all.)*
 * **Gap 8 (burn view / AA sweep):** no interaction — funding does not touch `perp_supply`/`perp_burned`.
 
 ---

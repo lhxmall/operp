@@ -298,7 +298,8 @@ cargo run --release -p operp-exec --example hft_onedag -- 60000 8 4
 # export a real batch payload
 cargo run -p operp-settle --example export_batch
 
-# AA lifecycle on local devnet (needs node; uses vendored aa-testkit)
+# AA lifecycle on local devnet (needs node + a C++ toolchain for the
+# vendored aa-testkit's native rocksdb/sqlite3; see Verification status)
 cd obyte-local && node test_vault_aa.js
 
 # deploy the vault AA to Obyte testnet
@@ -473,6 +474,31 @@ Validation gates for every item above: `cargo test --workspace`,
 `cd obyte-local && node tools/check_aa_complexity.js` (≤85),
 `node test_vault_aa.js`, and `cargo run --release -p operp-exec --example
 bench_raw`.
+
+## Verification status
+
+* **Rust suite (CI-covered):** `.github/workflows/ci.yml` runs
+  `cargo test --workspace` on push/PR (stable toolchain; MSRV pinned at
+  1.85). 124 tests green at HEAD — covers gossip caps, journal CRC +
+  physical truncation, snapshot versioning/fallback, canonical-number
+  hash rules, batch-commit gov-nonce WAL (H2 regression included).
+* **AA complexity gate (manual):** `node obyte-local/tools/check_aa_complexity.js`
+  — currently **85/100** (ops 1086/2000), exactly at the ≤85 CI gate. This
+  check is NOT yet wired into CI; run it before any AA change.
+* **Golden vector (manual):** `node obyte-local/golden_vector_check.js`
+  prints the canonical Obyte JSON source + data_hash for a fixed input
+  (incl. `big` string > 2^53 and `eps: 0.001`); the Rust-side unit test
+  `golden_vector_matches_ocore_get_json_source` pins the identical hash
+  (`4efa7a37…`), so JS/Rust `get_data_hash` parity is verified by running
+  both sides.
+* **AA devnet E2E (NOT run on this host):** `test_vault_aa.js` needs the
+  vendored aa-testkit's native `rocksdb`/`sqlite3`, which require a C++
+  toolchain (`node-gyp`) — unavailable on Windows dev hosts without Visual
+  Studio Build Tools. The W-gate positives/negatives, respond forest
+  anchoring, escape gates and malformed-input guards are therefore verified
+  statically + by Rust-side golden vectors, not by a live devnet run. Run
+  `cd obyte-local && npm install && node test_vault_aa.js` on a build-tools
+  host or in CI before any testnet/mainnet deploy.
 
 See the commit history for the full security-audit remediation this repo
 went through (proof-gated withdrawals, deposit whitelisting, overflow

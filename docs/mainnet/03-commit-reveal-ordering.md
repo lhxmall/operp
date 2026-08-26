@@ -16,7 +16,7 @@
 |-------|------|--------|
 | `operp-types` | `crates/operp-types/src/lib.rs` | constants `ORDERING_SALT_DOMAIN`, `ORDERING_EPOCH` |
 | `operp-types` | `crates/operp-types/src/amount.rs` | `sha256` (reuse) |
-| `operp-dag` | `crates/operp-dag/src/lib.rs` | `Unit` (no field change in v1; optional fields in v2), `canonical_bytes`, `unit_id`, `Dag::ready_linearized`, `Dag::ready_linearized_with_salt`, `Dag::ordering_salt` helper, `ORPHAN_CAP` eviction site (L403-405, note cross-gap), `sign_unit` docs |
+| `operp-dag` | `crates/operp-dag/src/lib.rs` | `Unit` (no field change in v1; optional fields in v2), `canonical_bytes`, `unit_id`, `Dag::ready_linearized` (**desalted**: plain lex tie-break — the salt no longer orders execution, see audit-remediation note below), `set_eviction_salt` (eviction only), `ORPHAN_CAP` eviction site (L403-405, note cross-gap), `sign_unit` docs |
 | `operp-exec` | `crates/operp-exec/src/lib.rs` | `Engine::apply_ready`, `Engine::ingest`, new `Engine::ordering_salt` / `Engine::last_finalized_root` plumbing |
 | `operp-state` | `crates/operp-state/src/lib.rs` | `ChainState::last_finalized_root` (new field if not derivable), `ChainState::state_root` / `height` usage |
 | `operp-settle` | `crates/operp-settle/src/lib.rs` | `Batch::from_applied`, `Batch::validate_against` (ordering replay check), `Checkpoint` no change, `PostedBatch` selection unaffected |
@@ -36,6 +36,18 @@ No wire-format change in v1. v2 touches `canonical_bytes`.
 * **Grind** = signer iterates over a mutable field (`client_seq`, `price±tick`, `qty`, `parents` order already constrained, two parents max) to minimize tie-break key.
 
 ### 2.1 Recommendation: ship v1 (salted sort), leave full commit-reveal as v2
+
+> **Audit-remediation update (2026-08-26):** the salted sort shipped as v1, then was
+> **desalted** by user decision — `Dag::ready_linearized` is deterministic
+> lexicographic `UnitId` order; `ready_linearized_with_salt` was removed. The
+> salt survives ONLY for orphan eviction (`set_eviction_salt` via
+> `Engine::note_finalized`). Rationale: replicas that observe finalization at
+> different times derived different ordering salts and disagreed on execution
+> order; salted execution order is deferred until finalize-batch
+> determinization lands (root README Limitations #13). Anti-grind therefore
+> rests on the commit-reveal v2 path (below) and the deterministic-matching
+> fee race, not on per-batch salt rotation. Sections 2.2/3.x below describing
+> `ready_linearized_with_salt` are historical.
 
 | Dimension | v1 — Salted sort `H(salt || unit_id)` per batch | v2 — Full commit-reveal |
 |-----------|--------------------------------------------------|--------------------------|
@@ -97,8 +109,8 @@ pub fn ordering_key(salt: &[u8; 32], id: &UnitId) -> [u8; 32] {
 
 Change `Dag::ready_linearized`:
 
-* Keep existing `pub fn ready_linearized(&self) -> Vec<UnitId>` for backward-compat/testing, but deprecate (or keep as `#[cfg(test)]` delegating to salted with zero salt).
-* Add `pub fn ready_linearized_with_salt(&self, salt: &[u8; 32]) -> Vec<UnitId>`:
+* ~~Keep existing `pub fn ready_linearized(&self) -> Vec<UnitId>` for backward-compat/testing…~~
+* ~~Add `pub fn ready_linearized_with_salt(&self, salt: &[u8; 32]) -> Vec<UnitId>`~~ — **REMOVED in the audit remediation** (desalting). The shipped shape is the original lex `ready_linearized`; this sketch is retained for history:
 
 ```rust
 pub fn ready_linearized_with_salt(&self, salt: &[u8; 32]) -> Vec<UnitId> {
@@ -236,10 +248,10 @@ It changes wire format, needs wallet UX, doubles throughput cost, and needs Oscr
 
 ### 3.1 Correctness invariants (must hold for v1)
 
-1. **Topological:** `ready_linearized_with_salt` output remains a valid topological order for every salt — every unit appears after all its pending parents. Test: random DAGs, verify `position[parent] < position[child]` whenever both pending.
-2. **Deterministic:** Two replicas with identical `pending` set and identical `salt` produce byte-identical orderings. Test: clone `Dag`, run `ready_linearized_with_salt(&s)` on both, assert eq.
-3. **Salt sensitivity:** Flipping one bit of `salt` permutes order with probability ~1 - 1/pending! (i.e., almost always). Test: fixed set of 8 units, two salts differ by one bit, orderings differ.
-4. **Backward compat at flag:** `height < ACTIVATION_HEIGHT` uses lexicographic, `height >= ACTIVATION` uses salted; replay with wrong branch fails. Test: `Batch::validate_against` with cross-branch ordering → `RootMismatch`.
+1. **Topological:** `ready_linearized` (lex tie-break) output remains a valid topological order — every unit appears after all its pending parents. Test: random DAGs, verify `position[parent] < position[child]` whenever both pending.
+2. **Deterministic:** Two replicas with identical `pending` set produce byte-identical orderings regardless of finalization state (no salt consulted). Test: clone `Dag`, run `ready_linearized` on both, assert eq; also assert order is salt-independent (set different `eviction_salt`s, order unchanged).
+3. **Salt sensitivity (historical):** superseded by desalting — the salt must NOT permute execution order. Test: fixed set of 8 units, two salts, orderings identical.
+4. **No branch (desalted):** ordering is lexicographic at every height; there is no salted branch to diverge. The commit-reveal v2 ordering remains activation-gated at 1 000 000.
 5. **No wire change:** Old signed fixtures (hex dumps from `post_batch.js` temp_data) still verify under new code before activation height.
 
 ### 3.2 Anti-grind property (the graded assertion)
@@ -330,7 +342,7 @@ fn unknown_salt_unpredictable() {
 ### 4.1 Code size & blast radius
 
 * v1 diff: ~3 files touched, ~60 new lines, ~40 removed/changed, ~120 lines tests. `canonical_bytes` untouched, `UnitId` stable.
-* Execution path change is isolated to `Engine::apply_ready` → `Dag::ready_linearized_with_salt`; risk is consensus divergence if salt derivation diverges.
+* Execution path change is isolated to `Engine::apply_ready` → `Dag::ready_linearized` (desalted lex); consensus-divergence risk from salt derivation is gone — the only salt-dependent code is orphan eviction, which is not consensus state.
 
 ### 4.2 Performance (compiled code, per constraints)
 

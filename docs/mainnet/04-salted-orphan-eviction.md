@@ -396,7 +396,7 @@ fn two_engines_same_finalized_root_evict_same() {
 
 ### 4.4 What v1 deliberately does NOT do
 
-* No per-batch epoch mixing (ordering Gap 5 will add epoch; keep eviction salt epoch-free for simplicity).
+* No per-batch epoch mixing. *(Update: the shipped `Engine::note_finalized` rotates the eviction salt per epoch — `sha256(ORDERING_SALT_DOMAIN ‖ finalized_root ‖ epoch_le)` — so eviction IS epoch-bound in the implementation, deviating from this design sketch for the same rotation reason the ordering salt was dropped.)*
 * No persistent orphan store, no disk spill.
 * No eviction notification to peers (victim is simply dropped; orphan sync will re-request if needed).
 * No weighted eviction (e.g. prefer evicting orphans with fee < X) — keep victim pure function of id+salt.
@@ -406,7 +406,7 @@ fn two_engines_same_finalized_root_evict_same() {
 ## 5. Open Questions
 
 1. **Fallback salt choice**: `genesis_id().0` vs `sha256(b"empty")` vs `[0;32]`. Proposed `genesis_id`. `sha256(b"empty")` equals `merkle_root(empty)` sentinel — aliasing with empty-tree root could confuse diagnostics (two domains sharing a value). `[0;32]` is clean but less domain-separated. Any of the three is deterministic; reviewers to ratify.
-2. **Salt domain separator**: Should `eviction_key` prepend a tag `b"operp-evict-v1"` before `salt||id` to separate from ordering salt `b"operp-order-v1"`? Ordering design uses `last_finalized_root || epoch_le`. Eviction uses `salt || id`. Tags are cheap (one extra copy). Recommendation: add `b"evict:"` prefix (6 bytes) → `sha256(b"evict:" || salt || id)` for hygiene; overhead is 6 bytes. Leave to reviewer — bare `salt||id` already domain-separated by input length (32+32 vs 32+8 vs variable).
+2. **Salt domain separator**: Should `eviction_key` prepend a tag `b"operp-evict-v1"` before `salt||id`? *(Update: ordering was desalted in the audit remediation — there is no ordering salt anymore, so the `b"operp-order-v1"` domain separation concern is moot; bare `salt||id` is the shipped form.)*
 3. **Should `pending_orphans` eviction be LRU-aware as well?** Salted random is good for grind resistance but drops uniformly; an attacker flooding with fresh ids still has 4096/5000 survival rate. Rate-limit per-account orphan count (e.g. max 256 orphans per AccountId) would bound Sybil. Out of scope for this gap — propose as follow-up Gap 6b (Sybil quota).
 4. **Coordination with Gap 5 (commit-reveal / salted ordering)**: Gap 5 proposes `salt = sha256(last_finalized_root || epoch_le)` refreshed per batch for ordering, while eviction uses `salt = last_finalized_root` stable per finalization. Two salts share `last_finalized_root` source but refresh at different cadences — correct. Should we unify helper `fn eviction_salt(&self) -> [u8;32]` and `fn ordering_salt(&self)->[u8;32]` behind one `ChainState::finalization_anchor()`? Proposed yes — share `note_finalized` entry point, derive each key differently.
 5. **Cross-node sync transport**: Which P2P stack? Current deployment is single-operator (no p2p). Sketch assumes libp2p or simple TCP gossip; actual choice deferred. Should sync be incentivized (pay peer for serving missing parent) to avoid free-riding? Leave to P2P design phase.

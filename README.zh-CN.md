@@ -254,7 +254,8 @@ cargo run --release -p operp-exec --example hft_onedag -- 60000 8 4
 # 导出真实批次载荷
 cargo run -p operp-settle --example export_batch
 
-# AA 生命周期集成测试（本地 devnet，使用 vendored aa-testkit）
+# AA 生命周期集成测试（本地 devnet；需 node + C++ 工具链以编译
+# vendored aa-testkit 的原生 rocksdb/sqlite3——见「验证状态」）
 cd obyte-local && node test_vault_aa.js
 
 # 部署 vault AA 到 Obyte 测试网
@@ -425,6 +426,29 @@ v2 扩展分期；偏差与延期积压见下）：
 `cd obyte-local && node tools/check_aa_complexity.js`（≤85）、
 `node test_vault_aa.js`，以及
 `cargo run --release -p operp-exec --example bench_raw`。
+
+## 验证状态
+
+- **Rust 套件（CI 覆盖）**：`.github/workflows/ci.yml` 在 push/PR 上运行
+  `cargo test --workspace`（stable 工具链；MSRV 钉在 1.85）。HEAD 上
+  124 个测试全绿——覆盖 gossip 上限、journal CRC + 物理截断、快照
+  版本/回退、canonical-number 哈希规则、批次提交式 gov-nonce WAL
+  （含 H2 回归）。
+- **AA 复杂度门（手动）**：`node obyte-local/tools/check_aa_complexity.js`
+  ——当前 **85/100**（ops 1086/2000），恰在 ≤85 CI 门上。此检查尚未
+  接入 CI；任何 AA 改动前须手动跑。
+- **Golden vector（手动）**：`node obyte-local/golden_vector_check.js`
+  打印固定输入（含 >2^53 的 `big` 字符串与 `eps: 0.001`）的 canonical
+  Obyte JSON source 与 data_hash；Rust 侧单元测试
+  `golden_vector_matches_ocore_get_json_source` 钉住同一哈希
+  （`4efa7a37…`），两侧同跑即验证 JS/Rust `get_data_hash` 一致。
+- **AA devnet E2E（本机未运行）**：`test_vault_aa.js` 依赖 vendored
+  aa-testkit 的原生 `rocksdb`/`sqlite3`，需 C++ 工具链（`node-gyp`）——
+  无 Visual Studio Build Tools 的 Windows 开发机无法安装。W 门正/负用例、
+  respond 森林锚定、escape 门与畸形输入防护因此目前只做静态 + Rust 侧
+  golden vector 验证，未经真实 devnet 运行。任何 testnet/mainnet 部署前，
+  必须在具备构建工具的主机或 CI 上执行
+  `cd obyte-local && npm install && node test_vault_aa.js`。
 
 提交历史记录了本仓库经历的完整安全审计整改（proof 门控出金、存款白名单、
 溢出防护、市场白名单、严格签名、孤儿恢复、有界日志、keeper 奖励、坏账
