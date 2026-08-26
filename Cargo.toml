@@ -8,6 +8,7 @@ members = [
   "crates/operp-state",
   "crates/operp-exec",
   "crates/operp-settle",
+  "crates/operp-gossip",
 ]
 
 [workspace.package]
@@ -29,4 +30,5 @@ operp-account = { path = "crates/operp-account" }
 operp-dag = { path = "crates/operp-dag" }
 operp-state = { path = "crates/operp-state" }
 operp-exec = { path = "crates/operp-exec" }
+operp-gossip = { path = "crates/operp-gossip" }
 operp-settle = { path = "crates/operp-settle" }

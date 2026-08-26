@@ -233,6 +233,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "operp-gossip"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "operp-dag",
+ "operp-types",
+ "thiserror",
+]
+
+[[package]]
 name = "operp-settle"
 version = "0.1.0"
 dependencies = [
