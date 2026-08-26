@@ -6,7 +6,9 @@ use operp_types::{
     INSURANCE_ACCOUNT, INSURANCE_SEED, PRICE_SCALE, USD_SCALE,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-#[derive(Clone, Debug)]
+pub mod journal;
+pub mod persist;
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Withdrawal {
     pub amount: Usd,
     pub pending: bool,
@@ -14,7 +16,7 @@ pub struct Withdrawal {
     /// 256-height replay-protection window enforced by `prune_withdrawals`.
     pub height: Height,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ChainState {
     pub height: Height,
     pub last_unit: UnitId,
@@ -94,7 +96,7 @@ pub struct ChainState {
 /// finalize identically. Voting weight is the voter's PERP balance snapshotted
 /// at proposal creation (`weight_snapshot`); burning after creation cannot
 /// shrink a committed vote or dodge quorum.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Proposal {
     pub creator: AccountId,
     pub market: MarketId,

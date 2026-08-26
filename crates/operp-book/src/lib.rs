@@ -4,7 +4,7 @@ pub use book::OrderBook;
 
 use operp_types::{AccountId, MarketId, OrderId, OrderType, Price, Qty, Seq, Side, TimeInForce};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Order {
     pub id: OrderId,
     pub account: AccountId,
@@ -18,7 +18,7 @@ pub struct Order {
     pub seq: Seq,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Fill {
     pub taker_id: OrderId,
     pub maker_id: OrderId,
@@ -31,7 +31,7 @@ pub struct Fill {
     pub taker_side: Side,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MatchResult {
     pub fills: Vec<Fill>,
     pub taker_remaining: Qty,

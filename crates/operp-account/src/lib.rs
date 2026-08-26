@@ -5,14 +5,14 @@ use operp_types::{
 };
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Position {
     pub market: MarketId,
     pub qty: i64,
     pub entry_price: Price,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Account {
     pub id: AccountId,
     pub collateral: Usd,
@@ -20,7 +20,7 @@ pub struct Account {
     pub positions: BTreeMap<MarketId, Position>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RiskSnapshot {
     pub equity: Usd,
     pub mm: Usd,

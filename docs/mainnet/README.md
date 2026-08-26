@@ -34,6 +34,6 @@
 | 08 Burn accounting | ✅ Rust/checkpoint shipped; AA mirror vars dropped for budget |
 | 09 Complexity audit | ✅ R1/R3/R4 applied — probe `tools/check_aa_complexity.js`, now **94/100** |
 | 10 Tree depth/sharding | ⏸ depth stays 16; 18-bump reverted for budget — pair with sharding v2 |
-| 11 Replay window | ✅ constants + generalized pruning shipped; activation height stays `1_000_000` until deploy |
+| 11 Replay window | ✅ v1 shipped — constants + generalized pruning + `GovNonceJournal` WAL (fsync-before-watermark in `gov_withdraw`) + bincode snapshots (`Engine::load_or_genesis`/`flush_snapshot`); RocksDB v1.1 open |
 
 **Verification of the implementation batch:** `cargo test --workspace` 68 passed; `node tools/check_aa_complexity.js` 94/100 (ops 967/2000); `bench_raw` 5209 ops/s (−5.3%, within <10% gate). Devnet E2E (`test_vault_aa.js`) updated for the new trigger API but requires a live aa-testkit network run.

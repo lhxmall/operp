@@ -1,6 +1,8 @@
 use operp_account::AccountError;
 use operp_book::{BookError, Fill, Order};
 use operp_dag::{unit_id, verify_sig_by_id, Dag, DagError, Op, Unit};
+use operp_state::journal::{GovNonceJournal, GovNonceRecord};
+use operp_state::persist;
 use operp_state::{ChainState, Proposal};
 use operp_types::{
     bps, genesis_params, liq_order_id, notional_usd, order_id, valid_obyte_addr, AccountId, Bps,
@@ -9,6 +11,7 @@ use operp_types::{
     PROPOSAL_DURATION_SEQS, PROPOSAL_MIN_STAKE_PERP, PROPOSAL_QUORUM_DEN, PROPOSAL_QUORUM_NUM,
 };
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// Withdrawal ledger bound: once this many (account, nonce) entries are
 /// pending, further withdrawals are rejected with Risk until entries clear.
@@ -20,6 +23,9 @@ pub struct Engine {
     pub dag: Dag,
     pub state: ChainState,
     pub log: Vec<ExecEvent>,
+    /// Persistence root (`gap 11 v1`). `None` = ephemeral engine (tests,
+    /// replay validators). When set: gov-nonce WAL + optional snapshots.
+    pub store_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,7 +82,63 @@ impl Engine {
             dag: Dag::new(),
             state: ChainState::new(),
             log: Vec::new(),
+            store_dir: None,
         }
+    }
+
+    /// Restart recovery (gap 11): load the newest `chainstate.<height>.snap`
+    /// from `dir` (genesis state when none exists), then max-merge the
+    /// gov-nonce WAL over it. The DAG and event log restart empty — finalized
+    /// batches newer than the snapshot must be replayed via
+    /// `Batch::validate_against` by the caller, exactly as the design's
+    /// recovery sequence prescribes.
+    pub fn load_or_genesis(dir: &Path) -> std::io::Result<Self> {
+        let mut state = match persist::load_latest(dir)? {
+            Some((_, s)) => s,
+            None => ChainState::new(),
+        };
+        let journal = GovNonceJournal::open(dir)?;
+        for GovNonceRecord { account, nonce, .. } in journal.read_all()? {
+            let cur = state.seen_gov_nonces.get(&account).copied().unwrap_or(0);
+            if nonce > cur {
+                state.seen_gov_nonces.insert(account, nonce);
+            }
+        }
+        Ok(Self {
+            dag: Dag::new(),
+            state,
+            log: Vec::new(),
+            store_dir: Some(dir.to_path_buf()),
+        })
+    }
+
+    /// Write a snapshot of the current state to the store dir. No-op for
+    /// ephemeral engines. Compacts the gov-nonce WAL into the same atomic
+    /// checkpoint.
+    pub fn flush_snapshot(&mut self) -> std::io::Result<Option<PathBuf>> {
+        let Some(dir) = self.store_dir.clone() else { return Ok(None) };
+        persist::save_snapshot(&dir, &self.state).map(Some)
+    }
+
+    /// Cadence wrapper: flush every [`persist::SNAPSHOT_EVERY`] heights.
+    /// Returns whether a snapshot was written this call.
+    pub fn maybe_flush_snapshot(&mut self) -> std::io::Result<bool> {
+        if self.store_dir.is_none() || self.state.height == 0 || self.state.height % persist::SNAPSHOT_EVERY != 0 {
+            return Ok(false);
+        }
+        self.flush_snapshot()?;
+        Ok(true)
+    }
+
+    /// WAL-checkpoint the gov-nonce journal once it exceeds the compaction
+    /// threshold. Called after batch commits; cheap no-op below 1 MB.
+    pub fn compact_journal_if_needed(&mut self) -> std::io::Result<()> {
+        let Some(dir) = self.store_dir.clone() else { return Ok(()) };
+        let j = GovNonceJournal::open(&dir)?;
+        if j.should_compact() {
+            j.compact(&self.state.seen_gov_nonces)?;
+        }
+        Ok(())
     }
 
     pub fn ingest(&mut self, unit: Unit) -> Result<Vec<ExecEvent>, ExecError> {
@@ -670,6 +732,15 @@ impl Engine {
         let bal = self.state.perp_balances.get(&account).copied().unwrap_or(0);
         if bal < amount {
             return Err(RejectReason::Insufficient);
+        }
+        // Durability gate (gap 11): fsync the nonce to the WAL BEFORE the
+        // in-memory watermark advances, so a crash between the two leaves
+        // the nonce recoverable via `load_or_genesis`. A failed WAL write
+        // rejects the op without mutating state — safe to retry.
+        if let Some(dir) = self.store_dir.as_ref() {
+            GovNonceJournal::open(dir)
+                .and_then(|j| j.append(account, nonce, self.state.height))
+                .map_err(|_| RejectReason::Risk)?;
         }
         self.state.perp_balances.insert(account, bal - amount);
         self.state.perp_supply -= amount;
@@ -2064,6 +2135,98 @@ mod tests {
         }
         eng.ingest(gov_with(vec![g], &sk(1), 100, 4)).unwrap();
         assert_eq!(eng.state.seen_gov_nonces[&acct_of(&sk(1))], 4);
+    }
+
+
+    /// Gap 11 acceptance: the gov-nonce watermark survives a node restart
+    /// via the WAL, so replays below it keep bouncing.
+    #[test]
+    fn gov_nonce_watermark_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("operp-g11-wal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = Engine::load_or_genesis(&dir).unwrap();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        eng.ingest(gov_dep(vec![g], &sk(1), 10_000, 7)).unwrap();
+        // WAL record is fsynced inside gov_withdraw before the watermark moves.
+        eng.ingest(gov_with(vec![g], &sk(1), 1_000, 5)).unwrap();
+        assert_eq!(eng.state.seen_gov_nonces[&acct_of(&sk(1))], 5);
+
+        // Snapshot balances/dedup maps, then crash: the journal alone covers
+        // the watermark, the snapshot covers everything else.
+        eng.flush_snapshot().unwrap();
+        let mut eng2 = Engine::load_or_genesis(&dir).unwrap();
+        allow_all(&mut eng2);
+        assert_eq!(eng2.state.seen_gov_nonces[&acct_of(&sk(1))], 5);
+        // Lower nonce still rejected; higher nonce applies and re-journals.
+        let evs = eng2.ingest(gov_with(vec![g], &sk(1), 50, 4)).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected { reason: RejectReason::DuplicateNonce, .. }
+        )));
+        eng2.ingest(gov_with(vec![g], &sk(1), 50, 6)).unwrap();
+        assert_eq!(eng2.state.seen_gov_nonces[&acct_of(&sk(1))], 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gap 11 acceptance: collateral withdrawals and PERP deposits deduped by
+    /// `withdrawals` / `seen_aa_units` survive a restart via snapshot load.
+    #[test]
+    fn withdraw_and_deposit_dedup_survive_restart() {
+        let dir = std::env::temp_dir().join(format!("operp-g11-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = Engine::load_or_genesis(&dir).unwrap();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        let alice = sk(1);
+        let account = acct_of(&alice);
+        eng.ingest(deposit(vec![g], &alice, 10_000 * USD_SCALE as i128, 1)).unwrap();
+        // Withdraw collateral (nonce 7) and deposit PERP (distinct aa unit,
+        // same bound address).
+        let wd = sign_unit(
+            vec![g],
+            Op::Withdraw { account, amount: 100 * USD_SCALE as i128, nonce: 7 },
+            &alice,
+        );
+        eng.ingest(wd).unwrap();
+        let gd = sign_unit(
+            vec![g],
+            Op::GovDeposit {
+                account,
+                addr: test_addr(1), // must match the account's bound address
+                amount: 500,
+                aa_unit: [9u8; 32],
+            },
+            &alice,
+        );
+        let evs_gd = eng.ingest(gd).unwrap();
+        assert!(evs_gd.iter().any(|e| matches!(e, ExecEvent::Applied { .. })));
+
+        // Snapshot + restart.
+        eng.flush_snapshot().unwrap();
+        let mut eng2 = Engine::load_or_genesis(&dir).unwrap();
+        allow_all(&mut eng2);
+        assert!(eng2.state.withdrawals.contains_key(&(account, 7)));
+
+        // Same withdraw nonce after restart → DuplicateNonce.
+        let dup = sign_unit(
+            vec![g],
+            Op::Withdraw { account, amount: 100 * USD_SCALE as i128, nonce: 7 },
+            &alice,
+        );
+        let evs = eng2.ingest(dup).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected { reason: RejectReason::DuplicateNonce, .. }
+        )));
+        // Reused aa_unit after restart → DuplicateDeposit (collateral kind).
+        let dep2 = deposit(vec![g], &sk(3), 100 * USD_SCALE as i128, 9);
+        let evs = eng2.ingest(dep2).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected { reason: RejectReason::DuplicateDeposit, .. }
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }

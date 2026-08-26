@@ -3,7 +3,7 @@ use operp_types::{MarketId, OrderId, OrderType, Price, Qty, Side, TimeInForce};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OrderBook {
     market: MarketId,
     bids: BTreeMap<Reverse<Price>, VecDeque<OrderId>>,

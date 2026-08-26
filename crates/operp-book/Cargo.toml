@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 operp-types = { workspace = true }
 thiserror = { workspace = true }
+
+serde = { workspace = true }

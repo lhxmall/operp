@@ -352,7 +352,7 @@ The 11 gaps above each have a concrete design in [`docs/mainnet/`](docs/mainnet/
  - [x] **08 Burn accounting (Rust + checkpoint)** — `perp_burned` in `meta_leaf`, emitted via `Checkpoint.perp_burned` / `temp_data`; AA-side mirror vars dropped for budget, `holdings−supply==burned` stays watcher-verifiable
  - [x] **09 Complexity audit** — R1 single-sha256 fold, unified claim dispatcher (`claim:'kind'`), `bal_`/`pperp_` ledgers deleted; probe: `node tools/check_aa_complexity.js`. Current **94/100** (ops 967/2000)
  - [ ] **10 AA-tree sharding** — `10-aa-tree-sharding.md`: v1 16→18 (262k accounts, 0 new vars), v2 S=16×D16=1M sharded forest
- - [ ] **11 Replay persistence** — `11-replay-persistence.md`: `256→2048` (`~68 min`) + persistent BTree/RocksDB vs journal, `gov watermark` durable
+- [x] **11 Replay persistence (v1)** — `11-replay-persistence.md`: `256→2048` constants + generalized pruning *(Gate1)*; **now** `GovNonceJournal` WAL — fsync-before-watermark in `gov_withdraw`, max-merge on restart — plus bincode snapshots `chainstate.<height>.snap` via `Engine::load_or_genesis` / `flush_snapshot` / `maybe_flush_snapshot` (every 64 heights). RocksDB (`persist-rocksdb`) stays v1.1
 
 **Gate2/3 known deviations (v2 backlog):**
 - **Replay window 256→2048**: constants shipped (`REPLAY_WINDOW`,

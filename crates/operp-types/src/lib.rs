@@ -195,7 +195,7 @@ impl ParamKey {
 }
 
 /// Per-market risk/fee parameters, mutable via governance proposals.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MarketParams {
     /// Right-zero-padded ASCII symbol.
     pub symbol: [u8; 16],
