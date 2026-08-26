@@ -365,6 +365,7 @@
 					// falsy values ('0', 0) pass. (A direct `X == false`
 					// comparison would fatal-error whenever X is present.)
 					if (typeof(trigger.data.amount) == 'boolean'
+						OR typeof(trigger.data.amount) == 'string'
 						OR typeof(trigger.data.withdrawn) == 'boolean'
 						OR typeof(trigger.data.leaf_account) == 'boolean'
 						OR typeof(trigger.data.collateral) == 'boolean'
@@ -400,6 +401,12 @@
 						if (!$sa OR timestamp < $sa + 604800)
 							bounce('chain not stalled');
 					}
+					// perp length cap must run BEFORE the subtraction below: a
+					// malformed over-15-digit string would fatal in the
+					// arithmetic instead of bouncing (same short-circuit issue
+					// as the main amount gate, applied to the earlier statement).
+					if (length(trigger.data.perp) > 15)
+						bounce('bad claim amount');
 					// Single gate for leaf ownership and the GLOBAL cumulative
 					// caps wd_/wp_ (anti-replay across heights; every withdrawal
 					// caps the claim; perp_amount optionally claims less).
@@ -412,10 +419,14 @@
 						AND trigger.data.perp_amount >= 0
 						AND trigger.data.perp_amount < $unclaimed)
 						? trigger.data.perp_amount : $unclaimed;
+					// Length caps come FIRST: OR short-circuits, so a malformed
+					// over-15-digit string must bounce here — reaching `min`
+					// below with such input would fatal (not a decimal) instead
+					// of bouncing, and the cap would never be evaluated.
 					if (trigger.data.leaf_account != trigger.address
+						OR length(trigger.data.collateral) > 15 OR length(trigger.data.perp) > 15 OR length(trigger.data.withdrawn) > 15
 						OR trigger.data.amount < 0
 						OR trigger.data.amount + (var['wd_' || trigger.address] otherwise 0) > min(trigger.data.collateral, trigger.data.withdrawn)
-						OR length(trigger.data.collateral) > 15 OR length(trigger.data.perp) > 15 OR length(trigger.data.withdrawn) > 15
 						OR $perp_claimed < 0)
 						bounce('bad claim amount');
 					$fold = ($acc, $i, $sib) => (!$acc OR !$sib.hash) ? false

@@ -553,10 +553,11 @@ async function main() {
 
   // ---------- 1b. generate the REAL withdrawal claim (root committed at submit) ----------
   require("child_process").execSync(
-    // <addr> <collateral> <perp> <withdrawn> — withdrawn=1000000 so the
-    // cumulative-W gate (amount + wd_ <= withdrawn) clears the 900000 test
-    // withdrawal, matching the on-chain AA's enforced W constraint.
-    "cargo run -p operp-settle --example gen_withdraw_proof -- " + aliceAddr + " 1000000 0 1000000",
+    // <addr> <collateral> <perp> <withdrawn> — collateral=2000000 stays well
+    // above the 900000 test withdrawal while withdrawn=1000000 IS the W
+    // budget: the over-W and replay negative cases below then trip ONLY the
+    // W arm (amount + wd_ > withdrawn), isolating it from the collateral arm.
+    "cargo run -p operp-settle --example gen_withdraw_proof -- " + aliceAddr + " 2000000 0 1000000",
     // The testkit chdirs into its devnet home; pin the workspace root so
     // cargo finds the Cargo.toml.
     { cwd: path.join(__dirname, "..") },
@@ -751,9 +752,10 @@ async function main() {
     throw new Error("withdraw wallet delta " + wdDelta + " != " + (wdAmount - 10000 - wdFee));
   console.log("GOOD PROOF WITHDRAWAL PAID (wallet delta", wdDelta, "=", wdAmount, "- 10000 -", wdFee, "fee)");
 
-  // REPLAY: the identical withdraw a second time must bounce — the
-  // cumulative wd_<addr> marker now equals the proven collateral,
-  // tripping the cumulative-cap arm of the bad-claim-amount gate.
+  // REPLAY: the identical withdraw a second time must bounce — with
+  // wd_ = 900000 the second claim's amount + wd_ = 1800000 exceeds the
+  // proven W (withdrawn = 1000000), tripping the W arm of the
+  // bad-claim-amount gate (the collateral arm at 2000000 stays clear).
   const replay = await triggerRaw(alice, {
     withdraw: 1,
     height: 1,
