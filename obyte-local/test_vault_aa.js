@@ -164,10 +164,13 @@ function paymentPayloads(j) {
 // total payout of `asset` ('base' or an asset id) to `address` in a unit.
 async function paidToAddress(unit, address, asset) {
   const j = await getJoint(unit);
+  // `asset` lives on the PAYLOAD (one asset per payment message), not on
+  // individual outputs; base payloads simply omit it.
   return paymentPayloads(j)
+    .filter((p) => (asset === "base" ? !p.asset : p.asset === asset))
     .flatMap((p) => p.outputs || [])
-    .filter((o) => o.address === address && (asset === "base" ? !o.asset : o.asset === asset))
-    .reduce((s, o) => s + o.amount, 0);
+    .filter((o) => o.address === address)
+    .reduce((s, o) => s + Number(o.amount), 0);
 }
 
 
@@ -844,23 +847,17 @@ async function main() {
     const depAa = await network.getAaResponseToUnit(depRes.unit);
     console.log("PERP deposit AA response:", JSON.stringify(depAa && depAa.response).slice(0, 300));
 
-    // Final AA has NO case that retains a PERP asset payment (deposit_perp
-    // and the pperp_ ledger were dropped in the complexity reclamation), so
-    // ocore AUTO-BOUNCES any asset-bearing trigger and refunds the asset.
-    // That IS the current on-chain contract: assert the bounce + that a
-    // refund response unit exists (a prior run's joint dump showed the full
-    // 200000 PERP returned to alice).
-    if (!(depAa && depAa.response && depAa.response.bounced === true))
-      throw new Error("PERP deposit neither accepted nor refunded: " + JSON.stringify(depAa && depAa.response).slice(0, 600));
-    if (!depAa.response.response_unit)
-      throw new Error("PERP deposit bounced without a refund unit");
-    await network.witnessUntilStable(depAa.response.response_unit);
-    const refunded = await paidToAddress(depAa.response.response_unit, aliceAddr, PERP_ASSET);
-    console.log("PERP deposit auto-refunded by the vault (no deposit_perp case in final AA); refund readback =", refunded);
-    // NOTE: with the vault unable to hold PERP, the proof-gated PERP
-    // withdrawal below can only be exercised as a BOUNCE path. Re-enabling
-    // PERP deposits requires an owner-less AA upgrade (header comment,
-    // migration path).
+    // Restored deposit_perp case ACCEPTS the asset-bearing payment and
+    // credits the reconciliation ledger pperp_<trigger.address> (keyed
+    // identically to wd_/wp_ read in withdraw init). pperp_ is a mirror of
+    // the sidechain GovDeposit credits, NOT a payout cap: the proven leaf's
+    // perp value stays the withdrawal authority.
+    if (!(depAa && depAa.response && depAa.response.bounced !== true))
+      throw new Error("PERP deposit did not credit pperp_: " + JSON.stringify(depAa && depAa.response).slice(0, 600));
+    const stDep = await pVars();
+    if (Number(stDep["pperp_" + aliceAddr] || 0) !== PERP_DEPOSIT)
+      throw new Error("pperp_ mirror credited " + stDep["pperp_" + aliceAddr] + ", expected exactly " + PERP_DEPOSIT);
+    console.log("PERP DEPOSIT ACCEPTED, pperp_" + aliceAddr + " =", PERP_DEPOSIT);
 
     // ---- 10b. sidechain batch: GovDeposit -> CreateMarket -> proposal ----
     // Signing-key convention matches export_batch.rs sk(n): seed = [n;32];
@@ -880,9 +877,12 @@ async function main() {
     }
 
     // Op::GovDeposit{account, amount, aa_unit, addr} — aa_unit is the Obyte
-    // PERP deposit unit above (base64 unit id -> raw [u8;32]), replay-guarded
-    // by operp-settle's deposits_allowed injection; addr binds the sidechain
-    // account to alice's Obyte withdrawal address.
+    // PERP deposit trigger unit above (base64 unit id -> raw [u8;32]). The
+    // unit id is fixed at posting time and independent of the AA response,
+    // so restoring deposit_perp (accept instead of auto-bounce) does NOT
+    // change which id is referenced; operp-settle's deposits_allowed
+    // injection still replay-guards it. addr binds the sidechain account
+    // to alice's Obyte withdrawal address.
     const aaUnit = Buffer.from(depRes.unit, "base64");
     if (aaUnit.length !== 32) throw new Error("deposit unit id is not 32 bytes");
     postOp(
@@ -1012,12 +1012,12 @@ async function main() {
     st = await pVars();
     if (Number(st.last_finalized) !== HEIGHT) throw new Error("finalize h" + HEIGHT + " failed");
     console.log("height", HEIGHT, "locked & finalized with PERP aa_root committed");
-
-    // ---- 10d. PERP withdrawal against an UNFUNDED vault ----
-    // The vault cannot hold PERP (see the auto-refund in 10a), so a valid
-    // sharded proof with perp > 0 must BOUNCE at the payout stage: the AA
-    // has no PERP to send. Crucially, the bounced unit's state writes
-    // (wp_ cumulative marker) are rolled back, so anti-replay stays intact.
+    // ---- 10d. FUNDED PERP withdrawal against the committed aa_root ----
+    // With the deposit_perp case restored, the vault now actually HOLDS
+    // PERP (PERP_DEPOSIT), so the same sharded proof that previously
+    // bounced at the payout stage pays out. Payout authority is the proven
+    // leaf's perp value (pperp_ is only a reconciliation mirror); wp_ is
+    // the cumulative anti-replay marker.
     const perpBalBefore = await balances(alice);
     const goodPerp = await pTriggerRaw(alice, {
       withdraw: 1,
@@ -1030,15 +1030,62 @@ async function main() {
       shard: shard,
       proof,
     });
-    if (!(goodPerp.response && goodPerp.response.bounced === true))
-      throw new Error("unfunded PERP withdrawal did not bounce: " + JSON.stringify(goodPerp).slice(0, 600));
-    st = await pVars();
-    if (Number(st["wp_" + aliceAddr] || 0) !== 0)
-      throw new Error("wp_ marker updated despite bounced PERP withdrawal");
+    const perpPaid = await paidToAddress(goodPerp.response.response_unit, aliceAddr, PERP_ASSET);
+    if (perpPaid !== WITHDRAW_PERP)
+      throw new Error("PERP withdraw payout mismatch: paid " + perpPaid + ", claimed " + WITHDRAW_PERP);
     const perpBalAfter = await balances(alice);
-    if (perpBalAfter[PERP_ASSET] !== perpBalBefore[PERP_ASSET])
-      throw new Error("alice PERP balance changed on bounced withdrawal");
-    console.log("UNFUNDED PERP WITHDRAWAL BOUNCED, wp_ untouched (anti-replay intact)");
+    if (perpBalAfter[PERP_ASSET] !== perpBalBefore[PERP_ASSET] + WITHDRAW_PERP)
+      throw new Error("alice PERP balance delta mismatch on funded withdrawal");
+    st = await pVars();
+    if (Number(st["wp_" + aliceAddr] || 0) !== WITHDRAW_PERP)
+      throw new Error("wp_ marker not advanced by exactly " + WITHDRAW_PERP + ": " + st["wp_" + aliceAddr]);
+    console.log("FUNDED PERP WITHDRAWAL PAID", WITHDRAW_PERP, ", wp_", aliceAddr, "=", WITHDRAW_PERP);
+
+    // Idempotent replay of the SAME claim: the cumulative wp_ cap clamps
+    // $unclaimed to 0, so the response succeeds but emits NO asset output
+    // ($perp_claimed > 0 gate) and moves no PERP. Anti-replay here is a
+    // silent zero-payout clamp, NOT a bounce — a bounce would roll back
+    // nothing and prove less.
+    const replay = await pTriggerRaw(alice, {
+      withdraw: 1,
+      height: HEIGHT,
+      amount: 0,
+      leaf_account: aliceAddr,
+      collateral: COLLATERAL_CLAIM,
+      withdrawn: COLLATERAL_CLAIM,
+      perp: String(WITHDRAW_PERP),
+      shard: shard,
+      proof,
+    });
+    if (replay.response && replay.response.bounced === true)
+      throw new Error("replayed PERP claim bounced instead of clamping: " + JSON.stringify(replay.response).slice(0, 600));
+    const perpBalReplay = await balances(alice);
+    if (perpBalReplay[PERP_ASSET] !== perpBalAfter[PERP_ASSET])
+      throw new Error("replayed PERP claim moved funds despite exhausted wp_ cap");
+    st = await pVars();
+    if (Number(st["wp_" + aliceAddr] || 0) !== WITHDRAW_PERP)
+      throw new Error("wp_ marker drifted on replayed claim");
+    console.log("REPLAYED PERP CLAIM CLAMPED TO ZERO PAYOUT, wp_ intact (anti-replay holds)");
+
+    // Negative-path coverage stays cheap through the existing machinery:
+    // an over-proven leaf (perp bumped) folds to a different leaf hash and
+    // bounces at merkle validation before any state write.
+    const overProof = await pTriggerRaw(alice, {
+      withdraw: 1,
+      height: HEIGHT,
+      amount: 0,
+      leaf_account: aliceAddr,
+      collateral: COLLATERAL_CLAIM,
+      withdrawn: COLLATERAL_CLAIM,
+      perp: String(WITHDRAW_PERP * 10),
+      shard: shard,
+      proof,
+    });
+    if (!(overProof.response && overProof.response.bounced === true))
+      throw new Error("over-proven PERP leaf did not bounce: " + JSON.stringify(overProof.response).slice(0, 600));
+    if (Number((await pVars())["wp_" + aliceAddr] || 0) !== WITHDRAW_PERP)
+      throw new Error("wp_ marker updated despite bounced over-proof");
+    console.log("OVER-PROVEN PERP LEAF BOUNCED AT MERKLE VALIDATION");
   }
   await network.stop();
   process.exit(0);
