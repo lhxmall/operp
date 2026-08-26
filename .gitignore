@@ -27,3 +27,7 @@ obyte-local/agents/operp_vault_base.aa
 obyte-local/agents/operp_vault_perp.aa
 obyte-local/e2e_out.log
 agents/operp_vault_perp.aa
+
+# local agent-session artifacts
+.kilo/
+local/
