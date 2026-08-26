@@ -35,6 +35,7 @@ function resolveVaultAa() {
 const aaRoot = path.join(__dirname, "..", "vendor", "aa-testkit");
 const nm = path.join(aaRoot, "node_modules");
 process.env.NODE_PATH = [nm, process.env.NODE_PATH].filter(Boolean).join(path.delimiter);
+require("module").Module._initPaths(); // pick up NODE_PATH for bare ocore requires
 process.env.devnet = "1";
 
 const { Testkit } = require(path.join(aaRoot, "main.js"));
@@ -42,42 +43,32 @@ const { Network } = Testkit({
   TESTDATA_DIR: path.join(__dirname, "testdata-poster"),
 });
 
-function getLength(value) {
-  const cache = new WeakMap();
-  function _len(v) {
-    if (v === null) return 0;
-    switch (typeof v) {
-      case "string": return v.length;
-      case "number": if (!isFinite(v)) throw new Error("bad number"); return 8;
-      case "boolean": return 1;
-      case "object": {
-        if (cache.has(v)) return cache.get(v);
-        let n = 0;
-        if (Array.isArray(v)) { for (const el of v) n += _len(el); }
-        else { for (const k of Object.keys(v)) n += k.length + _len(v[k]); }
-        cache.set(v, n);
-        return n;
-      }
-      default: throw new Error("unsupported type " + typeof v);
-    }
-  }
-  return _len(value);
+// H3 — single canonical definition of the batch data hash/length, matching
+// Rust operp_settle::obyte_hash::get_data_hash: the canonical source is
+// ocore's recursively key-sorted minified JSON (string_utils.getJsonSourceString),
+// data_hash is its SHA-256 in HEX, data_length its UTF-8 byte length.
+const { getJsonSourceString } = require("ocore/string_utils.js");
+
+function obyteDataLength(data) {
+  return Buffer.byteLength(getJsonSourceString(data));
 }
 
-function obyteBase64Hash(obj) {
-  // OIP-0007 canonical source string + SHA-256 base64 (matches ocore
-  // getBase64Hash(obj, true): minified JSON with sorted keys).
-  const minified = JSON.stringify(obj, (k, v) => v, 0);
-  return crypto.createHash("sha256").update(minified, "utf8").digest("base64");
+function obyteDataHash(data) {
+  return crypto.createHash("sha256").update(getJsonSourceString(data), "utf8").digest("hex");
 }
 
 function tempDataMessage(data) {
+  // The ON-CHAIN OIP-0007 envelope must satisfy ocore's temp_data validator
+  // (validation.js pins data_hash to base64 getBase64Hash(data, true) and
+  // data_length to objectLength.getLength(data, true)), so both wire fields
+  // are delegated to ocore itself instead of hand-rolled copies. Watchers
+  // ignore them and recompute the canonical hex pair above from payload.data.
   return {
     app: "temp_data",
     payload_location: "inline",
     payload: {
-      data_length: getLength(data),
-      data_hash: obyteBase64Hash(data),
+      data_length: require("ocore/object_length.js").getLength(data, true),
+      data_hash: require("ocore/object_hash.js").getBase64Hash(data, true),
       data,
     },
   };
@@ -98,30 +89,38 @@ async function buildDepositEvidences(batchData, vaultAddress) {
     const isPerp = op.GovDeposit !== undefined;
     const dep = isPerp ? op.GovDeposit : op.Deposit;
     if (!dep) continue;
-    const aaUnit = dep.aa_unit;
+    const rawUnit = dep.aa_unit;
+    // serde emits aa_unit as a numeric byte array; accept both it and hex.
+    const aaUnit = Array.isArray(rawUnit)
+      ? Buffer.from(rawUnit).toString("hex")
+      : rawUnit;
     if (typeof aaUnit !== "string" || aaUnit.length !== 64) continue;
     if (seen.has(aaUnit)) continue;
     seen.add(aaUnit);
     let joint;
     try {
       joint = await new Promise((resolve, reject) => {
-        hub.getJoint(aaUnit, (err, j) => (err ? reject(err) : resolve(j)));
+        hub.getJoint(Buffer.from(aaUnit, "hex").toString("base64"), (err, j) => (err ? reject(err) : resolve(j)));
       });
     } catch (e) {
       throw new Error("deposit anchor missing on Obyte: " + aaUnit.slice(0, 16));
     }
     if (!joint || !joint.unit) throw new Error("no joint for " + aaUnit.slice(0, 16));
+    // joint carries the FULL joint unit object: the watcher recomputes
+    // unit_hash(joint.unit) via operp_settle::obyte_hash::get_unit_hash and
+    // compares against the sidechain deposit's aa_unit.
     evidences.push({
       aa_unit: aaUnit,
       is_perp: isPerp,
       amount: String(dep.amount),
       vault_address: vaultAddress,
-      joint: { unit: joint.unit, unit_hash: joint.unitHash },
+      joint: joint.unit,
     });
   }
   evidences.sort((a, b) => (a.aa_unit < b.aa_unit ? -1 : 1));
   return evidences;
 }
+
 async function trigger(wallet, data, amount) {
   const r = await wallet.triggerAaWithData({
     toAddress: network.agent.vault,
@@ -136,8 +135,14 @@ async function trigger(wallet, data, amount) {
 let network;
 
 async function main() {
+  if (PERP_ASSET_ID === "PERP_ASSET_ID_HERE")
+    throw new Error("Set PERP_ASSET_ID to the issued asset id before posting");
   const batchFile = process.argv[2] || path.join(__dirname, "batch.json");
   const batchData = JSON.parse(fs.readFileSync(batchFile, "utf8"));
+  // H3 contract visibility: the canonical pair watchers recompute from
+  // payload.data (Rust operp_settle::obyte_hash::get_data_hash).
+  console.log("canonical data_hash:", obyteDataHash(batchData),
+    "data_length:", obyteDataLength(batchData));
   console.log("batch:", batchData.chain_id, "height", batchData.height,
     "units", (batchData.unit_ids || []).length);
 
@@ -166,6 +171,15 @@ async function main() {
 
   // 2. join the submit race — 50000 SUBMIT_BOND_NET + >=10000 fee headroom
   // Step6/8: carry optional validity_proof_hash and perp_burned audit mirror.
+  // Phase 5.2: submit carries the sharded commitment — aa_forest is the
+  // 1024-hex concat of the 16 shard roots (shard i at offset i*64) and
+  // aa_root stays the 64-hex forest hash over that concat; the AA
+  // length-gates both (64 / 1024).
+  const shardRoots = batchData.aa_shard_roots;
+  if (!Array.isArray(shardRoots) || shardRoots.length !== 16 ||
+      !shardRoots.every((r) => typeof r === "string" && /^[0-9a-f]{64}$/.test(r)))
+    throw new Error("batch.json is missing a valid 16-entry aa_shard_roots array");
+  const aaForest = shardRoots.join("");
   const submitData = {
     submit: 1,
     chain_id: batchData.chain_id || "operp-mvp-1",
@@ -173,6 +187,7 @@ async function main() {
     prev_state_hash: batchData.prev_state_hash,
     state_root: batchData.state_root,
     aa_root: batchData.aa_root,
+    aa_forest: aaForest,
     fills_hash: batchData.fills_hash,
   };
   if (batchData.validity_proof_hash) submitData.validity_proof_hash = batchData.validity_proof_hash;

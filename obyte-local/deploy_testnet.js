@@ -43,6 +43,8 @@ const { Network } = Testkit({
 });
 
 async function main() {
+  if (PERP_ASSET_ID === "PERP_ASSET_ID_HERE")
+    throw new Error("Set PERP_ASSET_ID to the issued asset id before deploying");
   console.log("deploying operp_vault.aa to TESTNET ...");
   const network = await Network.create()
     .with.agent({ vault: resolveVaultAa() })
