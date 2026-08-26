@@ -83,17 +83,28 @@ fn stored(dir: &std::path::Path) -> Engine {
     eng
 }
 
-/// One batch-commit step: advance a height, prune exactly like
-/// `Batch::from_applied`, flush snapshots at cadence.
-fn commit_step(eng: &mut Engine) {
-    eng.state.height += 1;
-    let h = eng.state.height;
-    eng.state.prune_withdrawals(h);
-    eng.state.prune_aa_units(h);
-    eng.state.prune_deposits_allowed(h);
-    eng.state.prune_commits(h);
-    let _ = eng.maybe_flush_snapshot();
-    let _ = eng.compact_journal_if_needed();
+/// One REAL batch-commit step: cut a batch through `Batch::from_applied`
+/// (height advance, ledger pruning, snapshot cadence, gov-nonce WAL flush)
+/// rather than hand-rolling the same sequence. Each step deposits a fresh
+/// minimal amount under a step-unique AA unit so `from_applied` has a
+/// non-empty applied set; collisions with the test's own AA units only make
+/// that step's deposit rejected (still committable), never affect assertions.
+fn commit_step(eng: &mut Engine, i: u32) {
+    use operp_settle::Batch;
+    let g = genesis_id();
+    let prev = eng.state.clone();
+    // Secret, aa byte and amount all derive from the FULL index, so wrapped
+    // aa bytes across >256 steps still produce distinct units (dag dedup).
+    let secret = sk((i as u8).wrapping_add(64));
+    let d = deposit(
+        vec![g],
+        &secret,
+        USD_SCALE as i128 * (1 + i as i128),
+        i as u8,
+    );
+    let id = unit_id(&d);
+    eng.ingest(d).unwrap();
+    Batch::from_applied(&prev, eng, &[id]).unwrap();
 }
 
 fn rejected<'a>(evs: &'a [ExecEvent]) -> Option<&'a RejectReason> {
@@ -129,8 +140,8 @@ fn duplicate_withdraw_300h_rejected_after_restart() {
 
     // Advance 150 heights, then restart MID-STREAM and keep going on the
     // recovered engine — recovery must be seamless mid-batch-stream.
-    for _ in 0..150 {
-        commit_step(&mut eng);
+    for i in 0..150u16 {
+        commit_step(&mut eng, u32::from(i));
     }
     eng.flush_snapshot().unwrap();
     let mut eng = Engine::load_or_genesis(&dir).unwrap();
@@ -139,8 +150,8 @@ fn duplicate_withdraw_300h_rejected_after_restart() {
         eng.state.withdrawals.contains_key(&key),
         "restart must not lose the dedup entry"
     );
-    for _ in 0..160 {
-        commit_step(&mut eng);
+    for i in 150..310u16 {
+        commit_step(&mut eng, u32::from(i));
     }
 
     // Entry must survive 310 heights under the 2048 window (legacy 256
@@ -174,14 +185,19 @@ fn gov_nonce_watermark_survives_restart_without_snapshot() {
     let tip = unit_id(&d);
     eng.ingest(d).unwrap();
 
-    // GovWithdraw nonce=5: journaled (fsync) BEFORE the watermark advances.
+    // GovWithdraw nonce=5: buffered at ingest, persisted to the journal at
+    // BATCH COMMIT (`from_applied`) — an uncommitted batch never burns a
+    // nonce (H2), so the commit must happen before the simulated crash.
     let w = gov_with(vec![tip], &alice, 100, 5);
+    let wid = unit_id(&w);
+    let prev = eng.state.clone();
     let evs = eng.ingest(w).unwrap();
     assert!(
         evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
         "gov_with nonce=5 must apply, got {:?}",
         evs
     );
+    operp_settle::Batch::from_applied(&prev, &mut eng, &[wid]).unwrap();
 
     // Crash WITHOUT any snapshot: the journal alone must carry the watermark
     // across the restart (closes the snapshot-cadence gap of up to 63 heights).
@@ -205,12 +221,15 @@ fn gov_nonce_watermark_survives_restart_without_snapshot() {
     // temp_data replay; here a fresh GovDeposit re-funds the account.)
     let evs = eng2.ingest(gov_dep(vec![g], &alice, 500, 8)).unwrap();
     assert!(evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })), "refund must apply, got {:?}", evs);
-    let evs = eng2.ingest(gov_with(vec![g], &alice, 50, 6)).unwrap();
+    let w6 = gov_with(vec![g], &alice, 50, 6);
+    let prev3 = eng2.state.clone();
+    let evs = eng2.ingest(w6.clone()).unwrap();
     assert!(
         evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
         "higher nonce must apply, got {:?}",
         evs
     );
+    operp_settle::Batch::from_applied(&prev3, &mut eng2, &[unit_id(&w6)]).unwrap();
     // ...and survives yet another restart.
     let eng3 = Engine::load_or_genesis(&dir).unwrap();
     assert_eq!(eng3.state.seen_gov_nonces.get(&acct_of(&alice)).copied(), Some(6));
@@ -233,8 +252,8 @@ fn aa_unit_reused_after_300h_still_rejected_after_restart() {
     assert!(evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })));
     assert!(eng.state.seen_aa_units.contains_key(&[9u8; 32]));
 
-    for _ in 0..300 {
-        commit_step(&mut eng);
+    for i in 0..300u16 {
+        commit_step(&mut eng, u32::from(i));
     }
     eng.flush_snapshot().unwrap();
     let mut eng2 = Engine::load_or_genesis(&dir).unwrap();
@@ -380,4 +399,56 @@ fn restart_midstream_recovered_via_validate_against_no_double_apply() {
         Some(&RejectReason::DuplicateNonce),
         "duplicate must be rejected after restart + validate_against recovery"
     );
+}
+
+/// H2 regression: a validation replay that FAILS must not persist the batch's
+/// gov-withdraw nonces. The batch is produced (and committed) on the producer
+/// engine, then validated against a cloned validator with its own store dir;
+/// validation ingests the GovWithdraw (buffering nonce 5) but fails on a
+/// tampered fills hash. A restart of the validator must boot WITHOUT nonce 5 —
+/// no burning nonces from batches that never committed on this node.
+#[test]
+fn failed_validate_against_does_not_persist_gov_nonce() {
+    use operp_settle::SettleError;
+
+    let producer_dir = temp_store("h2a");
+    let validator_dir = temp_store("h2b");
+    let mut eng = stored(&producer_dir);
+    allow_all(&mut eng);
+    eng.state.height = 50;
+
+    let alice = acct_of(&sk(1));
+    eng.state.perp_balances.insert(alice, 1_000);
+    eng.state.perp_supply = 1_000;
+    let prev = eng.state.clone();
+
+    // Validator engine: identical state (clone), separate store dir — the
+    // design's recovery shape (fresh node replaying a produced batch).
+    let mut validator = eng.clone();
+    validator.store_dir = Some(validator_dir.clone());
+
+    let g = genesis_id();
+    let w = gov_with(vec![g], &sk(1), 100, 5);
+    let wid = unit_id(&w);
+    eng.ingest(w).unwrap();
+    let mut batch = operp_settle::Batch::from_applied(&prev, &mut eng, &[wid]).unwrap();
+    // Producer committed: its own watermark carries nonce 5.
+    assert_eq!(eng.state.seen_gov_nonces.get(&alice).copied(), Some(5));
+
+    // Corrupt the checkpoint so validation fails AFTER replaying the batch.
+    batch.checkpoint.fills_hash = [0xAA; 32];
+    let err = batch.validate_against(prev.state_root(), &mut validator).unwrap_err();
+    assert!(matches!(err, SettleError::FillsMismatch), "got {err:?}");
+
+    // The validator replay advanced its in-memory watermark...
+    assert_eq!(validator.state.seen_gov_nonces.get(&alice).copied(), Some(5));
+    // ...but restart rebuilds from snapshot + journal: nonce 5 must be GONE.
+    let eng3 = Engine::load_or_genesis(&validator_dir).unwrap();
+    assert_eq!(
+        eng3.state.seen_gov_nonces.get(&alice).copied(),
+        None,
+        "failed validation must not burn the nonce on the validator node"
+    );
+    let _ = std::fs::remove_dir_all(&producer_dir);
+    let _ = std::fs::remove_dir_all(&validator_dir);
 }

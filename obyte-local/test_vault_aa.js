@@ -553,7 +553,10 @@ async function main() {
 
   // ---------- 1b. generate the REAL withdrawal claim (root committed at submit) ----------
   require("child_process").execSync(
-    "cargo run -p operp-settle --example gen_withdraw_proof -- " + aliceAddr + " 1000000",
+    // <addr> <collateral> <perp> <withdrawn> — withdrawn=1000000 so the
+    // cumulative-W gate (amount + wd_ <= withdrawn) clears the 900000 test
+    // withdrawal, matching the on-chain AA's enforced W constraint.
+    "cargo run -p operp-settle --example gen_withdraw_proof -- " + aliceAddr + " 1000000 0 1000000",
     // The testkit chdirs into its devnet home; pin the workspace root so
     // cargo finds the Cargo.toml.
     { cwd: path.join(__dirname, "..") },
@@ -711,7 +714,10 @@ async function main() {
     throw new Error("h1 not finalized: last_finalized=" + st.last_finalized);
   console.log("height 1 finalized");
 
-  const wdAmount = Math.min(Number(claim.collateral), 900000);
+  // Clamp to the proven W (cumulative withdrawn) as well: the AA enforces
+  // amount + wd_ <= withdrawn, so a claim whose withdrawn is less than the
+  // collateral must not drive the test into the W arm accidentally.
+  const wdAmount = Math.min(Number(claim.collateral), Number(claim.withdrawn), 900000);
   const wdBalBefore = await balances(alice);
   const wdUnit = await triggerAwaitUnit(alice, {
     withdraw: 1,
@@ -782,6 +788,42 @@ async function main() {
     throw new Error("bad proof did not bounce with 'bad merkle root': " + JSON.stringify(bad).slice(0, 2000));
   console.log("BAD PROOF BOUNCED AS EXPECTED");
 
+  // ---------- W-gate negatives (audit C1/C2) ----------
+  // (a) negative amount: the amount gate's `amount < 0` arm must bounce
+  // before any balance math runs.
+  const neg = await triggerRaw(alice, {
+    withdraw: 1,
+    height: 1,
+    amount: -500000,
+    leaf_account: claim.leaf_account,
+    collateral: claim.collateral,
+    perp: claim.perp || "0",
+    withdrawn: claim.withdrawn,
+    shard: claim.shard,
+    proof: claim.proof,
+  });
+  if (!JSON.stringify(neg).includes("bad claim amount"))
+    throw new Error("negative amount did not bounce: " + JSON.stringify(neg).slice(0, 600));
+  console.log("NEGATIVE AMOUNT BOUNCED AS EXPECTED");
+
+  // (b) amount beyond the remaining W budget (withdrawn - wd_): the good
+  // withdrawal above consumed 900000 of withdrawn=1000000, so an amount that
+  // alone is under collateral but pushes amount + wd_ past withdrawn must
+  // bounce — replay protection stays intact after the W gate ships.
+  const overW = await triggerRaw(alice, {
+    withdraw: 1,
+    height: 1,
+    amount: Number(claim.withdrawn) - 1000,
+    leaf_account: claim.leaf_account,
+    collateral: claim.collateral,
+    perp: claim.perp || "0",
+    withdrawn: claim.withdrawn,
+    shard: claim.shard,
+    proof: claim.proof,
+  });
+  if (!JSON.stringify(overW).includes("bad claim amount"))
+    throw new Error("over-W amount did not bounce: " + JSON.stringify(overW).slice(0, 600));
+  console.log("OVER-W AMOUNT BOUNCED AS EXPECTED");
 
   // Issue the PERP asset on THIS network while it is still running.
   PERP_ASSET = await resolvePerpAsset(alice);

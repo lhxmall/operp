@@ -21,13 +21,22 @@ const { getJsonSourceString } = require("ocore/string_utils.js");
 
 // Fixed nested object: unsorted keys at two depths, array kept in order,
 // every JSON value kind ocore's canonicalizer handles (no empty containers —
-// getJsonSourceString rejects those by default).
+// getJsonSourceString rejects those by default). `big` exercises the
+// decimal-string path for >2^53 integers; `eps` a small non-canonical-free
+// float.
 const obj = {
   zeta: 1,
   alpha: { k2: [1, 2.5, true], k1: "v" },
   mid: false,
   s: "hello",
+  big: "12345678901234567890",
+  eps: 0.001,
 };
+
+// NOTE: bare JSON numbers with magnitude > 2^53 (or non-canonical forms such
+// as 1.0 / -0.0 / >=1e21) are REJECTED Rust-side by get_data_hash — the
+// canonical-number rules fail closed. Integers that large must travel as
+// decimal strings, hence `big` above.
 
 const source = getJsonSourceString(obj);
 const dataHash = crypto.createHash("sha256").update(source, "utf8").digest("hex");

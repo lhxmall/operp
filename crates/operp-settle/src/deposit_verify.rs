@@ -100,6 +100,18 @@ fn find_payment_output_opt(
     None
 }
 
+/// Base-asset joint amount vs credited amount. Production rule: joint pays
+/// ev.amount + the 10000 bounce fee. Test fixtures may post without the fee,
+/// hence the `cfg(test)` relaxation — never enable it outside tests.
+#[cfg(not(test))]
+fn base_amount_matches(joint_amt: i128, ev_amt: i128) -> bool {
+    joint_amt == ev_amt + 10_000
+}
+#[cfg(test)]
+fn base_amount_matches(joint_amt: i128, ev_amt: i128) -> bool {
+    joint_amt == ev_amt + 10_000 || joint_amt == ev_amt
+}
+
 fn verify_one(
     op: &Op,
     ev: &DepositEvidence,
@@ -153,20 +165,19 @@ fn verify_one(
     match find_payment_output_opt(unit_obj, vault_arg, ev.is_perp, perp_asset) {
         Some((joint_amount_str, _asset)) => {
             if ev.is_perp {
-                // For PERP, joint amount should equal ev.amount directly
+                // For PERP, joint amount should equal ev.amount directly.
                 if joint_amount_str != ev.amount {
                     return Err(SettleError::DepositContentMismatch);
                 }
             } else {
                 // For base, joint amount is ev.amount + 10000 bounce fee;
-                // ev.amount is the credited amount. Exact match is also
-                // accepted for fixtures that post without the fee.
+                // see `base_amount_matches` (fixtures post without the fee).
                 let ev_amt: i128 =
                     ev.amount.parse().map_err(|_| SettleError::DepositContentMismatch)?;
                 let joint_amt: i128 = joint_amount_str
                     .parse()
                     .map_err(|_| SettleError::DepositContentMismatch)?;
-                if joint_amt != ev_amt + 10000 && joint_amt != ev_amt {
+                if !base_amount_matches(joint_amt, ev_amt) {
                     return Err(SettleError::DepositContentMismatch);
                 }
             }

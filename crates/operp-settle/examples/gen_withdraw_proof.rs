@@ -75,7 +75,12 @@ fn main() {
 
     let (shard, siblings, shard_root) =
         operp_state::aa_sharded_proof_for(&pairs, &addr)
-            .unwrap_or_else(|| panic!("no proof for {}", addr));
+            .unwrap_or_else(|| {
+                panic!(
+                    "no sharded proof for {addr}: register PAD decoy bindings for its shard first \
+                     (see the bucket-padding note above)"
+                )
+            });
     let roots = operp_state::aa_sharded_roots_of(&pairs);
     assert_eq!(roots[shard as usize], shard_root, "proof must reach its shard root");
     let forest = roots.concat();

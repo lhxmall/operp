@@ -29,6 +29,15 @@ pub struct Engine {
     /// Persistence root (`gap 11 v1`). `None` = ephemeral engine (tests,
     /// replay validators). When set: gov-nonce WAL + optional snapshots.
     pub store_dir: Option<PathBuf>,
+    /// Replay-validation mode (H2): while validating a batch, gov-withdraw
+    /// nonces are NOT written to the WAL — only `Batch::from_applied` on the
+    /// production path persists them, at batch-commit time.
+    pub validating: bool,
+    /// Gov-withdraw nonces awaiting durable commit. Pushed at ingest,
+    /// flushed to the WAL by [`Engine::flush_gov_wal`] when the batch
+    /// commits (`Batch::from_applied`); dropped (never persisted) if the
+    /// batch is abandoned — no more burning nonces on uncommitted batches.
+    pub pending_gov_wal: Vec<(AccountId, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +99,8 @@ impl Engine {
             log: Vec::new(),
             sig_verifier: SigVerifier::new(),
             store_dir: None,
+            validating: false,
+            pending_gov_wal: Vec::new(),
         }
     }
 
@@ -117,6 +128,8 @@ impl Engine {
             log: Vec::new(),
             sig_verifier: SigVerifier::new(),
             store_dir: Some(dir.to_path_buf()),
+            validating: false,
+            pending_gov_wal: Vec::new(),
         })
     }
 
@@ -136,6 +149,30 @@ impl Engine {
         }
         self.flush_snapshot()?;
         Ok(true)
+    }
+
+    /// Durably persist every gov-withdraw nonce buffered since the last
+    /// flush, then clear the buffer. Called at batch commit
+    /// (`Batch::from_applied`) so an abandoned/uncommitted batch never burns
+    /// nonces on disk (H2). No-op on ephemeral or validating engines.
+    pub fn flush_gov_wal(&mut self) -> std::io::Result<()> {
+        let Some(dir) = self.store_dir.clone() else {
+            self.pending_gov_wal.clear();
+            return Ok(());
+        };
+        if self.validating {
+            self.pending_gov_wal.clear();
+            return Ok(());
+        }
+        if self.pending_gov_wal.is_empty() {
+            return Ok(());
+        }
+        let j = GovNonceJournal::open(&dir)?;
+        for (account, nonce) in &self.pending_gov_wal {
+            j.append(*account, *nonce, self.state.height)?;
+        }
+        self.pending_gov_wal.clear();
+        Ok(())
     }
 
     /// WAL-checkpoint the gov-nonce journal once it exceeds the compaction
@@ -201,13 +238,14 @@ impl Engine {
 
     pub fn note_finalized(&mut self, root: [u8; 32], height: operp_types::Height) {
         self.state.note_finalized(root, height);
-        // Step9: rotate the DAG eviction/ordering salt to
+        // Step9: rotate the DAG EVICTION salt to
         // sha256(ORDERING_SALT_DOMAIN || finalized_root || epoch_le), where
         // epoch = height / ORDERING_EPOCH_UNITS. Deriving from (root, epoch)
-        // — not the raw root — keeps ordering stable within an epoch and
+        // — not the raw root — keeps eviction stable within an epoch and
         // forces rotation at epoch boundaries even if the same root were
-        // re-finalized. `Dag::ready_linearized` (via `apply_ready`) picks up
-        // this salt for both ready-set tie-breaks and orphan eviction.
+        // re-finalized. The salt deliberately does NOT influence execution
+        // order anymore (desalted, user-approved): `Dag::ready_linearized`
+        // uses plain lex order; only orphan eviction stays salted.
         let epoch = (height / operp_types::ORDERING_EPOCH_UNITS).to_le_bytes();
         let mut buf = Vec::with_capacity(operp_types::ORDERING_SALT_DOMAIN.len() + 64);
         buf.extend_from_slice(operp_types::ORDERING_SALT_DOMAIN);
@@ -776,14 +814,15 @@ impl Engine {
         if bal < amount {
             return Err(RejectReason::Insufficient);
         }
-        // Durability gate (gap 11): fsync the nonce to the WAL BEFORE the
-        // in-memory watermark advances, so a crash between the two leaves
-        // the nonce recoverable via `load_or_genesis`. A failed WAL write
-        // rejects the op without mutating state — safe to retry.
-        if let Some(dir) = self.store_dir.as_ref() {
-            GovNonceJournal::open(dir)
-                .and_then(|j| j.append(account, nonce, self.state.height))
-                .map_err(|_| RejectReason::Risk)?;
+        // Durability (H2, low-D19): the nonce is buffered here and fsynced
+        // to the WAL only when the batch commits (`flush_gov_wal` from
+        // `Batch::from_applied`). Uncommitted batches — crash after ingest,
+        // or validation replays — never persist the nonce, so a withdraw
+        // that never committed does not burn the account's nonce. The
+        // in-memory watermark still advances at ingest (duplicate detection
+        // semantics unchanged).
+        if self.store_dir.is_some() && !self.validating {
+            self.pending_gov_wal.push((account, nonce));
         }
         self.state.perp_balances.insert(account, bal - amount);
         self.state.perp_supply -= amount;
@@ -897,8 +936,16 @@ impl Engine {
                 voted: HashSet::new(),
                 // Voting weight is frozen at creation: burning or moving
                 // PERP afterwards can neither boost nor dodge a ballot, and
-                // the quorum denominator stays fixed.
-                weight_snapshot: self.state.perp_balances.clone(),
+                // the quorum denominator stays fixed. Zero balances are
+                // dropped from the snapshot (they vote 0 anyway — tally
+                // reads use `unwrap_or(0)`), keeping proposal payloads slim.
+                weight_snapshot: self
+                    .state
+                    .perp_balances
+                    .iter()
+                    .filter(|(_, &b)| b != 0)
+                    .map(|(a, &b)| (*a, b))
+                    .collect(),
             },
         );
         Ok(Vec::new())

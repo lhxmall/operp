@@ -56,7 +56,7 @@ cd obyte-local && node deploy_testnet.js   # 把 vault AA 部署到 Obyte 测试
 | `operp-account` | 每账户抵押/仓位、VWAP 入场价、已实现 PnL、风险快照 |
 | | `liquidatable`：equity·10000 ≤ mm·10500；`reduce_only`：≤ 12000 |
 | `operp-state` | ChainState：账户/簿/mark/提款记录，字节域 Merkle 树（`state_root`）+ 字符串域森林（`aa_root`，供 AA 验证）；重启持久化（快照 + gov-nonce WAL） |
-| `operp-dag` | unit DAG、签名严格校验（`verify_strict`）、orphan 缓冲（4096 上限，盐化驱逐）、盐化确定性线性化（`ready_linearized_with_salt`） |
+| `operp-dag` | unit DAG、签名严格校验（`verify_strict`）、orphan 缓冲（4096 上限，盐化驱逐）、确定性字典序线性化（`ready_linearized`，已去盐） |
 | `operp-exec` | 引擎本体：ingest → apply → 事件流；place/cancel/deposit/withdraw/liquidate 全量入口校验 |
 | `operp-settle` | 批次 checkpoint、`validate_against` 重放审计（含独立充值证据验证）、`temp_data` 载荷、提款证明生成 |
 | `operp-gossip` | operator 之间 WantUnits/HaveUnits 按需孤儿同步（纯 P2P 层，传输无关，绝不进共识） |
@@ -68,7 +68,7 @@ cd obyte-local && node deploy_testnet.js   # 把 vault AA 部署到 Obyte 测试
 每个用户操作都是引用至多 2 个父单元的签名 **unit**。引擎按 `unit_id`
 升序执行 pending 单元——任何副本无需共识流量即可复现的规范确定性全序。
 乱序投递可容忍：父母未知的单元进入缓冲（上限 4096，按盐化序
-`argmin(sha256(salt ‖ id))` 驱逐——盐由最后最终化根派生并随排序 epoch
+`argmin(sha256(salt ‖ id))` 驱逐——盐由最后最终化根派生并随驱逐 epoch
 轮换），同一 id 携带不同 canonical 字节的重试被拒
 （`DagError::RetryMismatch`），Deposit/GovDeposit 的地址在任何缓冲之前即
 受 128 字符上限约束（`DagError::AddrTooLong`）。缺失单元可通过
@@ -234,6 +234,12 @@ docs/PROTOCOL.md         协议设计叙事
                          与威胁模型矩阵
 ```
 
+## 构建前提
+
+- Rust >= **1.85**（workspace 钉死 `rust-version = "1.85"`；经
+  [rustup](https://rustup.rs) 安装：
+  `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`）
+
 ## 运行
 
 ```bash
@@ -286,10 +292,10 @@ cd obyte-local && node post_batch.js
    8 个存活 commit、`reveal_commit_hash = sha256(op_bytes ‖ salt)`），但与其
    他 v2 路径一样激活门控——激活高度翻转之前排序不变。费率竞速与确定性
    撮合无论何时都在压缩磨队可榨取的空间。
-5. **孤儿驱逐在副本间留下瞬时分叉窗口。** 驱逐/排序盐按
-   `(finalized_root, epoch)` 每 epoch 轮换，但观测到 finalize 的时刻不同的
-   副本在收敛前可能驱逐不同的缓冲孤儿；DA 层自愈——`temp_data` 全量重放
-   可确定性重建缺失单元，WantUnits gossip 也可点对点索取。
+5. **孤儿驱逐在副本间留下瞬时分叉窗口。** 驱逐盐按 `(finalized_root,
+   epoch)` 每 epoch 轮换，但观测到 finalize 的时刻不同的副本在收敛前可能
+   驱逐不同的缓冲孤儿；DA 层自愈——`temp_data` 全量重放可确定性重建缺失
+   单元，WantUnits gossip 也可点对点索取。（盐刻意不再影响执行序——见 #13。）
 6. **烧毁的 PERP 永久滞留 vault AA。** 烧毁只扣减 `perp_supply`，对应代币
    仍托管在 AA 中（永久超额抵押）——审计时须把「AA 持有量 − perp_supply」
    视为累计烧毁额。
@@ -297,13 +303,24 @@ cd obyte-local && node post_batch.js
    归零而在任者毫无成本（`active_bond_` 仍在自己名下）。这是接受的活性
    权衡：只拖延自家高度，任何竞争者都可花 50 000-byte 债券接管该高度。
 8. AA 未做正式安全审计。Oscript 复杂度门恰在其上限（**85/100**，ops
-   1038/2000——运行 `node tools/check_aa_complexity.js`），后续任何改动
+   1075/2000——运行 `node tools/check_aa_complexity.js`），后续任何改动
    都必须先腾出等额预算。
 9. **重放去重窗口按高度有界**——旧版 256 高度，`state.height ≥
    REPLAY_ACTIVATION_HEIGHT`（1 000 000；部署期翻转）后扩展为
    `REPLAY_WINDOW = 2048`。窗口外的重复操作逃过侧链去重（AA 侧全局
-   `wd_`/`wp_` 封顶仍然有效）。gov nonce 另用严格水位线并落盘日志
-   （fsync-before-watermark WAL），乱序低 nonce 永久拒绝——包括跨重启。
+   `wd_`/`wp_` 封顶仍然有效）。gov nonce 另用严格水位线，在批次提交时
+   落盘（见 #14），乱序低 nonce 永久拒绝——包括跨重启。
+10. AA 强制 `amount + wd_ <= min(collateral, withdrawn)`，且叶子数字字段
+    上限为 15 位十进制（< 2^53）。
+11. 单账户分片证明生成必须先注册 PAD 诱饵绑定，否则
+    `aa_sharded_proof_for_account` 返回 `None`。
+12. 批次 JSON 的 `perp_burned` 是十进制字符串。
+13. 当前执行序是确定性字典序；盐只用于孤儿驱逐。盐化执行序将在
+    finalize-batch 确定性设计落地后回归。
+14. gov nonce WAL 在批次提交（`from_applied`）时持久化；未提交的批次
+    不烧毁 nonce。
+15. 快照携带格式版本头（当前 v1）；跨版本的快照/日志互不兼容
+    （主网前不做迁移）。
 
 近期关闭：存款白名单、溢出防护、市场白名单、严格签名、孤儿恢复
 （确定性驱逐 + 缺失父反向索引）、日志按批裁剪、已实现 PnL 即时结算进
@@ -325,8 +342,9 @@ perp 字段）、烧毁上架费的无许可市场上架（每市场风险参数
 
 本轮关闭了剩余审计发现与路线图缺口：`validate_against` 剪枝对齐
 （withdrawals / seen-AA-units / deposits_allowed 与 `from_applied` 完全一致
-地剪枝）、`validate_against` 内独立充值证据验证、epoch 盐化排序/驱逐
-（salt = `sha256(ORDERING_SALT_DOMAIN ‖ root ‖ epoch_le)`）、先乘后除的
+地剪枝）、`validate_against` 内独立充值证据验证、epoch 盐化孤儿驱逐
+（salt = `sha256(ORDERING_SALT_DOMAIN ‖ root ‖ epoch_le)`；执行序已去盐为
+确定性字典序——局限 #13）、先乘后除的
 PnL 定标、`RetryMismatch`/`AddrTooLong` DAG 防护、meta 叶对全部共识映射的
 承诺扩展（`state_root` 格式破坏性变更）、canonical `data_hash`/`data_length`
 经 ocore `getJsonSource` 在 Rust/JS 两侧统一、充值证据携带完整 joint 单元、
@@ -351,7 +369,8 @@ v2 扩展分期；偏差与延期积压见下）：
   `operp_settle::obyte_hash::get_unit_hash` 复算；收款人/资产以调用方提供的
   `expected_vault`/`perp_asset` 绑定核对，失败映射
   `SettleError::DepositEvidence`；watcher 经 `evidences_from_payload` 取回
-- [x] **03 commit-reveal 排序** — v1 盐化排序早前已发；**本轮 v2 叠加落地**：
+- [x] **03 commit-reveal 排序** — v1 盐化排序早前已发、**本轮去盐**（执行序
+  为确定性字典序，盐仅用于孤儿驱逐——局限 #13）；**v2 叠加落地**：
   `Op::Commit`（tag 18）/ `Op::Reveal`（tag 19），TTL
   `COMMIT_TTL_HEIGHTS = 16`、每账户 ≤ 8 个存活 commit、
   `reveal_commit_hash = sha256(inner_op_bytes ‖ salt)`，1 000 000 激活门控
@@ -376,16 +395,16 @@ v2 扩展分期；偏差与延期积压见下）：
   `holdings−supply==burned` 保持 watcher 可验证
 - [x] **09 复杂度审计** — 单 sha256 折叠、统一 claim 分发（`claim:'kind'`）、
   lock-merge 重构；探针：`node tools/check_aa_complexity.js`。当前 **85/100**
-  （ops 1038/2000）——恰在门槛
+  （ops 1075/2000）——恰在门槛
 - [x] **10 AA 树分片（v2）** — 本轮干净切换：单个 1024-hex `aa_forest` 变量 =
   16 个拼接的 shard 根（恰好命中 `MAX_STATE_VAR_VALUE_LENGTH`）、空 shard
   哨兵根、深度保持 16 → 每批约 100 万账户；doc 的 v1 depth-18 路径按其
   OpenQ3 被取代
 - [x] **11 重放持久化（v1）** — `256→2048` 常量 + 泛化剪枝；`GovNonceJournal`
-  WAL——`gov_withdraw` 先 fsync 再推水位线、重启 max-merge——外加 bincode
-  快照 `chainstate.<height>.snap`（`Engine::load_or_genesis` /
-  `flush_snapshot` / `maybe_flush_snapshot`，每 64 高度）。RocksDB
-  （`persist-rocksdb`）保持文档声明的 v1.1 积压
+  WAL——批次提交（`Batch::from_applied`）时落盘、重启 max-merge——外加带
+  版本头的 bincode 快照 `chainstate.<height>.snap`
+  （`Engine::load_or_genesis` / `flush_snapshot` / `maybe_flush_snapshot`，
+  每 64 高度）。RocksDB（`persist-rocksdb`）保持文档声明的 v1.1 积压
 
 **已知偏差 / 延期积压：**
 

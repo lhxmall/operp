@@ -48,6 +48,7 @@ pub struct Checkpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validity_proof_hash: Option<String>,
     /// Optional perp burned total audit field (mirrors ChainState.perp_burned).
+    /// On the wire (temp_data JSON) it is a decimal string, not a number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perp_burned: Option<u128>,
 }
@@ -120,6 +121,8 @@ pub enum SettleError {
     DepositDuplicateAnchor,
     #[error("deposit evidence too large")]
     DepositEvidenceTooLarge,
+    #[error("gov wal flush failed")]
+    WalFlush,
 }
 
 /// Canonical byte encoding of fills shared by batch construction and replay
@@ -178,6 +181,10 @@ impl Batch {
         engine.state.prune_aa_units(height);
         engine.state.prune_deposits_allowed(height);
         engine.state.prune_commits(height);
+        // H2: gov-nonce WAL hits disk exactly here, at batch commit — not at
+        // ingest. If the batch is abandoned, the buffered nonces are dropped
+        // with it (nothing burned on uncommitted batches).
+        engine.flush_gov_wal().map_err(|_| SettleError::WalFlush)?;
         // gap 11: persistence hooks fire on the production commit path only
         // (replay validators run store-less engines, where both are no-ops).
         // Best-effort per the design's failure-mode table: a failed snapshot
@@ -244,7 +251,9 @@ impl Batch {
             data["validity_proof_hash"] = serde_json::Value::String(v.clone());
         }
         if let Some(v) = self.checkpoint.perp_burned {
-            data["perp_burned"] = serde_json::json!(v);
+            // Wire format is a decimal STRING: u128 exceeds the JS safe
+            // integer range and obyte-local/post_batch.js forwards it verbatim.
+            data["perp_burned"] = serde_json::json!(v.to_string());
         }
         // Canonical Obyte form (Phase 4.1): data_hash = hex(sha256(getJsonSource(data))),
         // data_length = UTF-8 byte length of that source — same contract as
@@ -266,9 +275,9 @@ impl Batch {
         if self.units.is_empty() {
             return Err(SettleError::Empty);
         }
-        if self.chain_id != CHAIN_ID {
-            return Err(SettleError::ChainMismatch);
-        }
+        // H2: validation replays must never write gov nonces to the WAL —
+        // only the committing engine (`from_applied`) persists them.
+        replay.validating = true;
         if replay.state.state_root() != prev_root {
             return Err(SettleError::PrevMismatch);
         }

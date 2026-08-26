@@ -279,6 +279,11 @@ docs/PROTOCOL.md         protocol design narrative
                          edge case, and the threat-model matrix
 ```
 
+## Build prerequisites
+
+- Rust >= **1.85** (the workspace pins `rust-version = "1.85"`; install via
+  [rustup](https://rustup.rs): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+
 ## Running
 
 ```bash
@@ -343,11 +348,12 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    flips, ordering is unchanged. The fee race and deterministic matching
    bound what grinding can extract either way.
 5. **Orphan eviction leaves a transient fork window across replicas.**
-   Eviction/ordering salts rotate per epoch from `(finalized_root, epoch)`,
-   but replicas that observe finalization at different times may evict
+   Eviction salts rotate per epoch from `(finalized_root, epoch)`, but
+   replicas that observe finalization at different times may evict
    different buffered orphans before converging; the DA layer self-heals —
    a `temp_data` full replay reconstructs missing units deterministically,
-   and WantUnits gossip fetches them peer-to-peer.
+   and WantUnits gossip fetches them peer-to-peer. (The salt deliberately
+   does NOT order execution anymore — see #13.)
 6. **Burned PERP stays stranded in the vault AA.** Burns decrement
    `perp_supply` but the corresponding tokens remain escrowed (the AA is
    permanently over-collateralized) — auditors must treat
@@ -358,7 +364,7 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    it delays only their own height, and any competitor can spend the
    50 000-byte bond to take the height over.
 8. The AA has had no formal security audit. The Oscript complexity gate
-   sits exactly at its ceiling (**85/100**, ops 1038/2000 — run
+   sits exactly at its ceiling (**85/100**, ops 1075/2000 — run
    `node tools/check_aa_complexity.js`), so every further AA change must
    free equal budget first.
 9. **Replay-dedup windows are height-bounded** — legacy 256 heights,
@@ -366,9 +372,21 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    REPLAY_ACTIVATION_HEIGHT` (1 000 000; flip at deploy). A duplicate op
    arriving outside the window escapes sidechain dedup (AA-side global
    `wd_`/`wp_` caps still hold). Gov nonces additionally use a strict
-   watermark journalled to disk (fsync-before-watermark WAL), so an
+   watermark journalled to disk at batch commit (see #14), so an
    out-of-order lower nonce is rejected permanently — including across
    restarts.
+10. AA enforces `amount + wd_ <= min(collateral, withdrawn)`, and leaf
+    numeric fields are capped at 15 decimal digits (< 2^53).
+11. Single-account shard proof generation requires registering PAD decoy
+    bindings first, else `aa_sharded_proof_for_account` returns `None`.
+12. Batch JSON `perp_burned` is a decimal string.
+13. Execution order is currently deterministic lex order; the salt is used
+    only for orphan eviction. Salted execution order returns after the
+    finalize-batch determinization design lands.
+14. Gov nonce WAL persists at batch commit (`from_applied`); uncommitted
+    batches do not burn nonces.
+15. Snapshots carry a format version header (currently v1); cross-version
+    snapshots/journals are incompatible (no migration pre-mainnet).
 
 Recently closed: deposit whitelisting, overflow guards, market whitelist,
 strict signatures, orphan recovery with deterministic eviction plus a
@@ -399,9 +417,10 @@ snapshot quorum and snapshot-weighted voting.
 This round closed the remaining audit findings and roadmap gaps: pruning
 parity in `validate_against` (withdrawals / seen-AA-units / deposits_allowed
 pruned exactly like `from_applied`), independent deposit-evidence
-verification inside `validate_against`, epoch-salted ordering/eviction
-(salt = `sha256(ORDERING_SALT_DOMAIN ‖ root ‖ epoch_le)`), multiply-before-
-divide PnL scaling, `RetryMismatch`/`AddrTooLong` DAG guards, meta-leaf
+verification inside `validate_against`, epoch-salted orphan eviction
+(salt = `sha256(ORDERING_SALT_DOMAIN ‖ root ‖ epoch_le)`; execution order
+desalted to deterministic lex — Limitations #13), multiply-before-divide
+PnL scaling, `RetryMismatch`/`AddrTooLong` DAG guards, meta-leaf
 commitment expansion over all consensus maps (a breaking `state_root`
 format change), canonical `data_hash`/`data_length` unified across Rust and
 JS via ocore `getJsonSource`, deposit evidences carrying the full joint
@@ -423,15 +442,15 @@ noted below):
 
 - [x] **01 Fraud slashing** — `01-fraud-slashing.md`: 50%/50% burn/reward split + `validity_proof_hash` plug, no matcher re-execution in Oscript *(AA failed-finalize splits the submit bond into `slash_reward_` + burned half)*
 - [x] **02 Deposit independent verification** — `temp_data.deposit_evidences` carries FULL Obyte joint units; `unit_hash(joint)` recomputed inside `validate_against` via `operp_settle::obyte_hash::get_unit_hash`; payee/asset checked against caller-supplied `expected_vault`/`perp_asset`, failures map to `SettleError::DepositEvidence`; watchers rehydrate via `evidences_from_payload`
-- [x] **03 Commit-reveal ordering** — v1 salted sort shipped earlier; **v2 additive landed this round**: `Op::Commit` (tag 18) / `Op::Reveal` (tag 19), TTL `COMMIT_TTL_HEIGHTS = 16`, ≤ 8 live commits/account, `reveal_commit_hash = sha256(inner_op_bytes ‖ salt)`, activation-gated at 1 000 000
+- [x] **03 Commit-reveal ordering** — v1 salted sort shipped earlier and **desalted this round** (execution order is deterministic lex; the salt remains for orphan eviction only — Limitations #13); **v2 additive landed this round**: `Op::Commit` (tag 18) / `Op::Reveal` (tag 19), TTL `COMMIT_TTL_HEIGHTS = 16`, ≤ 8 live commits/account, `reveal_commit_hash = sha256(inner_op_bytes ‖ salt)`, activation-gated at 1 000 000
 - [x] **04 Salted orphan eviction + WantUnits gossip** — `argmin sha256(salt‖unit_id)` with `Engine::note_finalized` rotating the salt per epoch (`sha256(ORDERING_SALT_DOMAIN ‖ root ‖ epoch_le)`); **gossip landed this round**: new `crates/operp-gossip` (WantUnits/HaveUnits, debounced fanout, bounded requests/responses) as a pure operator/P2P layer — wire transport per doc OQ5
 - [x] **05 Oracle slashing + TWAP** — 50k PERP stake/unstake (256-height unbond)/slash, TWAP rings, 500 bps ×3-streak double condition, `SlashOracle` tag 16, height-gated
 - [x] **06 Funding external anchor** — funding-index abstraction + activation gate shipped earlier; **operator wiring landed this round**: `Op::UpdateExternalPrice` (tag 17), source allowlist, `AggregatedExternal` mode, staleness fallback external TWAP → bonded-median TWAP → instant median (`FUNDING_EXTERNAL_MAX_STALENESS = 32`)
 - [x] **07 Escape hatch** — **landed this round**, folded into existing cases for budget: `{escape_finalize: 1}` rides the finalize handler (any caller, `ESCAPE_STALL_SECS = 604800` mainnet / 3600 testnet), `{escape_withdraw: 1}` rides withdraw against the stale candidate's forest at `last_finalized + 1`; deviation per doc07 §4 waiver: escape_finalize enforces only the LOCAL stall gate
 - [x] **08 Burn accounting (Rust + checkpoint)** — `perp_burned` in `meta_leaf`, emitted via `Checkpoint.perp_burned` / `temp_data`; AA-side mirror vars dropped for budget, `holdings−supply==burned` stays watcher-verifiable
-- [x] **09 Complexity audit** — single-sha256 fold, unified claim dispatcher (`claim:'kind'`), lock-merge refactor; probe: `node tools/check_aa_complexity.js`. Current **85/100** (ops 1038/2000) — exactly at the gate
+- [x] **09 Complexity audit** — single-sha256 fold, unified claim dispatcher (`claim:'kind'`), lock-merge refactor; probe: `node tools/check_aa_complexity.js`. Current **85/100** (ops 1075/2000) — exactly at the gate
 - [x] **10 AA-tree sharding (v2)** — clean cutover this round: ONE 1024-hex `aa_forest` var = 16 concatenated shard roots (fits `MAX_STATE_VAR_VALUE_LENGTH` exactly), empty-shard sentinel roots, depth stays 16 → ~1M accounts/batch; the doc's v1 depth-18 path is superseded per its own OpenQ3
-- [x] **11 Replay persistence (v1)** — `256→2048` constants + generalized pruning; `GovNonceJournal` WAL — fsync-before-watermark in `gov_withdraw`, max-merge on restart — plus bincode snapshots `chainstate.<height>.snap` via `Engine::load_or_genesis` / `flush_snapshot` / `maybe_flush_snapshot` (every 64 heights). RocksDB (`persist-rocksdb`) stays doc-declared v1.1 backlog
+- [x] **11 Replay persistence (v1)** — `256→2048` constants + generalized pruning; `GovNonceJournal` WAL — flushed at batch commit (`Batch::from_applied`), max-merge on restart — plus versioned bincode snapshots `chainstate.<height>.snap` via `Engine::load_or_genesis` / `flush_snapshot` / `maybe_flush_snapshot` (every 64 heights). RocksDB (`persist-rocksdb`) stays doc-declared v1.1 backlog
 
 **Known deviations / deferred backlog:**
 

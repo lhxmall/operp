@@ -32,8 +32,11 @@
 	// withdraw requires { amount, withdrawn, leaf_account, collateral, perp,
 	// shard, proof } where shard = the account's shard index 0..15 and perp =
 	// proven PERP balance (may be "0") and withdrawn = the leaf's cumulative
-	// sidechain-withdrawal total W; optional `perp_amount` overrides the PERP
-	// amount claimed now (defaults to the full unclaimed remainder).
+	// sidechain-withdrawal total W; the AA enforces the full W constraint
+	//   amount + wd_<addr> <= min(collateral, withdrawn)
+	// (amount non-negative; collateral/perp/withdrawn decimal strings capped
+	// at 15 chars); optional `perp_amount` overrides the PERP amount claimed
+	// now (defaults to the full unclaimed remainder).
 	// proof = [ {hash, right}, ... ] sibling list within the shard's tree
 	// (depth <= MAX_AA_TREE_DEPTH); the AA folds it, extracts the claimed
 	// shard's root from var['aa_root_' || h] via substring(shard*64, 64),
@@ -155,8 +158,12 @@
 					// Impostors bounce here — state messages cannot bounce.
 					$frozen = (var['frozen_' || $h] otherwise 0);
 					if ($frozen == 1){
+						// H3: the respond must also re-commit the identical
+						// forest — a state_root match alone would let a
+						// challenger swap the shard roots underneath it.
 						if (trigger.address != $old
-							OR trigger.data.state_root != var['cand_root_' || $h])
+							OR trigger.data.state_root != var['cand_root_' || $h]
+							OR trigger.data.aa_forest != var['cand_aa_root_' || $h])
 							bounce('not operator');
 						if (timestamp >= var['stable_at_' || $h] + 3600)
 							bounce('response window closed');
@@ -298,7 +305,14 @@
 								if ($ch)
 									var['slash_reward_' || $ch] += 25000;
 								var['active_bond_' || trigger.data.height] = 0;
-								var['submitted_at_' || trigger.data.height] = timestamp;
+								// M5: fraud-proven candidate loses its forest (and
+								// with it all escape_withdraw eligibility — the
+								// escape path bounces 'no candidate'). submitted_at_
+								// needs no explicit zero: a re-submit overwrites it,
+								// and without one the zeroed forest already blocks
+								// escape. (Complexity-budget dedup, same pattern as
+								// the active_bond_ comment above.)
+								var['cand_aa_root_' || trigger.data.height] = 0;
 							}
 						else {
 								var['last_finalized'] = trigger.data.height;
@@ -378,9 +392,12 @@
 							bounce('use finalize');
 						// Dual stall gates (doc 07 §2.2): candidate must be
 						// ESCAPE_STALL_SECS old AND the whole chain stalled.
+						// (M6: stable_at must actually exist — a missing value
+						// is a permanent stall, not a pass.)
 						if (timestamp < var['submitted_at_' || $h] + 604800)
 							bounce('candidate not stalled');
-						if (timestamp < (var['stable_at_' || $lf] otherwise 0) + 604800)
+						$sa = (var['stable_at_' || $lf] otherwise 0);
+						if (!$sa OR timestamp < $sa + 604800)
 							bounce('chain not stalled');
 					}
 					// Single gate for leaf ownership and the GLOBAL cumulative
@@ -396,7 +413,9 @@
 						AND trigger.data.perp_amount < $unclaimed)
 						? trigger.data.perp_amount : $unclaimed;
 					if (trigger.data.leaf_account != trigger.address
-						OR trigger.data.amount + (var['wd_' || trigger.address] otherwise 0) > trigger.data.collateral
+						OR trigger.data.amount < 0
+						OR trigger.data.amount + (var['wd_' || trigger.address] otherwise 0) > min(trigger.data.collateral, trigger.data.withdrawn)
+						OR length(trigger.data.collateral) > 15 OR length(trigger.data.perp) > 15 OR length(trigger.data.withdrawn) > 15
 						OR $perp_claimed < 0)
 						bounce('bad claim amount');
 					$fold = ($acc, $i, $sib) => (!$acc OR !$sib.hash) ? false

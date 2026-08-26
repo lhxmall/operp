@@ -34,6 +34,10 @@ pub const MAX_WANT_IDS: usize = 64;
 pub const MAX_HAVE_UNITS: usize = 64;
 /// Min interval between responses to the same peer (doc 04 §2.4.3).
 pub const RESPONSE_RATE_LIMIT_MS: u64 = 100;
+/// Max nesting of Reveal ops accepted on decode (matches consensus intent).
+pub(crate) const MAX_REVEAL_DEPTH: u32 = 32;
+/// Hard cap on any inbound gossip message.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PeerId(pub u64);
@@ -86,6 +90,9 @@ impl GossipMessage {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<GossipMessage, GossipError> {
+        if bytes.len() > MAX_MESSAGE_BYTES {
+            return Err(GossipError::Oversize);
+        }
         let mut r = Reader::new(bytes);
         match r.u8()? {
             1 => {
@@ -130,6 +137,9 @@ fn unit_wire(unit: &Unit) -> Vec<u8> {
 /// Inverse of [`unit_wire`]. The canonical section is self-delimiting (every
 /// variable field is length-prefixed), so parsing is deterministic.
 pub fn decode_unit(bytes: &[u8]) -> Result<Unit, GossipError> {
+    if bytes.len() > MAX_MESSAGE_BYTES {
+        return Err(GossipError::Oversize);
+    }
     let mut r = Reader::new(bytes);
     match r.take(4)? {
         b"ODX1" | b"ODX2" => {}
@@ -140,7 +150,7 @@ pub fn decode_unit(bytes: &[u8]) -> Result<Unit, GossipError> {
     for _ in 0..nparents {
         parents.push(UnitId(r.arr32()?));
     }
-    let op = decode_op(&mut r)?;
+    let op = decode_op(&mut r, 0)?;
     let pubkey = r.arr32()?;
     let sig = r.arr::<64>()?;
     r.finish()?;
@@ -155,7 +165,10 @@ pub fn decode_unit(bytes: &[u8]) -> Result<Unit, GossipError> {
 /// Tagged op decoder mirroring `operp_dag::encode_op`, including the v2
 /// commit-reveal / external-price tags (ODX2 domain). Recursive for
 /// Reveal's inner payload.
-fn decode_op(r: &mut Reader) -> Result<operp_dag::Op, GossipError> {
+fn decode_op(r: &mut Reader, depth: u32) -> Result<operp_dag::Op, GossipError> {
+    if depth >= MAX_REVEAL_DEPTH {
+        return Err(GossipError::Oversize);
+    }
     use operp_dag::Op;
     use operp_types::{AccountId, MarketId, OrderId, OrderType, Side, TimeInForce};
     Ok(match r.u8()? {
@@ -277,7 +290,7 @@ fn decode_op(r: &mut Reader) -> Result<operp_dag::Op, GossipError> {
             let commit_ref = r.arr32()?;
             // Inner payload in the same tagged wire order (encode_op
             // recursion in operp-dag), followed by the 32-byte salt.
-            let inner = decode_op(r)?;
+            let inner = decode_op(r, depth + 1)?;
             let salt = r.arr::<32>()?;
             Op::Reveal {
                 account,
@@ -408,8 +421,9 @@ impl GossipNode {
     pub fn new(peers: Vec<PeerId>) -> Self {
         Self::seeded(peers, 0x5EED_0001)
     }
-
     pub fn seeded(peers: Vec<PeerId>, seed: u64) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let peers: Vec<PeerId> = peers.into_iter().filter(|p| seen.insert(*p)).collect();
         Self {
             peers,
             rng: Rng(seed | 1),
@@ -431,6 +445,9 @@ impl GossipNode {
         missing: &[UnitId],
         now_ms: u64,
     ) -> Vec<(PeerId, GossipMessage)> {
+        // Bound the debounce map against unbounded growth over long uptimes.
+        self.last_want
+            .retain(|_, &mut t| now_ms.saturating_sub(t) < WANT_DEBOUNCE_MS);
         if missing.is_empty() || self.peers.is_empty() {
             return Vec::new();
         }
@@ -493,6 +510,8 @@ impl GossipNode {
         {
             return None; // rate limited
         }
+        // Budget consumed on any request past the rate gate, served or not.
+        self.last_response.insert(from, now_ms);
         let units: Vec<Unit> = missing
             .iter()
             .copied()
@@ -502,7 +521,6 @@ impl GossipNode {
         if units.is_empty() {
             return None;
         }
-        self.last_response.insert(from, now_ms);
         Some(GossipMessage::HaveUnits { units })
     }
 
@@ -758,6 +776,77 @@ mod tests {
         eng_a.mark_executed(cid);
         assert!(eng_a.is_executed(pid));
         assert!(eng_a.is_executed(cid));
+    }
+
+    #[test]
+    fn decode_rejects_excessive_reveal_nesting() {
+        // 40 nested Reveals around a Place: over MAX_REVEAL_DEPTH.
+        let deep = (0..40).fold(
+            Op::Place {
+                account: AccountId([9; 32]),
+                market: MarketId(1),
+                side: operp_types::Side::Bid,
+                typ: operp_types::OrderType::Limit,
+                tif: operp_types::TimeInForce::Gtc,
+                price: 1,
+                qty: 1,
+                client_seq: 0,
+            },
+            |inner, _| Op::Reveal {
+                account: AccountId([9; 32]),
+                commit_ref: [0xE; 32],
+                op: Box::new(inner),
+                salt: [0xF; 32],
+            },
+        );
+        let unit = operp_dag::sign_unit(vec![genesis_id()], deep, &[1; 32]);
+        assert_eq!(decode_unit(&unit_wire(&unit)), Err(GossipError::Oversize));
+
+        // Shallow nesting still round-trips.
+        let shallow = Op::Reveal {
+            account: AccountId([9; 32]),
+            commit_ref: [0xE; 32],
+            op: Box::new(Op::StakeOracle {
+                account: AccountId([9; 32]),
+            }),
+            salt: [0xF; 32],
+        };
+        let u2 = operp_dag::sign_unit(vec![genesis_id()], shallow, &[1; 32]);
+        assert_eq!(decode_unit(&unit_wire(&u2)).unwrap(), u2);
+    }
+
+    #[test]
+    fn decode_rejects_messages_over_byte_cap() {
+        let junk = vec![0u8; MAX_MESSAGE_BYTES + 1];
+        assert_eq!(GossipMessage::decode(&junk), Err(GossipError::Oversize));
+        assert_eq!(decode_unit(&junk), Err(GossipError::Oversize));
+    }
+
+    #[test]
+    fn empty_want_consumes_response_budget() {
+        let mut node = GossipNode::new(vec![PeerId(2)]);
+        let unknown = vec![UnitId([0xEE; 32])];
+        let serve = |_: UnitId| -> Option<Unit> { None };
+        // First (unanswered) want burns the peer's response budget...
+        assert!(node.handle_want(PeerId(1), &unknown, 1_000, &serve).is_none());
+        // ...so a servable want right after is rate-limited.
+        let u = signed(vec![genesis_id()], 3);
+        let one = vec![operp_dag::unit_id(&u)];
+        let known = |id: UnitId| -> Option<Unit> { (id == one[0]).then(|| u.clone()) };
+        assert!(node.handle_want(PeerId(1), &one, 1_010, &known).is_none());
+        assert!(node.handle_want(PeerId(1), &one, 1_000 + RESPONSE_RATE_LIMIT_MS + 10, &known).is_some());
+    }
+
+    #[test]
+    fn seeded_dedups_peers_before_fanout() {
+        let mut mesh = GossipNode::seeded(vec![PeerId(1), PeerId(1), PeerId(7)], 42);
+        let missing = vec![UnitId([0x11; 32])];
+        for now in [1_000u64, 5_000] {
+            let out = mesh.observe_missing(&missing, now);
+            let targets: std::collections::HashSet<PeerId> = out.iter().map(|(p, _)| *p).collect();
+            assert_eq!(targets.len(), out.len(), "fanout must not repeat a peer");
+            assert!(out.iter().all(|(p, _)| *p == PeerId(1) || *p == PeerId(7)));
+        }
     }
 
     // Minimal stand-in exercising only the Dag surface the P2P layer touches;

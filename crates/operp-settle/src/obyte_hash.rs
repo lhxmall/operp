@@ -30,13 +30,8 @@ fn get_source_string(v: &Value) -> Result<String, String> {
                 comps.push(s.clone());
             }
             Value::Number(n) => {
-                if let Some(f) = n.as_f64() {
-                    if !f.is_finite() {
-                        return Err(format!("invalid number: {}", f));
-                    }
-                }
                 comps.push("n".to_string());
-                comps.push(n.to_string());
+                comps.push(canonical_number(n)?);
             }
             Value::Bool(b) => {
                 comps.push("b".to_string());
@@ -84,6 +79,35 @@ fn to_well_formed_json_string(s: &str) -> String {
     serde_json::to_string(s).unwrap()
 }
 
+/// Ocore's JS number-to-string rules, fail-closed. JS observers and this
+/// Rust port must never disagree on hash input, so any Number whose serde
+/// textual form could diverge from JavaScript's output is rejected outright:
+/// - integers representable as i64/u64 print as bare decimal digits;
+/// - non-integral f64 within safe range prints via `to_string()`;
+/// - everything else (`1.0` → JS `"1"`, `-0.0`, |x| > 2^53 precision loss,
+///   |x| >= 1e21 exponential-form divergence) is an error.
+fn canonical_number(n: &serde_json::Number) -> Result<String, String> {
+    if let Some(i) = n.as_i64() {
+        return Ok(i.to_string());
+    }
+    if let Some(u) = n.as_u64() {
+        return Ok(u.to_string());
+    }
+    let f = n
+        .as_f64()
+        .ok_or_else(|| format!("invalid number: {n}"))?;
+    if !f.is_finite()
+        || f.fract() == 0.0
+        || f.abs() > 9_007_199_254_740_992.0
+        || f.abs() >= 1e21
+    {
+        return Err(format!(
+            "number {n} has no unambiguous JS canonical string"
+        ));
+    }
+    Ok(f.to_string())
+}
+
 fn get_json_source_string(v: &Value) -> Result<String, String> {
     fn stringify(val: &Value, root: &Value, allow_empty: bool) -> Result<String, String> {
         if val.is_null() {
@@ -91,14 +115,7 @@ fn get_json_source_string(v: &Value) -> Result<String, String> {
         }
         match val {
             Value::String(s) => Ok(to_well_formed_json_string(s)),
-            Value::Number(n) => {
-                if let Some(f) = n.as_f64() {
-                    if !f.is_finite() {
-                        return Err(format!("invalid number: {}", f));
-                    }
-                }
-                Ok(n.to_string())
-            }
+            Value::Number(n) => Ok(canonical_number(n)?),
             Value::Bool(b) => Ok(b.to_string()),
             Value::Array(arr) => {
                 if arr.is_empty() && !allow_empty {
@@ -316,26 +333,53 @@ mod tests {
 
     #[test]
     fn golden_vector_matches_ocore_get_json_source() {
-        // Cross-checked against ocore string_utils.getJsonSourceString:
-        //   node -e "const su=require('.../ocore/string_utils.js');
-        //            const obj={alpha:{k1:'v',k2:[1,2.5,true]},mid:false,s:'hello',zeta:1};
-        //            console.log(su.getJsonSourceString(obj))"
-        // → {"alpha":{"k1":"v","k2":[1,2.5,true]},"mid":false,"s":"hello","zeta":1}
-        // sha256 hex = 99eb495a661595222840f105f122791c0e27f91b6ac98a8a265c80d2e6fe04d9
-        // UTF-8 length = 71 (contract shared with obyte-local/post_batch.js).
+        // Cross-checked against obyte-local/golden_vector_check.js, whose
+        // fixed input now also carries a big decimal STRING (>2^53 travels
+        // as a string: bare numbers that size are rejected Rust-side) and a
+        // short decimal number. The JS output for this exact input must stay
+        // byte-identical with `get_data_hash` — re-run both sides together.
         let v: Value = serde_json::from_str(
-            r#"{"s":"hello","zeta":1,"mid":false,"alpha":{"k2":[1,2.5,true],"k1":"v"}}"#,
+            r#"{"zeta":1,"alpha":{"k2":[1,2.5,true],"k1":"v"},"mid":false,"s":"hello","big":"12345678901234567890","eps":0.001}"#,
         )
         .unwrap();
         assert_eq!(
             get_json_source(&v),
-            r#"{"alpha":{"k1":"v","k2":[1,2.5,true]},"mid":false,"s":"hello","zeta":1}"#
+            r#"{"alpha":{"k1":"v","k2":[1,2.5,true]},"big":"12345678901234567890","eps":0.001,"mid":false,"s":"hello","zeta":1}"#
         );
-        assert_eq!(get_json_source(&v).len(), 71);
+        assert_eq!(get_json_source(&v).len(), 112);
         let h = get_data_hash(&v);
         assert_eq!(
             hex::encode(h),
-            "99eb495a661595222840f105f122791c0e27f91b6ac98a8a265c80d2e6fe04d9"
+            "4efa7a37d070cbd34ac38b44ce5dfd0fc70f99fb62f3c619529cecb08a5f5180"
         );
+    }
+
+    #[test]
+    fn canonical_number_rejects_ambiguous_forms() {
+        // `1.0` would print "1.0" in Rust but "1" in JS: fail closed.
+        assert!(canonical_number(&json!(1.0).as_number().unwrap()).is_err());
+        assert!(canonical_number(&serde_json::Number::from_f64(-0.0).unwrap()).is_err());
+        assert!(canonical_number(&json!(1e21).as_number().unwrap()).is_err());
+        assert!(canonical_number(
+            &serde_json::Number::from_f64(9_007_199_254_740_994.0).unwrap()
+        )
+        .is_err());
+        // Short decimals and exact integers are fine.
+        assert_eq!(
+            canonical_number(&json!(2.5).as_number().unwrap()).as_deref(),
+            Ok("2.5")
+        );
+        assert_eq!(
+            canonical_number(&json!(0.001).as_number().unwrap()).as_deref(),
+            Ok("0.001")
+        );
+        assert_eq!(
+            canonical_number(&json!(12345678901234567u64).as_number().unwrap()).as_deref(),
+            Ok("12345678901234567")
+        );
+        // Both hash entry points propagate the rejection.
+        let bad = json!({"x": 1.0});
+        assert!(get_source_string(&bad).is_err());
+        assert!(get_json_source_string(&bad).is_err());
     }
 }

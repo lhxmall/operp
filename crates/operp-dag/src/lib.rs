@@ -726,26 +726,15 @@ impl Dag {
     }
 
     /// Deterministic execution order over all known-but-unexecuted units:
-    /// Kahn's topological sort with the current eviction-salt tie-break
-    /// (sha256(salt||unit_id); salt set by `set_eviction_salt`), so replicas
-    /// sharing the same finalized-root salt derive the identical total order
-    /// without consensus traffic. Units whose parents are still buffered
-    /// orphans stay excluded until `mark_executed` links them.
+    /// Kahn's topological sort with plain lexicographic UnitId tie-break.
+    /// The eviction salt is deliberately NOT consulted here (user-approved
+    /// desalting): the salt rotates per finalized root, so salting the
+    /// ready-set order made replicas that lag finalization disagree; salt
+    /// remains in force for orphan eviction only. Salted execution order is
+    /// deferred until finalize-batch determinization lands (README
+    /// Limitations). Units whose parents are still buffered orphans stay
+    /// excluded until `mark_executed` links them.
     pub fn ready_linearized(&self) -> Vec<UnitId> {
-        self.ready_linearized_with_salt(self.eviction_salt)
-    }
-
-    /// Salted variant (Step9): ready-set tie-break on sha256(salt||unit_id)
-    /// instead of the raw UnitId, so unit-id grinding cannot buy ordering
-    /// priority. Salt = sha256(ORDERING_SALT_DOMAIN || last_finalized_root ||
-    /// epoch_le), epoch = height / ORDERING_EPOCH_UNITS.
-    pub fn ready_linearized_with_salt(&self, salt: [u8; 32]) -> Vec<UnitId> {
-        let key = |id: &UnitId| -> [u8; 32] {
-            let mut b = Vec::with_capacity(64);
-            b.extend_from_slice(&salt);
-            b.extend_from_slice(&id.0);
-            sha256(&b)
-        };
         // Indegree counts only parents inside the pending set; executed
         // parents (and genesis) impose no ordering constraint.
         let mut indeg: HashMap<UnitId, usize> = self
@@ -767,7 +756,7 @@ impl Dag {
             .filter(|(_, &d)| d == 0)
             .map(|(&id, _)| id)
             .collect();
-        ready.sort_by_key(key);
+        ready.sort_unstable();
         let mut out = Vec::with_capacity(self.pending.len());
         while let Some(id) = ready.first().copied() {
             ready.remove(0);
@@ -776,9 +765,7 @@ impl Dag {
                 if let Some(d) = indeg.get_mut(c) {
                     *d -= 1;
                     if *d == 0 {
-                        let pos = ready
-                            .binary_search_by(|probe| key(probe).cmp(&key(c)))
-                            .unwrap_or_else(|p| p);
+                        let pos = ready.binary_search(c).unwrap_or_else(|p| p);
                         ready.insert(pos, *c);
                     }
                 }
@@ -820,9 +807,8 @@ mod tests {
 
     #[test]
     fn two_children_deterministic_across_replicas() {
-        // Step9: tie-break is now sha256(salt||unit_id), not raw UnitId, so
-        // the exact order differs from lex — what consensus needs is that
-        // every replica derives the SAME order.
+        // Tie-break is plain lexicographic UnitId order (desalted): every
+        // replica derives the SAME order regardless of finalization state.
         let mut dag = Dag::new();
         let g = genesis_id();
         let u1 = deposit(vec![g], &sk(1), 1);
@@ -843,9 +829,9 @@ mod tests {
     }
 
     #[test]
-    fn salted_ordering_changes_tiebreak() {
-        // Different salts may reorder ready siblings; each salt is
-        // deterministic across replicas.
+    fn ready_order_is_salt_independent_and_lex() {
+        // The eviction salt must NOT reorder ready units (desalting): two
+        // engines with different salts produce identical execution order.
         let g = genesis_id();
         let mk = |dag: &mut Dag| -> Vec<UnitId> {
             let secret = [7u8; 32];
@@ -859,12 +845,11 @@ mod tests {
         let o1 = mk(&mut d1);
         let mut d2 = Dag::new();
         d2.set_eviction_salt([0x99; 32]);
-        let o2 = mk(&mut d2);
-        // Determinism per salt.
-        let mut d3 = Dag::new();
-        d3.set_eviction_salt([0x99; 32]);
-        assert_eq!(mk(&mut d3), o2);
-        let _ = o1; // order may or may not differ; determinism is the contract
+        assert_eq!(mk(&mut d2), o1, "salt must not affect ready order");
+        // And the order is exactly lexicographic by UnitId.
+        let mut lex = o1.clone();
+        lex.sort();
+        assert_eq!(o1, lex);
     }
 
     #[test]

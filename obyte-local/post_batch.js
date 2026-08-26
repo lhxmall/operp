@@ -1,6 +1,8 @@
 "use strict";
 
-// OPERP batch poster — the operator's mainnet/testnet submission flow.
+// OPERP batch poster — local devnet drill by default; pass testnet/mainnet
+// env explicitly (process.env.testnet / process.env.mainnet) to target a
+// real network.
 //
 // Reads an exported batch (obyte-local/batch.json from
 // `cargo run -p operp-settle --example export_batch` or stress tooling),
@@ -34,9 +36,17 @@ function resolveVaultAa() {
 
 const aaRoot = path.join(__dirname, "..", "vendor", "aa-testkit");
 const nm = path.join(aaRoot, "node_modules");
-process.env.NODE_PATH = [nm, process.env.NODE_PATH].filter(Boolean).join(path.delimiter);
+// Network selection: devnet drill by default; pass testnet/mainnet env
+// explicitly to target a real network.
+if (process.env.testnet) {
+  process.env.testnet = "1";
+  delete process.env.devnet;
+} else if (process.env.mainnet) {
+  process.env.mainnet = "1";
+} else {
+  process.env.devnet = "1";
+}
 require("module").Module._initPaths(); // pick up NODE_PATH for bare ocore requires
-process.env.devnet = "1";
 
 const { Testkit } = require(path.join(aaRoot, "main.js"));
 const { Network } = Testkit({
@@ -191,7 +201,7 @@ async function main() {
     fills_hash: batchData.fills_hash,
   };
   if (batchData.validity_proof_hash) submitData.validity_proof_hash = batchData.validity_proof_hash;
-  if (batchData.perp_burned !== undefined) submitData.perp_burned = batchData.perp_burned;
+  if (batchData.perp_burned !== undefined) submitData.perp_burned = String(batchData.perp_burned);
   await trigger(poster, submitData, 60000);
   // 3. stability window then lock
   await network.timetravel({ shift: "700s" });

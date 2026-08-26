@@ -1268,7 +1268,12 @@ pub fn aa_sharded_roots_of_state(state: &ChainState) -> [String; AA_SHARD_COUNT]
 /// Proof path for one address within its shard's tree:
 /// `(shard, siblings, shard_root)`. Returns `None` when the path would need
 /// more than `MAX_AA_TREE_DEPTH` siblings (the AA unrolls exactly that many
-/// reduction steps per proof).
+/// reduction steps per proof). Also returns `None` when the target's shard
+/// bucket holds fewer than 2 leaves: a singleton bucket would need an EMPTY
+/// proof array and ocore fatals on empty arrays in trigger data — such a
+/// claim can never be posted, so it is refused up front. Register PAD/decoy
+/// bindings first (see `gen_withdraw_proof.rs`'s
+/// `format!("{:0<32}", format!("PAD{pad}"))` pattern).
 pub fn aa_sharded_proof_for(
     pairs: &[(String, Usd, u128, i128)],
     addr: &str,
@@ -1279,11 +1284,15 @@ pub fn aa_sharded_proof_for(
         .filter(|(a, ..)| aa_shard_of(a) == shard)
         .cloned()
         .collect();
+    if bucket.len() < 2 {
+        return None;
+    }
     let (siblings, root) = aa_proof_for(&bucket, addr)?;
     Some((shard, siblings, root))
 }
 
-/// Sharded proof for an account by sidechain id.
+/// Sharded proof for an account by sidechain id. See [`aa_sharded_proof_for`]
+/// for the singleton-bucket (PAD decoy) requirement.
 pub fn aa_sharded_proof_for_account(
     state: &ChainState,
     id: &AccountId,
