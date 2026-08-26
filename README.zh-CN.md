@@ -334,6 +334,10 @@ PnL 定标、`RetryMismatch`/`AddrTooLong` DAG 防护、meta 叶对全部共识�
 分片 aa 森林、`escape_finalize`/`escape_withdraw`、commit-reveal v2、
 WantUnits gossip、资金费外部锚接线。
 
+审计后追加：恢复 `{deposit_perp}` 入账（vault 保留 PERP 并镜像记入
+`pperp_<addr>`；已证明叶子仍是唯一提款权威），并通过缓存 ed25519 密钥
+展开 + release LTO 把裸引擎吞吐从 5199 提到 7316 ops/s。
+
 ## 主网路线图（已实现）
 
 [`docs/mainnet/`](docs/mainnet/) 的十一个设计全部实现（按 v1 保守版 +

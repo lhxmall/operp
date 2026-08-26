@@ -556,10 +556,13 @@ reward_<addr>, sbond_<addr>(可回收提交债券),
 slash_reward_<addr>(罚没分成, {claim:"slash"} 领取),
 wd_<h>_<addr>                                # 抵押提款累计标记（防证明重放）
 wp_<h>_<addr>                                # PERP 提款累计标记（语义与 wd_ 对称）
+pperp_<addr>                                 # PERP 入账镜像：{deposit_perp} 触发把
+                                             # 资产支付记入 trigger.address 名下
 ```
-诊断影子账本 `bal_`/`pperp_` 已在复杂度腾挪中删除：余额权威是证明叶子，
-支付由 AA 原生余额机械兜底。所有领取统一为单一 `{claim:
-"reward"|"bond"|"sbond"|"slash"}` 字段。
+`pperp_` 是对账镜像（键与 `wd_`/`wp_` 同为 trigger.address），**不是**支付
+上限——提款权威始终是已证明叶子的 perp 值；不设上限是为了不搁浅从未经过
+`deposit_perp` 的侧链收益 PERP。诊断账本 `bal_` 已在复杂度腾挪中删除。
+所有领取统一为单一 `{claim:"reward"|"bond"|"sbond"|"slash"}` 字段。
 
 ### 10.1 submit(h)
 

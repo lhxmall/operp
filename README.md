@@ -410,6 +410,11 @@ unit, fail-fast on unset `PERP_ASSET_ID`, the lock bond gate
 `escape_withdraw`, commit-reveal v2, WantUnits gossip, and the funding
 external-anchor wiring.
 
+Post-audit follow-ups restored `{deposit_perp}` crediting (the vault
+retains PERP and mirrors it into `pperp_<addr>`; the proven leaf stays the
+sole withdrawal authority) and lifted raw engine throughput from 5199 to
+7316 ops/s via cached ed25519 key setup plus release LTO.
+
 ## Mainnet Roadmap (implemented)
 
 All eleven designs in [`docs/mainnet/`](docs/mainnet/) are now implemented
