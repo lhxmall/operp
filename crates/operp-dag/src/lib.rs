@@ -408,6 +408,43 @@ pub fn verify_sig_by_id(unit: &Unit, id: &UnitId) -> bool {
     vk.verify_strict(&id.0, &sig).is_ok() && account_matches(unit)
 }
 
+/// Bounded pubkey -> VerifyingKey cache. Validator traffic is heavily skewed
+/// toward a small operator set, so Edwards-point decompression (the setup
+/// cost of every ed25519 verification) amortizes to ~zero in steady state.
+/// Clears wholesale past [`SigVerifier::CAP`] to keep memory bounded without
+#[derive(Clone, Default, Debug)]
+pub struct SigVerifier {
+    cache: HashMap<[u8; 32], Option<VerifyingKey>>,
+}
+
+impl SigVerifier {
+    pub const CAP: usize = 4096;
+
+    pub fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Same contract as [`verify_sig_by_id`] with decompression cached.
+    pub fn verify_by_id(&mut self, unit: &Unit, id: &UnitId) -> bool {
+        let vk = match self.cache.get(&unit.pubkey) {
+            Some(cached) => cached.clone(),
+            None => {
+                let parsed = VerifyingKey::from_bytes(&unit.pubkey).ok();
+                if self.cache.len() >= Self::CAP {
+                    self.cache.clear();
+                }
+                self.cache.insert(unit.pubkey, parsed.clone());
+                parsed
+            }
+        };
+        let Some(vk) = vk else { return false };
+        let sig = Signature::from_bytes(&unit.sig);
+        vk.verify_strict(&id.0, &sig).is_ok() && account_matches(unit)
+    }
+}
+
 fn account_matches(unit: &Unit) -> bool {
     let expected = account_id_from_pubkey(&unit.pubkey);
     match &unit.op {

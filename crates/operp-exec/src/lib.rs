@@ -1,6 +1,6 @@
 use operp_account::AccountError;
 use operp_book::{BookError, Fill, Order};
-use operp_dag::{unit_id, verify_sig_by_id, Dag, DagError, Op, Unit};
+use operp_dag::{unit_id, Dag, DagError, Op, SigVerifier, Unit};
 use operp_state::journal::{GovNonceJournal, GovNonceRecord};
 use operp_state::persist;
 use operp_state::{ChainState, Proposal};
@@ -24,6 +24,8 @@ pub struct Engine {
     pub dag: Dag,
     pub state: ChainState,
     pub log: Vec<ExecEvent>,
+    /// Cached pubkey -> VerifyingKey decompression for ingest verification.
+    pub sig_verifier: SigVerifier,
     /// Persistence root (`gap 11 v1`). `None` = ephemeral engine (tests,
     /// replay validators). When set: gov-nonce WAL + optional snapshots.
     pub store_dir: Option<PathBuf>,
@@ -86,6 +88,7 @@ impl Engine {
             dag: Dag::new(),
             state: ChainState::new(),
             log: Vec::new(),
+            sig_verifier: SigVerifier::new(),
             store_dir: None,
         }
     }
@@ -112,6 +115,7 @@ impl Engine {
             dag: Dag::new(),
             state,
             log: Vec::new(),
+            sig_verifier: SigVerifier::new(),
             store_dir: Some(dir.to_path_buf()),
         })
     }
@@ -149,7 +153,7 @@ impl Engine {
         // Hash exactly once: the signature is verified against this id and
         // the same id is handed to the DAG, skipping its recomputation.
         let id = unit_id(&unit);
-        if !verify_sig_by_id(&unit, &id) {
+        if !self.sig_verifier.verify_by_id(&unit, &id) {
             return Err(ExecError::BadSig);
         }
         self.dag.insert_verified(unit, id)?;
