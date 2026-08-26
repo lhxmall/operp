@@ -104,6 +104,26 @@
 				]
 			},
 			{
+				// PERP governance asset deposit: credits pperp_<address>,
+				// the reconciliation mirror of the sidechain's GovDeposit
+				// credits (keyed by aa_unit). Without this explicit case
+				// ocore's auto-bounce would swallow the asset-bearing
+				// payment; here it is accepted and ledgered instead.
+				if: "{trigger.data.deposit_perp}",
+				init: "{
+					if (!(trigger.output[[asset='PERP_ASSET_ID_HERE']] > 0))
+						bounce('bad deposit');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							var['pperp_' || trigger.address] = (var['pperp_' || trigger.address] otherwise 0) + trigger.output[[asset='PERP_ASSET_ID_HERE']];
+						}"
+					}
+				]
+			},
+			{
 				if: "{trigger.data.submit}",
 				init: "{
 					$h = trigger.data.height;
@@ -116,8 +136,6 @@
 						bounce('bad submit');
 					if ($ll > 0 AND trigger.data.prev_state_hash != var['root_' || $ll])
 						bounce('prev mismatch');
-					if (var['root_' || $h])
-						bounce('already locked');
 					$old = (var['active_bond_' || $h] otherwise 0);
 					// Bond needed only from NEW candidates: the sitting
 					// operator re-submitting (respond-by-resubmit) keeps his
@@ -187,7 +205,7 @@
 					// submit). A failed finalize confiscates and clears it,
 					// so a rolled-back height cannot be re-locked until a
 					// fresh bonded submit recreates the candidate.
-					if (!$cr OR var['root_' || $h] OR $h != (var['last_locked'] otherwise 0) + 1 OR timestamp < var['submitted_at_' || $h] + 600
+					if (!$cr OR $h != (var['last_locked'] otherwise 0) + 1 OR timestamp < var['submitted_at_' || $h] + 600
 						OR !var['active_bond_' || $h])
 						bounce('cannot lock yet');
 				}",
@@ -212,8 +230,6 @@
 					$h = trigger.data.height;
 					if (!$h OR $h > (var['last_locked'] otherwise 0))
 						bounce('bad height');
-					if (!var['root_' || $h])
-						bounce('not locked');
 					if (var['frozen_' || $h] OR timestamp >= var['stable_at_' || $h] + 3600)
 						bounce('challenge not possible');
 					if ((var['bond_' || trigger.address] otherwise 0) > 0)
