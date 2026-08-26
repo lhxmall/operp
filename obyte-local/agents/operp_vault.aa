@@ -11,25 +11,40 @@
 	//   10000         -> BOUNCE_FEES base (deducted from trigger outputs)
 	//   20000         -> challenge bond minimum incl. bounce fee headroom
 	//   50000         -> SUBMIT_BOND_NET (submit bond locked per candidate height)
-	//   18            -> MAX_AA_TREE_DEPTH (withdraw proof unroll; Rust mirrors 18)
-	//     substitute the real asset id for this placeholder before deployment
+	//   16            -> MAX_AA_TREE_DEPTH (per-shard withdraw proof depth; Rust mirrors 16)
+	//   16            -> AA_SHARD_COUNT: address space is split into 16 shards
+	//     (shard of an account = aa_shard_of(addr) off-chain, doc 10 §B1(1);
+	//     the AA trusts the claimed `shard` tag — soundness comes from the
+	//     leaf preimage, a mis-claimed shard folds to the wrong root). Each
+	//     batch commits 16 shard roots concatenated into ONE 1024-hex string
+	//     `aa_forest` (shard <i> at offset i*64); this fits
+	//     MAX_STATE_VAR_VALUE_LENGTH=1024 exactly, so submit/lock/failure-
+	//     sweep stay single-var operations (complexity-budget decision per
+	//     doc 10 §5.2 mitigation ladder; replaces 16 per-shard vars).
+	//   604800        -> ESCAPE_STALL_SECS: liveness stall before the escape
+	//     hatch opens (doc 07; 7d mainnet, timetravel on devnet)
 	//
-	// WITHDRAWALS ARE PROOF-GATED. The operator commits `aa_root` per batch:
-	// a merkle tree over hex strings (Oscript sha256 hashes UTF-8 text):
+	// WITHDRAWALS ARE PROOF-GATED. The operator commits one 1024-hex
+	// `aa_forest` per batch: 16 shard merkle trees over hex strings (Oscript
+	// sha256 hashes UTF-8 text):
 	//   node = sha256(left_hex + right_hex) -> hex
 	//   leaf = sha256("acct:" + account_hex + ":" + collateral_decimal_string + ":" + perp_decimal_string + ":" + withdrawn_decimal_string) -> hex
 	// withdraw requires { amount, withdrawn, leaf_account, collateral, perp,
-	// proof } where perp = proven PERP balance (may be "0") and withdrawn =
-	// the leaf's cumulative sidechain-withdrawal total W; optional
-	// `perp_amount` overrides the PERP amount claimed now (defaults to the
-	// full unclaimed remainder). proof = [ {hash, right}, ... ] sibling
-	// list; the AA recomputes the root with string ops and compares to
-	// var['aa_root_' || last_finalized].
+	// shard, proof } where shard = the account's shard index 0..15 and perp =
+	// proven PERP balance (may be "0") and withdrawn = the leaf's cumulative
+	// sidechain-withdrawal total W; optional `perp_amount` overrides the PERP
+	// amount claimed now (defaults to the full unclaimed remainder).
+	// proof = [ {hash, right}, ... ] sibling list within the shard's tree
+	// (depth <= MAX_AA_TREE_DEPTH); the AA folds it, extracts the claimed
+	// shard's root from var['aa_root_' || h] via substring(shard*64, 64),
+	// and compares. Empty shards commit a distinct sentinel root off-chain
+	// (hex(sha256("empty:<shard>")), doc 10 §5.4) so zero-proofs cannot hop
+	// shards.
 	// State vars:
-	//   boot, chain_id, last_locked, last_finalized
-	//   submitted_at_<h>, cand_root_<h>, cand_aa_root_<h>, cand_who_<h>
-	//     candidate (replaceable pre-lock); submitted_at_ resets only when
-	//     a submit presents an aa_root differing from the stored candidate
+	//   last_locked, last_finalized
+	//   submitted_at_<h>, cand_root_<h>, cand_aa_root_<h>
+	//     candidate (replaceable pre-lock); submitted_at_ restarts on EVERY
+	//     submit. cand_aa_root_<h>/aa_root_<h> hold the 1024-hex forest.
 	//   active_bond_<h>                          address holding the 50000-
 	//     byte submit bond for the live candidate of <h>; replaced
 	//     candidates get their bond moved to sbond_<old>, successful
@@ -43,9 +58,10 @@
 	//     challenge bond accounting: a challenge bounces while the sender
 	//     still holds an outstanding bond (one challenge at a time);
 	//     bond_height_ records which height that bond challenges so
-		//     {claim_bond} refuses payout while frozen_<h> == 1. Operator
-	//     responds by RE-SUBMITTING the identical root (same case);
-	//     pays it out and zeroes both keys.
+	//     {claim_bond} refuses payout while frozen_<h> == 1. Operator
+	//     responds by RE-SUBMITTING the identical root (same case), which
+	//     confiscates the challenger's bond (bond_ zeroed; stale
+	//     bond_height_ is inert because claim gates on owed > 0 first).
 	//   reward_<addr>                            accrued operator race reward
 	//   wd_<addr>                                cumulative bytes withdrawn by
 	//     <addr> across ALL finalized heights; capped at the presented
@@ -54,7 +70,22 @@
 	//     capped at the proven PERP balance — symmetric to wd_
 	//   slash_reward_<addr>                      claimable half of a confiscated
 	//     submit bond after a challenge-failed finalize (Step6 fraud slash)
-	//   (escape hatch deferred to v2 — complexity budget; see README)
+	// ESCAPE HATCH (doc 07): after ESCAPE_STALL_SECS with no finalization
+	//   progress, {escape_finalize: 1, height} stall-finalizes the oldest
+	//   locked height (any caller, bounce-headroom only; never overrides a
+	//   live challenge — frozen==1 must go through finalize's failure sweep)
+	//   and {escape_withdraw: 1, ...claim fields} pays a proof against the
+	//   STALE CANDIDATE's forest at h = last_finalized+1 when it was never
+	//   locked (or rolled back frozen==2) and both stall gates elapsed.
+	//   Anti-replay is shared with withdraw via wd_/wp_. Both entries are
+	//   FOLDED into the existing finalize/withdraw cases (distinct trigger
+	//   keys; complexity budget per doc 07 §4 mitigation ladder).
+	//   Deviation from doc 07 §2.3.1 sketch: escape_finalize enforces only
+	//   the LOCAL stall gate (stable_at_h + 604800), not the additional
+	//   global last_finalized-stale gate — plain finalize is already
+	//   permissionless at stable_at_h + 3600, so the clean escape path is
+	//   strictly slower than the normal path and the local gate alone caps
+	//   the escape rate at one height per ESCAPE_STALL_SECS.
 	bounce_fees: { base: 10000 },
 	messages: {
 		cases: [
@@ -80,7 +111,8 @@
 					if (trigger.data.chain_id != 'operp-mvp-1' OR !$h OR $h != $ll + 1
 						OR !trigger.data.state_root OR length(trigger.data.state_root) != 64
 						OR !trigger.data.aa_root OR length(trigger.data.aa_root) != 64
-						OR !trigger.data.prev_state_hash OR length(trigger.data.prev_state_hash) != 64)
+						OR !trigger.data.prev_state_hash OR length(trigger.data.prev_state_hash) != 64
+						OR !trigger.data.aa_forest OR length(trigger.data.aa_forest) != 1024)
 						bounce('bad submit');
 					if ($ll > 0 AND trigger.data.prev_state_hash != var['root_' || $ll])
 						bounce('prev mismatch');
@@ -99,11 +131,13 @@
 					// bond each round, so only the attacker pays for delay.
 					// RESPOND-BY-RESUBMIT: a challenge is answered by the same
 					// operator re-submitting the identical root within the
-					// response window (identity via cand_who_). Impostors
-					// bounce here — state messages cannot bounce.
+					// response window. Identity via $old (active_bond_<h>):
+					// while frozen==1 it always equals the live candidate's
+					// submitter and does not change during a challenge.
+					// Impostors bounce here — state messages cannot bounce.
 					$frozen = (var['frozen_' || $h] otherwise 0);
 					if ($frozen == 1){
-						if (trigger.address != var['cand_who_' || $h]
+						if (trigger.address != $old
 							OR trigger.data.state_root != var['cand_root_' || $h])
 							bounce('not operator');
 						if (timestamp >= var['stable_at_' || $h] + 3600)
@@ -118,7 +152,6 @@
 								var['frozen_' || $h] = 0;
 								$ch = (var['challenger_' || $h] otherwise '');
 								var['bond_' || $ch] = 0;
-								var['bond_height_' || $ch] = 0;
 							}
 							// Replacing another address's candidate releases its
 							// locked bond as claimable sbond_; same-address
@@ -128,8 +161,9 @@
 							}
 							var['active_bond_' || trigger.data.height] = trigger.address;
 							var['cand_root_' || trigger.data.height] = trigger.data.state_root;
-							var['cand_aa_root_' || trigger.data.height] = trigger.data.aa_root;
-							var['cand_who_' || trigger.data.height] = trigger.address;
+							// Sharded commitment: aa_forest = the 16 shard roots
+							// concatenated (shard i at offset i*64, 1024 hex).
+							var['cand_aa_root_' || trigger.data.height] = trigger.data.aa_forest;
 							// Stability timer restarts on EVERY submit (audit
 							// contingency: simpler than root-change detection).
 							var['submitted_at_' || trigger.data.height] = timestamp;
@@ -145,16 +179,23 @@
 				if: "{trigger.data.lock}",
 				init: "{
 					$h = trigger.data.height;
-					// stability gate (OBYTE_STABILITY_SECS = 600): simulates the
-					// Obyte finality window on devnet where none exists.
-					if (!var['cand_root_' || $h] OR var['root_' || $h] OR $h != (var['last_locked'] otherwise 0) + 1 OR timestamp < var['submitted_at_' || $h] + 600)
+					// cand_root_ read once here and reused by the state copy
+					// below (complexity-budget dedup).
+					$cr = var['cand_root_' || $h];
+					// H1 bond gate: a live candidate always has its submit
+					// bond holder recorded (active_bond_<h>, set on every
+					// submit). A failed finalize confiscates and clears it,
+					// so a rolled-back height cannot be re-locked until a
+					// fresh bonded submit recreates the candidate.
+					if (!$cr OR var['root_' || $h] OR $h != (var['last_locked'] otherwise 0) + 1 OR timestamp < var['submitted_at_' || $h] + 600
+						OR !var['active_bond_' || $h])
 						bounce('cannot lock yet');
 				}",
 				messages: [
 					{
 						app: "state",
 						state: "{
-							var['root_' || trigger.data.height] = var['cand_root_' || trigger.data.height];
+							var['root_' || trigger.data.height] = $cr;
 							var['aa_root_' || trigger.data.height] = var['cand_aa_root_' || trigger.data.height];
 							var['stable_at_' || trigger.data.height] = timestamp;
 							var['last_locked'] = trigger.data.height;
@@ -200,16 +241,27 @@
 				//        bond stays credited for {claim_bond} and the
 				//        submit bond is confiscated.
 				//   clean window -> root becomes the withdrawal basis for h.
-				if: "{trigger.data.finalize}",
+				if: "{trigger.data.finalize OR trigger.data.escape_finalize}",
 				init: "{
 					$h = trigger.data.height;
 					if (!$h)
 						bounce('no height');
 					$frozen = (var['frozen_' || $h] otherwise 0);
-					$failed = ($frozen == 1 AND timestamp >= var['stable_at_' || $h] + 3600);
+					$sa = var['stable_at_' || $h];
+					$failed = ($frozen == 1 AND timestamp >= $sa + 3600);
 					if ($h > (var['last_locked'] otherwise 0))
 						bounce('not locked');
-					if (!$failed AND ($frozen OR !var['root_' || $h] OR timestamp < var['stable_at_' || $h] + 3600 OR $h != (var['last_finalized'] otherwise 0) + 1))
+					// escape_finalize (doc 07 §2.3.1): stall-finalize the oldest
+					// locked height after ESCAPE_STALL_SECS. Any caller; writes
+					// are identical to the clean finalize below. It never
+					// overrides a live challenge — frozen==1 must go through
+					// the normal failure sweep, which refunds the challenger.
+					if (trigger.data.escape_finalize AND $frozen == 1)
+						bounce('challenged');
+					$lf = (var['last_finalized'] otherwise 0);
+					if (!$failed AND ($frozen OR !var['root_' || $h]
+						OR timestamp < $sa + (trigger.data.escape_finalize ? 604800 : 3600)
+						OR $h != $lf + 1))
 						bounce('cannot finalize');
 				}",
 				messages: [
@@ -240,7 +292,12 @@
 								$ab = var['active_bond_' || trigger.data.height];
 								if ($ab){
 									var['sbond_' || $ab] += 50000;
-									var['active_bond_' || trigger.data.height] = 0;
+									// No active_bond_=0 clear here: a cleanly finalized
+									// height is permanently unresubmittable (root_<h>
+									// persists) and unlockable (lock requires root_<h>
+									// absent), so the stale value is never read again.
+									// (Complexity-budget dedup; the failure sweep below
+									// keeps its own explicit clear.)
 								}
 								$fw = var['fee_winner_' || trigger.data.height];
 								if ($fw){
@@ -258,14 +315,21 @@
 				// debited here); it never gates withdrawals — AA native balance
 				// mechanically gates the payment, and stale/rolled-back roots
 				// are the root-chain + challenge game's job, not bal_'s.
-				if: "{trigger.data.withdraw}",
+				if: "{trigger.data.withdraw OR trigger.data.escape_withdraw}",
 				init: "{
-					$h = var['last_finalized'];
+					// Normal withdraw verifies against last_finalized; the folded
+					// escape_withdraw path (doc 07 §2.3.2) verifies against the
+					// STALE CANDIDATE's forest at h = last_finalized+1 (S1: no
+					// locked height, or frozen==2 rollback) and never advances
+					// finalization.
+					$ew = trigger.data.escape_withdraw;
+					$lf = var['last_finalized'];
+					$h = $ew ? $lf + 1 : $lf;
+					if (!$lf AND !$ew)
+						bounce('not finalizable');
 					// NOTE: no frozen_ check here — challenges only apply to
 					// locked-but-not-finalized heights, so last_finalized can
 					// never point at a frozen height.
-					if (!$h)
-						bounce('not finalizable');
 					// Presence gate: missing trigger fields evaluate to boolean
 					// false, so typeof()==='boolean' detects absence while legal
 					// falsy values ('0', 0) pass. (A direct `X == false`
@@ -277,6 +341,32 @@
 						OR typeof(trigger.data.perp) == 'boolean'
 						OR typeof(trigger.data.proof) == 'boolean')
 						bounce('bad claim');
+					// Shard tag: selects which of the 16 committed shard roots
+					// this proof must fold to. The AA trusts the claimed shard
+					// (doc 10 §B5): a mis-claimed shard folds to that shard's
+					// root and fails unless the leaf truly lives there.
+					$shard = trigger.data.shard;
+					if (typeof(trigger.data.shard) == 'boolean' OR $shard < 0 OR $shard > 15
+						OR !is_integer($shard))
+						bounce('bad shard');
+					// Root source: the finalized forest, or the stale candidate's
+					// forest on the escape_withdraw path (one keyed read).
+					$src = var[($ew ? 'cand_aa_root_' : 'aa_root_') || $h];
+					if ($ew){
+						if (!$src)
+							bounce('no candidate');
+						// A locked height must go through finalize/escape_finalize:
+						// withdrawing against its candidate would bypass the
+						// challenge game while a verdict is pending.
+						if (var['root_' || $h])
+							bounce('use finalize');
+						// Dual stall gates (doc 07 §2.2): candidate must be
+						// ESCAPE_STALL_SECS old AND the whole chain stalled.
+						if (timestamp < var['submitted_at_' || $h] + 604800)
+							bounce('candidate not stalled');
+						if (timestamp < (var['stable_at_' || $lf] otherwise 0) + 604800)
+							bounce('chain not stalled');
+					}
 					// Single gate for leaf ownership and the GLOBAL cumulative
 					// caps wd_/wp_ (anti-replay across heights; every withdrawal
 					// caps the claim; perp_amount optionally claims less).
@@ -297,7 +387,8 @@
 						: sha256(($sib.right ? $acc || $sib.hash : $sib.hash || $acc), 'hex');
 					$root = reduce(trigger.data.proof, 16, $fold,
 						sha256('acct:' || trigger.data.leaf_account || ':' || trigger.data.collateral || ':' || trigger.data.perp || ':' || trigger.data.withdrawn, 'hex'));
-					if ($root != var['aa_root_' || $h])
+					// Extract the claimed shard's root from the 1024-hex forest.
+					if ($root != substring($src, $shard * 64, 64))
 						bounce('bad merkle root');
 				}",
 				messages: [
@@ -343,9 +434,13 @@
 			{
 				if: "{trigger.data.claim}",
 				init: "{
-					$k = trigger.data.claim;
+				$k = trigger.data.claim;
 					if ($k != 'reward' AND $k != 'bond' AND $k != 'sbond' AND $k != 'slash') bounce('bad claim kind');
-					$owed = ($k=='reward' ? (var['reward_'||trigger.address] otherwise 0) : ($k=='bond' ? (var['bond_'||trigger.address] otherwise 0) : ($k=='sbond' ? (var['sbond_'||trigger.address] otherwise 0) : (var['slash_reward_'||trigger.address] otherwise 0))));
+					// Keyed dispatch: one var[] read/write pair serves all four
+					// claim families (complexity-budget dedup; $k is whitelisted
+					// above, so $key is always one of the four known prefixes).
+					$key = ($k=='reward' ? 'reward_' : ($k=='bond' ? 'bond_' : ($k=='sbond' ? 'sbond_' : 'slash_reward_')));
+					$owed = (var[$key || trigger.address] otherwise 0);
 					if (!$owed OR trigger.output[[asset=base]] < 10000) bounce('nothing claimable');
 					$bh = (var['bond_height_'||trigger.address] otherwise 0);
 					if ($k=='bond' AND $bh AND (var['frozen_'||$bh] otherwise 0) == 1) bounce('challenge unresolved');
@@ -366,10 +461,10 @@
 					{
 						app: "state",
 						state: "{
-							if ($k=='reward') var['reward_'||trigger.address]=0;
-							else if ($k=='bond'){ var['bond_'||trigger.address]=0; var['bond_height_'||trigger.address]=0; }
-							else if ($k=='sbond') var['sbond_'||trigger.address]=0;
-							else var['slash_reward_'||trigger.address]=0;
+							var[$key || trigger.address] = 0;
+							// bond_height_ left stale once bond_ is zeroed: claim
+							// gates on owed > 0 first, and a fresh challenge
+							// overwrites the height. (Complexity-budget dedup.)
 						}"
 					}
 				]
