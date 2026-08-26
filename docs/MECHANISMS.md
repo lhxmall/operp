@@ -103,6 +103,10 @@ Unit {
 | CreateProposal | 11 | creator, market_le4, key_u8（ParamKey）, value_le8 |
 | Vote | 12 | voter, proposal_id_le8, approve_u8（0/1） |
 | FinalizeProposal | 13 | caller, proposal_id_le8 |
+后续轮次追加的 v2 操作使用新的 canonical 前缀 `ODX2`（与上表 `ODX1`
+区分）：StakeOracle(tag 14)、UnstakeOracle(15)、SlashOracle(16)、
+UpdateExternalPrice(17，外部喂价锚，§6.2 末)、Commit(18)/Reveal(19)
+（v2 commit-reveal 排序，§2.5）。
 canonical 尾部追加 pubkey。签名验证用 ed25519 **verify_strict**：
 拒绝可延展签名（非规范 s 值、小阶分量）。
 
@@ -129,16 +133,51 @@ insert(unit):
   全部父母已知             → link 进 DAG，进 pending 集
 ```
 
-orphan 缓冲容量 4096，超出时驱逐 **UnitId 最小**的缓冲单元——驱逐决策
-只依赖缓冲内容（对同一内容集确定），但哪些单元进入缓冲仍取决于各副本
-的到达顺序。mark_executed 时做不动点扫描：所有"父母已全部已知"的孤儿
-链式解锁。效果：乱序投递不丢单元，最终全部恢复执行。
+orphan 缓冲容量 4096。驱逐按**盐化序**执行：对缓冲单元取
+`argmin(sha256(salt ‖ unit_id))`，其中
+`salt = sha256(ORDERING_SALT_DOMAIN ‖ 最后最终化根 ‖ epoch_le)`，
+`epoch = height / ORDERING_EPOCH_UNITS(512)`——引擎在 `note_finalized`
+时轮换盐（`Dag::set_eviction_salt`），同 epoch 内稳定、跨 epoch 轮换。
+同一 id 的重复重试若携带不同 canonical 字节，返回
+`DagError::RetryMismatch`；Deposit/GovDeposit 的 Obyte 地址超过
+`MAX_ADDR_LEN = 128` 字符时，在任何缓冲/验签之前即拒绝
+（`DagError::AddrTooLong`）。mark_executed 时做不动点扫描：所有"父母已
+全部已知"的孤儿链式解锁。残余边界：各副本观测 finalize 的时刻不同，
+收敛前可能驱逐不同的孤儿——DA 层自愈：temp_data 全量重放可确定性重建
+缺失单元，WantUnits gossip（`crates/operp-gossip`，§2.6）可按需向同伴
+索取。
 
-### 2.4 确定性线性化
+### 2.4 确定性线性化（盐化）
 
-ready_linearized()：收集 pending 中父母均已执行的单元，按 UnitId 字节
-升序返回。这是唯一公开全序——任何副本对同一批单元算出同一执行顺序，
-无需通信。该排序即撮合"价格时间优先"中的时间。
+ready_linearized_with_salt()：收集 pending 中父母均已执行的单元，按
+`sha256(salt ‖ unit_id)` 升序返回（盐即 §2.3 的 epoch 盐）。这是唯一
+公开全序——任何副本对同一 (单元集, 根, epoch) 算出同一执行顺序，无需
+通信。该排序即撮合"价格时间优先"中的时间；激活高度之前退化为 unit_id
+字典序。
+
+### 2.5 v2 commit-reveal 排序（additive，激活门控）
+
+默认排序仍可被"签名多个候选挑最小 id"磨队（MEV）。v2 追加两条操作：
+
+- **Commit(tag 18)** `{account, commit, ttl_height}`：提交
+  `reveal_commit_hash = sha256(inner_op_bytes ‖ salt)`，不含内容 MEV；
+  每账户同时存活的未揭示 commit 上限 `MAX_PENDING_COMMITS_PER_ACCOUNT
+  = 8`，过期期限 `COMMIT_TTL_HEIGHTS = 16` 个高度（~32 s），meta 叶承诺
+  全部 pending commitments（§9.1）。
+- **Reveal(tag 19)** `{account, commit_ref, op, salt}`：必须引用自己的
+  Commit 单元为父，重算哈希一致后才执行内层 op；TTL 过期未揭示的
+  commit 作废并剪枝。
+
+与盐化排序叠加：Commit 阶段外界看不到 op 内容，揭示后按既有全序执行。
+`COMMIT_REVEAL_ACTIVATION_HEIGHT = 1_000_000`，部署期翻转。
+
+### 2.6 WantUnits gossip（纯 P2P 层）
+
+`crates/operp-gossip` 实现 doc 04 §2.4 的按需孤儿同步：节点观测到缺失
+父单元后以 `WANT_FANOUT` 扇出 WantUnits（每 (peer, id) 去抖
+`WANT_DEBOUNCE_MS = 500`，单请求 ≤ 64 个 id）；收到请求的一方从 DAG 与
+orphan 缓冲两侧服务，单响应 ≤ 64 个单元且限频。本层不进共识、不影响
+执行确定性，传输载体按 doc OQ5 留待接线。
 
 ---
 
@@ -301,6 +340,12 @@ spot > index：正 payment → 多头付，空头收；反向镜像。
 总额——严格守恒、不产生负余额，截断残差为亚单位灰尘（设计允许）。
 保险基金作为普通账户参与资金费（可持有清算对冲仓位）。±50bps 钳幅防
 极端偏差抽干一方。
+资金费 index 锚可选接入外部价（doc 06）：`Op::UpdateExternalPrice`
+(tag 17) 仅接受 `external_sources` 白名单内的 keeper，且仅在市场资金源
+切到 `FundingSourceKind::AggregatedExternal` 后生效。index 取外部环的
+TWAP；环空或最新样本超过 `FUNDING_EXTERNAL_MAX_STALENESS = 32` 个高度
+即视为过期，逐级回退 债券中位数 TWAP → 即时中位数——喂价死亡不会冻结
+资金费。环与白名单、资金源选择器均进 meta 叶承诺（§9.1）。
 
 ### 6.3 dust 说明
 
@@ -326,7 +371,11 @@ Op::ReportPrice { oracle, market, price }        # canonical tag 6
 ```
 
 无许可注册：任何人向侧链质押 `ORACLE_BOND_PERP = 50_000` PERP 即成为
-报价者；债券记入 `oracle_bonds`，无白名单、无审批。
+报价者；债券记入 `oracle_bonds`，无白名单、无审批。退出走
+`UnstakeOracle`(tag 15) 的 `ORACLE_UNBOND_HEIGHTS = 256` 高度解锁排队，
+期间报价即失效；`SlashOracle`(tag 16) 对 TWAP 连续偏移达标者罚没
+（500 bps 偏移 ×3 连续采样双条件，激活门控），罚没 = 债券 ×
+slash_reward_bps 归挑战者、余下烧毁。
 
 规则：
 
@@ -340,13 +389,16 @@ Op::ReportPrice { oracle, market, price }        # canonical tag 6
 - spot 写入 `marks[market]` 前过 ±10% 帽（首个报价无条件设定）
 - 该市场有效报告数 ≥ 2 时，每次 report 触发一次资金费结算（§6.2）
 
-解除资格 = 通过 GovWithdraw 提走债券；`(market, oracle)` 一旦无债券，
-其后续报价自动失效。MVP 不设解锁延迟。
+解锁到期的债券经 unstake 路径回到 `perp_balances`，走与其他 PERP 相同的
+双币种 Merkle 证明出金路径（§10.6）。`(market, oracle)` 一旦无债券，
+其后续报价自动失效。
 
-### 7.3 无 TWAP 时的残余风险
+### 7.3 残余操纵风险
 
 ±10% 帽允许攻击者以每 tick 10% 步进逐渐走偏 mark；中位数要求腐化按
-债券计的多数报价者配合。完整解法是 TWAP 或外部多源——Phase 2。
+债券计的多数报价者配合。TWAP 平滑（oracle/funding 双环）与连续偏移罚没
+已落地，但合谋多数仍可在两次罚没之间施压；外部多源锚（§6.2 末）需
+治理启用后才提供第二意见。
 
 ---
 
@@ -380,19 +432,33 @@ OIP-0007 `temp_data` 消息发上 Obyte。意义：
 - 重放结果与 checkpoint 逐字段比对 → 欺诈必然可被检测
 - 检测后的执行依赖 §10 的挑战机制
 
-`data_hash` 为 sha256(serde_json bytes)，注明是侧链内部值；
-正式上主网时 poster 需换用 Obyte getBase64Hash。
+`data_hash`/`data_length` 采用与 ocore 一致的**单一规范形**：
+`source = getJsonSource(data)`（递归字典序排序对象键的 minified JSON；
+Rust 侧移植于 `operp_settle::obyte_hash::get_json_source`），
+`data_hash = hex(sha256(source))`，`data_length = source 的 UTF-8 字节长`。
+Rust `temp_data_payload` 与 JS 工具链（post_batch.js 的
+`obyteDataHash`/`obyteDataLength`）使用同一定义，黄金向量测试对拍同一
+嵌套对象得到相同 hash/length。注意区分：**链上 OIP-0007 信封**仍须满足
+ocore 校验器（base64 `getBase64Hash(data, true)` / `object_length`），
+post_batch.js 把信封两字段直接委托给 ocore，不手写副本。
 
 ### 8.3 validate_against（任何人可审计）
 
 ```
 chain_id ≠ CHAIN_ID                          → ChainMismatch
 replay 初始 root ≠ prev_root                 → PrevMismatch
+批次含 Deposit/GovDeposit → 独立验证充值证据（不再自证）：
+  evidences_from_payload(data) 从 temp_data 取回证据，verify_all 以
+  (expected_vault, perp_asset) 为绑定逐条复算 unit_hash(joint)，
+  并确认 joint 实际向该 vault 地址支付所报金额/资产
+                                              → 失败 DepositEvidence
 注入 deposits_allowed ← batch 内 Deposit ops 的 aa_unit 集
 逐 unit ingest（BadSig 等）                  → Replay
 重放事件聚合 fills_hash/fill_count 不符      → FillsMismatch
 checkpoint.height ≠ replay.height + 1        → RootMismatch（高度绑定）
-engine.state.height 推进至 checkpoint.height 后
+engine.state.height 推进至 checkpoint.height 后按窗口剪枝
+(withdrawals / seen_aa_units / deposits_allowed / commits —— 与
+from_applied 完全一致的剪枝集)
 last_unit 不符 ∨ state_root 不符             → RootMismatch
 ```
 
@@ -419,10 +485,21 @@ book_leaf    = sha256(params_57B ‖ b"book" ‖ market_le4 ‖ [price_le8 ‖
                #   ‖ delisted_u8（定宽 57 字节）——市场参数本身成为被承诺
                #   的共识状态；同时提交每一个价格档与每个活单，
                #   簿深度与参数都逃不过审计
-meta_leaf    = sha256(b"meta" ‖ height_le ‖ seq_le ‖ last_unit
-                      ‖ perp_burned_le16 ‖ next_market_id_le4
-                      ‖ next_proposal_id_le8)
-               # 新游标承诺治理计数器，防重放歧义
+meta_leaf    = sha256(b"meta" ‖ height ‖ seq ‖ last_unit
+                      ‖ perp_burned ‖ next_market_id ‖ next_proposal_id
+                      ‖ Σ_market(mark, funding_index)
+                      ‖ oracle_bonds ‖ oracle_unbonding ‖ oracle_slash_nonce
+                      ‖ oracle_twap ‖ funding_twap ‖ funding_index_twap
+                      ‖ external_price_ring ‖ external_sources
+                      ‖ commits(commit-reveal) ‖ funding_source
+                      ‖ oracle_configs ‖ oracle_reports
+                      ‖ oracle_report_history
+                      ‖ proposals(含投票集合与权重快照)
+                      ‖ perp_balances ‖ perp_supply)
+               # 每个 BTreeMap/Set 均带 u32 len 前缀 + 排序迭代写入；
+               # TWAP 样本携带 seq；HashSet（voted）排序后提交。
+               # 覆盖账户树之外的全部共识状态，重放无法在价格/资金费/
+               # 治理/承诺状态上分叉。此为 state_root 格式的破坏性变更。
 ```
 
 meta_leaf 绑定 height（from_applied 先把 engine.state.height 推到
@@ -430,26 +507,33 @@ checkpoint.height 再取根），使 state_root 跨批次成链：改历史高�
 meta_leaf **不含** finalized_height——Final 提升只影响本地节点视图，
 不属于被承诺的共识状态（见 §12）。
 
-### 9.2 hex 字符串域树（aa_root）
+### 9.2 hex 字符串域森林（aa_forest，16 分片）
 
 Oscript 的 `sha256()` 对参数 UTF-8 文本哈希且默认输出 base64——字节域树
-无法在 AA 内复算。因此另建同构字符串树：
+无法在 AA 内复算。因此另建同构字符串域承诺，并按 doc 10 的 v2 方案**分片**：
+账户按地址划入 16 个 shard，每个 shard 内：
 
 ```
 leaf = sha256_hex("acct:" + address + ":" + collateral十进制串
-                  + ":" + perp十进制串)
-node = sha256_hex(left_hex + right_hex)
+                  + ":" + perp十进制串 + ":" + withdrawn十进制串)
+node = sha256_hex(left_hex + right_hex)      # 每 shard 深度 ≤ 16
 ```
-Rust `aa_root_of(pairs)` / `aa_proof_for(pairs, addr)` 构造（pairs 三元组
-`(地址, 抵押, PERP 余额)`）；AA 用 `sha256(x, 'hex')` 复算。两树承诺相同
-(地址, 抵押, PERP) 集。经探针 AA 对拍验证 root 逐字节一致。
 
-### 9.3 为什么提款用 aa_root
+每批提交 16 个 shard 根**拼接为一个 1024-hex 字符串 `aa_forest`**
+(shard i 位于偏移 i*64)，恰好命中 Oscript `MAX_STATE_VAR_VALUE_LENGTH
+= 1024`，submit/lock/失败清扫保持单变量操作。空 shard 提交离线生成的
+哨兵根 `hex(sha256("empty:<shard>"))`，零证明无法跨 shard 跳动。Rust
+侧构造分片森林与证明；AA 用 `substring(shard*64, 64)` 取出所声明的
+shard 根后折叠兄弟路径比对——AA **信任 shard 标签**，但叶子前像保证
+可靠性：错报 shard 只会折到错误的根上。经探针 AA 对拍验证 root 逐字节
+一致。
+
+### 9.3 为什么提款用字符串域森林
 
 AA 只能做字符串拼接与 sha256——它无法解析 i128 LE、无法遍历仓位数组。
-字符串域树把"证明我有多少钱"压缩成 AA 能完成的两次 sha256 调用。
-字节域树则继续承担完整状态承诺（撮合簿、仓位、进度），供 Rust 观察者
-全量审计。
+字符串域森林把"证明我有多少钱"压缩成 AA 能完成的两次 sha256 调用
+（叶子重算 + 兄弟折叠）。字节域树则继续承担完整状态承诺（撮合簿、仓位、
+进度），供 Rust 观察者全量审计。
 
 ---
 
@@ -461,26 +545,39 @@ AA 地址上的状态变量（`<h>` 为高度数字后缀）：
 boot, chain_id='operp-mvp-1', last_locked, last_finalized
 submitted_at_h, cand_root_h, cand_aa_root_h, cand_prev_h,
   cand_fills_h, cand_who_h                    # 候选（lock 前可替换）
-root_h, aa_root_h, stable_at_h               # 已锁定
+active_bond_<h>                              # 现任候选的 50000-byte 提交
+                                             # 债券持有人地址（被替换者的
+                                             # 债券转入 sbond_<old>）
+root_h, aa_root_h, stable_at_h               # 已锁定；aa_root_ 存 1024-hex
+                                             # 分片森林
 frozen_h ∈ {∅/0=正常, 1=已挑战, 2=永久失败}
 challenger_h, bond_<addr>, fee_winner_h,
-reward_<addr>, bal_<addr>(诊断影子账本),
-pperp_<addr>(PERP 影子账本，与 bal_ 同地位),
+reward_<addr>, sbond_<addr>(可回收提交债券),
+slash_reward_<addr>(罚没分成, {claim:"slash"} 领取),
 wd_<h>_<addr>                                # 抵押提款累计标记（防证明重放）
 wp_<h>_<addr>                                # PERP 提款累计标记（语义与 wd_ 对称）
 ```
+诊断影子账本 `bal_`/`pperp_` 已在复杂度腾挪中删除：余额权威是证明叶子，
+支付由 AA 原生余额机械兜底。所有领取统一为单一 `{claim:
+"reward"|"bond"|"sbond"|"slash"}` 字段。
 
 ### 10.1 submit(h)
 
 前置：chain_id 正确 ∧ h == last_locked+1 ∧ prev 匹配 root_{h−1}
-∧ 有 state_root/aa_root/fills_hash ∧ 未锁定。
+∧ 有 64-hex 的 state_root/prev_state_hash ∧ aa_forest 恰 1024 hex
+∧ 未锁定。新候选须附 ≥ 60 000 bytes（10 000 bounce 余量 +
+50 000 `SUBMIT_BOND_NET`）；**在任候选**重发（respond-by-resubmit）免债
+券——身份经 `active_bond_<h>` 判定，冒充者 bounce('not operator')。
 
-副作用：写候选五元组 + submitted_at_h；竞速判定（§11）。
+副作用：写候选五元组 + active_bond_<h> + submitted_at_h（每次 submit 都
+重启稳定计时）；被替换候选的债券移入 sbond_<old>；竞速判定（§11）。
 
 ### 10.2 lock(h)
 
 候选存在 ∧ 未锁 ∧ h == last_locked+1 ∧ now ≥ submitted_at_h + 600
-→ root/aa_root/winner/stable_at 落定，last_locked = h。锁后不可变。
+∧ **active_bond_<h> 在位**（H1 债券门：失败 finalize 会没收并清零该键，
+故回滚后的高度在新的带债券 submit 重建候选之前无法被重新 lock）
+→ root/aa_forest/winner/stable_at 落定，last_locked = h。锁后不可变。
 
 600s 是 OBYTE_STABILITY_SECS 的模拟（devnet 用 timetravel 测试）。
 
@@ -491,31 +588,44 @@ root 已锁 ∧ 未冻结 ∧ now < stable_at_h + 3600 ∧ 输出 ≥ 20000 base
 
 ### 10.4 respond(h)
 
-身份门：`trigger.address == cand_who_h`（只有提交该候选的账户能应诉）
-∧ frozen == 1 ∧ 窗口内 ∧ root_confirmed == root_h
-→ 解冻，没收 bond_<challenger> 记录的恰好数额并清零（归 AA 库）。
+无独立触发器：operator 通过**重发同一根**应诉（submit 路径内识别）。
+身份门：`trigger.address == var['active_bond_' || h]`（frozen==1 期间恒
+等于现任候选人）∧ 窗口内 ∧ 重发根一致 → 解冻，没收 bond_<challenger>
+记录的恰好数额并清零（归 AA 库）。
 
-已知边界：MVP 应诉只校验重发根一致，不能证明根正确——真欺诈 operator
+已知边界：应诉只校验重发根一致，不能证明根正确——真欺诈 operator
 重复自己的假根即可通过。完整方案需要链上重放或有效性证明（README
 Limitations #1）。
 
-### 10.5 finalize(h)
+### 10.5 finalize / escape_finalize(h)
 
-两条路：
+`{finalize}` 与 `{escape_finalize: 1}` 共用同一处理分支：
 
 ```
 失败路: frozen_h == 1 ∧ 已超窗（operator 未应诉）
-        → frozen_h = 2（永久）、root_h/aa_root_h 清零、
-          last_locked 回退 h−1；不自动退款——challenger 之后通过
-          新的 claim_bond 领回记录在案的 bond
+        → frozen_h = 2（永久）、root_/aa_root_/active_bond_ 清零、
+          last_locked 回退 h−1；50 000 提交债券对半劈：
+          slash_reward_<challenger> += 25000（{claim:"slash"} 领取），
+          另一半留在金库（烧毁）；挑战者自身债券经 {claim:"bond"} 取回
 正常路: 根存在 ∧ 未冻结 ∧ 超窗 ∧ h == last_finalized+1
-        → last_finalized = h；fee_winner 累加 20000 bytes 奖励（§11）
+        → last_finalized = h；sbond_<持有人> += 50000 可回收；
+          fee_winner 累加 20000 bytes 奖励（§11）
+escape: trigger.data.escape_finalize 时窗口阈值改为
+        ESCAPE_STALL_SECS = 604800（主网 7 天 / devnet timetravel）；
+        任意账户可调用；绝不越过 live challenge（frozen==1 必须走
+        失败清扫以退还挑战者）。按 doc07 §4 豁免，只做本地停滞门。
 ```
 
-### 10.6 withdraw(h = last_finalized)
+### 10.6 withdraw / escape_withdraw
+
+普通 withdraw 验证对象为 `aa_root_last_finalized`；`{escape_withdraw:1}`
+验证对象为 **陈旧候选** `cand_aa_root_(last_finalized+1)`——仅当该高度
+从未锁定或已 frozen==2 回滚时可用，且不推进 finalization。两者共享
+wd_/wp_ 防重放累计。
 
 ```
-未冻结 ∧ (height 参数若给必须等于 last_finalized)
+未冻结（escape_withdraw 另要求目标高度无 root_ 且候选森林存在）
+$shard ∈ [0,15] 整数（AA 信任标签；错报 shard 折到错误根上必然失败）
 amount > 0 ∧ leaf_account == trigger.address
 wd_ 累计上限：wd_<h>_<addr> 已提累计 + amount
              ≤ 该高度证明叶子的 collateral（同一证明不可重放，
@@ -524,25 +634,21 @@ $perp 为必填 claim 字段（可为 0）；wp_ 累计上限与 wd_ 完全对�
              wp_<h>_<addr> 累计 + perp_claimed ≤ 叶子声明的 PERP，
              超出 bounce('bad perp claim')；$perp_claimed > 0 才发
              PERP asset 输出
-proof 深度 ≤ 16（reduce(...,16,...)，覆盖 2^16 账户）
-leaf  = sha256('acct:'+address+':'+collateral+':'+perp, 'hex')
+proof 深度 ≤ 16（reduce(...,16,...)，每 shard 最多 2^16 账户 ×
+             16 shard ≈ 每批 ~1M 账户）
+leaf  = sha256('acct:'+address+':'+collateral+':'+perp+':'+withdrawn,'hex')
 fold proof[]: right ? sha256(acc‖sib,'hex') : sha256(sib‖acc,'hex')
-结果 == var['aa_root_' || h]   否则 bounce('bad merkle root')
-→ 支付 trigger.address amount（+ $perp_claimed 的 PERP）；
-  bal_/pperp_ 同步扣减（仅诊断）
+结果 == substring($src, $shard*64, 64)   否则 bounce('bad merkle root')
+→ 支付 trigger.address amount（+ $perp_claimed 的 PERP）
 ```
 
-余额权威是 **证明叶子**，不是 bal_/pperp_。bal_ 移除门控的原因：
-它与 aa_root 是永不严格同步的双账本（费扣口径、批次延迟、回滚都会漂移），
-只会产生错误拒付；支付本身由 AA 原生余额机械兜底。
+### 10.7 统一 claim 入口
 
-### 10.7 claim_bond / claim_reward
-
-claim_bond：失败高度（frozen = 2）的 challenger 领回记录在案的 bond
-——需随单元附带 ≥10000 bytes 支付费用。
-claim_reward：领取竞速累积奖励（§11），同样要求附带 ≥10000 bytes。
-AA 临时缺币时单元 bounce，记账保留，稍后重试即可——finalize 流程不会
-因付款失败而卡死。
+`{claim: "reward"|"bond"|"sbond"|"slash"}` 四态分发（替代旧的三个布尔
+字段）：reward = 竞速累积奖励；bond = 失败高度 challenger 的记录债券；
+sbond = 被替换/正常完结候选的提交债券返还；slash = 确认欺诈后的罚没
+分成。均需随单元附带 ≥10000 bytes 支付费用。AA 临时缺币时单元 bounce，
+记账保留，稍后重试即可——finalize 流程不会因付款失败而卡死。
 
 ---
 
@@ -560,7 +666,7 @@ submit(h) 竞速:
 ```
 
 - 输家刷补贴无利可图：每次提交净成本 10000 bytes（留存处理费）> 补贴
-- 赢家奖励在 finalize 成功路径累加（失败高度不发放），claim_reward 提取
+- 赢家奖励在 finalize 成功路径累加（失败高度不发放），{claim:"reward"} 提取
 - "交易按第一个稳定的填充下一个"由 prev_state_hash 链保证：
   h+1 必须引用赢家的 root_h
 - 高度失败回滚后重新竞速（fee_winner/cand_* 随回滚语义自然重置）
@@ -595,12 +701,12 @@ ingest → Applied{status: Optimistic}     # 立即执行、立即成交
 | 攻击 | 防线 |
 |---|---|
 | 伪造成交 / 锁假根 | 双 Merkle 根 + validate_against 全量重放审计 + fills_hash |
-| 偷 AA 资金 | 提款只认 finalized aa_root 的 Merkle 证明；leaf 绑定提款人地址；wd_ 累计标记防证明重放 |
-| 冒名应诉挑战 | respond 身份门（cand_who 绑定） |
-| 存款凭空铸造 | deposits_allowed 白名单 + replay 注入交叉校验 |
+| 偷 AA 资金 | 提款只认 finalized 分片森林的 Merkle 证明；leaf 绑定提款人地址；wd_/wp_ 累计标记防证明重放；escape_withdraw 只认陈旧候选森林且不推进 finalization |
+| 冒名应诉挑战 | respond 身份门（active_bond_ 绑定，frozen==1 期间恒为现任候选人） |
+| 存款凭空铸造 | deposits_allowed 白名单 + replay 注入交叉校验 + validate_against 内独立充值证据验证（unit_hash(joint) 复算 + 实付 vault/资产核对） |
 | qty/名义额溢出 DoS | 入口 checked-mul + i64 上限 |
 | 签名延展 | ed25519 verify_strict |
-| 乱序投递丢单元 | orphan 缓冲（4096，最小 UnitId 确定性驱逐）+ 不动点解锁 |
+| 乱序投递丢单元 | orphan 缓冲（4096，epoch 盐化驱逐）+ 不动点解锁 + WantUnits gossip 按需补单元 |
 | 自我清算 | caller 密码学绑定 + BadAccount 拒绝 |
 | 灰尘单操纵 mark | 100 USD 名义额门槛 |
 | 单笔巨价操纵 mark | ±10% 偏离帽 |
@@ -613,19 +719,24 @@ ingest → Applied{status: Optimistic}     # 立即执行、立即成交
 | 日志无限增长 | prune_below 按批裁剪 |
 | 伪造提案操纵市场参数 | 法定人数 = 流通量快照（supply_at_create）的 10% 且 yes > no 多数 + 提案期限（20 000 seqs） |
 | 女巫账户刷投票 | 投票权重 = 投票执行时刻的 PERP 余额，拆分账户不放大总权重 |
+| 回滚高度无债券重锁（H1） | lock 要求 active_bond_<h> 在位；失败 finalize 清零该键 |
 
 ## 14. 明确的已知边界
 
 - respond 不能证明根正确（Oscript 无法重放撮合）；作恶 operator 只能
   造成停摆，配合 fee race 由诚实 operator 接管
-- 预言机为债券注册制（ORACLE_BOND_PERP = 50_000 PERP，无许可）；报价
-  质量取决于质押者的诚实度——按债券计的多数仍可合谋偏置中位数
-- 挑战彻底失败后高度永久 `frozen = 2`，无跳过机制——后续 submit 全部
-  停摆（活性攻击面，任何人可故意触发）；恢复 = 重部署新 AA
-- 大载荷内联 temp_data 会触发 ocore 校验器双回调崩溃；E2E 跳过链上揭示，
-  operator 发布批次需先修复 ocore 或分块揭示
-- 无第三方安全审计；Oscript 复杂度预算已实质耗尽（99/100），改动须先
-  腾出等额预算
+- 预言机为债券注册制（ORACLE_BOND_PERP = 50_000 PERP，无许可）；
+  TWAP 连续偏移罚没已落地（激活门控），但按债券计的多数合谋仍可在两次
+  罚没之间偏置中位数；外部价锚（§6.2 末）需治理切到 AggregatedExternal
+  且白名单 keeper 持续喂价才生效
+- 在任 operator 每次 resubmit 免费重启稳定计时（M5 处置：接受的活性
+  权衡——只拖延自家高度，竞争者可花债券夺走该高度）
+- 大载荷内联 temp_data 会触发 ocore 校验器双回调崩溃：post_batch.js 的
+  链上信封字段已直接委托 ocore，但 devnet E2E（test_vault_aa.js）仍跳过
+  内联揭示；数据可用性正确性由 Rust 侧 settle 测试覆盖
+- 无第三方安全审计；Oscript 复杂度门恰在上限 **85/100**
+  （ops 1038/2000，`node tools/check_aa_complexity.js`），后续任何 AA
+  改动必须先腾出等额预算
 
 ---
 
@@ -695,8 +806,9 @@ yes > no  ∧  yes × PROPOSAL_QUORUM_DEN(100)
 
 ### 15.4 烧毁语义
 
-烧毁统一走 `burn_perp`：目前唯一入口是 CreateMarket 的上架费
-`CREATE_MARKET_FEE_PERP = 10_000`（预言机罚没为规划项，MVP 未实现）。
+烧毁统一走 `burn_perp`：入口为 CreateMarket 的上架费
+`CREATE_MARKET_FEE_PERP = 10_000` 与 `SlashOracle`(tag 16) 罚没中的
+烧毁份额（§7.2）。
 烧毁 = 从 `perp_balances` 扣除并累计 `perp_burned` 统计量，**同时等额扣减
 `perp_supply`**：supply 定义为可赎回流通量，通缩使后续提案的 quorum
 分母随之收缩。
@@ -709,8 +821,8 @@ AA 中、不做链上销毁 sweep**——AA 对 PERP 处于超抵押状态。这
 ### 15.5 债券解锁
 
 预言机债券记入 `oracle_bonds`，与可自由支配的 `perp_balances` 分离：进入
-债券的 PERP 不计投票权重、不可直接提款。解锁 = 通过 GovWithdraw 提走债券
-金额，走与其他 PERP 完全相同的双币种 Merkle 证明出金路径（§10.6）。
-`(market, oracle)` 一旦无债券，其最新报价立即退出中位数集合、后续报价被
-防御性忽略（§7.2）。MVP 不设解锁延迟/退出排队：撤债即时生效，报价者抽走
-债券即同时放弃全部市场的报价资格。
+债券的 PERP 不计投票权重、不可直接提款。退出走 `UnstakeOracle`(tag 15)：
+进入 `ORACLE_UNBOND_HEIGHTS = 256` 高度的解锁排队（`oracle_unbonding`，
+meta 叶承诺），到期后债券回到 `perp_balances`，再经双币种 Merkle 证明
+出金（§10.6）。排队期间 `(market, oracle)` 已无债券——最新报价立即退出
+中位数集合、后续报价被防御性忽略（§7.2）。
