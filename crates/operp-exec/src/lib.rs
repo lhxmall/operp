@@ -6,9 +6,10 @@ use operp_state::persist;
 use operp_state::{ChainState, Proposal};
 use operp_types::{
     bps, genesis_params, liq_order_id, notional_usd, order_id, valid_obyte_addr, AccountId, Bps,
-    ExecStatus, MarketId, MarketParams, OrderId, OrderType, ParamKey, Qty, Seq, Side, TimeInForce,
-    UnitId, Usd, BTC_USD, CREATE_MARKET_FEE_PERP, INSURANCE_ACCOUNT, ORACLE_BOND_PERP,
-    PROPOSAL_DURATION_SEQS, PROPOSAL_MIN_STAKE_PERP, PROPOSAL_QUORUM_DEN, PROPOSAL_QUORUM_NUM,
+    ExecStatus, Height, MarketId, MarketParams, OrderId, OrderType, ParamKey, Price, Qty, Seq,
+    Side, TimeInForce, UnitId, Usd, BTC_USD, CREATE_MARKET_FEE_PERP, INSURANCE_ACCOUNT,
+    ORACLE_BOND_PERP, PROPOSAL_DURATION_SEQS, PROPOSAL_MIN_STAKE_PERP, PROPOSAL_QUORUM_DEN,
+    PROPOSAL_QUORUM_NUM,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -62,6 +63,9 @@ pub enum RejectReason {
     AlreadyBonded,
     Unbonding,
     SlashNotEligible,
+    /// Commit-reveal v2: commit unknown/expired/consumed, hash mismatch,
+    /// wrong account, or reveal missing its Commit parent (doc 03 §2.3.3).
+    BadCommit,
 }
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ExecError {
@@ -193,8 +197,20 @@ impl Engine {
 
     pub fn note_finalized(&mut self, root: [u8; 32], height: operp_types::Height) {
         self.state.note_finalized(root, height);
-        // Step9: rotate the DAG eviction/ordering salt to the finalized root.
-        self.dag.set_eviction_salt(root);
+        // Step9: rotate the DAG eviction/ordering salt to
+        // sha256(ORDERING_SALT_DOMAIN || finalized_root || epoch_le), where
+        // epoch = height / ORDERING_EPOCH_UNITS. Deriving from (root, epoch)
+        // — not the raw root — keeps ordering stable within an epoch and
+        // forces rotation at epoch boundaries even if the same root were
+        // re-finalized. `Dag::ready_linearized` (via `apply_ready`) picks up
+        // this salt for both ready-set tie-breaks and orphan eviction.
+        let epoch = (height / operp_types::ORDERING_EPOCH_UNITS).to_le_bytes();
+        let mut buf = Vec::with_capacity(operp_types::ORDERING_SALT_DOMAIN.len() + 64);
+        buf.extend_from_slice(operp_types::ORDERING_SALT_DOMAIN);
+        buf.extend_from_slice(&root);
+        buf.extend_from_slice(&epoch);
+        let salt = operp_types::sha256(&buf);
+        self.dag.set_eviction_salt(salt);
     }
 
     fn apply_one(&mut self, id: UnitId) -> ExecEvent {
@@ -265,8 +281,11 @@ impl Engine {
                 if !self.state.markets.contains_key(market) {
                     return Err(RejectReason::NotFound);
                 }
+                // Doc 06 §2.7: pass the pre-increment global seq so TWAP
+                // samples carry intra-height ordering without wall clocks.
+                let caller_seq = self.state.seq;
                 self.state
-                    .apply_report(*oracle, *market, *price)
+                    .apply_report(*oracle, *market, *price, caller_seq)
                     .map_err(map_state)?;
                 Ok(Vec::new())
             }
@@ -320,6 +339,26 @@ impl Engine {
                 target,
                 market,
             } => self.slash_oracle(*challenger, *target, *market),
+            Op::Commit {
+                account,
+                commit,
+                ttl_height,
+            } => self.commit_op(id, *account, *commit, *ttl_height),
+            Op::Reveal {
+                account,
+                commit_ref,
+                op,
+                salt,
+            } => self.reveal_op(id, *account, *commit_ref, op, salt),
+            Op::UpdateExternalPrice {
+                source,
+                market,
+                price,
+                source_id,
+            } => {
+                let caller_seq = self.state.seq;
+                self.update_external_price(*source, *market, *price, *source_id, caller_seq)
+            }
         }
     }
 
@@ -961,7 +1000,124 @@ impl Engine {
             .map_err(map_state)?;
         Ok(Vec::new())
     }
+
+    // -----------------------------------------------------------------------
+    // Commit-reveal ordering v2 (doc 03 §2.3)
+    //
+    /// Register a commitment (doc 03 §2.3.3 rule 1 + §2.3.5 DoS bounds).
+    /// Commits carry no content MEV; they are ordered by the v1 salted key
+    /// like any other unit.
+    fn commit_op(
+        &mut self,
+        id: UnitId,
+        account: AccountId,
+        commit: [u8; 32],
+        ttl_height: Height,
+    ) -> Result<Vec<Fill>, RejectReason> {
+        if self.state.height < operp_types::COMMIT_REVEAL_ACTIVATION_HEIGHT {
+            return Err(RejectReason::BadCommit);
+        }
+        if self.state.commits.contains_key(&commit) {
+            return Err(RejectReason::BadCommit);
+        }
+        // Bound the reveal deadline to COMMIT_TTL_HEIGHTS past creation so
+        // the pending set is memory-bounded; TTL ~16 heights ≈ 32 s.
+        let commit_height = self.state.height;
+        if ttl_height <= commit_height || ttl_height > commit_height + operp_types::COMMIT_TTL_HEIGHTS {
+            return Err(RejectReason::BadCommit);
+        }
+        // Per-account pending-commit cap (doc 03 §2.3.5, e.g. 8).
+        let pending = self
+            .state
+            .commits
+            .values()
+            .filter(|e| e.account == account && !e.revealed)
+            .count();
+        if pending >= operp_types::MAX_PENDING_COMMITS_PER_ACCOUNT {
+            return Err(RejectReason::BadCommit);
+        }
+        self.state.commits.insert(
+            commit,
+            operp_state::CommitEntry {
+                account,
+                commit_unit: id,
+                commit_height,
+                ttl_height,
+                revealed: false,
+            },
+        );
+        Ok(Vec::new())
+    }
+
+    /// Reveal a committed operation (doc 03 §2.3.3 rule 3): preimage check,
+    /// account match, TTL window, not-yet-revealed, and parent-edge
+    /// enforcement (the Reveal unit must descend from its Commit unit, doc
+    /// §2.3.4). On success the commit is consumed and the inner op executes
+    /// through the normal path (price-time, risk checks unchanged).
+    fn reveal_op(
+        &mut self,
+        id: UnitId,
+        account: AccountId,
+        commit_ref: [u8; 32],
+        inner: &Op,
+        salt: &[u8; 32],
+    ) -> Result<Vec<Fill>, RejectReason> {
+        if self.state.height < operp_types::COMMIT_REVEAL_ACTIVATION_HEIGHT {
+            return Err(RejectReason::BadCommit);
+        }
+        let entry = match self.state.commits.get(&commit_ref) {
+            Some(e) => *e,
+            None => return Err(RejectReason::BadCommit),
+        };
+        if entry.revealed
+            || entry.account != account
+            || self.state.height > entry.ttl_height
+            || operp_dag::reveal_commit_hash(inner, salt) != commit_ref
+        {
+            return Err(RejectReason::BadCommit);
+        }
+        // Parent-edge constraint: the Commit's unit id must be among this
+        // unit's parents so DAG topo order places the reveal after it and
+        // `ready_linearized` stays pure.
+        let parents = self.dag.get(id).map(|u| u.parents.clone()).unwrap_or_default();
+        if !parents.contains(&entry.commit_unit) {
+            return Err(RejectReason::BadCommit);
+        }
+        // Doc order: consume the commit first ("set revealed = true"), then
+        // execute the inner op; both steps are deterministic on replay.
+        self.state.commits.get_mut(&commit_ref).unwrap().revealed = true;
+        let seq = self.state.seq;
+        self.dispatch(id, seq, inner)
+    }
+
+    /// External keeper price intake (doc 06 §2.6): gated on the
+    /// AggregatedExternal source selection, the governance allowlist, and a
+    /// live known market. Writes only the sidechain-internal ring.
+    fn update_external_price(
+        &mut self,
+        source: AccountId,
+        market: MarketId,
+        price: Price,
+        source_id: u8,
+        caller_seq: Seq,
+    ) -> Result<Vec<Fill>, RejectReason> {
+        if self.state.height < operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT
+            || self.state.funding_source != operp_types::FundingSourceKind::AggregatedExternal
+        {
+            return Err(RejectReason::NotFound);
+        }
+        if !self.state.external_sources.contains(&source) {
+            return Err(RejectReason::BadAccount);
+        }
+        if !self.state.markets.contains_key(&market) || price == 0 {
+            return Err(RejectReason::NotFound);
+        }
+        self.state
+            .apply_external_price(source, market, price, source_id, caller_seq);
+        Ok(Vec::new())
+    }
 }
+
 fn map_acct(e: AccountError) -> RejectReason {
     match e {
         AccountError::Insufficient | AccountError::NonPositive => RejectReason::Insufficient,
@@ -2229,4 +2385,645 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    /// Reference implementation of the Phase-2 salt derivation contract:
+    /// sha256(ORDERING_SALT_DOMAIN || finalized_root || epoch_le).
+    fn derived_salt(root: [u8; 32], height: u64) -> [u8; 32] {
+        let epoch = (height / operp_types::ORDERING_EPOCH_UNITS).to_le_bytes();
+        let mut buf = Vec::with_capacity(operp_types::ORDERING_SALT_DOMAIN.len() + 64);
+        buf.extend_from_slice(operp_types::ORDERING_SALT_DOMAIN);
+        buf.extend_from_slice(&root);
+        buf.extend_from_slice(&epoch);
+        operp_types::sha256(&buf)
+    }
+
+    #[test]
+    fn note_finalized_salt_stable_per_root_and_epoch() {
+        // Same root + same epoch → same salt (stability).
+        let mut e1 = Engine::new();
+        let mut e2 = Engine::new();
+        let root = [0xABu8; 32];
+        e1.note_finalized(root, 0);
+        e2.note_finalized(root, operp_types::ORDERING_EPOCH_UNITS - 1);
+        assert_eq!(e1.dag.eviction_salt(), derived_salt(root, 0));
+        assert_eq!(e2.dag.eviction_salt(), derived_salt(root, 0));
+        assert_eq!(e1.dag.eviction_salt(), e2.dag.eviction_salt());
+
+        // Different epoch (same root) → different salt (rotation).
+        let mut e3 = Engine::new();
+        e3.note_finalized(root, operp_types::ORDERING_EPOCH_UNITS);
+        assert_ne!(e1.dag.eviction_salt(), e3.dag.eviction_salt());
+        assert_eq!(e3.dag.eviction_salt(), derived_salt(root, operp_types::ORDERING_EPOCH_UNITS));
+
+        // Different root → different salt.
+        let mut e4 = Engine::new();
+        e4.note_finalized([0xCDu8; 32], 0);
+        assert_ne!(e1.dag.eviction_salt(), e4.dag.eviction_salt());
+    }
+
+    #[test]
+    fn eviction_rotation_is_deterministic_and_epoch_bound() {
+        use operp_dag::{genesis_id, unit_id};
+        // Build an engine holding several ready units, then check that the
+        // post-finalization ordering is a pure function of (root, epoch):
+        // two engines with the same finalize inputs produce identical order,
+        // and crossing an epoch boundary rotates it deterministically.
+        let mk = |eng: &mut Engine| -> Vec<operp_types::UnitId> {
+            allow_all(eng);
+            let g = genesis_id();
+            let mut ids = Vec::new();
+            let mut prev = g;
+            for n in 1u8..=6 {
+                let secret = [n; 32];
+                let account = acct_of(&secret);
+                let u = sign_unit(
+                    vec![prev],
+                    Op::Place {
+                        account,
+                        market: BTC_USD,
+                        side: Side::Bid,
+                        typ: OrderType::Limit,
+                        tif: TimeInForce::Gtc,
+                        price: operp_types::PRICE_SCALE * u64::from(n),
+                        qty: QTY_SCALE,
+                        client_seq: u64::from(n),
+                    },
+                    &secret,
+                );
+                prev = unit_id(&u);
+                ids.push(prev);
+                eng.ingest(u).unwrap();
+            }
+            eng.apply_ready();
+            ids
+        };
+        let mut a = Engine::new();
+        let _ = mk(&mut a);
+        let mut b = Engine::new();
+        let _ = mk(&mut b);
+        let root = [7u8; 32];
+        a.note_finalized(root, 10);
+        b.note_finalized(root, 10);
+        let ord_a = a.apply_ready();
+        let ord_b = b.apply_ready();
+        assert_eq!(ord_a, ord_b, "same (root, epoch) must give same order");
+        assert_eq!(a.dag.eviction_salt(), derived_salt(root, 10));
+
+        // Same root, next epoch: deterministic rotation.
+        let mut c = Engine::new();
+        let _ = mk(&mut c);
+        c.note_finalized(root, 10 + operp_types::ORDERING_EPOCH_UNITS);
+        let ord_c1 = c.apply_ready();
+        let mut d = Engine::new();
+        let _ = mk(&mut d);
+        d.note_finalized(root, 10 + operp_types::ORDERING_EPOCH_UNITS);
+        assert_eq!(ord_c1, d.apply_ready());
+    }
+
+    // -------------------------------------------------------------------
+    // Commit-reveal ordering v2 (doc 03 §2.3) — reveal semantics
+
+    fn commit_unit(
+        parents: Vec<UnitId>,
+        secret: &[u8; 32],
+        commit: [u8; 32],
+        ttl_height: Height,
+    ) -> Unit {
+        sign_unit(
+            parents,
+            Op::Commit {
+                account: acct_of(secret),
+                commit,
+                ttl_height,
+            },
+            secret,
+        )
+    }
+
+    /// Engine past the v2 activation gate with deposit admission open.
+    fn activated_engine() -> Engine {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        eng.state.height = operp_types::COMMIT_REVEAL_ACTIVATION_HEIGHT;
+        eng
+    }
+
+    #[test]
+    fn commit_then_reveal_executes_inner_place() {
+        let mut eng = activated_engine();
+        let alice = sk(1);
+        let acct = acct_of(&alice);
+        let d = deposit(vec![genesis_id()], &alice, 10_000 * USD_SCALE as i128, 1);
+        let mut tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+
+        let inner = Op::Place {
+            account: acct,
+            market: BTC_USD,
+            side: Side::Bid,
+            typ: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: 100 * PRICE_SCALE,
+            qty: QTY_SCALE / 1000,
+            client_seq: 1,
+        };
+        let salt = [7u8; 32];
+        let commit_hash = operp_dag::reveal_commit_hash(&inner, &salt);
+        let c = commit_unit(
+            vec![tip],
+            &alice,
+            commit_hash,
+            eng.state.height + operp_types::COMMIT_TTL_HEIGHTS,
+        );
+        tip = unit_id(&c);
+        let events = eng.ingest(c).unwrap();
+        assert!(matches!(events.last(), Some(ExecEvent::Applied { .. })));
+        assert_eq!(eng.state.commits[&commit_hash].commit_unit, tip);
+
+        // Reveal parented on the Commit unit (doc §2.3.4) executes the inner
+        // op through the normal path.
+        let r = sign_unit(
+            vec![tip],
+            Op::Reveal {
+                account: acct,
+                commit_ref: commit_hash,
+                op: Box::new(inner.clone()),
+                salt,
+            },
+            &alice,
+        );
+        let events = eng.ingest(r).unwrap();
+        assert!(matches!(events.last(), Some(ExecEvent::Applied { .. })));
+        // A resting bid proves the inner Place went through the normal
+        // intake path (client-seq watermark advanced, order accepted).
+        assert_eq!(eng.state.seen_client_seq.get(&acct), Some(&1));
+        assert!(eng.state.commits[&commit_hash].revealed);
+    }
+
+    #[test]
+    fn reveal_without_commit_parent_rejected() {
+        let mut eng = activated_engine();
+        let alice = sk(1);
+        let acct = acct_of(&alice);
+        let d = deposit(vec![genesis_id()], &alice, 10_000 * USD_SCALE as i128, 1);
+        let tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let inner = Op::Place {
+            account: acct,
+            market: BTC_USD,
+            side: Side::Bid,
+            typ: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: 100 * PRICE_SCALE,
+            qty: QTY_SCALE / 1000,
+            client_seq: 1,
+        };
+        let salt = [7u8; 32];
+        let commit_hash = operp_dag::reveal_commit_hash(&inner, &salt);
+        let c = commit_unit(
+            vec![tip],
+            &alice,
+            commit_hash,
+            eng.state.height + operp_types::COMMIT_TTL_HEIGHTS,
+        );
+        eng.ingest(c).unwrap();
+        // Parent is the deposit tip, not the Commit unit → BadCommit and no
+        // execution (doc §2.3.4 parent-edge constraint).
+        let r = sign_unit(
+            vec![tip],
+            Op::Reveal {
+                account: acct,
+                commit_ref: commit_hash,
+                op: Box::new(inner),
+                salt,
+            },
+            &alice,
+        );
+        let events = eng.ingest(r).unwrap();
+        assert!(
+            matches!(
+                events.last(),
+                Some(ExecEvent::Rejected { reason: RejectReason::BadCommit, .. })
+            ),
+            "reveal must parent its commit"
+        );
+        assert!(!eng.state.accounts[&acct].positions.contains_key(&BTC_USD));
+    }
+
+    #[test]
+    fn reveal_preimage_mismatch_rejected() {
+        let mut eng = activated_engine();
+        let alice = sk(1);
+        let acct = acct_of(&alice);
+        let d = deposit(vec![genesis_id()], &alice, 10_000 * USD_SCALE as i128, 1);
+        let tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let inner = Op::Place {
+            account: acct,
+            market: BTC_USD,
+            side: Side::Bid,
+            typ: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: 100 * PRICE_SCALE,
+            qty: QTY_SCALE / 1000,
+            client_seq: 1,
+        };
+        let salt = [7u8; 32];
+        let commit_hash = operp_dag::reveal_commit_hash(&inner, &salt);
+        let c = commit_unit(
+            vec![tip],
+            &alice,
+            commit_hash,
+            eng.state.height + operp_types::COMMIT_TTL_HEIGHTS,
+        );
+        let cid = unit_id(&c);
+        eng.ingest(c).unwrap();
+        // Wrong salt: sha256(op_bytes || salt') != commit_ref.
+        let r = sign_unit(
+            vec![cid],
+            Op::Reveal {
+                account: acct,
+                commit_ref: commit_hash,
+                op: Box::new(inner),
+                salt: [8u8; 32],
+            },
+            &alice,
+        );
+        let events = eng.ingest(r).unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(ExecEvent::Rejected { reason: RejectReason::BadCommit, .. })
+        ));
+        assert!(!eng.state.commits[&commit_hash].revealed);
+    }
+
+    #[test]
+    fn expired_commit_rejected_and_pruned() {
+        let mut eng = activated_engine();
+        let alice = sk(1);
+        let acct = acct_of(&alice);
+        let d = deposit(vec![genesis_id()], &alice, 10_000 * USD_SCALE as i128, 1);
+        let tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let inner = Op::Place {
+            account: acct,
+            market: BTC_USD,
+            side: Side::Bid,
+            typ: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: 100 * PRICE_SCALE,
+            qty: QTY_SCALE / 1000,
+            client_seq: 1,
+        };
+        let salt = [7u8; 32];
+        let commit_hash = operp_dag::reveal_commit_hash(&inner, &salt);
+        let c = commit_unit(
+            vec![tip],
+            &alice,
+            commit_hash,
+            eng.state.height + operp_types::COMMIT_TTL_HEIGHTS,
+        );
+        let cid = unit_id(&c);
+        eng.ingest(c).unwrap();
+        // Past the TTL window the slot is wasted: reject and prune at batch
+        // commit (doc §2.3.3 rule 4 + §2.3.5).
+        eng.state.height += operp_types::COMMIT_TTL_HEIGHTS + 1;
+        let r = sign_unit(
+            vec![cid],
+            Op::Reveal {
+                account: acct,
+                commit_ref: commit_hash,
+                op: Box::new(inner),
+                salt,
+            },
+            &alice,
+        );
+        let events = eng.ingest(r).unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(ExecEvent::Rejected { reason: RejectReason::BadCommit, .. })
+        ));
+        eng.state.prune_commits(eng.state.height);
+        assert!(!eng.state.commits.contains_key(&commit_hash));
+    }
+
+    #[test]
+    fn duplicate_commit_and_pending_cap_enforced() {
+        let mut eng = activated_engine();
+        let alice = sk(1);
+        let acct = acct_of(&alice);
+        let d = deposit(vec![genesis_id()], &alice, 10_000 * USD_SCALE as i128, 1);
+        let mut tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let mk_inner = |seq: u64| Op::Place {
+            account: acct,
+            market: BTC_USD,
+            side: Side::Bid,
+            typ: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: 100 * PRICE_SCALE,
+            qty: QTY_SCALE / 1000,
+            client_seq: seq,
+        };
+        // Duplicate commit hash bounces (rule 1); distinct commits up to the
+        // per-account cap of 8 are admitted; the 9th bounces (§2.3.5).
+        for i in 0..9u64 {
+            let inner = mk_inner(i + 1);
+            let hash = operp_dag::reveal_commit_hash(&inner, &[i as u8; 32]);
+            let c = commit_unit(
+                vec![tip],
+                &alice,
+                hash,
+                eng.state.height + operp_types::COMMIT_TTL_HEIGHTS,
+            );
+            tip = unit_id(&c);
+            let events = eng.ingest(c).unwrap();
+            if i < 8 {
+                assert!(matches!(events.last(), Some(ExecEvent::Applied { .. })));
+            } else {
+                assert!(matches!(
+                    events.last(),
+                    Some(ExecEvent::Rejected { reason: RejectReason::BadCommit, .. })
+                ));
+            }
+        }
+        // Same hash a second time even below cap → rejected.
+        let inner = mk_inner(1);
+        let hash = operp_dag::reveal_commit_hash(&inner, &[0u8; 32]);
+        let dup = commit_unit(
+            vec![tip],
+            &alice,
+            hash,
+            eng.state.height + operp_types::COMMIT_TTL_HEIGHTS,
+        );
+        let events = eng.ingest(dup).unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(ExecEvent::Rejected { reason: RejectReason::BadCommit, .. })
+        ));
+    }
+
+    #[test]
+    fn pre_activation_commits_rejected() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let alice = sk(1);
+        let c = commit_unit(
+            vec![genesis_id()],
+            &alice,
+            [9u8; 32],
+            operp_types::COMMIT_TTL_HEIGHTS,
+        );
+        let events = eng.ingest(c).unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(ExecEvent::Rejected { reason: RejectReason::BadCommit, .. })
+        ));
+    }
+
+    #[test]
+    fn commit_reveal_deterministic_across_replicas() {
+        let build = |arrival_swap: bool| {
+            let mut eng = activated_engine();
+            let alice = sk(1);
+            let acct = acct_of(&alice);
+            let d = deposit(vec![genesis_id()], &alice, 10_000 * USD_SCALE as i128, 1);
+            let tip = unit_id(&d);
+            eng.ingest(d).unwrap();
+            let inner = Op::Place {
+                account: acct,
+                market: BTC_USD,
+                side: Side::Bid,
+                typ: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: 100 * PRICE_SCALE,
+                qty: QTY_SCALE / 1000,
+                client_seq: 1,
+            };
+            let salt = [3u8; 32];
+            let hash = operp_dag::reveal_commit_hash(&inner, &salt);
+            let c = commit_unit(
+                vec![tip],
+                &alice,
+                hash,
+                eng.state.height + operp_types::COMMIT_TTL_HEIGHTS,
+            );
+            let cid = unit_id(&c);
+            let r = sign_unit(
+                vec![cid],
+                Op::Reveal {
+                    account: acct,
+                    commit_ref: hash,
+                    op: Box::new(inner),
+                    salt,
+                },
+                &alice,
+            );
+            if arrival_swap {
+                eng.ingest(r).unwrap_err(); // buffered as orphan (parent unknown)
+                eng.ingest(c).unwrap();
+                // Orphans unblocked by execution become ready on the next
+                // drain (engine contract): run it so the reveal executes.
+                eng.apply_ready();
+            } else {
+                eng.ingest(c).unwrap();
+                eng.ingest(r).unwrap();
+            }
+            eng.state.state_root()
+        };
+        assert_eq!(build(false), build(false), "replicas must agree");
+        assert_eq!(
+            build(true),
+            build(false),
+            "orphan-buffered arrival must converge to the same state"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Funding external-anchor wiring (doc 06 §2.6/§2.7)
+
+    fn report_unit(parents: Vec<UnitId>, secret: &[u8; 32], px: Price) -> Unit {
+        sign_unit(
+            parents,
+            Op::ReportPrice {
+                oracle: acct_of(secret),
+                market: BTC_USD,
+                price: px,
+            },
+            secret,
+        )
+    }
+
+    fn external_price_unit(
+        parents: Vec<UnitId>,
+        secret: &[u8; 32],
+        px: Price,
+        source_id: u8,
+    ) -> Unit {
+        sign_unit(
+            parents,
+            Op::UpdateExternalPrice {
+                source: acct_of(secret),
+                market: BTC_USD,
+                price: px,
+                source_id,
+            },
+            secret,
+        )
+    }
+
+    /// Two bonded reporters primed at `px` across distinct heights so the
+    /// bonded-median funding TWAP converges to `px`.
+    fn prime_bonded_twap(eng: &mut Engine, tip: &mut UnitId, oa: &[u8; 32], ob: &[u8; 32], px: Price, heights: u64) {
+        for _ in 0..heights {
+            eng.state.height += 1;
+            let r1 = report_unit(vec![*tip], oa, px);
+            *tip = unit_id(&r1);
+            eng.ingest(r1).unwrap();
+            let r2 = report_unit(vec![*tip], ob, px);
+            *tip = unit_id(&r2);
+            eng.ingest(r2).unwrap();
+        }
+    }
+
+    #[test]
+    fn external_anchor_wiring_overrides_funding_index_when_active() {
+        let mut eng = activated_engine();
+        eng.state.height = operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT;
+        eng.state.funding_source = operp_types::FundingSourceKind::AggregatedExternal;
+        let oa = sk(5);
+        let ob = sk(6);
+        let keeper = sk(9);
+        // Bond reporters so funding ticks fire; allowlist the keeper.
+        eng.state.oracle_bonds.insert(acct_of(&oa), ORACLE_BOND_PERP);
+        eng.state.oracle_bonds.insert(acct_of(&ob), ORACLE_BOND_PERP);
+        eng.state.external_sources.insert(acct_of(&keeper));
+
+        let mut tip = genesis_id();
+        prime_bonded_twap(&mut eng, &mut tip, &oa, &ob, 90_000 * PRICE_SCALE, 4);
+        assert_eq!(
+            eng.state.funding_index_twap[&BTC_USD],
+            90_000 * PRICE_SCALE
+        );
+
+        // Keeper posts an external anchor at 95k through the real dispatch
+        // path; it lands in the ring but needs >= MIN_SAMPLES to drive index.
+        let e1 = external_price_unit(vec![tip], &keeper, 95_000 * PRICE_SCALE, 0);
+        tip = unit_id(&e1);
+        let events = eng.ingest(e1).unwrap();
+        assert!(matches!(events.last(), Some(ExecEvent::Applied { .. })));
+        let e2 = external_price_unit(vec![tip], &keeper, 95_000 * PRICE_SCALE, 0);
+        tip = unit_id(&e2);
+        eng.ingest(e2).unwrap();
+        assert_eq!(
+            eng.state.external_twap(BTC_USD),
+            Some(95_000 * PRICE_SCALE)
+        );
+        assert_eq!(
+            eng.state.effective_funding_index(BTC_USD, 90_000 * PRICE_SCALE),
+            95_000 * PRICE_SCALE,
+            "fresh external ring must override the bonded-median TWAP"
+        );
+
+        // Feed dies: after MAX_STALENESS heights the index falls back to the
+        // bonded TWAP so funding never freezes (doc §2.6 rule 2).
+        eng.state.height += operp_types::FUNDING_EXTERNAL_MAX_STALENESS + 1;
+        assert_eq!(
+            eng.state.effective_funding_index(BTC_USD, 90_000 * PRICE_SCALE),
+            90_000 * PRICE_SCALE
+        );
+    }
+
+    #[test]
+    fn unallowlisted_or_gate_blocked_external_prices_rejected() {
+        let mut eng = activated_engine();
+        eng.state.height = operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT;
+        eng.state.funding_source = operp_types::FundingSourceKind::AggregatedExternal;
+        let keeper = sk(9);
+        let stranger = sk(11);
+        eng.state.external_sources.insert(acct_of(&keeper));
+        // Not on the allowlist.
+        let u = external_price_unit(vec![genesis_id()], &stranger, 95_000 * PRICE_SCALE, 0);
+        let events = eng.ingest(u).unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(ExecEvent::Rejected { reason: RejectReason::BadAccount, .. })
+        ));
+        // BondedMedianTwap (default source): UpdateExternalPrice rejected so
+        // v1 replay stays byte-identical.
+        let mut eng2 = activated_engine();
+        eng2.state.height = operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT;
+        eng2.state.external_sources.insert(acct_of(&keeper));
+        let u2 = external_price_unit(vec![genesis_id()], &keeper, 95_000 * PRICE_SCALE, 0);
+        let events2 = eng2.ingest(u2).unwrap();
+        assert!(matches!(
+            events2.last(),
+            Some(ExecEvent::Rejected { reason: RejectReason::NotFound, .. })
+        ));
+        assert!(eng2.state.external_price_ring.is_empty());
+    }
+
+    #[test]
+    fn e2e_funding_pays_via_external_anchored_index_through_units() {
+        let mut eng = activated_engine();
+        eng.state.height = operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT;
+        eng.state.funding_source = operp_types::FundingSourceKind::AggregatedExternal;
+        let alice = sk(1);
+        let bob = sk(2);
+        let oa = sk(5);
+        let ob = sk(6);
+        let keeper = sk(9);
+        eng.state.oracle_bonds.insert(acct_of(&oa), ORACLE_BOND_PERP);
+        eng.state.oracle_bonds.insert(acct_of(&ob), ORACLE_BOND_PERP);
+        eng.state.external_sources.insert(acct_of(&keeper));
+        // Collateral + opposite positions via deposits/places.
+        let d1 = deposit(vec![genesis_id()], &alice, 1_000_000 * USD_SCALE as i128, 1);
+        let mut tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![tip], &bob, 1_000_000 * USD_SCALE as i128, 2);
+        tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+        let px = 100_000 * PRICE_SCALE;
+        let ask = place(
+            vec![tip], &bob, Side::Ask, OrderType::Limit, TimeInForce::Gtc, px, QTY_SCALE / 1000, 1,
+        );
+        tip = unit_id(&ask);
+        eng.ingest(ask).unwrap();
+        let bid = place(
+            vec![tip], &alice, Side::Bid, OrderType::Limit, TimeInForce::Gtc, px, QTY_SCALE / 1000, 1,
+        );
+        tip = unit_id(&bid);
+        eng.ingest(bid).unwrap();
+
+        // External keepers anchor the index at 50k while bonded reports push
+        // medians (and thus the capped mark) to 100k: longs must pay shorts.
+        let e1 = external_price_unit(vec![tip], &keeper, 50_000 * PRICE_SCALE, 0);
+        tip = unit_id(&e1);
+        eng.ingest(e1).unwrap();
+        let e2 = external_price_unit(vec![tip], &keeper, 50_000 * PRICE_SCALE, 0);
+        tip = unit_id(&e2);
+        eng.ingest(e2).unwrap();
+        prime_bonded_twap(&mut eng, &mut tip, &oa, &ob, 100_000 * PRICE_SCALE, 3);
+
+        let pre_long = eng.state.accounts[&acct_of(&alice)].collateral;
+        let pre_short = eng.state.accounts[&acct_of(&bob)].collateral;
+        // One more report tick fires funding against the external index.
+        eng.state.height += 1;
+        let r = report_unit(vec![tip], &oa, 100_000 * PRICE_SCALE);
+        tip = unit_id(&r);
+        let events = eng.ingest(r).unwrap();
+        assert!(matches!(events.last(), Some(ExecEvent::Applied { .. })));
+        assert!(
+            eng.state.accounts[&acct_of(&alice)].collateral < pre_long,
+            "long pays when capped mark > external-anchored index"
+        );
+        assert!(
+            eng.state.accounts[&acct_of(&bob)].collateral > pre_short,
+            "short receives when capped mark > external-anchored index"
+        );
+        let moved = pre_long - eng.state.accounts[&acct_of(&alice)].collateral;
+        // Per-tick cap: 50 bps of notional(qty, 50k).
+        let cap = operp_types::bps(i128::from(QTY_SCALE / 1000) * (50_000 * PRICE_SCALE as i128), operp_types::FUNDING_CAP_BPS as u64);
+        assert!(moved <= cap as i128 + USD_SCALE as i128, "cap holds");
+    }
 }

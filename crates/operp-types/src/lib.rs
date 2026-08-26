@@ -58,6 +58,26 @@ pub const SLASH_DEVIATION_BPS: u64 = 500;
 pub const SLASH_TWAP_STREAK: u64 = 3;
 pub const SLASH_REWARD_BPS: u64 = 5000;
 pub const FUNDING_TWAP_WINDOW: Height = 256;
+pub const FUNDING_TWAP_MIN_SAMPLES: usize = 2;
+pub const FUNDING_TWAP_WINDOW_MAX: u64 = 1800;
+/// AggregatedExternal freshness: an external feed older than this many
+/// heights falls back to the bonded-median TWAP so a liveness failure of
+/// external keepers cannot freeze funding (doc 06 §2.6 rule 2).
+pub const FUNDING_EXTERNAL_MAX_STALENESS: Height = 32;
+// ---------------------------------------------------------------------------
+// Commit-reveal ordering v2 (doc 03 §2.3) — additive on top of the salted
+// sort (v1). Commits carry no content MEV; reveals must parent their commit
+// and re-derive sha256(inner_op_bytes || salt).
+pub const COMMIT_REVEAL_ACTIVATION_HEIGHT: Height = 1_000_000;
+/// Reveal deadline: commits expire COMMIT_TTL_HEIGHTS after creation
+/// (~32 s at 2 s/batch), bounding the pending-commit set.
+pub const COMMIT_TTL_HEIGHTS: Height = 16;
+/// Per-account cap on live (unrevealed, unexpired) commits (doc 03 §2.3.5).
+pub const MAX_PENDING_COMMITS_PER_ACCOUNT: usize = 8;
+/// canonical_bytes op tags reserved by the v2 additions.
+pub const UPDATE_EXTERNAL_PRICE_TAG: u8 = 17;
+pub const COMMIT_TAG: u8 = 18;
+pub const REVEAL_TAG: u8 = 19;
 pub const ESCAPE_STALL_SECS: u64 = 604800;
 pub const ESCAPE_STALL_SECS_TESTNET: u64 = 3600;
 pub const VAULT_AA_ADDRESS: &str = "";
@@ -99,13 +119,15 @@ pub fn default_oracle_config() -> OracleConfig {
     OracleConfig::default()
 }
 
-/// TWAP sample: median at a given height.
+/// TWAP sample: median observed at a given height/seq. `seq` is the global
+/// applied-unit counter at sampling time — the doc-06 time proxy that gives
+/// intra-height ordering without wall clocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TwapSample {
+    pub seq: Seq,
     pub height: Height,
     pub median: Price,
 }
-
 /// Per-reporter price history sample for streak detection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportSample {
@@ -115,6 +137,17 @@ pub struct ReportSample {
 }
 
 /// Funding TWAP sample (alias to TwapSample for now).
+
+/// External price sample posted by an allowlisted keeper via
+/// `Op::UpdateExternalPrice` (doc 06 §2.3). Empty ring in v1
+/// BondedMedianTwap; structure committed in meta_leaf for forward compat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalSample {
+    pub seq: Seq,
+    pub height: Height,
+    pub price: Price,
+    pub source_id: u8,
+}
 pub type FundingTwapSample = TwapSample;
 
 

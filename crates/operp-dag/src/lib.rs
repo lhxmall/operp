@@ -1,7 +1,9 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use operp_types::{
-    account_id_from_pubkey, sha256, AccountId, Bps, MarketId, OrderId, OrderType, Price, Qty,
-    Side, TimeInForce, UnitId, Usd, MAX_PARENTS,
+    account_id_from_pubkey, sha256, AccountId, Bps, Height, MarketId, OrderId, OrderType, Price,
+    Qty,
+    Side, TimeInForce, UnitId, Usd, MAX_PARENTS, COMMIT_TAG, REVEAL_TAG,
+    UPDATE_EXTERNAL_PRICE_TAG,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -106,6 +108,29 @@ pub enum Op {
         target: AccountId,
         market: MarketId,
     },
+    /// v2 commit-reveal (doc 03 §2.3): registers `sha256(op_bytes(inner) ||
+    /// salt)` until `ttl_height`. Carries no content MEV; ordered salted.
+    Commit {
+        account: AccountId,
+        commit: [u8; 32],
+        ttl_height: Height,
+    },
+    /// v2 commit-reveal reveal half: proves the preimage of a prior Commit
+    /// and executes the inner operation. Must parent its Commit unit.
+    Reveal {
+        account: AccountId,
+        commit_ref: [u8; 32],
+        op: Box<Op>,
+        salt: [u8; 32],
+    },
+    /// External price tick posted by an allowlisted keeper (doc 06 §2.6).
+    /// Gated on `funding_source == AggregatedExternal`; rejected otherwise.
+    UpdateExternalPrice {
+        source: AccountId,
+        market: MarketId,
+        price: Price,
+        source_id: u8,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,7 +153,16 @@ pub enum DagError {
     Duplicate,
     #[error("empty parents")]
     EmptyParents,
+    #[error("deposit address too long")]
+    AddrTooLong,
+    #[error("orphan retry payload mismatch")]
+    RetryMismatch,
 }
+
+/// Hard cap on the Obyte withdrawal address bound by Deposit/GovDeposit ops.
+/// Enforced before signature checks so even the orphan-buffer path rejects
+/// oversized payloads.
+pub const MAX_ADDR_LEN: usize = 128;
 
 pub fn genesis_id() -> UnitId {
     UnitId(sha256(b"operp-mvp-1-genesis"))
@@ -136,12 +170,25 @@ pub fn genesis_id() -> UnitId {
 
 pub fn canonical_bytes(unit: &Unit) -> Vec<u8> {
     let mut b = Vec::new();
-    b.extend_from_slice(b"ODX1");
+    // v2 commit-reveal / external-price ops hash under the ODX2 domain so
+    // their unit ids can never collide with a legacy ODX1 id (doc 03 §2.3.2).
+    b.extend_from_slice(match &unit.op {
+        Op::Commit { .. } | Op::Reveal { .. } | Op::UpdateExternalPrice { .. } => &b"ODX2"[..],
+        _ => &b"ODX1"[..],
+    });
     b.push(unit.parents.len() as u8);
     for p in &unit.parents {
         b.extend_from_slice(&p.0);
     }
-    match &unit.op {
+    encode_op(&mut b, &unit.op);
+    b.extend_from_slice(&unit.pubkey);
+    b
+}
+
+/// Op payload encoding shared by `canonical_bytes` and the commit-reveal
+/// hash: tag byte followed by the op's fields in fixed wire order.
+fn encode_op(b: &mut Vec<u8>, op: &Op) {
+    match op {
         Op::Place {
             account,
             market,
@@ -296,9 +343,51 @@ pub fn canonical_bytes(unit: &Unit) -> Vec<u8> {
             b.extend_from_slice(&target.0);
             b.extend_from_slice(&market.0.to_le_bytes());
         }
+        Op::UpdateExternalPrice {
+            source,
+            market,
+            price,
+            source_id,
+        } => {
+            b.push(UPDATE_EXTERNAL_PRICE_TAG);
+            b.extend_from_slice(&source.0);
+            b.extend_from_slice(&market.0.to_le_bytes());
+            b.extend_from_slice(&price.to_le_bytes());
+            b.push(*source_id);
+        }
+        Op::Commit {
+            account,
+            commit,
+            ttl_height,
+        } => {
+            b.push(COMMIT_TAG);
+            b.extend_from_slice(&account.0);
+            b.extend_from_slice(commit);
+            b.extend_from_slice(&ttl_height.to_le_bytes());
+        }
+        Op::Reveal {
+            account,
+            commit_ref,
+            op,
+            salt,
+        } => {
+            b.push(REVEAL_TAG);
+            b.extend_from_slice(&account.0);
+            b.extend_from_slice(commit_ref);
+            // Inner payload in the same tagged wire order, so the commit
+            // hash (encode_op(inner) || salt) is derivable from bytes alone.
+            encode_op(b, op);
+            b.extend_from_slice(salt);
+        }
     }
-    b.extend_from_slice(&unit.pubkey);
-    b
+}
+
+/// Commit-reveal binding (doc 03 §2.3.1): sha256(op_bytes(inner) || salt).
+pub fn reveal_commit_hash(inner: &Op, salt: &[u8; 32]) -> [u8; 32] {
+    let mut buf = Vec::new();
+    encode_op(&mut buf, inner);
+    buf.extend_from_slice(salt);
+    sha256(&buf)
 }
 
 pub fn unit_id(unit: &Unit) -> UnitId {
@@ -330,6 +419,8 @@ fn account_matches(unit: &Unit) -> bool {
         | Op::GovWithdraw { account, .. } => *account == expected,
         Op::StakeOracle { account } | Op::UnstakeOracle { account } => *account == expected,
         Op::SlashOracle { challenger, .. } => *challenger == expected,
+        Op::Commit { account, .. } | Op::Reveal { account, .. } => *account == expected,
+        Op::UpdateExternalPrice { source, .. } => *source == expected,
         Op::Liquidate { caller, .. } | Op::FinalizeProposal { caller, .. } => *caller == expected,
         Op::ReportPrice { oracle, .. } => *oracle == expected,
         Op::CreateMarket { creator, .. } => *creator == expected,
@@ -416,25 +507,41 @@ impl Dag {
         let id = unit_id(&unit);
         self.insert_verified(unit, id)
     }
-
     /// Same as [`Dag::insert`] but the caller supplies the unit id, so an
     /// ingest path that already hashed the unit (signature check) never
     /// computes it twice. Unknown parents no longer drop the unit: on first
     /// sight it is buffered as an orphan and `Err(MissingParent)` returned; a
-    /// retry of the same unit while still orphaned returns its id without
-    /// error. Buffered orphans are linked automatically once their parents
-    /// arrive (see `mark_executed`), so out-of-order delivery recovers.
+    /// retry of the same canonical unit while still orphaned returns its id
+    /// without error — a retry with DIFFERENT canonical bytes under an equal
+    /// id is rejected with [`DagError::RetryMismatch`]. Buffered orphans are
+    /// linked automatically once their parents arrive (see `mark_executed`),
+    /// so out-of-order delivery recovers.
     ///
     /// Note: arrival-order buffering itself remains replica-dependent (which
-    /// units sit in the buffer depends on delivery order), but the eviction
-    /// choice below is a pure function of buffer contents — smallest UnitId —
-    /// so all replicas evict deterministically.
+    /// units sit in the buffer depends on delivery order). Eviction drops the
+    /// orphan with the smallest salted key sha256(salt||unit_id), where the
+    /// salt rotates with AA finalizations (`Engine::note_finalized`). Because
+    /// replicas can observe finalizations at slightly different times, two
+    /// replicas MAY evict different orphans before they converge; the DA
+    /// layer's temp_data full replay is the self-healing backstop that
+    /// restores a common unit set after convergence.
     pub fn insert_verified(&mut self, unit: Unit, id: UnitId) -> Result<UnitId, DagError> {
         if unit.parents.is_empty() {
             return Err(DagError::EmptyParents);
         }
         if unit.parents.len() > MAX_PARENTS {
             return Err(DagError::TooManyParents);
+        }
+        // Address-length gate BEFORE signature verification / buffering: a
+        // Deposit/GovDeposit with an oversized withdrawal addr must be
+        // rejected on every path, including the orphan buffer.
+        match &unit.op {
+            Op::Deposit { addr, .. } | Op::GovDeposit { addr, .. } => {
+                if addr.len() > MAX_ADDR_LEN {
+                    return Err(DagError::AddrTooLong);
+                }
+            }
+            _ => {}
         }
         let mut sorted = unit.parents.clone();
         sorted.sort();
@@ -452,15 +559,28 @@ impl Dag {
             .filter(|p| !self.known(*p))
             .collect();
         if !missing.is_empty() {
-            // Already buffered? Then report acceptance (pending), not an error.
+            // Already buffered? Accept the retry only if it is byte-for-byte
+            // the same unit: id equality alone is caller-supplied, and a
+            // second copy with different canonical bytes must not silently
+            // pass (the buffer keeps the first copy while the caller would
+            // believe its variant was accepted).
             if self.pending_orphans.contains_key(&id) {
+                if unit_id(&unit) != id
+                    || canonical_bytes(&unit) != canonical_bytes(&self.pending_orphans[&id])
+                {
+                    return Err(DagError::RetryMismatch);
+                }
                 return Ok(id);
             }
             if self.pending_orphans.len() >= ORPHAN_CAP {
-                // Deterministic eviction (Step9): drop the orphan with the
-                // smallest salted key sha256(salt||id) — grind-resistant vs
-                // bare lexicographic min, still a pure function of buffer
-                // contents so all replicas evict identically.
+                // Salted eviction (Step9): drop the orphan with the smallest
+                // key sha256(salt||id) — grind-resistant vs bare lexicographic
+                // min. The salt rotates with AA finalizations (see
+                // `Engine::note_finalized`), so eviction is NO LONGER a pure
+                // function of buffer contents: replicas whose finalize timing
+                // diverges pre-convergence may evict different orphans. The
+                // DA layer's temp_data full replay self-heals any resulting
+                // divergence.
                 if let Some(k) = self
                     .pending_orphans
                     .keys()
@@ -549,15 +669,31 @@ impl Dag {
         self.units.get(&id)
     }
 
+    /// Read-only P2P-layer support (docs/mainnet/04 §2.4.3): a WantUnits
+    /// peer serves missing units from BOTH linked units (`Dag::get`) and
+    /// buffered orphans. Pure peek — no mutation, no consensus-path effect.
+    pub fn get_orphan(&self, id: UnitId) -> Option<&Unit> {
+        self.pending_orphans.get(&id)
+    }
+
+    /// Read-only visibility check for the P2P layer (docs/mainnet/04 §2.4.2):
+    /// lets an off-engine observer compute which parents of an orphan are
+    /// still unknown so it can emit `WantUnits`. Same predicate as the
+    /// internal ingest-time missing-parent computation.
+    pub fn is_known(&self, id: UnitId) -> bool {
+        self.known(id)
+    }
+
     pub fn is_executed(&self, id: UnitId) -> bool {
         self.executed.contains(&id)
     }
 
     /// Deterministic execution order over all known-but-unexecuted units:
-    /// Kahn's topological sort with a smallest-UnitId tie-break, so any
-    /// replica derives the identical total order without consensus traffic.
-    /// Units whose parents are still buffered orphans stay excluded until
-    /// `mark_executed` links them.
+    /// Kahn's topological sort with the current eviction-salt tie-break
+    /// (sha256(salt||unit_id); salt set by `set_eviction_salt`), so replicas
+    /// sharing the same finalized-root salt derive the identical total order
+    /// without consensus traffic. Units whose parents are still buffered
+    /// orphans stay excluded until `mark_executed` links them.
     pub fn ready_linearized(&self) -> Vec<UnitId> {
         self.ready_linearized_with_salt(self.eviction_salt)
     }
@@ -813,5 +949,93 @@ mod tests {
         // by the signature preimage).
         assert_ne!(unit_id(&u1), unit_id(&u2));
         assert_ne!(u1.sig, u2.sig);
+    }
+    #[test]
+    fn oversized_deposit_addr_rejected() {
+        let account = account_id_from_pubkey(
+            &ed25519_dalek::SigningKey::from_bytes(&sk(6))
+                .verifying_key()
+                .to_bytes(),
+        );
+        // 129 chars > MAX_ADDR_LEN (128): must bounce before any buffering.
+        let long = "A".repeat(129);
+        let u = sign_unit(
+            vec![genesis_id()],
+            Op::Deposit {
+                account,
+                addr: long.clone(),
+                amount: 1,
+                aa_unit: [1; 32],
+            },
+            &sk(6),
+        );
+        assert_eq!(dag_insert_check(u), Err(DagError::AddrTooLong));
+        // GovDeposit is bound by the same cap.
+        let ug = sign_unit(
+            vec![genesis_id()],
+            Op::GovDeposit {
+                account,
+                addr: long,
+                amount: 1,
+                aa_unit: [1; 32],
+            },
+            &sk(6),
+        );
+        assert_eq!(dag_insert_check(ug), Err(DagError::AddrTooLong));
+        // Boundary: exactly 128 chars is legal.
+        let ok = sign_unit(
+            vec![genesis_id()],
+            Op::Deposit {
+                account,
+                addr: "A".repeat(MAX_ADDR_LEN),
+                amount: 1,
+                aa_unit: [1; 32],
+            },
+            &sk(6),
+        );
+        assert!(dag_insert_check(ok).is_ok());
+    }
+
+    /// insert() recomputes the id from canonical bytes; to exercise the
+    /// caller-supplied-id path (insert_verified) with a MISMATCHING id we
+    /// pass a deliberately wrong id directly.
+    fn dag_insert_check(u: Unit) -> Result<UnitId, DagError> {
+        let mut dag = Dag::new();
+        dag.insert(u)
+    }
+
+    #[test]
+    fn orphan_retry_with_different_payload_rejected() {
+        let mut dag = Dag::new();
+        let fake = UnitId([9; 32]);
+        let child = deposit(vec![fake], &sk(3), 1);
+        assert_eq!(dag.insert(child.clone()), Err(DagError::MissingParent));
+        // Same id, different canonical payload (amount tampered): the
+        // retry must not be silently accepted as the buffered copy.
+        let account = account_id_from_pubkey(
+            &ed25519_dalek::SigningKey::from_bytes(&sk(3))
+                .verifying_key()
+                .to_bytes(),
+        );
+        let impostor = sign_unit(
+            vec![fake],
+            Op::Deposit {
+                account,
+                addr: test_addr(1),
+                amount: 2 * USD_SCALE as i128,
+                aa_unit: [1; 32],
+            },
+            &sk(3),
+        );
+        // Force the impostor through the caller-supplied-id path with the
+        // ORIGINAL unit's id (signature no longer matches, but insert_verified
+        // is the DAG-level gate and must still catch the payload swap).
+        let original_id = unit_id(&child);
+        assert_eq!(
+            dag.insert_verified(impostor, original_id),
+            Err(DagError::RetryMismatch)
+        );
+        // The genuine retry still succeeds.
+        assert_eq!(dag.insert(child), Ok(original_id));
     }
 }

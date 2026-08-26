@@ -1,7 +1,14 @@
+//! Independent verification of deposit evidences (H2).
+//!
+//! An evidence binds a sidechain `Op::Deposit`/`Op::GovDeposit` anchor to a
+//! real Obyte joint that actually paid the vault AA. Verification is
+//! caller-parameterized (`expected_vault`, `perp_asset`) so replays never
+//! trust an evidence's self-declared payee.
+
 use crate::DepositEvidence;
 use crate::SettleError;
 use operp_dag::Op;
-use operp_types::{DEPOSIT_EVIDENCE_MAX_BYTES, VAULT_AA_ADDRESS};
+use operp_types::DEPOSIT_EVIDENCE_MAX_BYTES;
 use std::collections::{HashMap, HashSet};
 
 use crate::obyte_hash::get_unit_hash;
@@ -20,26 +27,63 @@ fn amount_str_matches(ev_amount: &str, op_amount_str: &str) -> bool {
     ev_amount == op_amount_str
 }
 
-fn find_payment_output(
+/// True when an Obyte asset string (hex or base64 of the 32-byte id)
+/// identifies `want`.
+fn asset_matches(s: &str, want: &[u8; 32]) -> bool {
+    if s == hex::encode(want) {
+        return true;
+    }
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map(|b| b.as_slice() == want)
+        .unwrap_or(false)
+}
+
+
+/// Finds the first output paying `vault` in the expected asset kind; accepts
+/// an output to ANY address when `vault` is None (vault address not
+/// configured pre-deploy). Asset-class binding is enforced either way so a
+/// PERP evidence can never ride a non-PERP payment.
+fn find_payment_output_opt(
     unit: &serde_json::Value,
-    vault: &str,
+    vault: Option<&str>,
     is_perp: bool,
+    perp_asset: &[u8; 32],
 ) -> Option<(String, Option<String>)> {
-    // Returns (amount_string, asset_string)
-    // unit is the Obyte unit object (joint.unit)
     let messages = unit.get("messages")?.as_array()?;
     for msg in messages {
         let payload = msg.get("payload")?;
-        // payload may contain outputs for payment messages
         let outputs = payload.get("outputs")?.as_array()?;
-        let asset = payload.get("asset").and_then(|v| v.as_str()).map(|s| s.to_string());
-        // For base, asset is None or "base"
-        for out in outputs {
-            let addr = out.get("address")?.as_str()?;
-            if addr != vault {
+        let asset = payload
+            .get("asset")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let is_base = match &asset {
+            None => true,
+            Some(a) => a == "base",
+        };
+        if is_perp == is_base {
+            // Wrong asset class for this evidence kind.
+            continue;
+        }
+        if is_perp {
+            // PERP-class payment must carry exactly the governed PERP asset.
+            if !asset
+                .as_deref()
+                .map(|a| asset_matches(a, perp_asset))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            // amount may be number or string? Obyte uses integer numbers
+        }
+        for out in outputs {
+            let addr = out.get("address")?.as_str()?;
+            if let Some(v) = vault {
+                if addr != v {
+                    continue;
+                }
+            }
             let amount_val = out.get("amount")?;
             let amount_str = if let Some(n) = amount_val.as_u64() {
                 n.to_string()
@@ -50,15 +94,6 @@ fn find_payment_output(
             } else {
                 continue;
             };
-            // Filter by asset kind
-            let is_asset_perp = asset.is_some() && asset.as_deref() != Some("base");
-            if is_perp != is_asset_perp {
-                // For base deposits we expect base asset; for perp we expect non-base
-                // However if payload has no asset field, it's base
-                // So skip mismatched
-                // But allow base asset_outputs to still be considered for perp? No.
-                continue;
-            }
             return Some((amount_str, asset));
         }
     }
@@ -68,12 +103,14 @@ fn find_payment_output(
 fn verify_one(
     op: &Op,
     ev: &DepositEvidence,
+    expected_vault: &str,
+    perp_asset: &[u8; 32],
 ) -> Result<([u8; 32], bool), SettleError> {
     // op kind and aa_unit extraction
     let (op_aa_unit, op_amount_str, op_is_perp) = match op {
         Op::Deposit { aa_unit, amount, .. } => (*aa_unit, amount.to_string(), false),
         Op::GovDeposit { aa_unit, amount, .. } => (*aa_unit, amount.to_string(), true),
-        _ => return Ok(( [0u8;32], false)), // not a deposit, caller filters
+        _ => return Ok(([0u8; 32], false)), // not a deposit, caller filters
     };
 
     // aa_unit hex string must decode and equal op aa_unit
@@ -89,8 +126,9 @@ fn verify_one(
     if !amount_str_matches(&ev.amount, &op_amount_str) {
         return Err(SettleError::DepositContentMismatch);
     }
-    // vault address check if configured
-    if !VAULT_AA_ADDRESS.is_empty() && ev.vault_address != VAULT_AA_ADDRESS {
+    // Payee check (H2): the declared vault must equal the caller's expected
+    // vault — an evidence can no longer vouch for itself.
+    if ev.vault_address != expected_vault {
         return Err(SettleError::DepositContentMismatch);
     }
     // hash check
@@ -98,45 +136,42 @@ fn verify_one(
     if computed != ev_bytes {
         return Err(SettleError::DepositContentMismatch);
     }
-    // content check: joint must actually pay vault
+    // content check: joint must actually pay the expected vault
     let unit_obj = if let Some(u) = ev.joint.get("unit") {
         u
     } else {
         &ev.joint
     };
-    let vault_to_check = if ev.vault_address.is_empty() {
-        VAULT_AA_ADDRESS
+    // Content check: the joint must actually pay the expected vault the
+    // claimed (amount, asset). Pre-deploy (empty expected vault) any payee
+    // is accepted, but the asset-class binding below still applies.
+    let vault_arg = if expected_vault.is_empty() {
+        None
     } else {
-        ev.vault_address.as_str()
+        Some(expected_vault)
     };
-    // If vault address empty (not configured), skip payee check except to require that some output exists
-    if !vault_to_check.is_empty() {
-        if let Some((joint_amount_str, _asset)) = find_payment_output(unit_obj, vault_to_check, ev.is_perp) {
+    match find_payment_output_opt(unit_obj, vault_arg, ev.is_perp, perp_asset) {
+        Some((joint_amount_str, _asset)) => {
             if ev.is_perp {
                 // For PERP, joint amount should equal ev.amount directly
                 if joint_amount_str != ev.amount {
                     return Err(SettleError::DepositContentMismatch);
                 }
             } else {
-                // For base, joint amount is ev.amount + 10000 bounce
-                // ev.amount is the credited amount, joint pays +10000
-                let ev_amt: i128 = ev.amount.parse().map_err(|_| SettleError::DepositContentMismatch)?;
-                let joint_amt: i128 = joint_amount_str.parse().map_err(|_| SettleError::DepositContentMismatch)?;
-                if joint_amt != ev_amt + 10000 {
-                    // Also allow exact match if test fixtures use exact (without bounce)
-                    // To keep tests flexible, accept either exact or +10000
-                    if joint_amt != ev_amt {
-                        return Err(SettleError::DepositContentMismatch);
-                    }
+                // For base, joint amount is ev.amount + 10000 bounce fee;
+                // ev.amount is the credited amount. Exact match is also
+                // accepted for fixtures that post without the fee.
+                let ev_amt: i128 =
+                    ev.amount.parse().map_err(|_| SettleError::DepositContentMismatch)?;
+                let joint_amt: i128 = joint_amount_str
+                    .parse()
+                    .map_err(|_| SettleError::DepositContentMismatch)?;
+                if joint_amt != ev_amt + 10000 && joint_amt != ev_amt {
+                    return Err(SettleError::DepositContentMismatch);
                 }
             }
-        } else {
-            // No matching output found
-            // If vault not configured, we might skip, but if vault configured we must fail
-            // For tests where joint is minimal stub, allow missing output only if joint has no messages?
-            // Be strict: require output
-            return Err(SettleError::DepositContentMismatch);
         }
+        None => return Err(SettleError::DepositContentMismatch),
     }
     Ok((ev_bytes, ev.is_perp))
 }
@@ -144,6 +179,8 @@ fn verify_one(
 pub fn verify_all(
     units: &[operp_dag::Unit],
     evidences: &[DepositEvidence],
+    expected_vault: &str,
+    perp_asset: &[u8; 32],
 ) -> Result<HashMap<[u8; 32], bool>, SettleError> {
     // Size gate
     let total_bytes: usize = evidences
@@ -153,7 +190,6 @@ pub fn verify_all(
     if total_bytes > DEPOSIT_EVIDENCE_MAX_BYTES {
         return Err(SettleError::DepositEvidenceTooLarge);
     }
-    // Also check per-evidence joint size? Use total.
 
     // Dedup
     let mut seen: HashSet<String> = HashSet::new();
@@ -179,18 +215,16 @@ pub fn verify_all(
         if !is_deposit {
             continue;
         }
-        let (op_aa_unit, _, _) = match &u.op {
-            Op::Deposit { aa_unit, .. } => (*aa_unit, 0, false),
-            Op::GovDeposit { aa_unit, .. } => (*aa_unit, 0, true),
+        let op_aa_unit = match &u.op {
+            Op::Deposit { aa_unit, .. } => *aa_unit,
+            Op::GovDeposit { aa_unit, .. } => *aa_unit,
             _ => unreachable!(),
         };
-        let hex = hex::encode(op_aa_unit);
-        let ev = map.get(&hex).ok_or(SettleError::DepositAnchorMissing)?;
-        let (bytes, is_perp) = verify_one(&u.op, ev)?;
+        let hex_id = hex::encode(op_aa_unit);
+        let ev = map.get(&hex_id).ok_or(SettleError::DepositAnchorMissing)?;
+        let (bytes, is_perp) = verify_one(&u.op, ev, expected_vault, perp_asset)?;
         verified.insert(bytes, is_perp);
     }
 
-    // Sort check not needed for HashMap; caller will insert deterministically.
-    // Ensure evidences are sorted lexicographically for determinism (not enforced here but payload sorts)
     Ok(verified)
 }

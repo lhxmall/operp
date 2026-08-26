@@ -141,6 +141,21 @@ fn get_base64_hash(obj: &Value, b_json_based: bool) -> Result<Vec<u8>, String> {
     Ok(hash.to_vec())
 }
 
+
+/// Canonical Obyte JSON source of `v` (ocore `string_utils.getJsonSource`):
+/// object keys recursively sorted lexicographically, arrays order-preserving,
+/// minified, numbers via ocore's toString rules. Panics on values the Obyte
+/// canonical form rejects (nulls, empty containers) — temp_data payloads are
+/// always well-formed.
+pub fn get_json_source(v: &Value) -> String {
+    get_json_source_string(v).expect("value has an Obyte canonical JSON source")
+}
+
+/// data_hash = sha256(get_json_source(v)), hex-encoded by callers.
+pub fn get_data_hash(v: &Value) -> [u8; 32] {
+    Sha256::digest(get_json_source(v).as_bytes()).into()
+}
+
 // ---- naked / stripped ----
 fn get_naked_unit(unit: &Value) -> Value {
     let mut naked = unit.clone();
@@ -297,5 +312,30 @@ mod tests {
         }
         let h3 = get_unit_hash(&unit2).unwrap();
         assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn golden_vector_matches_ocore_get_json_source() {
+        // Cross-checked against ocore string_utils.getJsonSourceString:
+        //   node -e "const su=require('.../ocore/string_utils.js');
+        //            const obj={alpha:{k1:'v',k2:[1,2.5,true]},mid:false,s:'hello',zeta:1};
+        //            console.log(su.getJsonSourceString(obj))"
+        // → {"alpha":{"k1":"v","k2":[1,2.5,true]},"mid":false,"s":"hello","zeta":1}
+        // sha256 hex = 99eb495a661595222840f105f122791c0e27f91b6ac98a8a265c80d2e6fe04d9
+        // UTF-8 length = 71 (contract shared with obyte-local/post_batch.js).
+        let v: Value = serde_json::from_str(
+            r#"{"s":"hello","zeta":1,"mid":false,"alpha":{"k2":[1,2.5,true],"k1":"v"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            get_json_source(&v),
+            r#"{"alpha":{"k1":"v","k2":[1,2.5,true]},"mid":false,"s":"hello","zeta":1}"#
+        );
+        assert_eq!(get_json_source(&v).len(), 71);
+        let h = get_data_hash(&v);
+        assert_eq!(
+            hex::encode(h),
+            "99eb495a661595222840f105f122791c0e27f91b6ac98a8a265c80d2e6fe04d9"
+        );
     }
 }

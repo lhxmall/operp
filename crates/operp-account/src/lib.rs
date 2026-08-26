@@ -225,7 +225,10 @@ fn realize(old_qty: i64, entry: Price, exit: Price, reduce_qty: Qty) -> Usd {
     } else {
         i128::from(entry) - i128::from(exit)
     };
-    signed * i128::from(reduce_qty) / i128::from(PRICE_SCALE) * i128::from(USD_SCALE)
+    // Scale up BEFORE dividing: `x / PRICE_SCALE * USD_SCALE` truncates
+    // toward zero on every partial step (fixed by multiplying first).
+    signed * i128::from(reduce_qty) * i128::from(USD_SCALE)
+        / i128::from(PRICE_SCALE)
         / i128::from(QTY_SCALE)
 }
 

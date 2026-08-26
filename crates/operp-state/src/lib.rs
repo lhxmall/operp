@@ -1,11 +1,12 @@
 pub use operp_account::Account;
 use operp_book::{Fill, OrderBook};
 use operp_types::{
-    bps, genesis_params, notional_usd, sha256, AccountId, FundingSourceKind, Height, MarketId,
-    MarketParams, OracleConfig, Price, ReportSample, Seq, TwapSample, UnitId, Usd, BTC_USD,
+    bps, genesis_params, notional_usd, sha256, AccountId, ExternalSample, FundingSourceKind,
+    Height, MarketId, MarketParams, OracleConfig, Price, ReportSample, Seq, TwapSample, UnitId,
+    Usd, BTC_USD, FUNDING_TWAP_MIN_SAMPLES, FUNDING_TWAP_WINDOW, FUNDING_EXTERNAL_MAX_STALENESS,
     INSURANCE_ACCOUNT, INSURANCE_SEED, PRICE_SCALE, USD_SCALE,
 };
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 pub mod journal;
 pub mod persist;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -89,6 +90,24 @@ pub struct ChainState {
     pub oracle_unbonding: BTreeMap<AccountId, Height>,
     /// Slash nonce counter for replay/debug (committed in meta leaf).
     pub oracle_slash_nonce: u64,
+    /// Pending commit-reveal commits keyed by commit hash (doc 03 §2.3.3).
+    pub commits: BTreeMap<[u8; 32], CommitEntry>,
+    /// External keeper price ring (doc 06 §2.3). Empty in BondedMedianTwap.
+    pub external_price_ring: BTreeMap<MarketId, VecDeque<ExternalSample>>,
+    /// Keeper accounts allowed to post `UpdateExternalPrice` (governed).
+    pub external_sources: BTreeSet<AccountId>,
+}
+
+/// A registered commit-reveal commitment (doc 03 §2.3.3). `commit_unit`
+/// records the Commit unit's id so Reveal parent-edge enforcement (doc
+/// §2.3.4) can require the reveal to descend from its commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommitEntry {
+    pub account: AccountId,
+    pub commit_unit: UnitId,
+    pub commit_height: Height,
+    pub ttl_height: Height,
+    pub revealed: bool,
 }
 
 /// An open governance proposal. `deadline_seq` and the quorum denominator
@@ -185,6 +204,9 @@ impl ChainState {
             perp_supply: 0,
             perp_burned: 0,
             proposals: BTreeMap::new(),
+            commits: BTreeMap::new(),
+            external_price_ring: BTreeMap::new(),
+            external_sources: BTreeSet::new(),
             next_proposal_id: 1,
             seen_aa_units: HashMap::new(),
             seen_client_seq: HashMap::new(),
@@ -260,7 +282,7 @@ impl ChainState {
         self.oracle_configs.get(&market).copied().unwrap_or_default()
     }
 
-    fn record_twap_sample(&mut self, market: MarketId, median: Price) {
+    fn record_twap_sample(&mut self, market: MarketId, median: Price, seq: Seq) {
         let cfg = self.oracle_config(market);
         let window_len = cfg.twap_window as usize;
         // Cap window_len to max to avoid unbounded growth if governance mis-sets
@@ -269,25 +291,31 @@ impl ChainState {
         if q.back().map(|s| s.height == self.height).unwrap_or(false) {
             // Same height: overwrite median if different (multiple reporters same batch)
             if q.back().unwrap().median != median {
-                q.back_mut().unwrap().median = median;
+                let back = q.back_mut().unwrap();
+                back.median = median;
+                back.seq = seq;
             } else {
                 return;
             }
         } else {
-            q.push_back(TwapSample { height: self.height, median });
+            q.push_back(TwapSample { seq, height: self.height, median });
             while q.len() > cap {
                 q.pop_front();
             }
         }
-        // Mirror into funding_twap and cache funding_index_twap for effective_funding_index
+        // Mirror into funding_twap and cache funding_index_twap for effective_funding_index.
+        // Doc 06 §2.4: dedup same-height-same-median so multiple reporters in one batch
+        // don't double-count; a different median at the same height overwrites (last wins).
         let fq = self.funding_twap.entry(market).or_default();
         if fq.back().map(|s| s.height == self.height).unwrap_or(false) {
             if fq.back().unwrap().median != median {
-                fq.back_mut().unwrap().median = median;
+                let back = fq.back_mut().unwrap();
+                back.median = median;
+                back.seq = seq;
             }
         } else {
-            fq.push_back(TwapSample { height: self.height, median });
-            while fq.len() > operp_types::FUNDING_TWAP_WINDOW as usize {
+            fq.push_back(TwapSample { seq, height: self.height, median });
+            while fq.len() > FUNDING_TWAP_WINDOW as usize {
                 fq.pop_front();
             }
         }
@@ -297,6 +325,46 @@ impl ChainState {
         if let Some(ftwap) = self.compute_funding_twap(market) {
             self.funding_index_twap.insert(market, ftwap);
         }
+    }
+
+    /// Record an external keeper tick (doc 06 §2.6): allowlist + live-market +
+    /// positive-price gated by the caller; ring capped at the funding window.
+    pub fn apply_external_price(
+        &mut self,
+        _source: AccountId,
+        market: MarketId,
+        price: Price,
+        source_id: u8,
+        seq: Seq,
+    ) {
+        let q = self.external_price_ring.entry(market).or_default();
+        q.push_back(ExternalSample { seq, height: self.height, price, source_id });
+        while q.len() > FUNDING_TWAP_WINDOW as usize {
+            q.pop_front();
+        }
+    }
+
+    /// TWAP over the external keeper ring (doc 06 §2.6 rule 2): requires
+    /// MIN_SAMPLES and freshness within FUNDING_EXTERNAL_MAX_STALENESS so a
+    /// dead feed falls back instead of freezing funding.
+    pub fn external_twap(&self, market: MarketId) -> Option<Price> {
+        let q = self.external_price_ring.get(&market)?;
+        if q.len() < FUNDING_TWAP_MIN_SAMPLES {
+            return None;
+        }
+        let last = q.back()?;
+        if last.height + FUNDING_EXTERNAL_MAX_STALENESS <= self.height {
+            return None;
+        }
+        let sum: u128 = q.iter().map(|s| s.price as u128).sum();
+        Some((sum / q.len() as u128) as Price)
+    }
+
+    /// Bounded cleanup for expired commit-reveal commitments: entries whose
+    /// reveal deadline has passed are dropped at batch commit (doc 03 §2.3.3
+    /// rule 4). Length is additionally bounded by the per-account cap.
+    pub fn prune_commits(&mut self, min_height: Height) {
+        self.commits.retain(|_, e| e.ttl_height >= min_height);
     }
 
     pub fn compute_twap(&self, market: MarketId) -> Option<Price> {
@@ -316,7 +384,6 @@ impl ChainState {
         let sum: u128 = q.iter().map(|s| s.median as u128).sum();
         Some((sum / q.len() as u128) as Price)
     }
-
     pub fn effective_funding_index(&self, market: MarketId, median: Price) -> Price {
         if self.height < operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT {
             return median;
@@ -326,8 +393,12 @@ impl ChainState {
                 self.funding_index_twap.get(&market).copied().unwrap_or(median)
             }
             FundingSourceKind::AggregatedExternal => {
-                // v1: no external feed, fallback to funding twap then median
-                self.funding_index_twap.get(&market).copied().unwrap_or(median)
+                // Doc 06 §2.6 rule 1: external TWAP overrides when fresh and
+                // populated; else fall back to bonded-median TWAP, then the
+                // instant median — funding never freezes.
+                self.external_twap(market).unwrap_or_else(|| {
+                    self.funding_index_twap.get(&market).copied().unwrap_or(median)
+                })
             }
         }
     }
@@ -481,6 +552,7 @@ impl ChainState {
         oracle: AccountId,
         market: MarketId,
         price: Price,
+        caller_seq: Seq,
     ) -> Result<(), StateError> {
         if price == 0 || !self.oracle_bonds.contains_key(&oracle) {
             return Ok(());
@@ -536,7 +608,7 @@ impl ChainState {
         };
         self.marks.insert(market, capped);
         // Record TWAP sample after median update
-        self.record_twap_sample(market, median);
+        self.record_twap_sample(market, median, caller_seq);
         // Funding: once at least two valid reports exist, every report tick
         // settles peer-to-peer funding.
         // premium_bps = (spot − funding_index)/funding_index, clamped to ±FUNDING_CAP_BPS.
@@ -839,6 +911,7 @@ fn meta_leaf(state: &ChainState) -> [u8; 32] {
         b.extend_from_slice(&m.0.to_le_bytes());
         b.extend_from_slice(&(window.len() as u32).to_le_bytes());
         for s in window {
+            b.extend_from_slice(&s.seq.to_le_bytes());
             b.extend_from_slice(&s.height.to_le_bytes());
             b.extend_from_slice(&s.median.to_le_bytes());
         }
@@ -848,6 +921,7 @@ fn meta_leaf(state: &ChainState) -> [u8; 32] {
         b.extend_from_slice(&m.0.to_le_bytes());
         b.extend_from_slice(&(window.len() as u32).to_le_bytes());
         for s in window {
+            b.extend_from_slice(&s.seq.to_le_bytes());
             b.extend_from_slice(&s.height.to_le_bytes());
             b.extend_from_slice(&s.median.to_le_bytes());
         }
@@ -856,6 +930,34 @@ fn meta_leaf(state: &ChainState) -> [u8; 32] {
     for (m, v) in &state.funding_index_twap {
         b.extend_from_slice(&m.0.to_le_bytes());
         b.extend_from_slice(&v.to_le_bytes());
+    }
+    // External keeper price ring (doc 06 §2.3): empty in v1 BondedMedianTwap
+    // (zero bytes beyond the length prefix), committed for forward compat.
+    b.extend_from_slice(&(state.external_price_ring.len() as u32).to_le_bytes());
+    for (m, ring) in &state.external_price_ring {
+        b.extend_from_slice(&m.0.to_le_bytes());
+        b.extend_from_slice(&(ring.len() as u32).to_le_bytes());
+        for s in ring {
+            b.extend_from_slice(&s.seq.to_le_bytes());
+            b.extend_from_slice(&s.height.to_le_bytes());
+            b.extend_from_slice(&s.price.to_le_bytes());
+            b.push(s.source_id);
+        }
+    }
+    b.extend_from_slice(&(state.external_sources.len() as u32).to_le_bytes());
+    for acct in &state.external_sources {
+        b.extend_from_slice(&acct.0);
+    }
+    // Pending commit-reveal commitments (doc 03 §2.3.3): keyed by commit
+    // hash, BTreeMap order is deterministic.
+    b.extend_from_slice(&(state.commits.len() as u32).to_le_bytes());
+    for (h, e) in &state.commits {
+        b.extend_from_slice(h);
+        b.extend_from_slice(&e.account.0);
+        b.extend_from_slice(&e.commit_unit.0);
+        b.extend_from_slice(&e.commit_height.to_le_bytes());
+        b.extend_from_slice(&e.ttl_height.to_le_bytes());
+        b.push(e.revealed as u8);
     }
     b.extend_from_slice(&[state.funding_source as u8]);
     // oracle_configs
@@ -866,6 +968,59 @@ fn meta_leaf(state: &ChainState) -> [u8; 32] {
         b.extend_from_slice(&cfg.twap_window.to_le_bytes());
         b.extend_from_slice(&cfg.slash_reward_bps.to_le_bytes());
     }
+    // Latest report per (market, reporter): the effective mark median reads
+    // this map, so leaving it uncommitted let replays diverge on marks.
+    b.extend_from_slice(&(state.oracle_reports.len() as u32).to_le_bytes());
+    for ((m, acct), price) in &state.oracle_reports {
+        b.extend_from_slice(&m.0.to_le_bytes());
+        b.extend_from_slice(&acct.0);
+        b.extend_from_slice(&price.to_le_bytes());
+    }
+    // Per-reporter last-K report history (slash streak-detection input).
+    b.extend_from_slice(&(state.oracle_report_history.len() as u32).to_le_bytes());
+    for ((m, acct), q) in &state.oracle_report_history {
+        b.extend_from_slice(&m.0.to_le_bytes());
+        b.extend_from_slice(&acct.0);
+        b.extend_from_slice(&(q.len() as u32).to_le_bytes());
+        for s in q {
+            b.extend_from_slice(&s.height.to_le_bytes());
+            b.extend_from_slice(&s.price.to_le_bytes());
+            b.extend_from_slice(&s.seq.to_le_bytes());
+        }
+    }
+    // Open governance proposals (tallies + creation weight snapshots);
+    // HashSet membership is committed via sorted iteration for determinism.
+    b.extend_from_slice(&(state.proposals.len() as u32).to_le_bytes());
+    for (id, p) in &state.proposals {
+        b.extend_from_slice(&id.to_le_bytes());
+        b.extend_from_slice(&p.creator.0);
+        b.extend_from_slice(&p.market.0.to_le_bytes());
+        b.push(p.key as u8);
+        b.extend_from_slice(&p.value.to_le_bytes());
+        b.extend_from_slice(&p.created_seq.to_le_bytes());
+        b.extend_from_slice(&p.deadline_seq.to_le_bytes());
+        b.extend_from_slice(&p.supply_at_create.to_le_bytes());
+        b.extend_from_slice(&p.yes.to_le_bytes());
+        b.extend_from_slice(&p.no.to_le_bytes());
+        let mut voted: Vec<&AccountId> = p.voted.iter().collect();
+        voted.sort();
+        b.extend_from_slice(&(voted.len() as u32).to_le_bytes());
+        for v in voted {
+            b.extend_from_slice(&v.0);
+        }
+        b.extend_from_slice(&(p.weight_snapshot.len() as u32).to_le_bytes());
+        for (a, w) in &p.weight_snapshot {
+            b.extend_from_slice(&a.0);
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    // Mirrored PERP balances and circulating supply.
+    b.extend_from_slice(&(state.perp_balances.len() as u32).to_le_bytes());
+    for (a, bal) in &state.perp_balances {
+        b.extend_from_slice(&a.0);
+        b.extend_from_slice(&bal.to_le_bytes());
+    }
+    b.extend_from_slice(&state.perp_supply.to_le_bytes());
     sha256(&b)
 }
 
@@ -1055,6 +1210,88 @@ fn aa_pairs_of(state: &ChainState) -> Vec<(String, Usd, u128, i128)> {
         .collect()
 }
 
+/// ---- Sharded AA forest (doc 10 §5.2, Phase 5.2 wire change) ----
+///
+/// The vault AA commits ONE 1024-hex `aa_forest` per batch: the 16 shard
+/// roots concatenated (shard i at offset i*64), which fits
+/// MAX_STATE_VAR_VALUE_LENGTH=1024 exactly and keeps every AA path a single
+/// var operation. Withdrawal proofs stay depth ≤ MAX_AA_TREE_DEPTH *within*
+/// their shard; the AA extracts the claimed shard's root via substring.
+
+pub const AA_SHARD_COUNT: usize = 16;
+
+/// Shard of an address: low 4 bits of sha256(address)[0] — deterministic,
+/// address-only, uniform (doc 10 §B1(1)). The AA never recomputes it; it
+/// trusts the claimed `shard` tag because soundness comes from the leaf
+/// preimage (a mis-claimed shard folds to that shard's root and fails).
+pub fn aa_shard_of(addr: &str) -> u8 {
+    sha256(addr.as_bytes())[0] & 0x0f
+}
+
+/// Distinct per-shard sentinel so an empty shard's committed root can never
+/// be reused as another empty shard's root (zero-proof cross-shard hopping,
+/// doc 10 §5.4). Unforgeable: deriving it requires preimaging sha256.
+fn aa_empty_shard_root(shard: usize) -> String {
+    hex::encode(sha256(format!("empty:{}", shard).as_bytes()))
+}
+
+/// Roots of the 16 per-shard hex-domain trees over `pairs`, bucketed by
+/// [`aa_shard_of`]. Each bucket root reuses [`aa_root_of`] verbatim — zero
+/// new crypto. Empty shards get distinct sentinels.
+pub fn aa_sharded_roots_of(pairs: &[(String, Usd, u128, i128)]) -> [String; AA_SHARD_COUNT] {
+    let mut buckets: Vec<Vec<(String, Usd, u128, i128)>> = vec![Vec::new(); AA_SHARD_COUNT];
+    for p in pairs {
+        buckets[aa_shard_of(&p.0) as usize].push(p.clone());
+    }
+    std::array::from_fn(|i| {
+        if buckets[i].is_empty() {
+            aa_empty_shard_root(i)
+        } else {
+            aa_root_of(&buckets[i])
+        }
+    })
+}
+
+/// 64-hex hash over the concatenated forest — the checkpoint's `aa_root`.
+/// Binds the whole forest so watchers can cross-check the 1024-hex string
+/// the operator posts on-chain against one length-checked field.
+pub fn aa_forest_hash(shards: &[String; AA_SHARD_COUNT]) -> String {
+    hex::encode(sha256(shards.concat().as_bytes()))
+}
+
+/// Sharded roots over every AA-bound account (same binding rules as
+/// [`aa_root_of_state`]: unbound accounts are excluded).
+pub fn aa_sharded_roots_of_state(state: &ChainState) -> [String; AA_SHARD_COUNT] {
+    aa_sharded_roots_of(&aa_pairs_of(state))
+}
+
+/// Proof path for one address within its shard's tree:
+/// `(shard, siblings, shard_root)`. Returns `None` when the path would need
+/// more than `MAX_AA_TREE_DEPTH` siblings (the AA unrolls exactly that many
+/// reduction steps per proof).
+pub fn aa_sharded_proof_for(
+    pairs: &[(String, Usd, u128, i128)],
+    addr: &str,
+) -> Option<(u8, Vec<(String, bool)>, String)> {
+    let shard = aa_shard_of(addr);
+    let bucket: Vec<_> = pairs
+        .iter()
+        .filter(|(a, ..)| aa_shard_of(a) == shard)
+        .cloned()
+        .collect();
+    let (siblings, root) = aa_proof_for(&bucket, addr)?;
+    Some((shard, siblings, root))
+}
+
+/// Sharded proof for an account by sidechain id.
+pub fn aa_sharded_proof_for_account(
+    state: &ChainState,
+    id: &AccountId,
+) -> Option<(u8, Vec<(String, bool)>, String)> {
+    let addr = state.aa_addresses.get(id)?;
+    aa_sharded_proof_for(&aa_pairs_of(state), addr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,7 +1392,7 @@ mod tests {
         let ob = AccountId([6; 32]);
         s.oracle_bonds.insert(oa, operp_types::ORACLE_BOND_PERP);
         s.oracle_bonds.insert(ob, operp_types::ORACLE_BOND_PERP);
-        s.apply_report(oa, BTC_USD, 100_000 * operp_types::PRICE_SCALE)
+        s.apply_report(oa, BTC_USD, 100_000 * operp_types::PRICE_SCALE, 1)
             .unwrap();
         let pre_funding =
             s.accounts[&long].collateral + s.accounts[&short].collateral;
@@ -1164,7 +1401,7 @@ mod tests {
         // (the smaller middle when even). |89k − 100k| = 11k > 10k, so the
         // ±10% cap holds the spot mark at 100k while the index drops to
         // 89k: premium > 0 → long pays short.
-        s.apply_report(ob, BTC_USD, 89_000 * operp_types::PRICE_SCALE)
+        s.apply_report(ob, BTC_USD, 89_000 * operp_types::PRICE_SCALE, 2)
             .unwrap();
 
         let long_bal = s.accounts[&long].collateral;
@@ -1232,10 +1469,150 @@ mod tests {
                 .map(|i| (format!("A{:031}", i), 1, 0u128, 0i128))
                 .collect()
         };
-        let ok = mk(1 << operp_types::MAX_AA_TREE_DEPTH);
-        assert!(aa_proof_for(&ok, &format!("A{:031}", 1)).is_some());
         let too_deep = mk((1 << operp_types::MAX_AA_TREE_DEPTH) + 1);
         assert!(aa_proof_for(&too_deep, &format!("A{:031}", 1)).is_none());
+    }
+
+    #[test]
+    fn external_twap_requires_min_samples_and_freshness() {
+        let mut s = ChainState::new();
+        let keeper = AccountId([7; 32]);
+        // One sample: below FUNDING_TWAP_MIN_SAMPLES → None.
+        s.apply_external_price(keeper, BTC_USD, 90_000 * PRICE_SCALE, 0, 1);
+        assert_eq!(s.external_twap(BTC_USD), None);
+        // Second distinct-height sample: TWAP forms.
+        s.height += 1;
+        s.apply_external_price(keeper, BTC_USD, 92_000 * PRICE_SCALE, 0, 2);
+        assert_eq!(
+            s.external_twap(BTC_USD),
+            Some((90_000 * PRICE_SCALE + 92_000 * PRICE_SCALE) / 2)
+        );
+        // Feed dies: past FUNDING_EXTERNAL_MAX_STALENESS the ring reads as
+        // stale (None) so effective_funding_index falls back (doc 06 §2.6).
+        s.height += operp_types::FUNDING_EXTERNAL_MAX_STALENESS + 1;
+        assert_eq!(s.external_twap(BTC_USD), None);
+        // Window cap holds the ring bounded at FUNDING_TWAP_WINDOW samples.
+        for i in 0..(operp_types::FUNDING_TWAP_WINDOW + 10) {
+            s.height += 1;
+            s.apply_external_price(keeper, BTC_USD, 50_000 * PRICE_SCALE, 0, i);
+        }
+        assert_eq!(
+            s.external_price_ring[&BTC_USD].len(),
+            operp_types::FUNDING_TWAP_WINDOW as usize
+        );
+    }
+
+    #[test]
+    fn prune_commits_drops_expired_entries() {
+        let mut s = ChainState::new();
+        let acct = AccountId([3; 32]);
+        s.commits.insert(
+            [1u8; 32],
+            CommitEntry {
+                account: acct,
+                commit_unit: UnitId([9u8; 32]),
+                commit_height: 100,
+                ttl_height: 116,
+                revealed: false,
+            },
+        );
+        s.commits.insert(
+            [2u8; 32],
+            CommitEntry {
+                account: acct,
+                commit_unit: UnitId([8u8; 32]),
+                commit_height: 110,
+                ttl_height: 126,
+                revealed: true,
+            },
+        );
+        // At min_height <= ttl the entries stay (reveal still legal).
+        s.prune_commits(116);
+        assert_eq!(s.commits.len(), 2);
+        // Past both TTLs everything expires (doc 03 §2.3.3 rule 4).
+        s.prune_commits(127);
+        assert!(s.commits.is_empty());
+    }
+
+    #[test]
+    fn twap_samples_carry_seq_and_dedup_same_height() {
+        let mut s = ChainState::new();
+        let oa = AccountId([5; 32]);
+        let ob = AccountId([6; 32]);
+        s.oracle_bonds.insert(oa, operp_types::ORACLE_BOND_PERP);
+        s.oracle_bonds.insert(ob, operp_types::ORACLE_BOND_PERP);
+        // Two reporters, same height, same median → one funding sample.
+        s.apply_report(oa, BTC_USD, 90_000 * PRICE_SCALE, 1).unwrap();
+        s.apply_report(ob, BTC_USD, 90_000 * PRICE_SCALE, 2).unwrap();
+        assert_eq!(s.funding_twap[&BTC_USD].len(), 1);
+        // New height, new median → new sample with that height's seq.
+        s.height += 1;
+        s.apply_report(oa, BTC_USD, 91_000 * PRICE_SCALE, 7).unwrap();
+        let q = &s.funding_twap[&BTC_USD];
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.back().unwrap().seq, 7);
+        assert_eq!(q.back().unwrap().height, 1);
+    }
+    #[test]
+    fn aa_shard_of_is_deterministic_and_bounded() {
+        for i in 0..200u32 {
+            let addr = format!("ADDR{}", i);
+            assert_eq!(aa_shard_of(&addr), aa_shard_of(&addr));
+            assert!(aa_shard_of(&addr) < AA_SHARD_COUNT as u8);
+        }
+    }
+
+    #[test]
+    fn empty_shard_sentinels_are_distinct_and_unforgeable() {
+        // Every empty shard commits a different sentinel; none equals the
+        // plain "empty" root, so a zero-proof cannot hop shards (doc 10 §5.4).
+        let roots = aa_sharded_roots_of(&[]);
+        for i in 0..AA_SHARD_COUNT {
+            let expected = hex::encode(sha256(format!("empty:{}", i).as_bytes()));
+            assert_eq!(roots[i], expected);
+            if i > 0 {
+                assert_ne!(roots[i], roots[i - 1]);
+            }
+            assert_ne!(roots[i], hex::encode(sha256(b"empty")));
+        }
+    }
+
+    #[test]
+    fn sharded_proof_folds_to_forest_slice() {
+        // Replicate the AA fold: proof within a shard's tree must land on
+        // exactly the shard's 64-hex slice of the concatenated forest.
+        let pairs: Vec<(String, Usd, u128, i128)> = (0..40u32)
+            .map(|i| (format!("OBADDR{}X", i), 100 + i as Usd, 0, 0))
+            .collect();
+        let forest_roots = aa_sharded_roots_of(&pairs);
+        let covered: std::collections::HashSet<u8> =
+            pairs.iter().map(|(a, ..)| aa_shard_of(a)).collect();
+        assert!(covered.len() > 1, "fixture must span several shards");
+        for (addr, col, perp, w) in &pairs {
+            let (shard, siblings, root) = aa_sharded_proof_for(&pairs, addr).unwrap();
+            assert_eq!(root, forest_roots[shard as usize]);
+            assert!(siblings.len() <= operp_types::MAX_AA_TREE_DEPTH);
+            let mut acc = hex::encode(sha256(
+                format!("acct:{}:{}:{}:{}", addr, col, perp, w).as_bytes(),
+            ));
+            for (sib, right) in &siblings {
+                let buf = if *right {
+                    format!("{}{}", acc, sib)
+                } else {
+                    format!("{}{}", sib, acc)
+                };
+                acc = hex::encode(sha256(buf.as_bytes()));
+            }
+            assert_eq!(
+                acc,
+                forest_roots.concat().get(shard as usize * 64..shard as usize * 64 + 64).unwrap()
+            );
+        }
+        // Forest hash binds all 16 roots in order.
+        assert_eq!(
+            aa_forest_hash(&forest_roots),
+            hex::encode(sha256(forest_roots.concat().as_bytes()))
+        );
     }
 }
 
