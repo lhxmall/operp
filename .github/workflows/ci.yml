@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -10,6 +11,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace -- -D warnings
+
   js-checks:
     runs-on: ubuntu-latest
     steps:
@@ -21,3 +33,23 @@ jobs:
         run: npm install --prefix vendor/aa-testkit --no-audit --no-fund || npm install --prefix vendor/aa-testkit
       - run: node obyte-local/tools/check_aa_complexity.js
       - run: node obyte-local/golden_vector_check.js
+
+  e2e:
+    runs-on: ubuntu-latest
+    # 完整 devnet E2E 要编 rocksdb/sqlite3（~5-8 分钟），只在 push 到 main 跑，PR 上可手动触发
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native deps (needs build-essential, already on ubuntu-latest)
+        run: |
+          npm install --prefix vendor/aa-testkit --no-audit --no-fund
+          npm install --prefix obyte-local --no-audit --no-fund
+      - name: Regenerate fixture
+        run: cargo run -p operp-settle --example gen_withdraw_proof -- I6X2KSUJJJC5D5T6ARVT7OH5Z7XMSMYG 2000000 0 1000000
+      - name: Run AA devnet E2E
+        run: node obyte-local/test_vault_aa.js
