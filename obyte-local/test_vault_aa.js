@@ -598,7 +598,7 @@ async function main() {
 
   // ---------- 2. submit height 1: single-candidate + height-taken ----------
   const submit1 = { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_CAND1, aa_root: sha256Hex("aacand1"), aa_forest: FOREST_CAND1 };
-  const batch1 = { chain_id: "operp-mvp-1", height: 1, state_root: ROOT_CAND1, unit_ids: [] };
+  const batch1 = { chain_id: "operp-mvp-1", height: 1, state_root: ROOT_CAND1, unit_ids: ["u1"] };
   // sub-60000 combined unit cannot post the SUBMIT_BOND_NET (value gate
   // sits behind the empty height-taken gate for a first submit).
   await expectBounce(() => sendCombinedSubmit(bob, 20000, submit1, batch1), "need submit bond");
@@ -608,7 +608,7 @@ async function main() {
   // even from a bond-sufficient different operator; bob stays the ONLY
   // candidate and da_unit_1 pins bob's unit.
   const submit2 = { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_FINAL1, aa_root: claim.aa_root, aa_forest: claim.aa_forest };
-  const batch2 = { chain_id: "operp-mvp-1", height: 1, state_root: ROOT_FINAL1, unit_ids: [] };
+  const batch2 = { chain_id: "operp-mvp-1", height: 1, state_root: ROOT_FINAL1, unit_ids: ["u2"] };
   await expectBounce(() => sendCombinedSubmit(alice, 60000, submit2, batch2), "height taken");
   st = await vars();
   console.log("cand after race:", st["cand_root_1"], st["cand_aa_root_1"]);
@@ -716,7 +716,7 @@ async function main() {
   // active_bond_1 and cand_aa_root_1, so $old is empty and a fresh COMBINED
   // unit can re-occupy the height (single-candidate gate passes).
   const reSubmit = { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_FINAL1, aa_root: claim.aa_root, aa_forest: claim.aa_forest };
-  const reBatch = { chain_id: "operp-mvp-1", height: 1, state_root: ROOT_FINAL1, unit_ids: [] };
+  const reBatch = { chain_id: "operp-mvp-1", height: 1, state_root: ROOT_FINAL1, unit_ids: ["u3"] };
   await sendCombinedSubmit(bob, 60000, reSubmit, reBatch);
   await network.timetravel({ shift: '700s' });
   await trigger(bob, { lock: 1, height: 1 });
