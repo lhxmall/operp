@@ -283,6 +283,12 @@ docs/PROTOCOL.md         protocol design narrative
 
 - Rust >= **1.85** (the workspace pins `rust-version = "1.85"`; install via
   [rustup](https://rustup.rs): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+- Node.js >= 20 (for `obyte-local` scripts and AA devnet E2E)
+- On Windows, a C++ toolchain for native `rocksdb`/`sqlite3` (required by
+  the vendored aa-testkit): install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+  with the **"Desktop development with C++"** workload, then `npm install`
+  in `obyte-local` and `vendor/aa-testkit` will succeed; without it
+  `node-gyp` reports `find VS` failure and the E2E cannot run
 
 ## Running
 

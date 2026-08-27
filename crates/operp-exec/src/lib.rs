@@ -5,11 +5,10 @@ use operp_state::journal::{GovNonceJournal, GovNonceRecord};
 use operp_state::persist;
 use operp_state::{ChainState, Proposal};
 use operp_types::{
-    bps, genesis_params, liq_order_id, notional_usd, order_id, valid_obyte_addr, AccountId, Bps,
-    ExecStatus, Height, MarketId, MarketParams, OrderId, OrderType, ParamKey, Price, Qty, Seq,
-    Side, TimeInForce, UnitId, Usd, BTC_USD, CREATE_MARKET_FEE_PERP, INSURANCE_ACCOUNT,
-    ORACLE_BOND_PERP, PROPOSAL_DURATION_SEQS, PROPOSAL_MIN_STAKE_PERP, PROPOSAL_QUORUM_DEN,
-    PROPOSAL_QUORUM_NUM,
+    bps, liq_order_id, notional_usd, order_id, valid_obyte_addr, AccountId, Bps, ExecStatus,
+    Height, MarketId, MarketParams, OrderId, OrderType, ParamKey, Price, Qty, Seq, Side,
+    TimeInForce, UnitId, Usd, CREATE_MARKET_FEE_PERP, INSURANCE_ACCOUNT, PROPOSAL_DURATION_SEQS,
+    PROPOSAL_MIN_STAKE_PERP, PROPOSAL_QUORUM_DEN, PROPOSAL_QUORUM_NUM,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -1193,7 +1192,7 @@ mod tests {
     use super::*;
     use operp_dag::{genesis_id, sign_unit, unit_id, Op};
     use operp_types::{
-        account_id_from_pubkey, PRICE_SCALE, QTY_SCALE, USD_SCALE,
+        account_id_from_pubkey, PRICE_SCALE, QTY_SCALE, USD_SCALE, BTC_USD, ORACLE_BOND_PERP,
     };
     use ed25519_dalek::SigningKey;
 
@@ -1313,7 +1312,7 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(fills.len(), 1);
-        let a = acct_of(&alice);
+        let _a = acct_of(&alice);
         let b = acct_of(&bob);
         assert_eq!(
             eng.state.accounts.get(&b).unwrap().positions[&BTC_USD].qty,
@@ -1972,7 +1971,7 @@ mod tests {
         eng.ingest(v).unwrap();
         eng.state.seq = eng.state.proposals[&1].deadline_seq;
         let fin = finalize(vec![g], &sk(2), 1);
-        let evs = eng.ingest(fin).unwrap();
+        let _evs = eng.ingest(fin).unwrap();
         // The failed proposal is removed at finalize; params stay intact.
         assert!(!eng.state.proposals.contains_key(&1));
         // Genesis im_bps untouched.
@@ -2964,7 +2963,7 @@ mod tests {
         let events = eng.ingest(e1).unwrap();
         assert!(matches!(events.last(), Some(ExecEvent::Applied { .. })));
         let e2 = external_price_unit(vec![tip], &keeper, 95_000 * PRICE_SCALE, 0);
-        tip = unit_id(&e2);
+        let _ = unit_id(&e2);
         eng.ingest(e2).unwrap();
         assert_eq!(
             eng.state.external_twap(BTC_USD),
@@ -3061,7 +3060,7 @@ mod tests {
         // One more report tick fires funding against the external index.
         eng.state.height += 1;
         let r = report_unit(vec![tip], &oa, 100_000 * PRICE_SCALE);
-        tip = unit_id(&r);
+        let _ = unit_id(&r);
         let events = eng.ingest(r).unwrap();
         assert!(matches!(events.last(), Some(ExecEvent::Applied { .. })));
         assert!(

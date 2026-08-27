@@ -239,6 +239,12 @@ docs/PROTOCOL.md         协议设计叙事
 - Rust >= **1.85**（workspace 钉死 `rust-version = "1.85"`；经
   [rustup](https://rustup.rs) 安装：
   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`）
+- Node.js >= 20（`obyte-local` 脚本与 AA devnet E2E 所需）
+- Windows 下需 C++ 工具链以编译原生 `rocksdb`/`sqlite3`（vendored
+  aa-testkit 依赖）：安装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+  并勾选 **"Desktop development with C++"** 工作负载，随后在
+  `obyte-local` 与 `vendor/aa-testkit` 下 `npm install` 即可；缺失时
+  `node-gyp` 报 `find VS` 错误，E2E 无法运行
 
 ## 运行
 

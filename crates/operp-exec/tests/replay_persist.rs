@@ -17,7 +17,7 @@ use operp_exec::{Engine, ExecEvent, RejectReason};
 use operp_state::{ChainState, Withdrawal};
 use operp_types::{
     account_id_from_pubkey, genesis_params, AccountId, Height, BTC_USD, USD_SCALE,
-    REPLAY_ACTIVATION_HEIGHT, REPLAY_WINDOW, REPLAY_WINDOW_LEGACY,
+    REPLAY_ACTIVATION_HEIGHT, REPLAY_WINDOW,
 };
 
 fn sk(n: u8) -> [u8; 32] {
@@ -132,7 +132,6 @@ fn duplicate_withdraw_300h_rejected_after_restart() {
 
     // Withdraw nonce=7 at h.
     let w = withdraw(vec![tip], &alice, 100 * USD_SCALE as i128, 7);
-    let tip = unit_id(&w);
     let evs = eng.ingest(w).unwrap();
     assert!(evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })));
     let key = (acct_of(&alice), 7u64);
