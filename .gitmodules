@@ -1,0 +1,3 @@
+[submodule "vendor/aa-testkit"]
+	path = vendor/aa-testkit
+	url = https://github.com/valyakin/aa-testkit.git
