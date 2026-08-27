@@ -39,6 +39,8 @@ function resolveVaultAa() {
 
 const aaRoot = path.join(__dirname, "..", "vendor", "aa-testkit");
 const nm = path.join(aaRoot, "node_modules");
+process.env.NODE_PATH = [nm, process.env.NODE_PATH].filter(Boolean).join(path.delimiter);
+require("module").Module._initPaths();
 // Network selection: devnet drill by default; pass testnet/mainnet env
 // explicitly to target a real network.
 if (process.env.testnet) {
@@ -119,9 +121,19 @@ async function buildDepositEvidences(batchData, vaultAddress) {
         hub.getJoint(Buffer.from(aaUnit, "hex").toString("base64"), (err, j) => (err ? reject(err) : resolve(j)));
       });
     } catch (e) {
+      if (process.env.devnet && !process.env.testnet && !process.env.mainnet) {
+        console.log("devnet fixture: evidence skipped for missing joint", aaUnit.slice(0, 16));
+        continue;
+      }
       throw new Error("deposit anchor missing on Obyte: " + aaUnit.slice(0, 16));
     }
-    if (!joint || !joint.unit) throw new Error("no joint for " + aaUnit.slice(0, 16));
+    if (!joint || !joint.unit) {
+      if (process.env.devnet && !process.env.testnet && !process.env.mainnet) {
+        console.log("devnet fixture: evidence skipped for empty joint", aaUnit.slice(0, 16));
+        continue;
+      }
+      throw new Error("no joint for " + aaUnit.slice(0, 16));
+    }
     // joint carries the FULL joint unit object: the watcher recomputes
     // unit_hash(joint.unit) via operp_settle::obyte_hash::get_unit_hash and
     // compares against the sidechain deposit's aa_unit.
@@ -172,9 +184,12 @@ async function main() {
 
   // Step4: build deposit_evidences BEFORE posting so the temp_data reveal
   // carries them (watchers verify unit_hash(joint) == aa_unit independently).
-  batchData.deposit_evidences = await buildDepositEvidences(batchData, vault);
-  if (batchData.deposit_evidences.length) {
+  const evidences = await buildDepositEvidences(batchData, vault);
+  if (evidences.length) {
+    batchData.deposit_evidences = evidences;
     console.log("deposit_evidences:", batchData.deposit_evidences.length);
+  } else {
+    delete batchData.deposit_evidences;
   }
 
   // 1+2 COMBINED: DA reveal + submit in ONE unit — block order = this
