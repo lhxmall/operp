@@ -3,7 +3,10 @@
 .idea/
 .vscode/
 *.pdb
-/vendor
+/vendor/*
+!/vendor/aa-testkit/
+/vendor/aa-testkit/*
+!/vendor/aa-testkit/package.json
 /obyte-local/node_modules
 /obyte-local/testdata
 /obyte-local/package-lock.json
