@@ -462,10 +462,7 @@ mod tests {
         );
         book.submit(b1.clone()).unwrap();
         book.submit(b2.clone()).unwrap();
-        assert_eq!(
-            book.best_bid().unwrap(),
-            (99 * PRICE_SCALE, QTY_SCALE * 3)
-        );
+        assert_eq!(book.best_bid().unwrap(), (99 * PRICE_SCALE, QTY_SCALE * 3));
         book.cancel(b2.id).unwrap();
         assert_eq!(book.best_bid().unwrap(), (99 * PRICE_SCALE, QTY_SCALE * 2));
         book.cancel(b1.id).unwrap();

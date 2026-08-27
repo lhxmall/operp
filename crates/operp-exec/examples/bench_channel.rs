@@ -9,7 +9,9 @@ fn main() {
         let tx = tx.clone();
         handles.push(std::thread::spawn(move || {
             for i in 0..2_000_000usize {
-                if tx.send((g as u64) * 1_000_000 + i as u64).is_err() { return; }
+                if tx.send((g as u64) * 1_000_000 + i as u64).is_err() {
+                    return;
+                }
             }
         }));
     }
@@ -22,7 +24,14 @@ fn main() {
             Err(_) => break,
         }
     }
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     let dt = t0.elapsed().as_secs_f64();
-    println!("channel: {} msgs in {:.2}s => {:.0} msg/s", n, dt, n as f64 / dt);
+    println!(
+        "channel: {} msgs in {:.2}s => {:.0} msg/s",
+        n,
+        dt,
+        n as f64 / dt
+    );
 }

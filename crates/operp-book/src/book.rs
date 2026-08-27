@@ -32,10 +32,7 @@ impl OrderBook {
     }
 
     pub fn order_count(&self) -> u64 {
-        self.orders
-            .values()
-            .filter(|o| o.remaining > 0)
-            .count() as u64
+        self.orders.values().filter(|o| o.remaining > 0).count() as u64
     }
 
     /// Canonical commitment over the FULL resting book — every price level and
@@ -159,8 +156,7 @@ impl OrderBook {
                 break;
             }
 
-            let (maker_account, maker_side, maker_remaining) = match self.orders.get(&maker_id)
-            {
+            let (maker_account, maker_side, maker_remaining) = match self.orders.get(&maker_id) {
                 Some(m) => (m.account, m.side, m.remaining),
                 None => {
                     self.pop_head(order.side.opposite());
@@ -207,11 +203,8 @@ impl OrderBook {
             }
         }
 
-
-        let rest = order.typ == OrderType::Limit
-            && order.tif == TimeInForce::Gtc
-            && order.remaining > 0;
-
+        let rest =
+            order.typ == OrderType::Limit && order.tif == TimeInForce::Gtc && order.remaining > 0;
 
         let taker_remaining = if rest { order.remaining } else { 0 };
         if rest {
@@ -274,7 +267,10 @@ impl OrderBook {
                     .push_back(order.id);
             }
             Side::Ask => {
-                self.asks.entry(order.price).or_default().push_back(order.id);
+                self.asks
+                    .entry(order.price)
+                    .or_default()
+                    .push_back(order.id);
             }
         }
         self.orders.insert(order.id, order);

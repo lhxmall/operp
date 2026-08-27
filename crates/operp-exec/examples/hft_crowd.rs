@@ -49,8 +49,12 @@ fn ingest_place(
 
 fn main() {
     let mut eng = Engine::new();
-    eng.state.deposits_allowed = (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
-    eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
+    eng.state.deposits_allowed = (1u8..=255)
+        .flat_map(|b| [([b; 32], false), ([b; 32], true)])
+        .collect();
+    eng.state
+        .markets
+        .insert(BTC_USD, operp_types::genesis_params());
     let mut secrets: Vec<[u8; 32]> = (1..=N as u8).map(sk).collect();
     let mut seqs = vec![1u64; N];
     let px = 100_000 * PRICE_SCALE;
@@ -60,7 +64,12 @@ fn main() {
     for (i, s) in secrets.iter().enumerate() {
         let u = sign_unit(
             vec![tip],
-            Op::Deposit { account: acct(s), addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(), amount: 1_000_000 * USD_SCALE as i128, aa_unit: [i as u8 + 1; 32] },
+            Op::Deposit {
+                account: acct(s),
+                addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                amount: 1_000_000 * USD_SCALE as i128,
+                aa_unit: [i as u8 + 1; 32],
+            },
             s,
         );
         tip = unit_id(&u);
@@ -76,9 +85,7 @@ fn main() {
     let mut last_fills = 0u64;
     let start = Instant::now();
     let end = start + Duration::from_secs(RUN_SECS);
-    println!(
-        "HFT crowd: {N} traders open/close 0.01 BTC, {RUN_SECS}s"
-    );
+    println!("HFT crowd: {N} traders open/close 0.01 BTC, {RUN_SECS}s");
     println!("elapsed_s\torders\tfills\trejects\tord/s\tfill/s");
 
     let mut pair = 0usize;
@@ -99,7 +106,15 @@ fn main() {
             seqs[i],
         );
         tip = id;
-        bump(&evs, i, &mut seqs, &mut orders, &mut fills, &mut applied, &mut rejected);
+        bump(
+            &evs,
+            i,
+            &mut seqs,
+            &mut orders,
+            &mut fills,
+            &mut applied,
+            &mut rejected,
+        );
         let (id, evs) = ingest_place(
             &mut eng,
             tip,
@@ -111,7 +126,15 @@ fn main() {
             seqs[j],
         );
         tip = id;
-        bump(&evs, j, &mut seqs, &mut orders, &mut fills, &mut applied, &mut rejected);
+        bump(
+            &evs,
+            j,
+            &mut seqs,
+            &mut orders,
+            &mut fills,
+            &mut applied,
+            &mut rejected,
+        );
 
         // close: j ask, i bid
         let (id, evs) = ingest_place(
@@ -125,7 +148,15 @@ fn main() {
             seqs[j],
         );
         tip = id;
-        bump(&evs, j, &mut seqs, &mut orders, &mut fills, &mut applied, &mut rejected);
+        bump(
+            &evs,
+            j,
+            &mut seqs,
+            &mut orders,
+            &mut fills,
+            &mut applied,
+            &mut rejected,
+        );
         let (id, evs) = ingest_place(
             &mut eng,
             tip,
@@ -137,7 +168,15 @@ fn main() {
             seqs[i],
         );
         tip = id;
-        bump(&evs, i, &mut seqs, &mut orders, &mut fills, &mut applied, &mut rejected);
+        bump(
+            &evs,
+            i,
+            &mut seqs,
+            &mut orders,
+            &mut fills,
+            &mut applied,
+            &mut rejected,
+        );
 
         if eng.log.len() > 8192 {
             eng.log.clear();

@@ -32,7 +32,11 @@ fn crc32(data: &[u8]) -> u32 {
     for (i, slot) in table.iter_mut().enumerate() {
         let mut c = i as u32;
         for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
         }
         *slot = c;
     }
@@ -81,7 +85,10 @@ impl GovNonceJournal {
         rec.extend_from_slice(&height.to_le_bytes());
         let crc = crc32(&rec);
         rec.extend_from_slice(&crc.to_le_bytes());
-        let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         f.write_all(&rec)?;
         f.sync_all()?;
         fsync_dir(self.path.parent().unwrap_or(Path::new(".")));
@@ -132,7 +139,10 @@ impl GovNonceJournal {
 
     /// WAL checkpoint: rewrite as exactly one record per account (the current
     /// watermark), fsync, atomic rename. Keeps the file at `|accounts| × 60B`.
-    pub fn compact(&self, watermarks: &std::collections::HashMap<AccountId, u64>) -> io::Result<()> {
+    pub fn compact(
+        &self,
+        watermarks: &std::collections::HashMap<AccountId, u64>,
+    ) -> io::Result<()> {
         let tmp = self.path.with_extension("tmp");
         {
             let mut f = File::create(&tmp)?;
@@ -157,7 +167,10 @@ impl GovNonceJournal {
     }
 
     pub fn should_compact(&self) -> bool {
-        self.path.metadata().map(|m| m.len() > COMPACT_THRESHOLD).unwrap_or(false)
+        self.path
+            .metadata()
+            .map(|m| m.len() > COMPACT_THRESHOLD)
+            .unwrap_or(false)
     }
 }
 
@@ -179,8 +192,22 @@ mod tests {
         }
         let recs = j.read_all().unwrap();
         assert_eq!(recs.len(), 2);
-        assert_eq!(recs[0], GovNonceRecord { account: AccountId([1; 32]), nonce: 5, height: 100 });
-        assert_eq!(recs[1], GovNonceRecord { account: AccountId([2; 32]), nonce: 9, height: 200 });
+        assert_eq!(
+            recs[0],
+            GovNonceRecord {
+                account: AccountId([1; 32]),
+                nonce: 5,
+                height: 100
+            }
+        );
+        assert_eq!(
+            recs[1],
+            GovNonceRecord {
+                account: AccountId([2; 32]),
+                nonce: 9,
+                height: 200
+            }
+        );
         // H1 regression: the PHYSICAL file is truncated to the record boundary.
         assert_eq!(
             fs::metadata(j.path()).unwrap().len() as usize % RECORD_LEN,
@@ -191,8 +218,16 @@ mod tests {
         j.append(AccountId([3; 32]), 12, 300).unwrap();
         let recs = GovNonceJournal::open(&dir).unwrap().read_all().unwrap();
         assert_eq!(recs.len(), 3);
-        assert_eq!(recs[2], GovNonceRecord { account: AccountId([3; 32]), nonce: 12, height: 300 });
-        j.compact(&std::iter::once((AccountId([2; 32]), 11u64)).collect()).unwrap();
+        assert_eq!(
+            recs[2],
+            GovNonceRecord {
+                account: AccountId([3; 32]),
+                nonce: 12,
+                height: 300
+            }
+        );
+        j.compact(&std::iter::once((AccountId([2; 32]), 11u64)).collect())
+            .unwrap();
         let recs = j.read_all().unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].nonce, 11);
@@ -201,10 +236,8 @@ mod tests {
 
     #[test]
     fn corrupted_record_drops_it_and_everything_after() {
-        let dir = std::env::temp_dir().join(format!(
-            "operp-journal-crc-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("operp-journal-crc-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let j = GovNonceJournal::open(&dir).unwrap();
         j.append(AccountId([1; 32]), 5, 100).unwrap();

@@ -373,9 +373,7 @@ impl<'a> Reader<'a> {
 /// Doc 04 §2.4.3 serving rule: look a requested id up among linked units AND
 /// buffered orphans. Returns an owned clone ready to go on the wire.
 pub fn serve_unit(dag: &Dag, id: UnitId) -> Option<Unit> {
-    dag.get(id)
-        .or_else(|| dag.get_orphan(id))
-        .cloned()
+    dag.get(id).or_else(|| dag.get_orphan(id)).cloned()
 }
 
 /// Doc 04 §2.4.2: which of `unit`'s parents does the local DAG still lack?
@@ -477,12 +475,7 @@ impl GossipNode {
             for id in &fresh {
                 self.last_want.insert((peer, *id), now_ms);
             }
-            out.push((
-                peer,
-                GossipMessage::WantUnits {
-                    missing: fresh,
-                },
-            ));
+            out.push((peer, GossipMessage::WantUnits { missing: fresh }));
         }
         out
     }
@@ -503,11 +496,9 @@ impl GossipNode {
         if missing.len() > MAX_WANT_IDS {
             return None; // drop oversize request
         }
-        if self
-            .last_response
-            .get(&from)
-            .map_or(false, |&t| now_ms.saturating_sub(t) < RESPONSE_RATE_LIMIT_MS)
-        {
+        if self.last_response.get(&from).map_or(false, |&t| {
+            now_ms.saturating_sub(t) < RESPONSE_RATE_LIMIT_MS
+        }) {
             return None; // rate limited
         }
         // Budget consumed on any request past the rate gate, served or not.
@@ -584,23 +575,94 @@ mod tests {
         let acct = AccountId(account_id_from_pubkey(&key.verifying_key().to_bytes()).0);
         let g = vec![genesis_id()];
         let ops = vec![
-            Op::Place { account: acct, market: MarketId(3), side: operp_types::Side::Ask, typ: operp_types::OrderType::Market, tif: operp_types::TimeInForce::Ioc, price: u64::MAX, qty: 7, client_seq: 42 },
-            Op::Cancel { account: acct, order_id: OrderId([1; 32]) },
-            Op::Deposit { account: acct, addr: "A".repeat(128), amount: -123456789i128, aa_unit: [2; 32] },
-            Op::Withdraw { account: acct, amount: 99i128, nonce: u64::MAX },
-            Op::ReportPrice { oracle: acct, market: MarketId(u32::MAX), price: 1 },
-            Op::Liquidate { caller: acct, target: AccountId([3; 32]), market: MarketId(2) },
-            Op::GovDeposit { account: acct, addr: String::new(), amount: u128::MAX, aa_unit: [4; 32] },
-            Op::GovWithdraw { account: acct, amount: u128::MAX, nonce: 5 },
-            Op::CreateMarket { creator: acct, symbol: *b"BTC-PERP-0000000", tick_size: 10, im_bps: 100, mm_bps: 50, taker_fee_bps: 5, keeper_reward_bps: 1 },
-            Op::CreateProposal { creator: acct, market: MarketId(1), key: 7, value: u64::MAX },
-            Op::Vote { voter: acct, proposal_id: 11, approve: true },
-            Op::FinalizeProposal { caller: acct, proposal_id: 12 },
+            Op::Place {
+                account: acct,
+                market: MarketId(3),
+                side: operp_types::Side::Ask,
+                typ: operp_types::OrderType::Market,
+                tif: operp_types::TimeInForce::Ioc,
+                price: u64::MAX,
+                qty: 7,
+                client_seq: 42,
+            },
+            Op::Cancel {
+                account: acct,
+                order_id: OrderId([1; 32]),
+            },
+            Op::Deposit {
+                account: acct,
+                addr: "A".repeat(128),
+                amount: -123456789i128,
+                aa_unit: [2; 32],
+            },
+            Op::Withdraw {
+                account: acct,
+                amount: 99i128,
+                nonce: u64::MAX,
+            },
+            Op::ReportPrice {
+                oracle: acct,
+                market: MarketId(u32::MAX),
+                price: 1,
+            },
+            Op::Liquidate {
+                caller: acct,
+                target: AccountId([3; 32]),
+                market: MarketId(2),
+            },
+            Op::GovDeposit {
+                account: acct,
+                addr: String::new(),
+                amount: u128::MAX,
+                aa_unit: [4; 32],
+            },
+            Op::GovWithdraw {
+                account: acct,
+                amount: u128::MAX,
+                nonce: 5,
+            },
+            Op::CreateMarket {
+                creator: acct,
+                symbol: *b"BTC-PERP-0000000",
+                tick_size: 10,
+                im_bps: 100,
+                mm_bps: 50,
+                taker_fee_bps: 5,
+                keeper_reward_bps: 1,
+            },
+            Op::CreateProposal {
+                creator: acct,
+                market: MarketId(1),
+                key: 7,
+                value: u64::MAX,
+            },
+            Op::Vote {
+                voter: acct,
+                proposal_id: 11,
+                approve: true,
+            },
+            Op::FinalizeProposal {
+                caller: acct,
+                proposal_id: 12,
+            },
             Op::StakeOracle { account: acct },
             Op::UnstakeOracle { account: acct },
-            Op::SlashOracle { challenger: acct, target: AccountId([9; 32]), market: MarketId(4) },
-            Op::UpdateExternalPrice { source: acct, market: MarketId(1), price: 55, source_id: 2 },
-            Op::Commit { account: acct, commit: [0xD; 32], ttl_height: 100 },
+            Op::SlashOracle {
+                challenger: acct,
+                target: AccountId([9; 32]),
+                market: MarketId(4),
+            },
+            Op::UpdateExternalPrice {
+                source: acct,
+                market: MarketId(1),
+                price: 55,
+                source_id: 2,
+            },
+            Op::Commit {
+                account: acct,
+                commit: [0xD; 32],
+                ttl_height: 100,
+            },
             // Nested: Reveal wrapping an inner Place exercises recursion.
             Op::Reveal {
                 account: acct,
@@ -620,7 +682,12 @@ mod tests {
         ];
         for (i, op) in ops.into_iter().enumerate() {
             let unit = operp_dag::sign_unit(g.clone(), op, &[(i + 1) as u8; 32]);
-            assert_eq!(decode_unit(&unit_wire(&unit)).unwrap(), unit, "variant {}", i);
+            assert_eq!(
+                decode_unit(&unit_wire(&unit)).unwrap(),
+                unit,
+                "variant {}",
+                i
+            );
         }
     }
 
@@ -628,7 +695,10 @@ mod tests {
     fn decode_rejects_truncated_and_bad_magic() {
         let unit = signed(vec![genesis_id()], 1);
         let wire = unit_wire(&unit);
-        assert_eq!(decode_unit(&wire[..wire.len() - 1]), Err(GossipError::Malformed));
+        assert_eq!(
+            decode_unit(&wire[..wire.len() - 1]),
+            Err(GossipError::Malformed)
+        );
         assert_eq!(decode_unit(&wire[1..]), Err(GossipError::Malformed));
         // Trailing junk after a complete unit is rejected.
         let mut padded = wire.clone();
@@ -638,17 +708,25 @@ mod tests {
 
     #[test]
     fn message_roundtrip_and_oversize_bounds() {
-        let want = GossipMessage::WantUnits { missing: vec![UnitId([1; 32]), UnitId([2; 32])] };
+        let want = GossipMessage::WantUnits {
+            missing: vec![UnitId([1; 32]), UnitId([2; 32])],
+        };
         assert_eq!(GossipMessage::decode(&want.encode()), Ok(want.clone()));
 
-        let units = vec![signed(vec![genesis_id()], 1), deposit_unit(vec![genesis_id()], 2, "addr-x")];
+        let units = vec![
+            signed(vec![genesis_id()], 1),
+            deposit_unit(vec![genesis_id()], 2, "addr-x"),
+        ];
         let have = GossipMessage::HaveUnits { units };
         assert_eq!(GossipMessage::decode(&have.encode()), Ok(have));
 
         // > MAX_WANT_IDS ids: dropped at decode.
         let big: Vec<UnitId> = (0..65).map(|i| UnitId([i as u8; 32])).collect();
         let big_msg = GossipMessage::WantUnits { missing: big };
-        assert_eq!(GossipMessage::decode(&big_msg.encode()), Err(GossipError::Oversize));
+        assert_eq!(
+            GossipMessage::decode(&big_msg.encode()),
+            Err(GossipError::Oversize)
+        );
     }
 
     #[test]
@@ -669,14 +747,17 @@ mod tests {
         assert_eq!(node.observe_missing(&missing, 1_000).len(), 3);
         assert!(node.observe_missing(&missing, 1_200).is_empty());
         assert_eq!(
-            node.observe_missing(&missing, 1_000 + WANT_DEBOUNCE_MS).len(),
+            node.observe_missing(&missing, 1_000 + WANT_DEBOUNCE_MS)
+                .len(),
             3
         );
 
         // Fanout never exceeds the peer count.
         let mut solo = GossipNode::new(vec![PeerId(1)]);
         assert_eq!(solo.observe_missing(&missing, 0).len(), 1);
-        assert!(GossipNode::new(vec![]).observe_missing(&missing, 0).is_empty());
+        assert!(GossipNode::new(vec![])
+            .observe_missing(&missing, 0)
+            .is_empty());
     }
 
     #[test]
@@ -687,10 +768,13 @@ mod tests {
         // Rate limit: second response within 100 ms suppressed.
         let u = signed(vec![genesis_id()], 3);
         let one = vec![operp_dag::unit_id(&u)];
-        let known = |id: UnitId| -> Option<Unit> { (id == operp_dag::unit_id(&u)).then(|| u.clone()) };
+        let known =
+            |id: UnitId| -> Option<Unit> { (id == operp_dag::unit_id(&u)).then(|| u.clone()) };
         assert!(node.handle_want(PeerId(1), &one, 1_000, &known).is_some());
         assert!(node.handle_want(PeerId(1), &one, 1_050, &known).is_none());
-        assert!(node.handle_want(PeerId(1), &one, 1_000 + RESPONSE_RATE_LIMIT_MS, &known).is_some());
+        assert!(node
+            .handle_want(PeerId(1), &one, 1_000 + RESPONSE_RATE_LIMIT_MS, &known)
+            .is_some());
 
         // A different peer is not throttled by peer 1's budget.
         assert!(node.handle_want(PeerId(5), &one, 1_001, &known).is_some());
@@ -698,7 +782,6 @@ mod tests {
 
     #[test]
     fn serving_covers_linked_units_and_buffered_orphans() {
-
         let mut dag = Dag::new();
         let parent = deposit_unit(vec![genesis_id()], 4, "p");
         let child = signed(vec![operp_dag::unit_id(&parent)], 5);
@@ -721,8 +804,6 @@ mod tests {
     /// normal ingest path — no DAG or consensus change involved.
     #[test]
     fn e2e_out_of_order_child_heals_via_want_have() {
-
-
         // Two independent engines (replicas A and B).
         let mut eng_a = operp_exec_like_dag();
         let mut eng_b = operp_exec_like_dag();
@@ -765,7 +846,9 @@ mod tests {
         let units = gossip_a.accept_have(&resp).unwrap();
         assert_eq!(units.len(), 1);
         for u in units {
-            eng_a.insert_verified(u.clone(), operp_dag::unit_id(&u)).unwrap();
+            eng_a
+                .insert_verified(u.clone(), operp_dag::unit_id(&u))
+                .unwrap();
         }
         // Parent linked; the waiting-index fixpoint pulls the buffered
         // child in when the parent executes.
@@ -828,13 +911,17 @@ mod tests {
         let unknown = vec![UnitId([0xEE; 32])];
         let serve = |_: UnitId| -> Option<Unit> { None };
         // First (unanswered) want burns the peer's response budget...
-        assert!(node.handle_want(PeerId(1), &unknown, 1_000, &serve).is_none());
+        assert!(node
+            .handle_want(PeerId(1), &unknown, 1_000, &serve)
+            .is_none());
         // ...so a servable want right after is rate-limited.
         let u = signed(vec![genesis_id()], 3);
         let one = vec![operp_dag::unit_id(&u)];
         let known = |id: UnitId| -> Option<Unit> { (id == one[0]).then(|| u.clone()) };
         assert!(node.handle_want(PeerId(1), &one, 1_010, &known).is_none());
-        assert!(node.handle_want(PeerId(1), &one, 1_000 + RESPONSE_RATE_LIMIT_MS + 10, &known).is_some());
+        assert!(node
+            .handle_want(PeerId(1), &one, 1_000 + RESPONSE_RATE_LIMIT_MS + 10, &known)
+            .is_some());
     }
 
     #[test]

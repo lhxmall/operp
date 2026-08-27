@@ -136,14 +136,19 @@ impl Engine {
     /// ephemeral engines. Compacts the gov-nonce WAL into the same atomic
     /// checkpoint.
     pub fn flush_snapshot(&mut self) -> std::io::Result<Option<PathBuf>> {
-        let Some(dir) = self.store_dir.clone() else { return Ok(None) };
+        let Some(dir) = self.store_dir.clone() else {
+            return Ok(None);
+        };
         persist::save_snapshot(&dir, &self.state).map(Some)
     }
 
     /// Cadence wrapper: flush every [`persist::SNAPSHOT_EVERY`] heights.
     /// Returns whether a snapshot was written this call.
     pub fn maybe_flush_snapshot(&mut self) -> std::io::Result<bool> {
-        if self.store_dir.is_none() || self.state.height == 0 || self.state.height % persist::SNAPSHOT_EVERY != 0 {
+        if self.store_dir.is_none()
+            || self.state.height == 0
+            || self.state.height % persist::SNAPSHOT_EVERY != 0
+        {
             return Ok(false);
         }
         self.flush_snapshot()?;
@@ -177,7 +182,9 @@ impl Engine {
     /// WAL-checkpoint the gov-nonce journal once it exceeds the compaction
     /// threshold. Called after batch commits; cheap no-op below 1 MB.
     pub fn compact_journal_if_needed(&mut self) -> std::io::Result<()> {
-        let Some(dir) = self.store_dir.clone() else { return Ok(()) };
+        let Some(dir) = self.store_dir.clone() else {
+            return Ok(());
+        };
         let j = GovNonceJournal::open(&dir)?;
         if j.should_compact() {
             j.compact(&self.state.seen_gov_nonces)?;
@@ -290,7 +297,15 @@ impl Engine {
                 qty,
                 client_seq,
             } => self.place(
-                *account, *market, *side, *typ, *tif, *price, *qty, *client_seq, seq,
+                *account,
+                *market,
+                *side,
+                *typ,
+                *tif,
+                *price,
+                *qty,
+                *client_seq,
+                seq,
             ),
             Op::Cancel { account, order_id } => self.cancel(*account, *order_id),
             Op::Deposit {
@@ -415,7 +430,12 @@ impl Engine {
         client_seq: u64,
         seq: Seq,
     ) -> Result<Vec<Fill>, RejectReason> {
-        let last = self.state.seen_client_seq.get(&account).copied().unwrap_or(0);
+        let last = self
+            .state
+            .seen_client_seq
+            .get(&account)
+            .copied()
+            .unwrap_or(0);
         let ok_seq = if last == 0 {
             client_seq == 1
         } else {
@@ -462,7 +482,6 @@ impl Engine {
                 }
             }
         }
-
 
         let snap = {
             let acct = self.state.accounts.get(&account);
@@ -711,7 +730,11 @@ impl Engine {
             let ins = INSURANCE_ACCOUNT;
             let mark = *self.state.marks.get(&market).unwrap_or(&0);
             let close_qty = remaining_pos.unsigned_abs() as u64;
-            let close_side = if remaining_pos > 0 { Side::Ask } else { Side::Bid };
+            let close_side = if remaining_pos > 0 {
+                Side::Ask
+            } else {
+                Side::Bid
+            };
             let fill = Fill {
                 taker_id: oid,
                 maker_id: OrderId([0u8; 32]),
@@ -745,7 +768,10 @@ impl Engine {
                 if let Some(a) = self.state.accounts.get_mut(&INSURANCE_ACCOUNT) {
                     a.collateral -= pay;
                 }
-                self.state.account_mut(caller).credit(pay).map_err(map_acct)?;
+                self.state
+                    .account_mut(caller)
+                    .credit(pay)
+                    .map_err(map_acct)?;
             }
         }
         Ok(fills)
@@ -805,7 +831,12 @@ impl Engine {
     ) -> Result<Vec<Fill>, RejectReason> {
         // Strictly increasing nonce watermark per account: any nonce at or
         // below the highest consumed one is a replay, and gaps are allowed.
-        let watermark = self.state.seen_gov_nonces.get(&account).copied().unwrap_or(0);
+        let watermark = self
+            .state
+            .seen_gov_nonces
+            .get(&account)
+            .copied()
+            .unwrap_or(0);
         if nonce <= watermark {
             return Err(RejectReason::DuplicateNonce);
         }
@@ -849,10 +880,19 @@ impl Engine {
         }
         // A bps parameter above 100% is nonsensical and lets a market creator
         // set, say, an unbounded keeper reward drained from the insurance fund.
-        if im_bps > 10_000 || mm_bps > 10_000 || taker_fee_bps > 10_000 || keeper_reward_bps > 10_000 {
+        if im_bps > 10_000
+            || mm_bps > 10_000
+            || taker_fee_bps > 10_000
+            || keeper_reward_bps > 10_000
+        {
             return Err(RejectReason::Risk);
         }
-        if im_bps <= mm_bps || mm_bps < 500 || im_bps > 5000 || taker_fee_bps > 200 || keeper_reward_bps > 500 {
+        if im_bps <= mm_bps
+            || mm_bps < 500
+            || im_bps > 5000
+            || taker_fee_bps > 200
+            || keeper_reward_bps > 500
+        {
             return Err(RejectReason::Risk);
         }
         let bal = self.state.perp_balances.get(&creator).copied().unwrap_or(0);
@@ -997,8 +1037,8 @@ impl Engine {
             if seq < p.deadline_seq {
                 return Err(RejectReason::Risk);
             }
-            let pass =
-                p.yes > p.no && p.yes * PROPOSAL_QUORUM_DEN >= p.supply_at_create * PROPOSAL_QUORUM_NUM;
+            let pass = p.yes > p.no
+                && p.yes * PROPOSAL_QUORUM_DEN >= p.supply_at_create * PROPOSAL_QUORUM_NUM;
             (pass, p.market, p.key, p.value)
         };
         if pass {
@@ -1073,7 +1113,9 @@ impl Engine {
         // Bound the reveal deadline to COMMIT_TTL_HEIGHTS past creation so
         // the pending set is memory-bounded; TTL ~16 heights ≈ 32 s.
         let commit_height = self.state.height;
-        if ttl_height <= commit_height || ttl_height > commit_height + operp_types::COMMIT_TTL_HEIGHTS {
+        if ttl_height <= commit_height
+            || ttl_height > commit_height + operp_types::COMMIT_TTL_HEIGHTS
+        {
             return Err(RejectReason::BadCommit);
         }
         // Per-account pending-commit cap (doc 03 §2.3.5, e.g. 8).
@@ -1129,7 +1171,11 @@ impl Engine {
         // Parent-edge constraint: the Commit's unit id must be among this
         // unit's parents so DAG topo order places the reveal after it and
         // `ready_linearized` stays pure.
-        let parents = self.dag.get(id).map(|u| u.parents.clone()).unwrap_or_default();
+        let parents = self
+            .dag
+            .get(id)
+            .map(|u| u.parents.clone())
+            .unwrap_or_default();
         if !parents.contains(&entry.commit_unit) {
             return Err(RejectReason::BadCommit);
         }
@@ -1190,11 +1236,11 @@ fn map_state(e: operp_state::StateError) -> RejectReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use operp_dag::{genesis_id, sign_unit, unit_id, Op};
     use operp_types::{
-        account_id_from_pubkey, PRICE_SCALE, QTY_SCALE, USD_SCALE, BTC_USD, ORACLE_BOND_PERP,
+        account_id_from_pubkey, BTC_USD, ORACLE_BOND_PERP, PRICE_SCALE, QTY_SCALE, USD_SCALE,
     };
-    use ed25519_dalek::SigningKey;
 
     /// Tests/examples run standalone (no AA feed): admit every deposit of
     /// BOTH asset kinds and seed the BTC_USD market with genesis params.
@@ -1205,7 +1251,9 @@ mod tests {
         eng.state.deposits_allowed = (0u8..=255)
             .flat_map(|b| [([b; 32], false), ([b; 32], true)])
             .collect();
-        eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
+        eng.state
+            .markets
+            .insert(BTC_USD, operp_types::genesis_params());
     }
 
     fn sk(n: u8) -> [u8; 32] {
@@ -1428,7 +1476,14 @@ mod tests {
         eng.ingest(bid).unwrap();
         eng.state.marks.insert(BTC_USD, 1 * PRICE_SCALE);
         let a = acct_of(&alice);
-        assert!(eng.state.accounts.get(&a).unwrap().snapshot(&eng.state.marks).liquidatable);
+        assert!(
+            eng.state
+                .accounts
+                .get(&a)
+                .unwrap()
+                .snapshot(&eng.state.marks)
+                .liquidatable
+        );
         let ask2 = place(
             vec![id4],
             &bob,
@@ -1591,10 +1646,28 @@ mod tests {
         let id2 = unit_id(&d2);
         eng.ingest(d2).unwrap();
         let px = 100_000 * PRICE_SCALE;
-        let ask = place(vec![id2], &bob, Side::Ask, OrderType::Limit, TimeInForce::Gtc, px, QTY_SCALE, 1);
+        let ask = place(
+            vec![id2],
+            &bob,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
         let id3 = unit_id(&ask);
         eng.ingest(ask).unwrap();
-        let bid = place(vec![id3], &alice, Side::Bid, OrderType::Limit, TimeInForce::Gtc, px, QTY_SCALE, 1);
+        let bid = place(
+            vec![id3],
+            &alice,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
         let id4 = unit_id(&bid);
         eng.ingest(bid).unwrap();
         // crash to 80k: alice goes underwater (shortfall 5k absorbed by the
@@ -1602,10 +1675,24 @@ mod tests {
         // 1% keeper reward of 800 USD that the fund can actually pay.
         eng.state.marks.insert(BTC_USD, 80_000 * PRICE_SCALE);
         let a = acct_of(&alice);
-        let ask2 = place(vec![id4], &bob, Side::Bid, OrderType::Limit, TimeInForce::Gtc, 80_000 * PRICE_SCALE, QTY_SCALE, 2);
+        let ask2 = place(
+            vec![id4],
+            &bob,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            80_000 * PRICE_SCALE,
+            QTY_SCALE,
+            2,
+        );
         let id5 = unit_id(&ask2);
         eng.ingest(ask2).unwrap();
-        let ins_before = eng.state.accounts.get(&INSURANCE_ACCOUNT).unwrap().collateral;
+        let ins_before = eng
+            .state
+            .accounts
+            .get(&INSURANCE_ACCOUNT)
+            .unwrap()
+            .collateral;
         let liq = sign_unit(
             vec![id5],
             Op::Liquidate {
@@ -1621,9 +1708,19 @@ mod tests {
             ExecEvent::Applied { fills, .. } if !fills.is_empty()
         )));
         let keeper_acct = acct_of(&keeper);
-        let keeper_bal = eng.state.accounts.get(&keeper_acct).map(|x| x.collateral).unwrap_or(0);
+        let keeper_bal = eng
+            .state
+            .accounts
+            .get(&keeper_acct)
+            .map(|x| x.collateral)
+            .unwrap_or(0);
         assert!(keeper_bal > 0, "keeper must be rewarded");
-        let ins_after = eng.state.accounts.get(&INSURANCE_ACCOUNT).unwrap().collateral;
+        let ins_after = eng
+            .state
+            .accounts
+            .get(&INSURANCE_ACCOUNT)
+            .unwrap()
+            .collateral;
         assert!(ins_after < ins_before, "insurance pays the reward");
     }
 
@@ -1643,10 +1740,11 @@ mod tests {
         // Operator observes the AA finalizing height 1 (containing id1).
         let promoted = eng.promote_finalized(&[id1]);
         assert_eq!(promoted, 1);
-        assert!(eng.log.iter().any(
-            |e| matches!(e, ExecEvent::Applied { unit, status, .. }
-                if *unit == id1 && *status == ExecStatus::Final)
-        ));
+        assert!(eng
+            .log
+            .iter()
+            .any(|e| matches!(e, ExecEvent::Applied { unit, status, .. }
+                if *unit == id1 && *status == ExecStatus::Final)));
         // Idempotent: promoting again is a no-op.
         assert_eq!(eng.promote_finalized(&[id1]), 0);
     }
@@ -1680,8 +1778,12 @@ mod tests {
         allow_all(&mut eng);
         let oa = acct_of(&sk(5));
         let ob = acct_of(&sk(6));
-        eng.state.oracle_bonds.insert(oa, operp_types::ORACLE_BOND_PERP);
-        eng.state.oracle_bonds.insert(ob, operp_types::ORACLE_BOND_PERP);
+        eng.state
+            .oracle_bonds
+            .insert(oa, operp_types::ORACLE_BOND_PERP);
+        eng.state
+            .oracle_bonds
+            .insert(ob, operp_types::ORACLE_BOND_PERP);
         let g = genesis_id();
         let mk = |secret: &[u8; 32], px: u64| {
             sign_unit(
@@ -1728,7 +1830,6 @@ mod tests {
             "oracle-authoritative mark must ignore fills"
         );
     }
-
 
     fn gov_dep(parents: Vec<UnitId>, secret: &[u8; 32], amount: u128, aa: u8) -> Unit {
         sign_unit(
@@ -1829,8 +1930,9 @@ mod tests {
                 ..
             }
         )));
-        eng.state.deposits_allowed =
-            (0u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
+        eng.state.deposits_allowed = (0u8..=255)
+            .flat_map(|b| [([b; 32], false), ([b; 32], true)])
+            .collect();
         let w = gov_with(vec![g], &sk(1), 2_000, 1);
         eng.ingest(w).unwrap();
         assert_eq!(eng.state.perp_balances[&acct_of(&sk(1))], 3_000);
@@ -2048,7 +2150,9 @@ mod tests {
             &alice,
         );
         let evs = eng.ingest(c).unwrap();
-        assert!(evs.iter().all(|e| matches!(e, ExecEvent::Applied { ref fills, .. } if fills.is_empty())));
+        assert!(evs
+            .iter()
+            .all(|e| matches!(e, ExecEvent::Applied { ref fills, .. } if fills.is_empty())));
     }
 
     #[test]
@@ -2065,19 +2169,46 @@ mod tests {
         tip = unit_id(&d2);
         eng.ingest(d2).unwrap();
         let px = 100_000 * PRICE_SCALE;
-        let ask = place(vec![tip], &bob, Side::Ask, OrderType::Limit, TimeInForce::Gtc, px, QTY_SCALE, 1);
+        let ask = place(
+            vec![tip],
+            &bob,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
         tip = unit_id(&ask);
         eng.ingest(ask).unwrap();
         // Alice is long 1 BTC with just enough margin for that position.
-        let bid = place(vec![tip], &alice, Side::Bid, OrderType::Limit, TimeInForce::Gtc, px, QTY_SCALE, 1);
+        let bid = place(
+            vec![tip],
+            &alice,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
         tip = unit_id(&bid);
         eng.ingest(bid).unwrap();
         // Flipping to short 2 BTC opens 1 net BTC: it must post full IM for
         // the opened leg, which her ~15k equity cannot cover (10k IM on the
         // open + maintenance on the existing one) → Risk.
-        let evs = eng.ingest(
-            place(vec![tip], &alice, Side::Ask, OrderType::Limit, TimeInForce::Gtc, px, 2 * QTY_SCALE, 2),
-        ).unwrap();
+        let evs = eng
+            .ingest(place(
+                vec![tip],
+                &alice,
+                Side::Ask,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                px,
+                2 * QTY_SCALE,
+                2,
+            ))
+            .unwrap();
         assert!(evs.iter().any(|e| matches!(
             e,
             ExecEvent::Rejected {
@@ -2119,22 +2250,28 @@ mod tests {
             }
         )));
         assert_eq!(eng.state.next_market_id, 2);
-        assert_eq!(eng.state.perp_balances[&acct_of(&sk(1))], CREATE_MARKET_FEE_PERP);
+        assert_eq!(
+            eng.state.perp_balances[&acct_of(&sk(1))],
+            CREATE_MARKET_FEE_PERP
+        );
     }
 
     #[test]
     fn misaligned_tick_limit_rejected() {
         let mut eng = Engine::new();
         allow_all(&mut eng);
-        eng.state.markets.insert(BTC_USD, operp_types::MarketParams {
-            symbol: [0u8; 16],
-            tick_size: 100 * operp_types::PRICE_SCALE,
-            im_bps: operp_types::IM_RATE_BPS,
-            mm_bps: operp_types::MM_RATE_BPS,
-            taker_fee_bps: operp_types::TAKER_FEE_BPS,
-            keeper_reward_bps: operp_types::KEEPER_REWARD_BPS,
-            delisted: false,
-        });
+        eng.state.markets.insert(
+            BTC_USD,
+            operp_types::MarketParams {
+                symbol: [0u8; 16],
+                tick_size: 100 * operp_types::PRICE_SCALE,
+                im_bps: operp_types::IM_RATE_BPS,
+                mm_bps: operp_types::MM_RATE_BPS,
+                taker_fee_bps: operp_types::TAKER_FEE_BPS,
+                keeper_reward_bps: operp_types::KEEPER_REWARD_BPS,
+                delisted: false,
+            },
+        );
         eng.state
             .accounts
             .entry(acct_of(&sk(1)))
@@ -2142,9 +2279,18 @@ mod tests {
             .credit(1_000_000 * USD_SCALE as i128)
             .unwrap();
         // 150.5 is off the 100-grid → Risk; Market orders stay exempt.
-        let evs = eng.ingest(
-            place(vec![genesis_id()], &sk(1), Side::Bid, OrderType::Limit, TimeInForce::Gtc, 150_500 * PRICE_SCALE / 1000, QTY_SCALE, 1),
-        ).unwrap();
+        let evs = eng
+            .ingest(place(
+                vec![genesis_id()],
+                &sk(1),
+                Side::Bid,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                150_500 * PRICE_SCALE / 1000,
+                QTY_SCALE,
+                1,
+            ))
+            .unwrap();
         assert!(evs.iter().any(|e| matches!(
             e,
             ExecEvent::Rejected {
@@ -2191,7 +2337,16 @@ mod tests {
         // ...and must not advance the sequence counter.
         assert_eq!(eng.state.seq, applied_before);
         // The next valid unit still gets exactly the next seq number.
-        let good = place(vec![tip], &alice, Side::Bid, OrderType::Limit, TimeInForce::Gtc, 90_000 * PRICE_SCALE, QTY_SCALE, 1);
+        let good = place(
+            vec![tip],
+            &alice,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            90_000 * PRICE_SCALE,
+            QTY_SCALE,
+            1,
+        );
         eng.ingest(good).unwrap();
         assert_eq!(eng.state.seq, applied_before + 1);
     }
@@ -2241,10 +2396,16 @@ mod tests {
         let mut eng = Engine::new();
         // Only a collateral endorsement for unit 5 exists — no PERP one.
         eng.state.deposits_allowed = [([5u8; 32], false)].into_iter().collect();
-        eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
+        eng.state
+            .markets
+            .insert(BTC_USD, operp_types::genesis_params());
         let g = genesis_id();
-        eng.ingest(deposit(vec![g], &sk(1), 1_000 * USD_SCALE as i128, 5)).unwrap();
-        assert_eq!(eng.state.accounts[&acct_of(&sk(1))].collateral, 1_000 * USD_SCALE as i128);
+        eng.ingest(deposit(vec![g], &sk(1), 1_000 * USD_SCALE as i128, 5))
+            .unwrap();
+        assert_eq!(
+            eng.state.accounts[&acct_of(&sk(1))].collateral,
+            1_000 * USD_SCALE as i128
+        );
         // The same unit must NOT be reusable as a PERP endorsement: the
         // shared seen-unit ledger rejects the exact replay first...
         let evs = eng.ingest(gov_dep(vec![g], &sk(1), 5_000, 5)).unwrap();
@@ -2295,7 +2456,8 @@ mod tests {
             }
         )));
         // First valid deposit binds B...
-        eng.ingest(deposit(vec![g], &sk(1), 1_000 * USD_SCALE as i128, 1)).unwrap();
+        eng.ingest(deposit(vec![g], &sk(1), 1_000 * USD_SCALE as i128, 1))
+            .unwrap();
         assert_eq!(eng.state.aa_addresses.get(&account).unwrap(), &test_addr(1));
         // ...and rebinding to a different address is refused.
         let rebind = sign_unit(
@@ -2343,7 +2505,6 @@ mod tests {
         assert_eq!(eng.state.seen_gov_nonces[&acct_of(&sk(1))], 4);
     }
 
-
     /// Gap 11 acceptance: the gov-nonce watermark survives a node restart
     /// via the WAL, so replays below it keep bouncing.
     #[test]
@@ -2368,7 +2529,10 @@ mod tests {
         let evs = eng2.ingest(gov_with(vec![g], &sk(1), 50, 4)).unwrap();
         assert!(evs.iter().any(|e| matches!(
             e,
-            ExecEvent::Rejected { reason: RejectReason::DuplicateNonce, .. }
+            ExecEvent::Rejected {
+                reason: RejectReason::DuplicateNonce,
+                ..
+            }
         )));
         eng2.ingest(gov_with(vec![g], &sk(1), 50, 6)).unwrap();
         assert_eq!(eng2.state.seen_gov_nonces[&acct_of(&sk(1))], 6);
@@ -2386,12 +2550,17 @@ mod tests {
         let g = genesis_id();
         let alice = sk(1);
         let account = acct_of(&alice);
-        eng.ingest(deposit(vec![g], &alice, 10_000 * USD_SCALE as i128, 1)).unwrap();
+        eng.ingest(deposit(vec![g], &alice, 10_000 * USD_SCALE as i128, 1))
+            .unwrap();
         // Withdraw collateral (nonce 7) and deposit PERP (distinct aa unit,
         // same bound address).
         let wd = sign_unit(
             vec![g],
-            Op::Withdraw { account, amount: 100 * USD_SCALE as i128, nonce: 7 },
+            Op::Withdraw {
+                account,
+                amount: 100 * USD_SCALE as i128,
+                nonce: 7,
+            },
             &alice,
         );
         eng.ingest(wd).unwrap();
@@ -2406,7 +2575,9 @@ mod tests {
             &alice,
         );
         let evs_gd = eng.ingest(gd).unwrap();
-        assert!(evs_gd.iter().any(|e| matches!(e, ExecEvent::Applied { .. })));
+        assert!(evs_gd
+            .iter()
+            .any(|e| matches!(e, ExecEvent::Applied { .. })));
 
         // Snapshot + restart.
         eng.flush_snapshot().unwrap();
@@ -2417,24 +2588,33 @@ mod tests {
         // Same withdraw nonce after restart → DuplicateNonce.
         let dup = sign_unit(
             vec![g],
-            Op::Withdraw { account, amount: 100 * USD_SCALE as i128, nonce: 7 },
+            Op::Withdraw {
+                account,
+                amount: 100 * USD_SCALE as i128,
+                nonce: 7,
+            },
             &alice,
         );
         let evs = eng2.ingest(dup).unwrap();
         assert!(evs.iter().any(|e| matches!(
             e,
-            ExecEvent::Rejected { reason: RejectReason::DuplicateNonce, .. }
+            ExecEvent::Rejected {
+                reason: RejectReason::DuplicateNonce,
+                ..
+            }
         )));
         // Reused aa_unit after restart → DuplicateDeposit (collateral kind).
         let dep2 = deposit(vec![g], &sk(3), 100 * USD_SCALE as i128, 9);
         let evs = eng2.ingest(dep2).unwrap();
         assert!(evs.iter().any(|e| matches!(
             e,
-            ExecEvent::Rejected { reason: RejectReason::DuplicateDeposit, .. }
+            ExecEvent::Rejected {
+                reason: RejectReason::DuplicateDeposit,
+                ..
+            }
         )));
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 
     /// Reference implementation of the Phase-2 salt derivation contract:
     /// sha256(ORDERING_SALT_DOMAIN || finalized_root || epoch_le).
@@ -2463,7 +2643,10 @@ mod tests {
         let mut e3 = Engine::new();
         e3.note_finalized(root, operp_types::ORDERING_EPOCH_UNITS);
         assert_ne!(e1.dag.eviction_salt(), e3.dag.eviction_salt());
-        assert_eq!(e3.dag.eviction_salt(), derived_salt(root, operp_types::ORDERING_EPOCH_UNITS));
+        assert_eq!(
+            e3.dag.eviction_salt(),
+            derived_salt(root, operp_types::ORDERING_EPOCH_UNITS)
+        );
 
         // Different root → different salt.
         let mut e4 = Engine::new();
@@ -2653,7 +2836,10 @@ mod tests {
         assert!(
             matches!(
                 events.last(),
-                Some(ExecEvent::Rejected { reason: RejectReason::BadCommit, .. })
+                Some(ExecEvent::Rejected {
+                    reason: RejectReason::BadCommit,
+                    ..
+                })
             ),
             "reveal must parent its commit"
         );
@@ -2702,7 +2888,10 @@ mod tests {
         let events = eng.ingest(r).unwrap();
         assert!(matches!(
             events.last(),
-            Some(ExecEvent::Rejected { reason: RejectReason::BadCommit, .. })
+            Some(ExecEvent::Rejected {
+                reason: RejectReason::BadCommit,
+                ..
+            })
         ));
         assert!(!eng.state.commits[&commit_hash].revealed);
     }
@@ -2751,7 +2940,10 @@ mod tests {
         let events = eng.ingest(r).unwrap();
         assert!(matches!(
             events.last(),
-            Some(ExecEvent::Rejected { reason: RejectReason::BadCommit, .. })
+            Some(ExecEvent::Rejected {
+                reason: RejectReason::BadCommit,
+                ..
+            })
         ));
         eng.state.prune_commits(eng.state.height);
         assert!(!eng.state.commits.contains_key(&commit_hash));
@@ -2793,7 +2985,10 @@ mod tests {
             } else {
                 assert!(matches!(
                     events.last(),
-                    Some(ExecEvent::Rejected { reason: RejectReason::BadCommit, .. })
+                    Some(ExecEvent::Rejected {
+                        reason: RejectReason::BadCommit,
+                        ..
+                    })
                 ));
             }
         }
@@ -2809,7 +3004,10 @@ mod tests {
         let events = eng.ingest(dup).unwrap();
         assert!(matches!(
             events.last(),
-            Some(ExecEvent::Rejected { reason: RejectReason::BadCommit, .. })
+            Some(ExecEvent::Rejected {
+                reason: RejectReason::BadCommit,
+                ..
+            })
         ));
     }
 
@@ -2827,7 +3025,10 @@ mod tests {
         let events = eng.ingest(c).unwrap();
         assert!(matches!(
             events.last(),
-            Some(ExecEvent::Rejected { reason: RejectReason::BadCommit, .. })
+            Some(ExecEvent::Rejected {
+                reason: RejectReason::BadCommit,
+                ..
+            })
         ));
     }
 
@@ -2924,7 +3125,14 @@ mod tests {
 
     /// Two bonded reporters primed at `px` across distinct heights so the
     /// bonded-median funding TWAP converges to `px`.
-    fn prime_bonded_twap(eng: &mut Engine, tip: &mut UnitId, oa: &[u8; 32], ob: &[u8; 32], px: Price, heights: u64) {
+    fn prime_bonded_twap(
+        eng: &mut Engine,
+        tip: &mut UnitId,
+        oa: &[u8; 32],
+        ob: &[u8; 32],
+        px: Price,
+        heights: u64,
+    ) {
         for _ in 0..heights {
             eng.state.height += 1;
             let r1 = report_unit(vec![*tip], oa, px);
@@ -2945,16 +3153,17 @@ mod tests {
         let ob = sk(6);
         let keeper = sk(9);
         // Bond reporters so funding ticks fire; allowlist the keeper.
-        eng.state.oracle_bonds.insert(acct_of(&oa), ORACLE_BOND_PERP);
-        eng.state.oracle_bonds.insert(acct_of(&ob), ORACLE_BOND_PERP);
+        eng.state
+            .oracle_bonds
+            .insert(acct_of(&oa), ORACLE_BOND_PERP);
+        eng.state
+            .oracle_bonds
+            .insert(acct_of(&ob), ORACLE_BOND_PERP);
         eng.state.external_sources.insert(acct_of(&keeper));
 
         let mut tip = genesis_id();
         prime_bonded_twap(&mut eng, &mut tip, &oa, &ob, 90_000 * PRICE_SCALE, 4);
-        assert_eq!(
-            eng.state.funding_index_twap[&BTC_USD],
-            90_000 * PRICE_SCALE
-        );
+        assert_eq!(eng.state.funding_index_twap[&BTC_USD], 90_000 * PRICE_SCALE);
 
         // Keeper posts an external anchor at 95k through the real dispatch
         // path; it lands in the ring but needs >= MIN_SAMPLES to drive index.
@@ -2965,12 +3174,10 @@ mod tests {
         let e2 = external_price_unit(vec![tip], &keeper, 95_000 * PRICE_SCALE, 0);
         let _ = unit_id(&e2);
         eng.ingest(e2).unwrap();
+        assert_eq!(eng.state.external_twap(BTC_USD), Some(95_000 * PRICE_SCALE));
         assert_eq!(
-            eng.state.external_twap(BTC_USD),
-            Some(95_000 * PRICE_SCALE)
-        );
-        assert_eq!(
-            eng.state.effective_funding_index(BTC_USD, 90_000 * PRICE_SCALE),
+            eng.state
+                .effective_funding_index(BTC_USD, 90_000 * PRICE_SCALE),
             95_000 * PRICE_SCALE,
             "fresh external ring must override the bonded-median TWAP"
         );
@@ -2979,7 +3186,8 @@ mod tests {
         // bonded TWAP so funding never freezes (doc §2.6 rule 2).
         eng.state.height += operp_types::FUNDING_EXTERNAL_MAX_STALENESS + 1;
         assert_eq!(
-            eng.state.effective_funding_index(BTC_USD, 90_000 * PRICE_SCALE),
+            eng.state
+                .effective_funding_index(BTC_USD, 90_000 * PRICE_SCALE),
             90_000 * PRICE_SCALE
         );
     }
@@ -2997,7 +3205,10 @@ mod tests {
         let events = eng.ingest(u).unwrap();
         assert!(matches!(
             events.last(),
-            Some(ExecEvent::Rejected { reason: RejectReason::BadAccount, .. })
+            Some(ExecEvent::Rejected {
+                reason: RejectReason::BadAccount,
+                ..
+            })
         ));
         // BondedMedianTwap (default source): UpdateExternalPrice rejected so
         // v1 replay stays byte-identical.
@@ -3008,7 +3219,10 @@ mod tests {
         let events2 = eng2.ingest(u2).unwrap();
         assert!(matches!(
             events2.last(),
-            Some(ExecEvent::Rejected { reason: RejectReason::NotFound, .. })
+            Some(ExecEvent::Rejected {
+                reason: RejectReason::NotFound,
+                ..
+            })
         ));
         assert!(eng2.state.external_price_ring.is_empty());
     }
@@ -3023,8 +3237,12 @@ mod tests {
         let oa = sk(5);
         let ob = sk(6);
         let keeper = sk(9);
-        eng.state.oracle_bonds.insert(acct_of(&oa), ORACLE_BOND_PERP);
-        eng.state.oracle_bonds.insert(acct_of(&ob), ORACLE_BOND_PERP);
+        eng.state
+            .oracle_bonds
+            .insert(acct_of(&oa), ORACLE_BOND_PERP);
+        eng.state
+            .oracle_bonds
+            .insert(acct_of(&ob), ORACLE_BOND_PERP);
         eng.state.external_sources.insert(acct_of(&keeper));
         // Collateral + opposite positions via deposits/places.
         let d1 = deposit(vec![genesis_id()], &alice, 1_000_000 * USD_SCALE as i128, 1);
@@ -3035,12 +3253,26 @@ mod tests {
         eng.ingest(d2).unwrap();
         let px = 100_000 * PRICE_SCALE;
         let ask = place(
-            vec![tip], &bob, Side::Ask, OrderType::Limit, TimeInForce::Gtc, px, QTY_SCALE / 1000, 1,
+            vec![tip],
+            &bob,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE / 1000,
+            1,
         );
         tip = unit_id(&ask);
         eng.ingest(ask).unwrap();
         let bid = place(
-            vec![tip], &alice, Side::Bid, OrderType::Limit, TimeInForce::Gtc, px, QTY_SCALE / 1000, 1,
+            vec![tip],
+            &alice,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE / 1000,
+            1,
         );
         tip = unit_id(&bid);
         eng.ingest(bid).unwrap();
@@ -3073,7 +3305,10 @@ mod tests {
         );
         let moved = pre_long - eng.state.accounts[&acct_of(&alice)].collateral;
         // Per-tick cap: 50 bps of notional(qty, 50k).
-        let cap = operp_types::bps(i128::from(QTY_SCALE / 1000) * (50_000 * PRICE_SCALE as i128), operp_types::FUNDING_CAP_BPS as u64);
+        let cap = operp_types::bps(
+            i128::from(QTY_SCALE / 1000) * (50_000 * PRICE_SCALE as i128),
+            operp_types::FUNDING_CAP_BPS as u64,
+        );
         assert!(moved <= cap as i128 + USD_SCALE as i128, "cap holds");
     }
 }

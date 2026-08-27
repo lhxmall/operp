@@ -137,7 +137,6 @@ pub struct ReportSample {
 }
 
 /// Funding TWAP sample (alias to TwapSample for now).
-
 /// External price sample posted by an allowlisted keeper via
 /// `Op::UpdateExternalPrice` (doc 06 §2.3). Empty ring in v1
 /// BondedMedianTwap; structure committed in meta_leaf for forward compat.
@@ -149,7 +148,6 @@ pub struct ExternalSample {
     pub source_id: u8,
 }
 pub type FundingTwapSample = TwapSample;
-
 
 pub type Price = u64;
 pub type Qty = u64;
@@ -266,7 +264,6 @@ pub fn parse_hex32(s: &str) -> Result<[u8; 32], TypesError> {
     let a: [u8; 32] = v.try_into().map_err(|_| TypesError::InvalidHex)?;
     Ok(a)
 }
-
 
 /// Obyte address validity: 32 chars from the base32 alphabet used by
 /// `isValidAddress` in vendor/ocore/validation_utils.js (`/^[A-Z2-7]{32}$/`).

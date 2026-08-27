@@ -40,7 +40,6 @@ fn asset_matches(s: &str, want: &[u8; 32]) -> bool {
         .unwrap_or(false)
 }
 
-
 /// Finds the first output paying `vault` in the expected asset kind; accepts
 /// an output to ANY address when `vault` is None (vault address not
 /// configured pre-deploy). Asset-class binding is enforced either way so a
@@ -120,8 +119,12 @@ fn verify_one(
 ) -> Result<([u8; 32], bool), SettleError> {
     // op kind and aa_unit extraction
     let (op_aa_unit, op_amount_str, op_is_perp) = match op {
-        Op::Deposit { aa_unit, amount, .. } => (*aa_unit, amount.to_string(), false),
-        Op::GovDeposit { aa_unit, amount, .. } => (*aa_unit, amount.to_string(), true),
+        Op::Deposit {
+            aa_unit, amount, ..
+        } => (*aa_unit, amount.to_string(), false),
+        Op::GovDeposit {
+            aa_unit, amount, ..
+        } => (*aa_unit, amount.to_string(), true),
         _ => return Ok(([0u8; 32], false)), // not a deposit, caller filters
     };
 
@@ -172,8 +175,10 @@ fn verify_one(
             } else {
                 // For base, joint amount is ev.amount + 10000 bounce fee;
                 // see `base_amount_matches` (fixtures post without the fee).
-                let ev_amt: i128 =
-                    ev.amount.parse().map_err(|_| SettleError::DepositContentMismatch)?;
+                let ev_amt: i128 = ev
+                    .amount
+                    .parse()
+                    .map_err(|_| SettleError::DepositContentMismatch)?;
                 let joint_amt: i128 = joint_amount_str
                     .parse()
                     .map_err(|_| SettleError::DepositContentMismatch)?;

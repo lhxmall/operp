@@ -45,8 +45,8 @@ fn snapshot_name(height: Height) -> String {
 /// Returns the snapshot path.
 pub fn save_snapshot(dir: &Path, state: &ChainState) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
-    let bytes = bincode::serialize(state)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let bytes =
+        bincode::serialize(state).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let path = dir.join(snapshot_name(state.height));
     let tmp = dir.join(format!("{}.tmp", snapshot_name(state.height)));
     {
@@ -70,7 +70,9 @@ pub fn load_latest(dir: &Path) -> io::Result<Option<(Height, ChainState)>> {
     for (_, path) in snapshot_candidates(dir)? {
         let parsed = (|| -> io::Result<ChainState> {
             let bytes = fs::read(&path)?;
-            if bytes.len() < 4 || u32::from_le_bytes(bytes[..4].try_into().unwrap()) != SNAPSHOT_FORMAT_VERSION {
+            if bytes.len() < 4
+                || u32::from_le_bytes(bytes[..4].try_into().unwrap()) != SNAPSHOT_FORMAT_VERSION
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "unknown snapshot format version",
@@ -106,8 +108,12 @@ fn snapshot_candidates(dir: &Path) -> io::Result<Vec<(Height, PathBuf)>> {
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let Some(rest) = name.strip_prefix(SNAPSHOT_PREFIX) else { continue };
-        let Some(h) = rest.strip_suffix(&format!(".{SNAPSHOT_EXT}")) else { continue };
+        let Some(rest) = name.strip_prefix(SNAPSHOT_PREFIX) else {
+            continue;
+        };
+        let Some(h) = rest.strip_suffix(&format!(".{SNAPSHOT_EXT}")) else {
+            continue;
+        };
         if let Ok(h) = h.parse::<Height>() {
             out.push((h, dir.join(snapshot_name(h))));
         }
@@ -126,7 +132,9 @@ fn prune_snapshots(dir: &Path, keep: usize) -> io::Result<()> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             if name.to_string_lossy().starts_with(SNAPSHOT_PREFIX)
-                && name.to_string_lossy().ends_with(&format!(".{SNAPSHOT_EXT}.tmp"))
+                && name
+                    .to_string_lossy()
+                    .ends_with(&format!(".{SNAPSHOT_EXT}.tmp"))
             {
                 let _ = fs::remove_file(entry.path());
             }
@@ -160,7 +168,11 @@ mod tests {
         // Pruning caps retained snapshots at KEEP_SNAPSHOTS.
         let mut n = 0;
         for e in fs::read_dir(&dir).unwrap() {
-            if e.unwrap().file_name().to_string_lossy().ends_with(SNAPSHOT_EXT) {
+            if e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(SNAPSHOT_EXT)
+            {
                 n += 1;
             }
         }

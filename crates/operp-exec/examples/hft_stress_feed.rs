@@ -25,7 +25,10 @@ struct Cfg {
 
 fn parse_args() -> Cfg {
     let mut args = std::env::args().skip(1);
-    let run_ms: u64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(1_200_000);
+    let run_ms: u64 = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(1_200_000);
     let out = args
         .next()
         .map(PathBuf::from)
@@ -38,8 +41,12 @@ fn main() {
     std::fs::create_dir_all(&cfg.out).expect("mkdir");
 
     let mut eng = Engine::new();
-    eng.state.deposits_allowed = (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
-    eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
+    eng.state.deposits_allowed = (1u8..=255)
+        .flat_map(|b| [([b; 32], false), ([b; 32], true)])
+        .collect();
+    eng.state
+        .markets
+        .insert(BTC_USD, operp_types::genesis_params());
     let secrets: Vec<[u8; 32]> = (1..=N as u8).map(sk).collect();
     let mut seqs = vec![1u64; N];
     let px = 100_000 * PRICE_SCALE;
@@ -49,7 +56,12 @@ fn main() {
     for (i, s) in secrets.iter().enumerate() {
         let u = sign_unit(
             vec![tip],
-            Op::Deposit { account: acct(s), addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(), amount: 10_000_000 * USD_SCALE as i128, aa_unit: [i as u8 + 1; 32] },
+            Op::Deposit {
+                account: acct(s),
+                addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                amount: 10_000_000 * USD_SCALE as i128,
+                aa_unit: [i as u8 + 1; 32],
+            },
             s,
         );
         tip = unit_id(&u);
@@ -57,7 +69,10 @@ fn main() {
     }
 
     println!("READY");
-    println!("HFT sidechain feed: {N} traders, {}ms, open/close 0.01 BTC @ {}", cfg.run_ms, px);
+    println!(
+        "HFT sidechain feed: {N} traders, {}ms, open/close 0.01 BTC @ {}",
+        cfg.run_ms, px
+    );
 
     let start = Instant::now();
     let end = start + Duration::from_millis(cfg.run_ms);
@@ -205,7 +220,12 @@ fn main() {
 
     let mut open = 0i64;
     for s in &secrets {
-        if let Some(p) = eng.state.accounts.get(&acct(s)).and_then(|a| a.positions.get(&BTC_USD)) {
+        if let Some(p) = eng
+            .state
+            .accounts
+            .get(&acct(s))
+            .and_then(|a| a.positions.get(&BTC_USD))
+        {
             open += p.qty.abs();
         }
     }

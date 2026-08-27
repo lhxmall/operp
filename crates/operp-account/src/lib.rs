@@ -74,9 +74,7 @@ impl Account {
         });
         let old = pos.qty;
         if old == 0 || same_sign(old, delta) {
-            let new_qty = old
-                .checked_add(delta)
-                .ok_or(AccountError::Overflow)?;
+            let new_qty = old.checked_add(delta).ok_or(AccountError::Overflow)?;
             let entry = if old == 0 {
                 price
             } else {
@@ -112,7 +110,11 @@ impl Account {
                         market,
                         Position {
                             market,
-                            qty: if delta > 0 { open as i64 } else { -(open as i64) },
+                            qty: if delta > 0 {
+                                open as i64
+                            } else {
+                                -(open as i64)
+                            },
                             entry_price: price,
                         },
                     );
@@ -153,7 +155,8 @@ impl Account {
                     continue;
                 }
             };
-            upnl += signed_notional_usd(pos.qty, mark) - signed_notional_usd(pos.qty, pos.entry_price);
+            upnl +=
+                signed_notional_usd(pos.qty, mark) - signed_notional_usd(pos.qty, pos.entry_price);
             let abs_n = notional_usd(pos.qty.unsigned_abs() as u64, mark);
             mm += bps(abs_n, MM_RATE_BPS);
             im += bps(abs_n, IM_RATE_BPS);
@@ -192,7 +195,11 @@ impl Account {
         Ok(())
     }
 
-    pub fn debit(&mut self, amount: Usd, marks: &BTreeMap<MarketId, Price>) -> Result<(), AccountError> {
+    pub fn debit(
+        &mut self,
+        amount: Usd,
+        marks: &BTreeMap<MarketId, Price>,
+    ) -> Result<(), AccountError> {
         if amount <= 0 {
             return Err(AccountError::NonPositive);
         }

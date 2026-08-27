@@ -73,16 +73,18 @@ fn main() {
         pairs.push((format!("{:0<32}", format!("PAD{}", pad)), 500, 0, 0));
     }
 
-    let (shard, siblings, shard_root) =
-        operp_state::aa_sharded_proof_for(&pairs, &addr)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no sharded proof for {addr}: register PAD decoy bindings for its shard first \
+    let (shard, siblings, shard_root) = operp_state::aa_sharded_proof_for(&pairs, &addr)
+        .unwrap_or_else(|| {
+            panic!(
+                "no sharded proof for {addr}: register PAD decoy bindings for its shard first \
                      (see the bucket-padding note above)"
-                )
-            });
+            )
+        });
     let roots = operp_state::aa_sharded_roots_of(&pairs);
-    assert_eq!(roots[shard as usize], shard_root, "proof must reach its shard root");
+    assert_eq!(
+        roots[shard as usize], shard_root,
+        "proof must reach its shard root"
+    );
     let forest = roots.concat();
     assert_eq!(forest.len(), 1024, "forest is 16 x 64 hex");
     let proof_json = serde_json::json!({
@@ -99,7 +101,8 @@ fn main() {
             .map(|(hash, right)| serde_json::json!({ "hash": hash, "right": right }))
             .collect::<Vec<_>>(),
     });
-    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../obyte-local/withdraw_claim.json");
+    let out =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../obyte-local/withdraw_claim.json");
     std::fs::write(&out, serde_json::to_string_pretty(&proof_json).unwrap()).expect("write");
     println!("wrote {} (shard {})", out.display(), shard);
 }

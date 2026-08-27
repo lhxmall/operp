@@ -1,8 +1,7 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use operp_types::{
     account_id_from_pubkey, sha256, AccountId, Bps, Height, MarketId, OrderId, OrderType, Price,
-    Qty,
-    Side, TimeInForce, UnitId, Usd, MAX_PARENTS, COMMIT_TAG, REVEAL_TAG,
+    Qty, Side, TimeInForce, UnitId, Usd, COMMIT_TAG, MAX_PARENTS, REVEAL_TAG,
     UPDATE_EXTERNAL_PRICE_TAG,
 };
 use serde::{Deserialize, Serialize};
@@ -83,10 +82,7 @@ pub enum Op {
         approve: bool,
     },
     /// Finalize a proposal once past its deadline; anyone may call.
-    FinalizeProposal {
-        caller: AccountId,
-        proposal_id: u64,
-    },
+    FinalizeProposal { caller: AccountId, proposal_id: u64 },
     /// Keeper-initiated liquidation. `caller` is the keeper requesting it and
     /// receives the keeper reward; signature must belong to `caller`.
     Liquidate {
@@ -95,13 +91,9 @@ pub enum Op {
         market: MarketId,
     },
     /// Stake PERP bond to become a price reporter.
-    StakeOracle {
-        account: AccountId,
-    },
+    StakeOracle { account: AccountId },
     /// Begin unbonding of a reporter; unlocks after 256 heights.
-    UnstakeOracle {
-        account: AccountId,
-    },
+    UnstakeOracle { account: AccountId },
     /// Slash a reporter whose reports deviate >500bps from TWAP for 3 consecutive heights.
     SlashOracle {
         challenger: AccountId,
@@ -310,7 +302,10 @@ fn encode_op(b: &mut Vec<u8>, op: &Op) {
             b.extend_from_slice(&proposal_id.to_le_bytes());
             b.push(u8::from(*approve));
         }
-        Op::FinalizeProposal { caller, proposal_id } => {
+        Op::FinalizeProposal {
+            caller,
+            proposal_id,
+        } => {
             b.push(13);
             b.extend_from_slice(&caller.0);
             b.extend_from_slice(&proposal_id.to_le_bytes());
@@ -465,7 +460,6 @@ fn account_matches(unit: &Unit) -> bool {
         Op::Vote { voter, .. } => *voter == expected,
     }
 }
-
 
 pub fn sign_unit(parents: Vec<UnitId>, op: Op, secret: &[u8; 32]) -> Unit {
     use ed25519_dalek::{Signer, SigningKey};
@@ -792,7 +786,11 @@ mod tests {
     }
 
     fn deposit(parents: Vec<UnitId>, secret: &[u8; 32], aa: u8) -> Unit {
-        let account = account_id_from_pubkey(&ed25519_dalek::SigningKey::from_bytes(secret).verifying_key().to_bytes());
+        let account = account_id_from_pubkey(
+            &ed25519_dalek::SigningKey::from_bytes(secret)
+                .verifying_key()
+                .to_bytes(),
+        );
         sign_unit(
             parents,
             Op::Deposit {

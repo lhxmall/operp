@@ -16,8 +16,8 @@ use operp_dag::{genesis_id, sign_unit, unit_id, Op};
 use operp_exec::{Engine, ExecEvent, RejectReason};
 use operp_state::{ChainState, Withdrawal};
 use operp_types::{
-    account_id_from_pubkey, genesis_params, AccountId, Height, BTC_USD, USD_SCALE,
-    REPLAY_ACTIVATION_HEIGHT, REPLAY_WINDOW,
+    account_id_from_pubkey, genesis_params, AccountId, Height, BTC_USD, REPLAY_ACTIVATION_HEIGHT,
+    REPLAY_WINDOW, USD_SCALE,
 };
 
 fn sk(n: u8) -> [u8; 32] {
@@ -45,28 +45,74 @@ fn test_addr(n: u8) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
-fn deposit(parents: Vec<operp_types::UnitId>, secret: &[u8; 32], amount: i128, aa: u8) -> operp_dag::Unit {
+fn deposit(
+    parents: Vec<operp_types::UnitId>,
+    secret: &[u8; 32],
+    amount: i128,
+    aa: u8,
+) -> operp_dag::Unit {
     sign_unit(
         parents,
-        Op::Deposit { account: acct_of(secret), addr: test_addr(aa), amount, aa_unit: [aa; 32] },
+        Op::Deposit {
+            account: acct_of(secret),
+            addr: test_addr(aa),
+            amount,
+            aa_unit: [aa; 32],
+        },
         secret,
     )
 }
 
-fn withdraw(parents: Vec<operp_types::UnitId>, secret: &[u8; 32], amount: i128, nonce: u64) -> operp_dag::Unit {
-    sign_unit(parents, Op::Withdraw { account: acct_of(secret), amount, nonce }, secret)
-}
-
-fn gov_dep(parents: Vec<operp_types::UnitId>, secret: &[u8; 32], amount: u128, aa: u8) -> operp_dag::Unit {
+fn withdraw(
+    parents: Vec<operp_types::UnitId>,
+    secret: &[u8; 32],
+    amount: i128,
+    nonce: u64,
+) -> operp_dag::Unit {
     sign_unit(
         parents,
-        Op::GovDeposit { account: acct_of(secret), addr: test_addr(aa), amount, aa_unit: [aa; 32] },
+        Op::Withdraw {
+            account: acct_of(secret),
+            amount,
+            nonce,
+        },
         secret,
     )
 }
 
-fn gov_with(parents: Vec<operp_types::UnitId>, secret: &[u8; 32], amount: u128, nonce: u64) -> operp_dag::Unit {
-    sign_unit(parents, Op::GovWithdraw { account: acct_of(secret), amount, nonce }, secret)
+fn gov_dep(
+    parents: Vec<operp_types::UnitId>,
+    secret: &[u8; 32],
+    amount: u128,
+    aa: u8,
+) -> operp_dag::Unit {
+    sign_unit(
+        parents,
+        Op::GovDeposit {
+            account: acct_of(secret),
+            addr: test_addr(aa),
+            amount,
+            aa_unit: [aa; 32],
+        },
+        secret,
+    )
+}
+
+fn gov_with(
+    parents: Vec<operp_types::UnitId>,
+    secret: &[u8; 32],
+    amount: u128,
+    nonce: u64,
+) -> operp_dag::Unit {
+    sign_unit(
+        parents,
+        Op::GovWithdraw {
+            account: acct_of(secret),
+            amount,
+            nonce,
+        },
+        secret,
+    )
 }
 
 /// Unique scratch store dir under the OS temp dir (no external deps).
@@ -219,7 +265,11 @@ fn gov_nonce_watermark_survives_restart_without_snapshot() {
     // in the snapshot, not the journal — with no snapshot they come from
     // temp_data replay; here a fresh GovDeposit re-funds the account.)
     let evs = eng2.ingest(gov_dep(vec![g], &alice, 500, 8)).unwrap();
-    assert!(evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })), "refund must apply, got {:?}", evs);
+    assert!(
+        evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+        "refund must apply, got {:?}",
+        evs
+    );
     let w6 = gov_with(vec![g], &alice, 50, 6);
     let prev3 = eng2.state.clone();
     let evs = eng2.ingest(w6.clone()).unwrap();
@@ -231,7 +281,10 @@ fn gov_nonce_watermark_survives_restart_without_snapshot() {
     operp_settle::Batch::from_applied(&prev3, &mut eng2, &[unit_id(&w6)]).unwrap();
     // ...and survives yet another restart.
     let eng3 = Engine::load_or_genesis(&dir).unwrap();
-    assert_eq!(eng3.state.seen_gov_nonces.get(&acct_of(&alice)).copied(), Some(6));
+    assert_eq!(
+        eng3.state.seen_gov_nonces.get(&acct_of(&alice)).copied(),
+        Some(6)
+    );
 }
 
 #[test]
@@ -286,8 +339,14 @@ fn activation_gate_selects_window_by_height() {
         let mut st = ChainState::new();
         st.height = h0;
         let raw = [7u8; 32];
-        st.withdrawals
-            .insert((AccountId(raw), 1), Withdrawal { amount: 1, pending: true, height: h0 });
+        st.withdrawals.insert(
+            (AccountId(raw), 1),
+            Withdrawal {
+                amount: 1,
+                pending: true,
+                height: h0,
+            },
+        );
         st.seen_aa_units.insert(raw, h0);
         st
     }
@@ -309,7 +368,11 @@ fn activation_gate_selects_window_by_height() {
     st.height += 300;
     st.prune_withdrawals(st.height);
     st.prune_aa_units(st.height);
-    assert_eq!(st.withdrawals.len(), 1, "above the gate nothing expires before 2048 heights");
+    assert_eq!(
+        st.withdrawals.len(),
+        1,
+        "above the gate nothing expires before 2048 heights"
+    );
     assert_eq!(st.seen_aa_units.len(), 1);
 }
 
@@ -327,7 +390,11 @@ fn prune_still_bounds_memory() {
         raw[..8].copy_from_slice(&i.to_le_bytes());
         st.withdrawals.insert(
             (AccountId(raw), i),
-            Withdrawal { amount: 1, pending: true, height: h0 + i },
+            Withdrawal {
+                amount: 1,
+                pending: true,
+                height: h0 + i,
+            },
         );
         st.seen_aa_units.insert(raw, h0 + i);
     }
@@ -377,7 +444,11 @@ fn restart_midstream_recovered_via_validate_against_no_double_apply() {
     // validate_against — exactly the design's recovery sequence.
     let mut eng2 = Engine::load_or_genesis(&dir).unwrap();
     allow_all(&mut eng2);
-    assert_eq!(eng2.state.state_root(), prev.state_root(), "restart must boot at the pre-commit snapshot");
+    assert_eq!(
+        eng2.state.state_root(),
+        prev.state_root(),
+        "restart must boot at the pre-commit snapshot"
+    );
     batch
         .validate_against(prev.state_root(), &mut eng2)
         .expect("replay after restart must reproduce the batch");
@@ -436,11 +507,16 @@ fn failed_validate_against_does_not_persist_gov_nonce() {
 
     // Corrupt the checkpoint so validation fails AFTER replaying the batch.
     batch.checkpoint.fills_hash = [0xAA; 32];
-    let err = batch.validate_against(prev.state_root(), &mut validator).unwrap_err();
+    let err = batch
+        .validate_against(prev.state_root(), &mut validator)
+        .unwrap_err();
     assert!(matches!(err, SettleError::FillsMismatch), "got {err:?}");
 
     // The validator replay advanced its in-memory watermark...
-    assert_eq!(validator.state.seen_gov_nonces.get(&alice).copied(), Some(5));
+    assert_eq!(
+        validator.state.seen_gov_nonces.get(&alice).copied(),
+        Some(5)
+    );
     // ...but restart rebuilds from snapshot + journal: nonce 5 must be GONE.
     let eng3 = Engine::load_or_genesis(&validator_dir).unwrap();
     assert_eq!(

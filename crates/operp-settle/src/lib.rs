@@ -9,7 +9,6 @@ use operp_types::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-
 pub mod deposit_verify;
 pub mod obyte_hash;
 
@@ -281,11 +280,12 @@ impl Batch {
         if replay.state.state_root() != prev_root {
             return Err(SettleError::PrevMismatch);
         }
-        if self
-            .units
-            .iter()
-            .any(|u| matches!(u.op, operp_dag::Op::Deposit { .. } | operp_dag::Op::GovDeposit { .. }))
-        {
+        if self.units.iter().any(|u| {
+            matches!(
+                u.op,
+                operp_dag::Op::Deposit { .. } | operp_dag::Op::GovDeposit { .. }
+            )
+        }) {
             // H2: deposit anchors are no longer self-attested — every batch
             // carrying Deposit/GovDeposit ops must present independently
             // verifiable evidence (joint pays the vault the claimed amount
@@ -446,7 +446,6 @@ pub fn check_withdraw(claim: &WithdrawClaim, finalized_root: [u8; 32]) -> Result
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,9 +510,12 @@ mod tests {
 
     fn seed_trade() -> (Engine, Engine, Vec<UnitId>, [u8; 32], Vec<DepositEvidence>) {
         let mut eng = Engine::new();
-        eng.state.deposits_allowed =
-            (0u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
-        eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
+        eng.state.deposits_allowed = (0u8..=255)
+            .flat_map(|b| [([b; 32], false), ([b; 32], true)])
+            .collect();
+        eng.state
+            .markets
+            .insert(BTC_USD, operp_types::genesis_params());
         let prev_root = eng.state.state_root();
         let pre = eng.clone();
         let g = genesis_id();
@@ -521,13 +523,13 @@ mod tests {
         let bob = sk(2);
         let mut applied = Vec::new();
         // Evidence-consistent deposit anchors: the joint is hashed with the same
-    // getUnitHash port the verifier uses, so evidence and op agree by construction.
-    let j1 = payment_joint(1, 10_000 * USD_SCALE as u64, None);
-    let a1: [u8; 32] = obyte_hash::get_unit_hash(&j1).unwrap();
-    // The AA feed endorses exactly these unit hashes (arbitrary bytes, not
-    // covered by the blanket [b; 32] preseed below).
-    eng.state.deposits_allowed.insert((a1, false));
-    let d1 = sign_unit(
+        // getUnitHash port the verifier uses, so evidence and op agree by construction.
+        let j1 = payment_joint(1, 10_000 * USD_SCALE as u64, None);
+        let a1: [u8; 32] = obyte_hash::get_unit_hash(&j1).unwrap();
+        // The AA feed endorses exactly these unit hashes (arbitrary bytes, not
+        // covered by the blanket [b; 32] preseed below).
+        eng.state.deposits_allowed.insert((a1, false));
+        let d1 = sign_unit(
             vec![g],
             Op::Deposit {
                 account: acct_of(&alice),
@@ -540,9 +542,9 @@ mod tests {
         applied.push(unit_id(&d1));
         eng.ingest(d1).unwrap();
         let j2 = payment_joint(2, 10_000 * USD_SCALE as u64, None);
-    let a2: [u8; 32] = obyte_hash::get_unit_hash(&j2).unwrap();
-    eng.state.deposits_allowed.insert((a2, false));
-    let d2 = sign_unit(
+        let a2: [u8; 32] = obyte_hash::get_unit_hash(&j2).unwrap();
+        eng.state.deposits_allowed.insert((a2, false));
+        let d2 = sign_unit(
             vec![applied[0]],
             Op::Deposit {
                 account: acct_of(&bob),
@@ -676,10 +678,7 @@ mod tests {
             mci: Some(10),
             stable: true,
         };
-        assert_eq!(
-            pick_stable_winner(h, &[a2, b]).unwrap().obyte_unit,
-            [1; 32]
-        );
+        assert_eq!(pick_stable_winner(h, &[a2, b]).unwrap().obyte_unit, [1; 32]);
         let none = PostedBatch {
             batch,
             obyte_unit: [3; 32],
@@ -705,8 +704,14 @@ mod tests {
         let alice = acct_of(&sk(1));
         let bob = acct_of(&sk(2));
         let qty = QTY_SCALE as i64;
-        assert_eq!(eng.state.accounts.get(&alice).unwrap().positions[&BTC_USD].qty, qty);
-        assert_eq!(eng.state.accounts.get(&bob).unwrap().positions[&BTC_USD].qty, -qty);
+        assert_eq!(
+            eng.state.accounts.get(&alice).unwrap().positions[&BTC_USD].qty,
+            qty
+        );
+        assert_eq!(
+            eng.state.accounts.get(&bob).unwrap().positions[&BTC_USD].qty,
+            -qty
+        );
         assert_eq!(
             *eng.state.marks.get(&BTC_USD).unwrap(),
             100_000 * PRICE_SCALE
@@ -735,9 +740,12 @@ mod tests {
         let mut eng = Engine::new();
         // NOTE: deliberately NOT endorsing [0; 32] — the test asserts the
         // unbacked GovDeposit bounce path.
-        eng.state.deposits_allowed =
-            (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
-        eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
+        eng.state.deposits_allowed = (1u8..=255)
+            .flat_map(|b| [([b; 32], false), ([b; 32], true)])
+            .collect();
+        eng.state
+            .markets
+            .insert(BTC_USD, operp_types::genesis_params());
         let g = genesis_id();
         let alice = acct_of(&sk(1));
         let d = sign_unit(
@@ -831,7 +839,6 @@ mod tests {
         assert_eq!(root, expected);
     }
 
-
     #[test]
     fn tampered_aa_shard_roots_are_root_mismatch() {
         // Phase 5.2: a watcher replay must reproduce all 16 shard roots;
@@ -891,7 +898,6 @@ mod tests {
         );
     }
 
-
     // -----------------------------------------------------------------------
     // Phase 1: pruning consistency (M3) + deposit evidence verification (H2)
 
@@ -899,7 +905,9 @@ mod tests {
     /// pre-ingest snapshot (replay seed), the unit, its id and evidence.
     fn one_deposit_fixture() -> (Engine, Engine, Unit, UnitId, DepositEvidence) {
         let mut eng = Engine::new();
-        eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
+        eng.state
+            .markets
+            .insert(BTC_USD, operp_types::genesis_params());
         let j = payment_joint(9, 5_000_000_000, None);
         let a: [u8; 32] = obyte_hash::get_unit_hash(&j).unwrap();
         eng.state.deposits_allowed.insert((a, false));
@@ -928,7 +936,9 @@ mod tests {
         let mut batch_with_ev = batch;
         batch_with_ev.deposit_evidences = vec![ev];
         let mut rp = pre.clone();
-        batch_with_ev.validate_against(pre.state.state_root(), &mut rp).unwrap();
+        batch_with_ev
+            .validate_against(pre.state.state_root(), &mut rp)
+            .unwrap();
         assert_eq!(rp.state.state_root(), eng.state.state_root());
     }
 
@@ -971,7 +981,9 @@ mod tests {
     fn perp_asset_mismatch_is_rejected() {
         // PERP-class evidence whose joint pays some OTHER asset id.
         let mut eng = Engine::new();
-        eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
+        eng.state
+            .markets
+            .insert(BTC_USD, operp_types::genesis_params());
         let wrong_asset = hex::encode([7u8; 32]); // != PERP_ASSET ([0u8;32])
         let j = payment_joint(8, 5_000, Some(&wrong_asset));
         let a: [u8; 32] = obyte_hash::get_unit_hash(&j).unwrap();
@@ -1004,13 +1016,14 @@ mod tests {
         let mut batch = Batch::from_applied(&pre.state, &mut eng, &[id]).unwrap();
         batch.deposit_evidences = vec![ev];
         let payload = batch.temp_data_payload();
-        let recovered =
-            evidences_from_payload(&payload.data).expect("payload evidences parse");
+        let recovered = evidences_from_payload(&payload.data).expect("payload evidences parse");
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].aa_unit, batch.deposit_evidences[0].aa_unit);
         assert_eq!(recovered[0], batch.deposit_evidences[0]);
         // Absent key → empty vec.
-        assert!(evidences_from_payload(&serde_json::json!({})).unwrap().is_empty());
+        assert!(evidences_from_payload(&serde_json::json!({}))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1023,8 +1036,9 @@ mod tests {
 
         let build = || -> (Engine, Engine, Vec<UnitId>, Vec<DepositEvidence>) {
             let mut eng = Engine::new();
-            eng.state.deposits_allowed =
-                (0u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
+            eng.state.deposits_allowed = (0u8..=255)
+                .flat_map(|b| [([b; 32], false), ([b; 32], true)])
+                .collect();
             eng.state.markets.insert(MKT, operp_types::genesis_params());
             let g = genesis_id();
             let secret = sk(6);
@@ -1036,14 +1050,23 @@ mod tests {
             let pre = eng.clone();
             let d = sign_unit(
                 vec![g],
-                Op::Deposit { account: acct, addr: test_addr(6), amount: 10_000 * USD_SCALE as i128, aa_unit: a },
+                Op::Deposit {
+                    account: acct,
+                    addr: test_addr(6),
+                    amount: 10_000 * USD_SCALE as i128,
+                    aa_unit: a,
+                },
                 &secret,
             );
             let did = unit_id(&d);
             eng.ingest(d).unwrap();
             let w = sign_unit(
                 vec![did],
-                Op::Withdraw { account: acct, amount: 100 * USD_SCALE as i128, nonce: 1 },
+                Op::Withdraw {
+                    account: acct,
+                    amount: 100 * USD_SCALE as i128,
+                    nonce: 1,
+                },
                 &secret,
             );
             let wid = unit_id(&w);
@@ -1097,15 +1120,24 @@ mod tests {
         // demonstrably pruned (old entries dropped on BOTH sides).
         assert_eq!(rp.state.withdrawals.len(), eng.state.withdrawals.len());
         assert_eq!(rp.state.seen_aa_units.len(), eng.state.seen_aa_units.len());
-        assert_eq!(rp.state.deposits_allowed.len(), eng.state.deposits_allowed.len());
+        assert_eq!(
+            rp.state.deposits_allowed.len(),
+            eng.state.deposits_allowed.len()
+        );
         let wk_r: HashSet<_> = rp.state.withdrawals.keys().collect();
         let wk_p: HashSet<_> = eng.state.withdrawals.keys().collect();
         assert_eq!(wk_r, wk_p);
         let ak_r: HashSet<_> = rp.state.seen_aa_units.keys().collect();
         let ak_p: HashSet<_> = eng.state.seen_aa_units.keys().collect();
         assert_eq!(ak_r, ak_p);
-        assert!(eng.state.withdrawals.is_empty(), "height-0 entries must be gone");
-        assert!(eng.state.seen_aa_units.is_empty(), "height-0 entries must be gone");
+        assert!(
+            eng.state.withdrawals.is_empty(),
+            "height-0 entries must be gone"
+        );
+        assert!(
+            eng.state.seen_aa_units.is_empty(),
+            "height-0 entries must be gone"
+        );
         assert_eq!(rp.state.state_root(), eng.state.state_root());
     }
 
@@ -1115,7 +1147,9 @@ mod tests {
         // batch commitment — the pending-commit set lives in meta_leaf, so a
         // watcher replay that diverges on reveal semantics fails RootMismatch
         let mut eng = Engine::new();
-        eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
+        eng.state
+            .markets
+            .insert(BTC_USD, operp_types::genesis_params());
         eng.state.height = operp_types::COMMIT_REVEAL_ACTIVATION_HEIGHT;
         // Evidence-consistent deposit anchor (same pattern as one_deposit_fixture).
         let j = payment_joint(7, 10_000 * USD_SCALE as u64, None);
@@ -1174,7 +1208,11 @@ mod tests {
         eng.ingest(r).unwrap();
 
         let mut batch = Batch::from_applied(&pre.state, &mut eng, &applied).unwrap();
-        batch.deposit_evidences = vec![evidence_from(&j, (10_000 * USD_SCALE as i128).to_string(), false)];
+        batch.deposit_evidences = vec![evidence_from(
+            &j,
+            (10_000 * USD_SCALE as i128).to_string(),
+            false,
+        )];
         batch.validate_against(prev_root, &mut pre).unwrap();
         assert_eq!(pre.state.state_root(), eng.state.state_root());
         assert!(eng.state.commits[&hash].revealed);
@@ -1184,4 +1222,3 @@ mod tests {
         );
     }
 }
-

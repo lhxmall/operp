@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "rust"]
+
+  - package-ecosystem: "npm"
+    directory: "/obyte-local"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "js"]
+
+  - package-ecosystem: "npm"
+    directory: "/vendor/aa-testkit"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "js"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "ci"]

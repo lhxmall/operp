@@ -24,9 +24,12 @@ fn test_addr(n: u8) -> String {
 
 fn main() {
     let mut eng = Engine::new();
-    eng.state.deposits_allowed =
-        (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
-    eng.state.markets.insert(BTC_USD, operp_types::genesis_params());
+    eng.state.deposits_allowed = (1u8..=255)
+        .flat_map(|b| [([b; 32], false), ([b; 32], true)])
+        .collect();
+    eng.state
+        .markets
+        .insert(BTC_USD, operp_types::genesis_params());
     let prev = eng.state.clone();
     let g = genesis_id();
     let alice = sk(1);
@@ -118,7 +121,10 @@ fn main() {
     println!("height {}", batch.checkpoint.height);
     println!("fill_count {}", batch.checkpoint.fill_count);
     println!("state_root {}", hex::encode(batch.checkpoint.state_root));
-    println!("prev_state_hash {}", hex::encode(batch.checkpoint.prev_state_hash));
+    println!(
+        "prev_state_hash {}",
+        hex::encode(batch.checkpoint.prev_state_hash)
+    );
     println!("units {}", batch.checkpoint.unit_ids.len());
     assert_eq!(batch.checkpoint.fill_count, 1);
     println!("OK: real engine batch exported");

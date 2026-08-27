@@ -29,18 +29,23 @@ struct Cfg {
 fn parse_args() -> Cfg {
     let mut args = std::env::args().skip(1);
     let run_ms: u64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(300_000);
-    let shards: usize = args
-        .next()
-        .and_then(|a| a.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+    let shards: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    });
     Cfg { run_ms, shards }
 }
 
 fn run_shard(shard_idx: usize, cfg: &Cfg) -> (u64, u64, u64) {
     let market = MarketId(shard_idx as u32 + 1);
     let mut eng = Engine::new();
-    eng.state.deposits_allowed = (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
-    eng.state.markets.insert(market, operp_types::genesis_params());
+    eng.state.deposits_allowed = (1u8..=255)
+        .flat_map(|b| [([b; 32], false), ([b; 32], true)])
+        .collect();
+    eng.state
+        .markets
+        .insert(market, operp_types::genesis_params());
 
     // seed mark for this market via first trade: place resting ask before bids.
     // ChainState::new() only seeds BTC_USD mark; other markets get mark from
@@ -57,7 +62,12 @@ fn run_shard(shard_idx: usize, cfg: &Cfg) -> (u64, u64, u64) {
     for (i, s) in secrets.iter().enumerate() {
         let u = sign_unit(
             vec![tip],
-            Op::Deposit { account: acct(s), addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(), amount: 10_000_000 * USD_SCALE as i128, aa_unit: [((shard_idx * TRADERS + i) % 250 + 1) as u8; 32] },
+            Op::Deposit {
+                account: acct(s),
+                addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                amount: 10_000_000 * USD_SCALE as i128,
+                aa_unit: [((shard_idx * TRADERS + i) % 250 + 1) as u8; 32],
+            },
             s,
         );
         tip = unit_id(&u);
@@ -126,12 +136,18 @@ fn run_shard(shard_idx: usize, cfg: &Cfg) -> (u64, u64, u64) {
 fn main() {
     let cfg = parse_args();
     println!("READY");
-    println!("SHARDED matching: {} markets x {} traders, {}ms", cfg.shards, TRADERS, cfg.run_ms);
+    println!(
+        "SHARDED matching: {} markets x {} traders, {}ms",
+        cfg.shards, TRADERS, cfg.run_ms
+    );
 
     let start = Instant::now();
     let mut handles = Vec::new();
     for idx in 0..cfg.shards {
-        let c = Cfg { run_ms: cfg.run_ms, shards: cfg.shards };
+        let c = Cfg {
+            run_ms: cfg.run_ms,
+            shards: cfg.shards,
+        };
         handles.push(std::thread::spawn(move || run_shard(idx, &c)));
     }
 
@@ -161,6 +177,9 @@ fn main() {
     println!("fills\t{tot_fills}");
     println!("rejected\t{tot_rej}");
     println!("aggregate_tps\t{:.1}", tot_ops as f64 / secs);
-    println!("per_market_tps\t{:.1}", tot_ops as f64 / secs / cfg.shards as f64);
+    println!(
+        "per_market_tps\t{:.1}",
+        tot_ops as f64 / secs / cfg.shards as f64
+    );
     println!("OK: sharded feed complete");
 }

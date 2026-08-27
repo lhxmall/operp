@@ -2,14 +2,13 @@ use ed25519_dalek::SigningKey;
 use operp_dag::{genesis_id, sign_unit, unit_id, Op};
 use operp_exec::{Engine, ExecEvent};
 use operp_types::{
-    account_id_from_pubkey, AccountId, MarketId, OrderType, Side, TimeInForce,
-    PRICE_SCALE, QTY_SCALE, USD_SCALE,
+    account_id_from_pubkey, AccountId, MarketId, OrderType, Side, TimeInForce, PRICE_SCALE,
+    QTY_SCALE, USD_SCALE,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-
 
 /// Single node, ONE DAG, multiple markets matched in parallel:
 /// every unit (all markets) goes into one shared Engine. apply_ready
@@ -38,7 +37,11 @@ fn parse_args() -> Cfg {
     let run_ms: u64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(60_000);
     let markets: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(8);
     let generators: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(4);
-    Cfg { run_ms, markets, generators }
+    Cfg {
+        run_ms,
+        markets,
+        generators,
+    }
 }
 
 fn main() {
@@ -52,7 +55,9 @@ fn main() {
     let mut eng0 = Engine::new();
     // Standalone example: no real AA feed — admit all synthetic deposit units
     // and all markets the generators will use.
-    eng0.state.deposits_allowed = (1u8..=255).flat_map(|b| [([b; 32], false), ([b; 32], true)]).collect();
+    eng0.state.deposits_allowed = (1u8..=255)
+        .flat_map(|b| [([b; 32], false), ([b; 32], true)])
+        .collect();
     for m in 1..=16u32 {
         eng0.state
             .markets
@@ -84,21 +89,27 @@ fn main() {
                         empty = 0;
                         match eng.lock().unwrap_or_else(|e| e.into_inner()).ingest(u) {
                             Ok(events) => {
-                            for e in &events {
-                                match e {
-                                    ExecEvent::Applied { fills: f, .. } => {
-                                        fills.fetch_add(f.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    ExecEvent::Rejected { .. } => {
-                                        rejected.fetch_add(1, Ordering::Relaxed);
+                                for e in &events {
+                                    match e {
+                                        ExecEvent::Applied { fills: f, .. } => {
+                                            fills.fetch_add(
+                                                f.len() as u64,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                        ExecEvent::Rejected { .. } => {
+                                            rejected.fetch_add(1, Ordering::Relaxed);
+                                        }
                                     }
                                 }
-                            }
-                            executed.fetch_add(events.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                                executed.fetch_add(
+                                    events.len() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                             }
                             Err(_) => {}
                         }
-                    },
+                    }
                     Err(_) => {
                         empty += 1;
                         if empty > 6 {
@@ -116,7 +127,10 @@ fn main() {
     let mut gens = Vec::new();
     for g in 0..cfg.generators {
         let tx = tx.clone();
-        let c = Cfg { run_ms: cfg.run_ms, ..cfg.clone() };
+        let c = Cfg {
+            run_ms: cfg.run_ms,
+            ..cfg.clone()
+        };
         gens.push(std::thread::spawn(move || {
             let secrets: Vec<[u8; 32]> = (0..TRADERS)
                 .map(|i| sk((((g * TRADERS + i + 5) * 43 + 3) % 251) as u8))
@@ -130,7 +144,12 @@ fn main() {
                 let s = &secrets[0];
                 let u = sign_unit(
                     vec![dep_tip],
-                    Op::Deposit { account: acct(s), addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(), amount: 10_000_000 * USD_SCALE as i128, aa_unit: [((g * 13 + 7) % 250 + 1) as u8; 32] },
+                    Op::Deposit {
+                        account: acct(s),
+                        addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                        amount: 10_000_000 * USD_SCALE as i128,
+                        aa_unit: [((g * 13 + 7) % 250 + 1) as u8; 32],
+                    },
                     s,
                 );
                 dep_tip = unit_id(&u);
@@ -139,7 +158,12 @@ fn main() {
                 for (ti, s) in secrets.iter().enumerate().skip(1) {
                     let u = sign_unit(
                         vec![dep_tip],
-                        Op::Deposit { account: acct(s), addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(), amount: 10_000_000 * USD_SCALE as i128, aa_unit: [((g * 31 + ti * 7 + 11) % 250 + 1) as u8; 32] },
+                        Op::Deposit {
+                            account: acct(s),
+                            addr: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                            amount: 10_000_000 * USD_SCALE as i128,
+                            aa_unit: [((g * 31 + ti * 7 + 11) % 250 + 1) as u8; 32],
+                        },
                         s,
                     );
                     dep_tip = unit_id(&u);
@@ -148,8 +172,7 @@ fn main() {
             }
             let funded_tip = dep_tip;
             // DAG still merges everything on one net with real concurrency.
-            let mut tips: Vec<operp_types::UnitId> =
-                (0..cfg.markets).map(|_| funded_tip).collect();
+            let mut tips: Vec<operp_types::UnitId> = (0..cfg.markets).map(|_| funded_tip).collect();
             let mut trader_tip: Vec<operp_types::UnitId> =
                 (0..TRADERS).map(|_| funded_tip).collect();
 
@@ -185,7 +208,9 @@ fn main() {
                     );
                     trader_tip[who] = unit_id(&u);
                     seqs[who] += 1;
-                    if tx.send((g, u)).is_err() { return; }
+                    if tx.send((g, u)).is_err() {
+                        return;
+                    }
                 }
                 // pace generators so the executor thread gets CPU on small VMs
                 std::thread::sleep(Duration::from_micros(400));

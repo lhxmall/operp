@@ -3,7 +3,7 @@ use operp_book::{Fill, OrderBook};
 use operp_types::{
     bps, genesis_params, notional_usd, sha256, AccountId, ExternalSample, FundingSourceKind,
     Height, MarketId, MarketParams, OracleConfig, Price, ReportSample, Seq, TwapSample, UnitId,
-    Usd, BTC_USD, FUNDING_TWAP_MIN_SAMPLES, FUNDING_TWAP_WINDOW, FUNDING_EXTERNAL_MAX_STALENESS,
+    Usd, BTC_USD, FUNDING_EXTERNAL_MAX_STALENESS, FUNDING_TWAP_MIN_SAMPLES, FUNDING_TWAP_WINDOW,
     INSURANCE_ACCOUNT, INSURANCE_SEED, PRICE_SCALE, USD_SCALE,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -228,7 +228,8 @@ impl ChainState {
     }
     /// General window prune (new path, activation-gated). Legacy wrappers below.
     pub fn prune_withdrawals_at(&mut self, min_height: Height, window: u64) {
-        self.withdrawals.retain(|_, w| w.height + window > min_height);
+        self.withdrawals
+            .retain(|_, w| w.height + window > min_height);
     }
     pub fn prune_aa_units_at(&mut self, min_height: Height, window: u64) {
         self.seen_aa_units.retain(|_, h| *h + window > min_height);
@@ -279,7 +280,10 @@ impl ChainState {
     // -----------------------------------------------------------------------
     // Oracle config / TWAP helpers
     pub fn oracle_config(&self, market: MarketId) -> OracleConfig {
-        self.oracle_configs.get(&market).copied().unwrap_or_default()
+        self.oracle_configs
+            .get(&market)
+            .copied()
+            .unwrap_or_default()
     }
 
     fn record_twap_sample(&mut self, market: MarketId, median: Price, seq: Seq) {
@@ -298,7 +302,11 @@ impl ChainState {
                 return;
             }
         } else {
-            q.push_back(TwapSample { seq, height: self.height, median });
+            q.push_back(TwapSample {
+                seq,
+                height: self.height,
+                median,
+            });
             while q.len() > cap {
                 q.pop_front();
             }
@@ -314,7 +322,11 @@ impl ChainState {
                 back.seq = seq;
             }
         } else {
-            fq.push_back(TwapSample { seq, height: self.height, median });
+            fq.push_back(TwapSample {
+                seq,
+                height: self.height,
+                median,
+            });
             while fq.len() > FUNDING_TWAP_WINDOW as usize {
                 fq.pop_front();
             }
@@ -338,7 +350,12 @@ impl ChainState {
         seq: Seq,
     ) {
         let q = self.external_price_ring.entry(market).or_default();
-        q.push_back(ExternalSample { seq, height: self.height, price, source_id });
+        q.push_back(ExternalSample {
+            seq,
+            height: self.height,
+            price,
+            source_id,
+        });
         while q.len() > FUNDING_TWAP_WINDOW as usize {
             q.pop_front();
         }
@@ -389,15 +406,20 @@ impl ChainState {
             return median;
         }
         match self.funding_source {
-            FundingSourceKind::BondedMedianTwap => {
-                self.funding_index_twap.get(&market).copied().unwrap_or(median)
-            }
+            FundingSourceKind::BondedMedianTwap => self
+                .funding_index_twap
+                .get(&market)
+                .copied()
+                .unwrap_or(median),
             FundingSourceKind::AggregatedExternal => {
                 // Doc 06 §2.6 rule 1: external TWAP overrides when fresh and
                 // populated; else fall back to bonded-median TWAP, then the
                 // instant median — funding never freezes.
                 self.external_twap(market).unwrap_or_else(|| {
-                    self.funding_index_twap.get(&market).copied().unwrap_or(median)
+                    self.funding_index_twap
+                        .get(&market)
+                        .copied()
+                        .unwrap_or(median)
                 })
             }
         }
@@ -431,9 +453,11 @@ impl ChainState {
         if bal < operp_types::ORACLE_BOND_PERP {
             return Err(StateError::InsufficientPerp);
         }
-        self.perp_balances.insert(account, bal - operp_types::ORACLE_BOND_PERP);
+        self.perp_balances
+            .insert(account, bal - operp_types::ORACLE_BOND_PERP);
         self.perp_supply = self.perp_supply.saturating_sub(0); // supply unchanged: bond locked, not burned
-        self.oracle_bonds.insert(account, operp_types::ORACLE_BOND_PERP);
+        self.oracle_bonds
+            .insert(account, operp_types::ORACLE_BOND_PERP);
         Ok(())
     }
 
@@ -444,7 +468,9 @@ impl ChainState {
         if self.oracle_unbonding.contains_key(&account) {
             return Err(StateError::Unbonding);
         }
-        let unlock = self.height.saturating_add(operp_types::ORACLE_UNBOND_HEIGHTS);
+        let unlock = self
+            .height
+            .saturating_add(operp_types::ORACLE_UNBOND_HEIGHTS);
         self.oracle_unbonding.insert(account, unlock);
         Ok(())
     }
@@ -502,7 +528,10 @@ impl ChainState {
             }
         }
         // Eligible: execute slash — burn half, reward half
-        let bond = self.oracle_bonds.remove(&target).unwrap_or(operp_types::ORACLE_BOND_PERP);
+        let bond = self
+            .oracle_bonds
+            .remove(&target)
+            .unwrap_or(operp_types::ORACLE_BOND_PERP);
         self.oracle_unbonding.remove(&target);
         self.oracle_reports.remove(&(market, target));
         self.oracle_report_history.remove(&(market, target));
@@ -602,7 +631,11 @@ impl ChainState {
         let capped = match self.marks.get(&market) {
             Some(&old) if old > 0 => {
                 let dev = (median as i128 - old as i128).abs();
-                if dev <= old as i128 / 10 { median } else { old }
+                if dev <= old as i128 / 10 {
+                    median
+                } else {
+                    old
+                }
             }
             _ => median,
         };
@@ -630,7 +663,12 @@ impl ChainState {
                         .iter()
                         .filter_map(|(id, a)| {
                             a.positions.get(&market).map(|pos| {
-                                (*id, operp_types::signed_notional_usd(pos.qty, funding_index) * diff_bps / 10_000)
+                                (
+                                    *id,
+                                    operp_types::signed_notional_usd(pos.qty, funding_index)
+                                        * diff_bps
+                                        / 10_000,
+                                )
                             })
                         })
                         .filter(|(_, p)| *p != 0)
@@ -726,7 +764,11 @@ impl ChainState {
                     Some(a) => a.snapshot(&self.marks),
                     None => continue,
                 };
-                if s.equity < 0 { -s.equity } else { 0 }
+                if s.equity < 0 {
+                    -s.equity
+                } else {
+                    0
+                }
             };
             if shortfall > 0 {
                 if let Some(a) = self.accounts.get_mut(&party) {
@@ -752,7 +794,11 @@ impl ChainState {
             let capped = match self.marks.get(&fill.market) {
                 Some(&old) if old > 0 => {
                     let dev = (fill.price as i128 - old as i128).abs();
-                    if dev <= old as i128 / 10 { fill.price } else { old }
+                    if dev <= old as i128 / 10 {
+                        fill.price
+                    } else {
+                        old
+                    }
                 }
                 _ => fill.price,
             };
@@ -764,11 +810,7 @@ impl ChainState {
     pub fn leaves(&self) -> Vec<[u8; 32]> {
         let mut leaves = Vec::new();
         for acct in self.accounts.values() {
-            let perp = self
-                .perp_balances
-                .get(&acct.id)
-                .copied()
-                .unwrap_or(0);
+            let perp = self.perp_balances.get(&acct.id).copied().unwrap_or(0);
             let withdrawn = self.withdrawn_total.get(&acct.id).copied().unwrap_or(0);
             leaves.push(account_leaf(acct, perp, withdrawn));
         }
@@ -890,9 +932,7 @@ fn meta_leaf(state: &ChainState) -> [u8; 32] {
     for (m, mark) in &state.marks {
         b.extend_from_slice(&m.0.to_le_bytes());
         b.extend_from_slice(&mark.to_le_bytes());
-        b.extend_from_slice(
-            &state.last_index.get(m).copied().unwrap_or(0).to_le_bytes(),
-        );
+        b.extend_from_slice(&state.last_index.get(m).copied().unwrap_or(0).to_le_bytes());
     }
     // Oracle bonding / TWAP state committed for replay determinism
     b.extend_from_slice(&(state.oracle_bonds.len() as u32).to_le_bytes());
@@ -1028,7 +1068,6 @@ fn operp_book_genesis() -> UnitId {
     UnitId(sha256(b"operp-mvp-1-genesis"))
 }
 
-
 pub fn merkle_root(mut leaves: Vec<[u8; 32]>) -> [u8; 32] {
     if leaves.is_empty() {
         return sha256(b"empty");
@@ -1066,7 +1105,10 @@ pub fn verify_proof(proof: &MerkleProof) -> bool {
     h == proof.root
 }
 
-fn merkle_proof_for(mut leaves: Vec<[u8; 32]>, leaf: [u8; 32]) -> (Vec<([u8; 32], bool)>, [u8; 32]) {
+fn merkle_proof_for(
+    mut leaves: Vec<[u8; 32]>,
+    leaf: [u8; 32],
+) -> (Vec<([u8; 32], bool)>, [u8; 32]) {
     if leaves.is_empty() {
         return (Vec::new(), sha256(b"empty"));
     }
@@ -1113,7 +1155,6 @@ pub fn aa_account_leaf_str(addr: &str, collateral: Usd, perp: u128, withdrawn: i
     let s = format!("acct:{}:{}:{}:{}", addr, collateral, perp, withdrawn);
     hex::encode(sha256(s.as_bytes()))
 }
-
 
 fn aa_parent(l: &str, r: &str) -> String {
     let mut buf = String::with_capacity(l.len() + r.len());
@@ -1324,8 +1365,12 @@ mod tests {
         let mut s = ChainState::new();
         let taker = AccountId([9; 32]);
         let maker = AccountId([8; 32]);
-        s.account_mut(taker).credit(1_000_000 * USD_SCALE as i128).unwrap();
-        s.account_mut(maker).credit(1_000_000 * USD_SCALE as i128).unwrap();
+        s.account_mut(taker)
+            .credit(1_000_000 * USD_SCALE as i128)
+            .unwrap();
+        s.account_mut(maker)
+            .credit(1_000_000 * USD_SCALE as i128)
+            .unwrap();
         let px = 100_000 * operp_types::PRICE_SCALE;
         let fill = Fill {
             taker_id: operp_types::OrderId([0u8; 32]),
@@ -1350,7 +1395,9 @@ mod tests {
         let taker = AccountId([9; 32]);
         let maker = AccountId([8; 32]);
         for id in [taker, maker] {
-            s.account_mut(id).credit(10_000_000 * USD_SCALE as i128).unwrap();
+            s.account_mut(id)
+                .credit(10_000_000 * USD_SCALE as i128)
+                .unwrap();
         }
         let mk_fill = |price| Fill {
             taker_id: operp_types::OrderId([0u8; 32]),
@@ -1364,11 +1411,19 @@ mod tests {
             taker_side: operp_types::Side::Bid,
         };
         // +200% spike: rejected by the ±10% cap — mark stays at genesis.
-        s.apply_fill_pair(&mk_fill(300_000 * operp_types::PRICE_SCALE)).unwrap();
-        assert_eq!(*s.marks.get(&BTC_USD).unwrap(), 100_000 * operp_types::PRICE_SCALE);
+        s.apply_fill_pair(&mk_fill(300_000 * operp_types::PRICE_SCALE))
+            .unwrap();
+        assert_eq!(
+            *s.marks.get(&BTC_USD).unwrap(),
+            100_000 * operp_types::PRICE_SCALE
+        );
         // +5% move: within the band — mark updates.
-        s.apply_fill_pair(&mk_fill(105_000 * operp_types::PRICE_SCALE)).unwrap();
-        assert_eq!(*s.marks.get(&BTC_USD).unwrap(), 105_000 * operp_types::PRICE_SCALE);
+        s.apply_fill_pair(&mk_fill(105_000 * operp_types::PRICE_SCALE))
+            .unwrap();
+        assert_eq!(
+            *s.marks.get(&BTC_USD).unwrap(),
+            105_000 * operp_types::PRICE_SCALE
+        );
     }
 
     #[test]
@@ -1376,8 +1431,12 @@ mod tests {
         let mut s = ChainState::new();
         let long = AccountId([9; 32]);
         let short = AccountId([8; 32]);
-        s.account_mut(long).credit(1_000_000 * USD_SCALE as i128).unwrap();
-        s.account_mut(short).credit(1_000_000 * USD_SCALE as i128).unwrap();
+        s.account_mut(long)
+            .credit(1_000_000 * USD_SCALE as i128)
+            .unwrap();
+        s.account_mut(short)
+            .credit(1_000_000 * USD_SCALE as i128)
+            .unwrap();
 
         // Both open 1 BTC at 100_000 via a fill (spot mark = index initially).
         let px = 100_000 * operp_types::PRICE_SCALE;
@@ -1403,8 +1462,7 @@ mod tests {
         s.oracle_bonds.insert(ob, operp_types::ORACLE_BOND_PERP);
         s.apply_report(oa, BTC_USD, 100_000 * operp_types::PRICE_SCALE, 1)
             .unwrap();
-        let pre_funding =
-            s.accounts[&long].collateral + s.accounts[&short].collateral;
+        let pre_funding = s.accounts[&long].collateral + s.accounts[&short].collateral;
 
         // Tick 2: reports {89k, 100k}; median = sorted[(len-1)/2] = 89k
         // (the smaller middle when even). |89k − 100k| = 11k > 10k, so the
@@ -1551,12 +1609,15 @@ mod tests {
         s.oracle_bonds.insert(oa, operp_types::ORACLE_BOND_PERP);
         s.oracle_bonds.insert(ob, operp_types::ORACLE_BOND_PERP);
         // Two reporters, same height, same median → one funding sample.
-        s.apply_report(oa, BTC_USD, 90_000 * PRICE_SCALE, 1).unwrap();
-        s.apply_report(ob, BTC_USD, 90_000 * PRICE_SCALE, 2).unwrap();
+        s.apply_report(oa, BTC_USD, 90_000 * PRICE_SCALE, 1)
+            .unwrap();
+        s.apply_report(ob, BTC_USD, 90_000 * PRICE_SCALE, 2)
+            .unwrap();
         assert_eq!(s.funding_twap[&BTC_USD].len(), 1);
         // New height, new median → new sample with that height's seq.
         s.height += 1;
-        s.apply_report(oa, BTC_USD, 91_000 * PRICE_SCALE, 7).unwrap();
+        s.apply_report(oa, BTC_USD, 91_000 * PRICE_SCALE, 7)
+            .unwrap();
         let q = &s.funding_twap[&BTC_USD];
         assert_eq!(q.len(), 2);
         assert_eq!(q.back().unwrap().seq, 7);
@@ -1614,7 +1675,10 @@ mod tests {
             }
             assert_eq!(
                 acc,
-                forest_roots.concat().get(shard as usize * 64..shard as usize * 64 + 64).unwrap()
+                forest_roots
+                    .concat()
+                    .get(shard as usize * 64..shard as usize * 64 + 64)
+                    .unwrap()
             );
         }
         // Forest hash binds all 16 roots in order.
@@ -1624,4 +1688,3 @@ mod tests {
         );
     }
 }
-

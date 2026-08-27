@@ -93,17 +93,9 @@ fn canonical_number(n: &serde_json::Number) -> Result<String, String> {
     if let Some(u) = n.as_u64() {
         return Ok(u.to_string());
     }
-    let f = n
-        .as_f64()
-        .ok_or_else(|| format!("invalid number: {n}"))?;
-    if !f.is_finite()
-        || f.fract() == 0.0
-        || f.abs() > 9_007_199_254_740_992.0
-        || f.abs() >= 1e21
-    {
-        return Err(format!(
-            "number {n} has no unambiguous JS canonical string"
-        ));
+    let f = n.as_f64().ok_or_else(|| format!("invalid number: {n}"))?;
+    if !f.is_finite() || f.fract() == 0.0 || f.abs() > 9_007_199_254_740_992.0 || f.abs() >= 1e21 {
+        return Err(format!("number {n} has no unambiguous JS canonical string"));
     }
     Ok(f.to_string())
 }
@@ -157,7 +149,6 @@ fn get_base64_hash(obj: &Value, b_json_based: bool) -> Result<Vec<u8>, String> {
     let hash = Sha256::digest(source.as_bytes());
     Ok(hash.to_vec())
 }
-
 
 /// Canonical Obyte JSON source of `v` (ocore `string_utils.getJsonSource`):
 /// object keys recursively sorted lexicographically, arrays order-preserving,
@@ -360,10 +351,10 @@ mod tests {
         assert!(canonical_number(&json!(1.0).as_number().unwrap()).is_err());
         assert!(canonical_number(&serde_json::Number::from_f64(-0.0).unwrap()).is_err());
         assert!(canonical_number(&json!(1e21).as_number().unwrap()).is_err());
-        assert!(canonical_number(
-            &serde_json::Number::from_f64(9_007_199_254_740_994.0).unwrap()
-        )
-        .is_err());
+        assert!(
+            canonical_number(&serde_json::Number::from_f64(9_007_199_254_740_994.0).unwrap())
+                .is_err()
+        );
         // Short decimals and exact integers are fine.
         assert_eq!(
             canonical_number(&json!(2.5).as_number().unwrap()).as_deref(),
