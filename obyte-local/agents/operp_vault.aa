@@ -46,11 +46,13 @@
 	// State vars:
 	//   last_locked, last_finalized
 	//   submitted_at_<h>, cand_root_<h>, cand_aa_root_<h>
-	//     candidate (replaceable pre-lock); submitted_at_ restarts on EVERY
-	//     submit. cand_aa_root_<h>/aa_root_<h> hold the 1024-hex forest.
+	//     the SINGLE candidate of <h> (first stable combined unit wins;
+	//     resubmits bounce 'height taken' unless frozen==1 respond).
+	//   da_unit_<h>                             hash of the combined unit
+	//     (temp_data + submit messages in ONE unit) that carries the root —
+	//     DA binding: root must point at exactly that data package.
 	//   active_bond_<h>                          address holding the 50000-
-	//     byte submit bond for the live candidate of <h>; replaced
-	//     candidates get their bond moved to sbond_<old>, successful
+	//     byte submit bond for the single live candidate of <h>; successful
 	//     finalize releases it to sbond_, failed finalize confiscates it
 	//     (keys cleared, coins stay in the pot)
 	//   sbond_<addr>                             released submit-bond balance,
@@ -140,34 +142,36 @@
 					if ($ll > 0 AND trigger.data.prev_state_hash != var['root_' || $ll])
 						bounce('prev mismatch');
 					$old = (var['active_bond_' || $h] otherwise 0);
-					// Bond needed only from NEW candidates: the sitting
-					// operator re-submitting (respond-by-resubmit) keeps his
-					// existing bond — no double charge.
-					if ($old != trigger.address
-						AND trigger.output[[asset=base]] - 10000 < 50000)
-						bounce('need submit bond');
-					// Bond handover detection reads PRE-trigger state (state
-					// messages come last in Oscript). Stability timer resets on
-					// EVERY submit: identical-root spam costs a fresh 50000
-					// bond each round, so only the attacker pays for delay.
-					// RESPOND-BY-RESUBMIT: a challenge is answered by the same
-					// operator re-submitting the identical root within the
-					// response window. Identity via $old (active_bond_<h>):
-					// while frozen==1 it always equals the live candidate's
-					// submitter and does not change during a challenge.
-					// Impostors bounce here — state messages cannot bounce.
+					// SINGLE-CANDIDATE GATE: before frozen, ANY resubmit on an
+					// already-occupied height bounces — including the sitting
+					// operator's. The height belongs to the first stable
+					// COMBINED unit (temp_data + submit in one unit, recorded
+					// as da_unit_<h>); the 600s lock timer therefore waits for
+					// exactly that one unit and cannot be reset by free spam.
+					if ((var['frozen_' || $h] otherwise 0) != 1
+						AND $old)
+						bounce('height taken');
 					$frozen = (var['frozen_' || $h] otherwise 0);
+					// RESPOND-BY-RESUBMIT (frozen==1): ONLY the original bond
+					// holder may re-commit the identical root within the
+					// response window; it does not touch da_unit_ or reset
+					// submitted_at_. Impostors bounce here — state messages
+					// cannot bounce. H3 contingency (complexity budget): only
+					// state_root is compared — forest comparison is a
+					// documented README limitation.
 					if ($frozen == 1){
-						// H3: the respond must also re-commit the identical
-						// forest — a state_root match alone would let a
-						// challenger swap the shard roots underneath it.
 						if (trigger.address != $old
-							OR trigger.data.state_root != var['cand_root_' || $h]
-							OR trigger.data.aa_forest != var['cand_aa_root_' || $h])
+							OR trigger.data.state_root != var['cand_root_' || $h])
 							bounce('not operator');
 						if (timestamp >= var['stable_at_' || $h] + 3600)
 							bounce('response window closed');
 					}
+					// New combined unit needs base >= 60000: 10000 bounce
+					// headroom + 50000 SUBMIT_BOND_NET. (frozen==1 responds by
+					// the same address carry no extra fee: only first submits
+					// reach this gate, and they always need the bond.)
+					if (trigger.output[[asset=base]] - 10000 < 50000)
+						bounce('need submit bond');
 				}",
 				messages: [
 					{
@@ -178,19 +182,25 @@
 								$ch = (var['challenger_' || $h] otherwise '');
 								var['bond_' || $ch] = 0;
 							}
-							// Replacing another address's candidate releases its
-							// locked bond as claimable sbond_; same-address
-							// resubmit neither charges nor refunds.
-							if ($old AND $old != trigger.address){
-								var['sbond_' || $old] += 50000;
-							}
+							// Single-candidate model: no candidate replacement can
+							// reach state (the gate bounces all pre-frozen
+							// resubmits), so no sbond_ handover here. A frozen==2
+							// height is re-occupiable because the failure sweep
+							// cleared active_bond_ and cand_aa_root_.
 							var['active_bond_' || trigger.data.height] = trigger.address;
 							var['cand_root_' || trigger.data.height] = trigger.data.state_root;
 							// Sharded commitment: aa_forest = the 16 shard roots
 							// concatenated (shard i at offset i*64, 1024 hex).
 							var['cand_aa_root_' || trigger.data.height] = trigger.data.aa_forest;
-							// Stability timer restarts on EVERY submit (audit
-							// contingency: simpler than root-change detection).
+							// DA BINDING: the root must point at the exact data
+							// package — record this combined unit's hash. Set only
+							// on first-occupying submits; the frozen==1 respond
+							// path keeps it untouched (init gate has already
+							// bounced impostors; identical fields are a no-op).
+							var['da_unit_' || trigger.data.height] = trigger.unit || '';
+							// Stability timer: single-shot clock for THIS unit's
+							// 600s stability window — never resettable (no
+							// incumbent clears exist anymore).
 							var['submitted_at_' || trigger.data.height] = timestamp;
 							// Fee race: first processed submit wins the batch reward.
 							if (!var['fee_winner_' || trigger.data.height]){

@@ -569,12 +569,18 @@ pperp_<addr>                                 # PERP 入账镜像：{deposit_perp
 
 前置：chain_id 正确 ∧ h == last_locked+1 ∧ prev 匹配 root_{h−1}
 ∧ 有 64-hex 的 state_root/prev_state_hash ∧ aa_forest 恰 1024 hex
-∧ 未锁定。新候选须附 ≥ 60 000 bytes（10 000 bounce 余量 +
-50 000 `SUBMIT_BOND_NET`）；**在任候选**重发（respond-by-resubmit）免债
-券——身份经 `active_bond_<h>` 判定，冒充者 bounce('not operator')。
+∧ 未锁定。提交必须是**组合单元**（temp_data + submit data 消息在同一
+unit）；新候选须附 ≥ 60 000 bytes（10 000 bounce 余量 +
+50 000 `SUBMIT_BOND_NET`）。
+**单候选门**：未冻结且 `active_bond_<h>` 已在位 → 一律
+bounce('height taken')（含在任者自由重发）；frozen==1 时仅原 bond 持有人
+可复读同一份 state_root（respond-by-resubmit），冒充者
+bounce('not operator')。
 
-副作用：写候选五元组 + active_bond_<h> + submitted_at_h（每次 submit 都
-重启稳定计时）；被替换候选的债券移入 sbond_<old>；竞速判定（§11）。
+副作用：写候选三元组 + active_bond_<h> + submitted_at_h（仅首交写入，
+不可被覆盖——600s 钟等待且只等待这一笔组合单元）+
+**da_unit_<h> = 该组合单元的 unit hash**（根与数据包的 DA 绑定）；
+竞速判定（§11）。
 
 ### 10.2 lock(h)
 
@@ -650,7 +656,7 @@ fold proof[]: right ? sha256(acc‖sib,'hex') : sha256(sib‖acc,'hex')
 
 `{claim: "reward"|"bond"|"sbond"|"slash"}` 四态分发（替代旧的三个布尔
 字段）：reward = 竞速累积奖励；bond = 失败高度 challenger 的记录债券；
-sbond = 被替换/正常完结候选的提交债券返还；slash = 确认欺诈后的罚没
+sbond = 正常完结候选的提交债券返还（单候选制下不存在"被替换"）；slash = 确认欺诈后的罚没
 分成。均需随单元附带 ≥10000 bytes 支付费用。AA 临时缺币时单元 bounce，
 记账保留，稍后重试即可——finalize 流程不会因付款失败而卡死。
 
@@ -658,22 +664,28 @@ sbond = 被替换/正常完结候选的提交债券返还；slash = 确认欺诈
 
 ## 11. Multi-operator 手续费竞速
 
-多个 operator 并行观察侧链、各自向 AA submit 批次。赢家判定利用
-Obyte 原生性质：**AA 只被稳定单元触发，触发按稳定序生效**。因此
-"最先稳定"天然等价于"AA 最先处理"：
+多个 operator 并行观察侧链、各自向 AA 提交组合单元（temp_data + submit
+同一 unit）。赢家判定利用 Obyte 原生性质：**AA 只被稳定单元触发，触发按
+稳定序生效**。因此"最先稳定"天然等价于"AA 最先处理"——height 归属 =
+第一笔被 AA 处理的该 height 组合单元；未冻结的后续提交一律
+bounce('height taken')（占位门），不产生安慰金（现状无补贴；输家的
+60000 bytes 原样退回，仅损失 bounce 费）：
 
 ```
 submit(h) 竞速:
-  $is_loser = fee_winner_h 已设置 ∧ ≠ trigger.address
+  if (!active_bond_h 或 frozen==1 的原持有人): 处理（首交者胜）
+  else: bounce('height taken')            # 单候选,无替换
+  da_unit_h ← trigger.unit                # 根↔数据绑定
   if (!fee_winner_h): fee_winner_h ← trigger.address   # 首个稳定者赢
-  else: 立即支付安慰金 5000 bytes 给后来者
 ```
 
-- 输家刷补贴无利可图：每次提交净成本 10000 bytes（留存处理费）> 补贴
+- 同批一起稳定的平局由 ocore 内建单元排序裁决；Rust 侧
+  `pick_stable_winner`（operp-settle, mci→unit_id 双键）语义一致
 - 赢家奖励在 finalize 成功路径累加（失败高度不发放），{claim:"reward"} 提取
 - "交易按第一个稳定的填充下一个"由 prev_state_hash 链保证：
   h+1 必须引用赢家的 root_h
-- 高度失败回滚后重新竞速（fee_winner/cand_* 随回滚语义自然重置）
+- 高度失败回滚后重新竞速（failure sweep 清空 active_bond_h /
+  cand_aa_root_h，组合单元可重新首占；fee_winner_h 保持首个处理者不变）
 
 ---
 

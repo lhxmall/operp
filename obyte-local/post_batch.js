@@ -7,13 +7,13 @@
 // Reads an exported batch (obyte-local/batch.json from
 // `cargo run -p operp-settle --example export_batch` or stress tooling),
 // then against the deployed vault AA:
-//   1. posts the FULL batch as OIP-0007 temp_data (data availability for
-//      watchers — anyone can re-execute and detect fraud),
-//   2. triggers AA submit (joins the operator fee race),
-//   3. travels the 600s stability window, locks,
-//   4. travels the 3600s challenge window, finalizes,
-//   5. claims the operator race reward.
-//
+//   1. posts the FULL batch as OIP-0007 temp_data PLUS the AA submit data
+//      message in ONE combined unit (data availability for watchers AND
+//      the submit in the same unit — the AA records da_unit_<h>; joins
+//      the operator fee race),
+//   2. travels the 600s stability window, locks,
+//   3. travels the 3600s challenge window, finalizes,
+//   4. claims the operator race reward.
 // Usage: cd obyte-local && node post_batch.js [batch.json]
 
 const path = require("path");
@@ -21,7 +21,10 @@ const fs = require("fs");
 const crypto = require("crypto");
 // ===== CONFIG: PERP governance asset ================================
 // Set to the real PERP asset id once issued; must match deploy_testnet.js.
-const PERP_ASSET_ID = "PERP_ASSET_ID_HERE";
+// devnet (default) has no issued asset: fall back to 'base' exactly like
+// test_vault_aa.js's bootstrap substitution — the perp-deposit branch is
+// keyed on trigger.data.deposit_perp, so base can never reach it here.
+let PERP_ASSET_ID = "PERP_ASSET_ID_HERE";
 // ====================================================================
 
 // The .aa source carries the PERP_ASSET_ID_HERE placeholder; aa-testkit
@@ -36,6 +39,8 @@ function resolveVaultAa() {
 
 const aaRoot = path.join(__dirname, "..", "vendor", "aa-testkit");
 const nm = path.join(aaRoot, "node_modules");
+process.env.NODE_PATH = [nm, process.env.NODE_PATH].filter(Boolean).join(path.delimiter);
+require("module").Module._initPaths();
 // Network selection: devnet drill by default; pass testnet/mainnet env
 // explicitly to target a real network.
 if (process.env.testnet) {
@@ -45,8 +50,11 @@ if (process.env.testnet) {
   process.env.mainnet = "1";
 } else {
   process.env.devnet = "1";
+  // devnet has no issued asset: fall back to 'base' exactly like
+  // test_vault_aa.js's bootstrap substitution — the perp-deposit branch is
+  // keyed on trigger.data.deposit_perp, so base can never reach it here.
+  PERP_ASSET_ID = "base";
 }
-require("module").Module._initPaths(); // pick up NODE_PATH for bare ocore requires
 
 const { Testkit } = require(path.join(aaRoot, "main.js"));
 const { Network } = Testkit({
@@ -113,9 +121,19 @@ async function buildDepositEvidences(batchData, vaultAddress) {
         hub.getJoint(Buffer.from(aaUnit, "hex").toString("base64"), (err, j) => (err ? reject(err) : resolve(j)));
       });
     } catch (e) {
+      if (process.env.devnet && !process.env.testnet && !process.env.mainnet) {
+        console.log("devnet fixture: evidence skipped for missing joint", aaUnit.slice(0, 16));
+        continue;
+      }
       throw new Error("deposit anchor missing on Obyte: " + aaUnit.slice(0, 16));
     }
-    if (!joint || !joint.unit) throw new Error("no joint for " + aaUnit.slice(0, 16));
+    if (!joint || !joint.unit) {
+      if (process.env.devnet && !process.env.testnet && !process.env.mainnet) {
+        console.log("devnet fixture: evidence skipped for empty joint", aaUnit.slice(0, 16));
+        continue;
+      }
+      throw new Error("no joint for " + aaUnit.slice(0, 16));
+    }
     // joint carries the FULL joint unit object: the watcher recomputes
     // unit_hash(joint.unit) via operp_settle::obyte_hash::get_unit_hash and
     // compares against the sidechain deposit's aa_unit.
@@ -146,7 +164,7 @@ let network;
 
 async function main() {
   if (PERP_ASSET_ID === "PERP_ASSET_ID_HERE")
-    throw new Error("Set PERP_ASSET_ID to the issued asset id before posting");
+    throw new Error("Set PERP_ASSET_ID to the issued asset id before posting (testnet/mainnet)");
   const batchFile = process.argv[2] || path.join(__dirname, "batch.json");
   const batchData = JSON.parse(fs.readFileSync(batchFile, "utf8"));
   // H3 contract visibility: the canonical pair watchers recompute from
@@ -166,25 +184,18 @@ async function main() {
 
   // Step4: build deposit_evidences BEFORE posting so the temp_data reveal
   // carries them (watchers verify unit_hash(joint) == aa_unit independently).
-  batchData.deposit_evidences = await buildDepositEvidences(batchData, vault);
-  if (batchData.deposit_evidences.length) {
+  const evidences = await buildDepositEvidences(batchData, vault);
+  if (evidences.length) {
+    batchData.deposit_evidences = evidences;
     console.log("deposit_evidences:", batchData.deposit_evidences.length);
+  } else {
+    delete batchData.deposit_evidences;
   }
 
-  // 1. data availability: full batch reveal as temp_data
-  const { unit: tdUnit, error: tdErr } = await poster.sendMulti({
-    messages: [tempDataMessage(batchData)],
-  });
-  if (tdErr) throw new Error("temp_data failed: " + tdErr);
-  await network.witnessUntilStable(tdUnit);
-  console.log("temp_data posted & stable:", tdUnit);
-
-  // 2. join the submit race — 50000 SUBMIT_BOND_NET + >=10000 fee headroom
-  // Step6/8: carry optional validity_proof_hash and perp_burned audit mirror.
-  // Phase 5.2: submit carries the sharded commitment — aa_forest is the
-  // 1024-hex concat of the 16 shard roots (shard i at offset i*64) and
-  // aa_root stays the 64-hex forest hash over that concat; the AA
-  // length-gates both (64 / 1024).
+  // 1+2 COMBINED: DA reveal + submit in ONE unit — block order = this
+  // unit's order. The AA records var['da_unit_<h>'] = this unit's hash, so
+  // the root provably points at exactly this temp_data package. First
+  // stable combined unit wins the height ('height taken' otherwise).
   const shardRoots = batchData.aa_shard_roots;
   if (!Array.isArray(shardRoots) || shardRoots.length !== 16 ||
       !shardRoots.every((r) => typeof r === "string" && /^[0-9a-f]{64}$/.test(r)))
@@ -202,7 +213,16 @@ async function main() {
   };
   if (batchData.validity_proof_hash) submitData.validity_proof_hash = batchData.validity_proof_hash;
   if (batchData.perp_burned !== undefined) submitData.perp_burned = String(batchData.perp_burned);
-  await trigger(poster, submitData, 60000);
+  // 60000 = 50000 SUBMIT_BOND_NET + 10000 bounce fee headroom.
+  const r = await poster.sendMulti({
+    messages: [tempDataMessage(batchData), { app: "data", payload: submitData }],
+    base_outputs: [{ address: vault, amount: 60000 }],
+  });
+  if (r.error) throw new Error("combined da_unit failed: " + r.error);
+  const daUnit = r.unit;
+  await network.witnessUntilStable(daUnit);
+  console.log("combined da_unit posted & stable:", daUnit);
+  console.log("da_unit:", daUnit);
   // 3. stability window then lock
   await network.timetravel({ shift: "700s" });
   await trigger(poster, { lock: 1, height: batchData.height });

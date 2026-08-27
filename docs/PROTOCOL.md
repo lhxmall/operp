@@ -193,8 +193,11 @@ TooManyUnits 上限（512）在 from_applied 就挡住超大批次。
 
 ```
 boot, chain_id, last_locked, last_finalized
-submitted_at_h, cand_root_h, cand_aa_root_h, cand_prev_h, cand_fills_h,
-  cand_who_h                     # 候选（lock 前可被替换）
+submitted_at_h, cand_root_h, cand_aa_root_h,
+  da_unit_h                      # 单一候选（首个稳定组合单元胜出；
+                                 # 后续 submit bounce 'height taken'）+
+                                 # DA 绑定：da_unit_h = 携带根的那笔
+                                 # 组合单元（temp_data+submit 同 unit）的 hash
 root_h, aa_root_h, stable_at_h  # 已锁定根
 frozen_h ∈ {∅/0=正常, 1=已挑战, 2=永久失败}
 challenger_h, bond_<address>               # 挑战 bond 记账
@@ -217,9 +220,9 @@ PERP 提款复用同一 withdraw 分支，仅叶子多一段 `:perp`。
 ### 生命周期（高度 h）
 
 ```
-submit(h)    h == last_locked+1 ∧ prev==root_{h-1} ∧ 有根
-             → 写 cand_*，记 submitted_at_h = now
-             （lock 前允许覆盖：front-run 一个坏候选无法 brick 链）
+submit(h)    h == last_locked+1 ∧ prev==root_{h-1} ∧ 有根 ∧ 组合单元
+             → 首交写 cand_*、da_unit_h = trigger.unit、submitted_at_h = now；
+               已占位（未冻结且 active_bond_h 在位）→ bounce('height taken')
 
 lock(h)      cand 存在 ∧ 未锁 ∧ now ≥ submitted_at_h + 600s
              → root_h ← cand，stable_at_h = now，last_locked = h

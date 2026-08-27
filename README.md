@@ -179,17 +179,17 @@ replica can audit the operator.
 
 Lifecycle per height *h*:
 
-1. **submit** — operator posts `{height: h, prev_state_hash, state_root,
-   aa_root}` with ≥ 60 000 bytes attached: 10 000 bounce headroom plus a
-   **50 000-byte `SUBMIT_BOND_NET`** locked per live candidate. Height must
-   equal `last_locked + 1`; the previous root must match; all three hash
-   fields must be exactly 64 hex chars. Candidates are **replaceable until
-   locked**: a replacing submitter takes the height over and the displaced
-   candidate's bond moves to `sbond_<addr>` for reclaim via
-   `{claim: "sbond"}` (failed finalizations confiscate it instead). The
-   sitting operator re-submitting keeps its bond (no double charge) and the
-   stability timer restarts on every submit — identical-root spam only
-   costs the attacker a fresh bond each round.
+1. **submit** — operator posts ONE **combined unit** carrying the batch as
+   OIP-0007 `temp_data` PLUS the `{height: h, prev_state_hash, state_root,
+   aa_root}` data message, with ≥ 60 000 bytes attached: 10 000 bounce
+   headroom plus a **50 000-byte `SUBMIT_BOND_NET`** locked per live
+   candidate. Height must equal `last_locked + 1`; the previous root must
+   match; all three hash fields must be exactly 64 hex chars. The height is
+   **single-candidate**: the first stable combined unit wins and the AA
+   records `da_unit_<h>` = that unit's hash (the root provably points at
+   exactly that data package); any further submit on the height bounces
+   `height taken` until it is finalized or fails. The 600 s stability clock
+   is set once by the winning submit and cannot be reset.
 2. **lock** — allowed only after the 600 s stability window
    (`OBYTE_STABILITY_SECS`) and only while the candidate's submit-bond
    holder record (`active_bond_<h>`) is present: a failed finalize
@@ -203,15 +203,17 @@ Lifecycle per height *h*:
    a second challenge, and `{claim: "bond"}` refuses payout while the
    challenged height is still frozen.
 4. **respond (by resubmit)** — there is no separate respond trigger: the
-   operator answers a challenge by re-submitting the identical root inside
-   the window (bond waived for the sitting candidate owner). Success
-   unfreezes and confiscates exactly the recorded challenger bond (zeroing
+   ORIGINAL bond holder answers a challenge by re-submitting the identical
+   root inside the window (the only resubmit that passes the
+   single-candidate gate; it does not touch `da_unit_<h>` or reset the
+   clock). Success unfreezes and confiscates exactly the recorded challenger bond (zeroing
    both its ledger keys); an impostor resubmit bounces `not operator`. If
    nobody responds in time, finalize marks the height permanently failed
    (`frozen = 2`), clears its roots, rolls `last_locked` back to h−1,
    confiscates the submit bond — split **50/50**: half accrues to the
-   challenger as `{claim: "slash"}`, half stays burned in the pot — and
-   restarts the stability clock; the challenger also recovers its own bond
+   challenger as `{claim: "slash"}`, half stays burned in the pot; the
+   failure sweep clears `active_bond_<h>` so a fresh combined unit can
+   re-occupy the height, and the challenger also recovers its own bond
    through `{claim: "bond"}`.
 5. **finalize** — after a clean 3600 s window the root becomes the withdrawal
    basis (`last_finalized`), strictly in height order; the submit bond is
@@ -270,10 +272,8 @@ obyte-local/
   agents/operp_vault.aa   the vault autonomous agent (security-hardened)
   test_vault_aa.js       full lifecycle integration test (devnet via aa-testkit)
   deploy_testnet.js      testnet deployment script (+ smoke deposit)
-  post_batch.js          operator submission flow (temp_data reveal,
-                         submit, lock, finalize, claim)
-  gen_withdraw_proof     see crates/operp-settle/examples
-vendor/aa-testkit/       Obyte autonomous-agent testkit (vendored)
+  post_batch.js          operator submission flow (combined temp_data+submit
+                         unit, lock, finalize, claim)
 docs/PROTOCOL.md         protocol design narrative
   docs/MECHANISMS.md     full mechanism reference (zh): every rule, constant,
                          edge case, and the threat-model matrix
@@ -311,11 +311,9 @@ cd obyte-local && node test_vault_aa.js
 # deploy the vault AA to Obyte testnet
 cd obyte-local && node deploy_testnet.js
 
-# operator flow: post full batch as temp_data + submit + lock +
+# operator flow: post ONE combined temp_data+submit unit + lock +
 # finalize + claim race reward (the complete mainnet sequence)
 cd obyte-local && node post_batch.js
-```
-
 Measured on this machine: `bench_raw` ≈ 5 500 ops/s; `hft_onedag` (8 markets,
 4 generators) ≈ 9 000–9 200 TPS aggregate with zero rejections.
 
@@ -365,11 +363,12 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    `perp_supply` but the corresponding tokens remain escrowed (the AA is
    permanently over-collateralized) — auditors must treat
    `vault holdings − perp_supply` as the cumulative burn figure.
-7. **The sitting operator resets the stability timer for free.** Every
-   resubmit restarts the 600 s clock at zero cost to the incumbent
-   (`active_bond_` stays theirs). This is an accepted liveness tradeoff:
-   it delays only their own height, and any competitor can spend the
-   50 000-byte bond to take the height over.
+7. ~~**The sitting operator resets the stability timer for free.**~~
+   **RESOLVED** (combined da_unit): submits are single-candidate — the
+   first stable combined `temp_data`+submit unit wins the height, the AA
+   pins `da_unit_<h>` to it, and every other submit bounces `height taken`
+   (only the frozen==1 respond-by-resubmit by the original bond holder
+   passes, without touching the clock). No incumbent clock-reset exists.
 8. The AA has had no formal security audit. The Oscript complexity gate
    sits exactly at its ceiling (**85/100**, ops 1075/2000 — run
    `node tools/check_aa_complexity.js`), so every further AA change must
