@@ -21,7 +21,10 @@ const fs = require("fs");
 const crypto = require("crypto");
 // ===== CONFIG: PERP governance asset ================================
 // Set to the real PERP asset id once issued; must match deploy_testnet.js.
-const PERP_ASSET_ID = "PERP_ASSET_ID_HERE";
+// devnet (default) has no issued asset: fall back to 'base' exactly like
+// test_vault_aa.js's bootstrap substitution — the perp-deposit branch is
+// keyed on trigger.data.deposit_perp, so base can never reach it here.
+let PERP_ASSET_ID = "PERP_ASSET_ID_HERE";
 // ====================================================================
 
 // The .aa source carries the PERP_ASSET_ID_HERE placeholder; aa-testkit
@@ -45,8 +48,11 @@ if (process.env.testnet) {
   process.env.mainnet = "1";
 } else {
   process.env.devnet = "1";
+  // devnet has no issued asset: fall back to 'base' exactly like
+  // test_vault_aa.js's bootstrap substitution — the perp-deposit branch is
+  // keyed on trigger.data.deposit_perp, so base can never reach it here.
+  PERP_ASSET_ID = "base";
 }
-require("module").Module._initPaths(); // pick up NODE_PATH for bare ocore requires
 
 const { Testkit } = require(path.join(aaRoot, "main.js"));
 const { Network } = Testkit({
@@ -146,7 +152,7 @@ let network;
 
 async function main() {
   if (PERP_ASSET_ID === "PERP_ASSET_ID_HERE")
-    throw new Error("Set PERP_ASSET_ID to the issued asset id before posting");
+    throw new Error("Set PERP_ASSET_ID to the issued asset id before posting (testnet/mainnet)");
   const batchFile = process.argv[2] || path.join(__dirname, "batch.json");
   const batchData = JSON.parse(fs.readFileSync(batchFile, "utf8"));
   // H3 contract visibility: the canonical pair watchers recompute from
