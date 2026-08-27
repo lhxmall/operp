@@ -1,9 +1,9 @@
 "use strict";
 
 // Full vault-AA lifecycle test (security-hardened, sharded-forest AA):
-//   deposit -> low-submit bounce ('need submit bond') -> submit (50000-byte
-//   SUBMIT_BOND_NET) -> candidate replacement (replaced submitter reclaims
-//   via {claim_submit_bond}) -> early lock bounce ->
+//   deposit -> low-submit bounce ('need submit bond') -> combined
+//   temp_data+submit (50000-byte SUBMIT_BOND_NET, da_unit_<h> pinned) ->
+//   second submit bounces 'height taken' (single-candidate) -> early lock bounce ->
 //   timetravel +600s -> lock -> early withdraw bounce ('not finalizable') ->
 //   challenge + immediate {claim_bond} bounce ('challenge unresolved') ->
 //   locked-height resubmit bounce ('bad submit': the final AA has NO
@@ -115,6 +115,29 @@ async function triggerRaw(wallet, data, amount) {
   // network.getAaResponseToUnit resolves { response: { bounced, info, ... } }
   const res = await network.getAaResponseToUnit(unit);
   return { unit, response: (res && res.response) || null };
+}
+
+// Combined DA+submit helper: mirrors post_batch.js — temp_data (DA reveal)
+// and the submit data message in ONE unit; the AA records da_unit_<h> from
+// this unit's hash. First stable combined unit wins the height.
+async function sendCombinedSubmit(wallet, amount, submitData, batchData) {
+  const tempData = {
+    app: "temp_data",
+    payload_location: "inline",
+    payload: {
+      data_length: require("ocore/object_length.js").getLength(batchData, true),
+      data_hash: require("ocore/object_hash.js").getBase64Hash(batchData, true),
+      data: batchData,
+    },
+  };
+  const r = await wallet.sendMulti({
+    messages: [tempData, { app: "data", payload: submitData }],
+    base_outputs: [{ address: network.agent.vault, amount }],
+  });
+  if (r.error) throw new Error("combined submit failed: " + r.error);
+  await network.witnessUntilStable(r.unit);
+  const res = await network.getAaResponseToUnit(r.unit);
+  return { unit: r.unit, response: (res && res.response) || null };
 }
 
 // Wallet-balance proof helpers: payout assertions compare real wallet
@@ -573,32 +596,29 @@ async function main() {
     throw new Error("local forest hash mismatch");
   console.log("local proof recheck OK (shard", claim.shard, ")");
 
-  // ---------- 2. submit height 1 + candidate replacement ----------
+  // ---------- 2. submit height 1: single-candidate + height-taken ----------
   const submit1 = { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_CAND1, aa_root: sha256Hex("aacand1"), aa_forest: FOREST_CAND1 };
-  // sub-50000 net output cannot post the SUBMIT_BOND_NET
-  await expectBounce(() => triggerRaw(bob, submit1, 20000), "need submit bond");
-  const sub1 = await triggerRaw(bob, submit1, 60000);
+  const batch1 = { chain_id: "operp-mvp-1", height: 1, state_root: ROOT_CAND1, unit_ids: [] };
+  // sub-60000 combined unit cannot post the SUBMIT_BOND_NET (value gate
+  // sits behind the empty height-taken gate for a first submit).
+  await expectBounce(() => sendCombinedSubmit(bob, 20000, submit1, batch1), "need submit bond");
+  const sub1 = await sendCombinedSubmit(bob, 60000, submit1, batch1);
   console.log("submit1 response:", JSON.stringify(sub1.response));
-  // second submit must REPLACE the first (pre-lock) — commits the REAL root;
-  // bob's locked bond moves to his claimable sbond_
+  // second combined submit on the same height bounces 'height taken' —
+  // even from a bond-sufficient different operator; bob stays the ONLY
+  // candidate and da_unit_1 pins bob's unit.
   const submit2 = { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_FINAL1, aa_root: claim.aa_root, aa_forest: claim.aa_forest };
-  const sub2 = await triggerRaw(alice, submit2, 60000);
-  console.log("submit2 response:", JSON.stringify(sub2.response));
+  const batch2 = { chain_id: "operp-mvp-1", height: 1, state_root: ROOT_FINAL1, unit_ids: [] };
+  await expectBounce(() => sendCombinedSubmit(alice, 60000, submit2, batch2), "height taken");
   st = await vars();
-  console.log("cand after replacement:", st["cand_root_1"], st["cand_aa_root_1"]);
+  console.log("cand after race:", st["cand_root_1"], st["cand_aa_root_1"]);
   console.log("var keys:", Object.keys(st));
-  // cand_aa_root_1 now holds the 1024-hex forest.
-  if (st["cand_root_1"] !== ROOT_FINAL1 || st["cand_aa_root_1"] !== claim.aa_forest)
-    throw new Error("candidate replacement failed");
-  // the replaced submitter reclaims his bond via {claim_submit_bond}
-  const sbondClaim = await triggerRaw(bob, { claim: "sbond" }, 30000);
-  if (!(sbondClaim.response && sbondClaim.response.bounced === false))
-    throw new Error("claim sbond bounced: " + JSON.stringify(sbondClaim).slice(0, 400));
+  if (st["cand_root_1"] !== ROOT_CAND1 || st["cand_aa_root_1"] !== FOREST_CAND1)
+    throw new Error("single-candidate not preserved");
+  if (st["da_unit_1"] !== sub1.unit)
+    throw new Error("da_unit_1 not pinned to first combined unit: " + st["da_unit_1"] + " != " + sub1.unit);
+  console.log("height taken enforced; da_unit_1 pinned to first combined unit");
   const bobAddr = await bob.getAddress();
-  st = await vars();
-  if (Number(st["sbond_" + bobAddr]) !== 0)
-    throw new Error("sbond_ not zeroed after claim");
-  console.log("replaced submitter reclaimed his 50000-byte bond");
 
   // ---------- 3. early lock must bounce ----------
   const earlyLock = await triggerRaw(bob, { lock: 1, height: 1 });
@@ -613,7 +633,7 @@ async function main() {
   console.log("lock response tail:", lr.slice(-300));
   st = await vars();
   console.log("after lock: root_1 =", st["root_1"], "last_locked =", st["last_locked"]);
-  if (st["root_1"] !== ROOT_FINAL1 || Number(st["last_locked"]) !== 1) throw new Error("lock failed");
+  if (st["root_1"] !== ROOT_CAND1 || Number(st["last_locked"]) !== 1) throw new Error("lock failed");
 
   // ---------- 5. withdraw before finalize bounces ----------
   const earlyWd = await triggerRaw(alice, { withdraw: 1, amount: 1000 });
@@ -690,11 +710,14 @@ async function main() {
     throw new Error("claim_bond wallet delta " + claimDelta + " != " + (aliceBondCredited - 30000 - claimFee));
   console.log("  claim_bond paid exactly", aliceBondCredited,
     "(wallet delta", claimDelta, "= owed - 30000 trigger -", claimFee, "fee)");
-  // ---------- 8c. frozen==2 unlock: fresh bonded resubmit / lock / finalize
-  // of height 1 with the REAL sharded commitment ----------
-  // The failed height is recoverable: the failure sweep cleared root_1 and
-  // restarted its stability clock, so a fresh candidate supersedes it.
-  await trigger(bob, { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_FINAL1, aa_root: claim.aa_root, aa_forest: claim.aa_forest }, 60000);
+  // ---------- 8c. frozen==2 unlock: fresh bonded combined resubmit / lock /
+  // finalize of height 1 with the REAL sharded commitment ----------
+  // The failed height is recoverable: the failure sweep cleared root_1,
+  // active_bond_1 and cand_aa_root_1, so $old is empty and a fresh COMBINED
+  // unit can re-occupy the height (single-candidate gate passes).
+  const reSubmit = { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_FINAL1, aa_root: claim.aa_root, aa_forest: claim.aa_forest };
+  const reBatch = { chain_id: "operp-mvp-1", height: 1, state_root: ROOT_FINAL1, unit_ids: [] };
+  await sendCombinedSubmit(bob, 60000, reSubmit, reBatch);
   await network.timetravel({ shift: '700s' });
   await trigger(bob, { lock: 1, height: 1 });
   st = await vars();
