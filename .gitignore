@@ -31,3 +31,6 @@ agents/operp_vault_perp.aa
 # local agent-session artifacts
 .kilo/
 local/
+# WSL distro imported to repo folder (large vhdx, do not push)
+.wsl/
+*.vhdx
