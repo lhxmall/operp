@@ -46,8 +46,8 @@ pub const REPLAY_WINDOW_LEGACY: u64 = 256;
 pub const REPLAY_ACTIVATION_HEIGHT: Height = 1_000_000;
 pub const ORDERING_EPOCH_UNITS: u64 = 512;
 pub const ORDERING_SALT_DOMAIN: &[u8] = b"operp-order-v1";
-pub const ORACLE_SLASH_ACTIVATION_HEIGHT: Height = 1_000_000;
-pub const FUNDING_TWAP_ACTIVATION_HEIGHT: Height = 1_000_000;
+pub const ORACLE_SLASH_ACTIVATION_HEIGHT: Height = 0;
+pub const FUNDING_TWAP_ACTIVATION_HEIGHT: Height = 0;
 pub const STAKE_ORACLE_TAG: u8 = 14;
 pub const UNSTAKE_ORACLE_TAG: u8 = 15;
 pub const SLASH_ORACLE_TAG: u8 = 16;
@@ -68,7 +68,7 @@ pub const FUNDING_EXTERNAL_MAX_STALENESS: Height = 32;
 // Commit-reveal ordering v2 (doc 03 §2.3) — additive on top of the salted
 // sort (v1). Commits carry no content MEV; reveals must parent their commit
 // and re-derive sha256(inner_op_bytes || salt).
-pub const COMMIT_REVEAL_ACTIVATION_HEIGHT: Height = 1_000_000;
+pub const COMMIT_REVEAL_ACTIVATION_HEIGHT: Height = 0;
 /// Reveal deadline: commits expire COMMIT_TTL_HEIGHTS after creation
 /// (~32 s at 2 s/batch), bounding the pending-commit set.
 pub const COMMIT_TTL_HEIGHTS: Height = 16;
@@ -80,6 +80,12 @@ pub const COMMIT_TAG: u8 = 18;
 pub const REVEAL_TAG: u8 = 19;
 pub const ESCAPE_STALL_SECS: u64 = 604800;
 pub const ESCAPE_STALL_SECS_TESTNET: u64 = 3600;
+pub const BOUNCE_FEE_BASE: u64 = 10_000;
+pub const SUBMIT_BOND_NET: u64 = 1_000_000_000_000; // 1000 GBYTE
+pub const CHALLENGE_BOND_NET: u64 = 1_000_000_000_000;
+pub const SUBMIT_BOND_SLASH_HALF: u64 = 500_000_000_000;
+pub const RACE_REWARD: u64 = 20_000;
+pub const OCCUPANCY_SECS: u64 = 3600; // unlocked candidate replaceable after this
 pub const VAULT_AA_ADDRESS: &str = "";
 pub const DEPOSIT_EVIDENCE_MAX_BYTES: usize = 1_048_576;
 pub const DEPOSIT_VERIFY_ACTIVATION_HEIGHT: Height = 1_000_000;

@@ -51,7 +51,7 @@ async function main() {
   console.log("deploying operp_vault.aa to TESTNET ...");
   const network = await Network.create()
     .with.agent({ vault: resolveVaultAa() })
-    .with.wallet({ operator: 1e9 })
+    .with.wallet({ operator: 1e13 })
     .run();
 
   const vault = network.agent.vault;
@@ -89,7 +89,7 @@ async function main() {
     perp_asset_id: PERP_ASSET_ID,
     challenge_secs: 3600,
     chain_id: CHAIN_ID,
-    challenge_bond_min: 20000,
+    challenge_bond_min: 10000000010000,
     deployed_at: new Date().toISOString(),
   };
   fs.writeFileSync(path.join(__dirname, "deployment.json"), JSON.stringify(info, null, 2));

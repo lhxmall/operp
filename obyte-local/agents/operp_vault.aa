@@ -7,9 +7,18 @@
 	// single source of truth; Oscript cannot include them):
 	//   'operp-mvp-1'  -> CHAIN_ID
 	//   600           -> OBYTE_STABILITY_SECS (lock stability window)
-	//   3600          -> CHALLENGE_SECS (challenge window before finalize; counts from stable_at (post-lock))
-	//   20000         -> challenge bond minimum incl. bounce fee headroom
-	//   50000         -> SUBMIT_BOND_NET (submit bond locked per candidate height)
+	//   3600          -> CHALLENGE_SECS (finalize clean window from stable_at; OCCUPANCY_SECS on unlocked candidate replacement)
+	//   1000000000000 -> SUBMIT_BOND_NET (submit bond locked per candidate height)
+	//   1000000010000 -> CHALLENGE_BOND_GROSS (CHALLENGE_BOND_NET + bounce headroom)
+	//   500000000000 -> SUBMIT_BOND_SLASH_HALF (challenger slash reward)
+	//   20000         -> RACE_REWARD (operator race reward)
+	//
+	// CHALLENGE = IMMEDIATE REOPEN (no respond-by-resubmit). A challenge of a
+	//   locked height is decided in the AA itself: it permanently fails the
+	//   candidate (frozen=2, root cleared, last_locked rolls back to h-1),
+	//   slashes half the submit bond to the challenger, and reopens h for a
+	//   fresh 1000-GBYTE first-stable submit. There is no response window.
+	//   Unlocked candidates are NOT challengeable (bounce 'bad height').
 	//   16            -> MAX_AA_TREE_DEPTH (per-shard withdraw proof depth; Rust mirrors 16)
 	//   16            -> AA_SHARD_COUNT: address space is split into 16 shards
 	//     (shard of an account = aa_shard_of(addr) off-chain, doc 10 §B1(1);
@@ -45,27 +54,25 @@
 	// State vars:
 	//   last_locked, last_finalized
 	//   submitted_at_<h>, cand_root_<h>, cand_aa_root_<h>
-	//     the SINGLE candidate of <h> (first stable combined unit wins;
-	//     resubmits bounce 'height taken' unless frozen==1 respond).
+	//     the SINGLE candidate of <h> (first stable combined unit wins; a
+	//     timed-out unlocked candidate is replaceable after OCCUPANCY_SECS).
 	//   da_unit_<h>                             hash of the combined unit
 	//     (temp_data + submit messages in ONE unit) that carries the root —
 	//     DA binding: root must point at exactly that data package.
-	//   active_bond_<h>                          address holding the 50000-
+	//   active_bond_<h>                          address holding the 1000000000000-
 	//     byte submit bond for the single live candidate of <h>; successful
-	//     finalize releases it to sbond_, failed finalize confiscates it
-	//     (keys cleared, coins stay in the pot)
+	//     finalize releases it to sbond_, a challenge slash keeps it in the pot
+	//     (half to challenger via slash_reward_, keys cleared).
 	//   sbond_<addr>                             released submit-bond balance,
 	//     claimable via {claim_submit_bond} (paid out and zeroed)
 	//   root_<h>, stable_at_<h>, aa_root_<h>     locked root
-	//   frozen_<h>   absent/0 = ok, 1 = challenged, 2 = permanently failed
+	//   frozen_<h>   absent/0 = ok, 1 = challenged (never persists), 2 = failed
 	//   challenger_<h>, bond_<address>, bond_height_<address>
 	//     challenge bond accounting: a challenge bounces while the sender
 	//     still holds an outstanding bond (one challenge at a time);
 	//     bond_height_ records which height that bond challenges so
-	//     {claim_bond} refuses payout while frozen_<h> == 1. Operator
-	//     responds by RE-SUBMITTING the identical root (same case), which
-	//     confiscates the challenger's bond (bond_ zeroed; stale
-	//     bond_height_ is inert because claim gates on owed > 0 first).
+	//     {claim_bond} refuses payout while frozen_<h> == 1. Challenge coins
+	//     stay in the AA pot (burned, NOT credited to bond_).
 	//   reward_<addr>                            accrued operator race reward
 	//   wd_<addr>                                cumulative bytes withdrawn by
 	//     <addr> across ALL finalized heights; capped at the presented
@@ -73,17 +80,15 @@
 	//   wp_<addr>                                cumulative PERP withdrawn,
 	//     capped at the proven PERP balance — symmetric to wd_
 	//   slash_reward_<addr>                      claimable half of a confiscated
-	//     submit bond after a challenge-failed finalize (Step6 fraud slash)
+	//     submit bond after a challenge (SUBMIT_BOND_SLASH_HALF)
 	// ESCAPE HATCH (doc 07): after ESCAPE_STALL_SECS with no finalization
 	//   progress, {escape_finalize: 1, height} stall-finalizes the oldest
 	//   locked height (any caller, bounce-headroom only; never overrides a
-	//   live challenge — frozen==1 must go through finalize's failure sweep)
-	//   and {escape_withdraw: 1, ...claim fields} pays a proof against the
-	//   STALE CANDIDATE's forest at h = last_finalized+1 when it was never
-	//   locked (or rolled back frozen==2) and both stall gates elapsed.
-	//   Anti-replay is shared with withdraw via wd_/wp_. Both entries are
-	//   FOLDED into the existing finalize/withdraw cases (distinct trigger
-	//   keys; complexity budget per doc 07 §4 mitigation ladder).
+	//   challenge — frozen heights are already failed by the challenge).
+	//   {escape_withdraw} is REMOVED: never-locked candidates cannot be
+	//   withdrawn against (bounce('no escape withdraw')). Anti-replay is
+	//   shared with withdraw via wd_/wp_. (distinct trigger key;
+	//   complexity budget per doc 07 §4 mitigation ladder).
 	//   Deviation from doc 07 §2.3.1 sketch: escape_finalize enforces only
 	//   the LOCAL stall gate (stable_at_h + 604800), not the additional
 	//   global last_finalized-stale gate — plain finalize is already
@@ -133,61 +138,42 @@
 					$h = trigger.data.height;
 					$ll = var['last_locked'] otherwise 0;
 					$frozen = (var['frozen_' || $h] otherwise 0);
-					if (trigger.data.chain_id != 'operp-mvp-1' OR !$h OR ($h != $ll + 1 AND !($frozen == 1 AND $h == $ll ))
+					if (trigger.data.chain_id != 'operp-mvp-1' OR !$h OR $h != $ll + 1
 						OR !trigger.data.state_root OR length(trigger.data.state_root) != 64
 						OR !trigger.data.aa_root OR length(trigger.data.aa_root) != 64
 						OR !trigger.data.prev_state_hash OR length(trigger.data.prev_state_hash) != 64
 						OR !trigger.data.aa_forest OR length(trigger.data.aa_forest) != 1024)
 						bounce('bad submit');
-					if ($ll > 0 AND $frozen != 1 AND trigger.data.prev_state_hash != var['root_' || $ll])
+					if ($ll > 0 AND trigger.data.prev_state_hash != var['root_' || $ll])
 						bounce('prev mismatch');
 					$old = (var['active_bond_' || $h] otherwise 0);
-					// SINGLE-CANDIDATE GATE: before frozen, ANY resubmit on an
-					// already-occupied height bounces — including the sitting
-					// operator's. The height belongs to the first stable
-					// COMBINED unit (temp_data + submit in one unit, recorded
-					// as da_unit_<h>); the 600s lock timer therefore waits for
-					// exactly that one unit and cannot be reset by free spam.
-					if ($frozen != 1
-						AND $old)
+					$locked = var['root_' || $h];
+					$sa_sub = (var['submitted_at_' || $h] otherwise 0);
+					// SINGLE-CANDIDATE GATE with OCCUPANCY TIMEOUT: an unlocked
+					// height is owned by its first stable COMBINED unit. A
+					// resubmit bounces 'height taken' while the current
+					// occupant is still live (locked, or inside the
+					// OCCUPANCY_SECS replacement window). After the timeout a
+					// DIFFERENT operator may re-occupy with a fresh combined
+					// submit; the evicted bond is overwritten (not refunded).
+					if ($old AND ($locked OR timestamp < $sa_sub + 3600))
 						bounce('height taken');
-					// RESPOND-BY-RESUBMIT (frozen==1): ONLY the original bond
-					// holder may re-commit the identical root within the
-					// response window; it does not touch da_unit_ or reset
-					// submitted_at_. Impostors bounce here — state messages
-					// cannot bounce. Respond must replay identical state_root
-					// AND aa_forest; DA binding stays on original da_unit.
-					if ($frozen == 1){
-						if (trigger.address != $old
-							OR trigger.data.state_root != var['cand_root_' || $h]
-							OR trigger.data.aa_forest != var['cand_aa_root_' || $h])
-							bounce('not operator');
-						if (timestamp >= (var['stable_at_' || $h] otherwise 0) + 3600)
-							bounce('response window closed');
-					}
-					// New combined unit needs base >= 60000: 10000 bounce
-					// headroom + 50000 SUBMIT_BOND_NET. (frozen==1 responds
-					// carry no extra fee: only first submits reach this gate.)
-					if ($frozen != 1 AND trigger.output[[asset=base]] - 10000 < 50000)
+					// New combined unit needs base >= 10000000010000: 10000
+					// bounce headroom + 1000000000000 SUBMIT_BOND_NET.
+					if (trigger.output[[asset=base]] - 10000 < 1000000000000)
 						bounce('need submit bond');
 				}",
 				messages: [
 					{
 						app: "state",
 						state: "{
-							if ($frozen == 1){
-								var['frozen_' || $h] = 0;
-								$ch = (var['challenger_' || $h] otherwise '');
-								var['bond_' || $ch] = 0;
-							} else {
-								var['active_bond_' || trigger.data.height] = trigger.address;
-								var['cand_root_' || trigger.data.height] = trigger.data.state_root;
-								var['cand_aa_root_' || trigger.data.height] = trigger.data.aa_forest;
-								var['da_unit_' || trigger.data.height] = trigger.unit || '';
-								var['submitted_at_' || trigger.data.height] = timestamp;
-								if (!var['fee_winner_' || trigger.data.height]){
-									var['fee_winner_' || trigger.data.height] = trigger.address;
-								}
+							var['active_bond_' || trigger.data.height] = trigger.address;
+							var['cand_root_' || trigger.data.height] = trigger.data.state_root;
+							var['cand_aa_root_' || trigger.data.height] = trigger.data.aa_forest;
+							var['da_unit_' || trigger.data.height] = trigger.unit || '';
+							var['submitted_at_' || trigger.data.height] = timestamp;
+							if (!var['fee_winner_' || trigger.data.height]){
+								var['fee_winner_' || trigger.data.height] = trigger.address;
 							}
 						}"
 					}
@@ -231,97 +217,65 @@
 					if (!$h OR $h > (var['last_locked'] otherwise 0)) bounce('bad height');
 					if (var['frozen_' || $h] OR timestamp >= (var['stable_at_' || $h] otherwise 0) + 3600) bounce('challenge not possible');
 					if ((var['bond_' || trigger.address] otherwise 0) > 0) bounce('outstanding bond');
-					if (trigger.output[[asset=base]] - 10000 < 10000) bounce('bond too small');
+					if (trigger.output[[asset=base]] - 10000 < 1000000000000) bounce('bond too small');
 				}",
 				messages: [
 					{
 						app: "state",
 						state: "{
-							var['frozen_' || trigger.data.height] = 1;
+							var['frozen_' || trigger.data.height] = 2;
+							var['root_' || trigger.data.height] = 0;
+							var['aa_root_' || trigger.data.height] = 0;
+							var['last_locked'] = trigger.data.height - 1;
 							var['challenger_' || trigger.data.height] = trigger.address;
-							var['bond_height_' || trigger.address] = trigger.data.height;
-							var['bond_' || trigger.address] += trigger.output[[asset=base]] - 10000;
+							var['slash_reward_' || trigger.address] += 500000000000;
+							var['active_bond_' || trigger.data.height] = 0;
+							var['cand_aa_root_' || trigger.data.height] = 0;
+							var['fee_winner_' || trigger.data.height] = 0;
 						}"
 					}
 				]
 			},
 			{
-				// finalize timer, with the challenge-FAILURE sweep folded in:
-				//   frozen==1 and window over (operator never responded)
-				//     -> height fails: frozen=2 permanent, root cleared,
-				//        last_locked rolls back to h-1; the challenger's
-				//        bond stays credited for {claim_bond} and the
-				//        submit bond is confiscated.
-				//   clean window -> root becomes the withdrawal basis for h.
+				// finalize timer, clean-path only: a challenged height is
+				// already failed by the challenge case (frozen=2 moved to the
+				// challenge, so `$failed` never occurs here). Clean window
+				// -> root becomes the withdrawal basis for h.
 				if: "{trigger.data.finalize OR trigger.data.escape_finalize}",
 				init: "{
 					$h = trigger.data.height;
 					if (!$h)
 						bounce('no height');
-					$frozen = (var['frozen_' || $h] otherwise 0);
-					$sa = var['stable_at_' || $h];
-					$failed = ($frozen == 1 AND timestamp >= $sa + 3600);
+					$sa = (var['stable_at_' || $h] otherwise 0);
 					if ($h > (var['last_locked'] otherwise 0))
 						bounce('not locked');
 					// escape_finalize (doc 07 §2.3.1): stall-finalize the oldest
 					// locked height after ESCAPE_STALL_SECS. Any caller; writes
-					// are identical to the clean finalize below. It never
-					// overrides a live challenge — frozen==1 must go through
-					// the normal failure sweep, which refunds the challenger.
-					if (trigger.data.escape_finalize AND $frozen == 1)
+					// are identical to the clean finalize below. A challenged
+					// height never reaches here (challenge already failed it).
+					if (trigger.data.escape_finalize AND var['frozen_' || $h])
 						bounce('challenged');
 					$lf = (var['last_finalized'] otherwise 0);
-					if (!$failed AND ($frozen OR !var['root_' || $h]
+					if (var['frozen_' || $h] OR !var['root_' || $h]
 						OR timestamp < $sa + (trigger.data.escape_finalize ? 604800 : 3600)
-						OR $h != $lf + 1))
+						OR $h != $lf + 1)
 						bounce('cannot finalize');
 				}",
 				messages: [
 					{
 						app: "state",
 						state: "{
-							if ($failed){
-								var['frozen_' || trigger.data.height] = 2;
-								var['root_' || trigger.data.height] = 0;
-								var['aa_root_' || trigger.data.height] = 0;
-								var['last_locked'] = trigger.data.height - 1;
-								// Fraud confirmed (Step6): the 50000 submit bond is
-								// split — half credited to the challenger as
-								// claimable slash_reward_, half burned (coins stay
-								// in the pot, no payment). Challenger's own bond is
-								// refunded via {claim bond} below.
-								$ch = (var['challenger_' || trigger.data.height] otherwise '');
-								if ($ch)
-									var['slash_reward_' || $ch] += 25000;
-								var['active_bond_' || trigger.data.height] = 0;
-								// M5: fraud-proven candidate loses its forest (and
-								// with it all escape_withdraw eligibility — the
-								// escape path bounces 'no candidate'). submitted_at_
-								// needs no explicit zero: a re-submit overwrites it,
-								// and without one the zeroed forest already blocks
-								// escape. (Complexity-budget dedup, same pattern as
-								// the active_bond_ comment above.)
-								var['cand_aa_root_' || trigger.data.height] = 0;
+							var['last_finalized'] = trigger.data.height;
+							// Release the submit bond to its holder, then pay
+							// the operator race reward accrued for the
+							// first-stable submitter of this height.
+							$ab = var['active_bond_' || trigger.data.height];
+							if ($ab){
+								var['sbond_' || $ab] += 1000000000000;
 							}
-						else {
-								var['last_finalized'] = trigger.data.height;
-								// Release the submit bond to its holder, then pay
-								// the operator race reward accrued for the
-								// first-stable submitter of this height.
-								$ab = var['active_bond_' || trigger.data.height];
-								if ($ab){
-									var['sbond_' || $ab] += 50000;
-									// No active_bond_=0 clear here: a cleanly finalized
-									// height is permanently unresubmittable (root_<h>
-									// persists) and unlockable (lock requires root_<h>
-									// absent), so the stale value is never read again.
-									// (Complexity-budget dedup; the failure sweep below
-									// keeps its own explicit clear.)
-								}
-								$fw = var['fee_winner_' || trigger.data.height];
-								if ($fw){
-									var['reward_' || $fw] += 20000;
-								}
+							$fw = var['fee_winner_' || trigger.data.height];
+							if ($fw){
+								var['reward_' || $fw] += 20000;
 							}
 						}"
 					}
@@ -336,15 +290,16 @@
 				// are the root-chain + challenge game's job, not bal_'s.
 				if: "{trigger.data.withdraw OR trigger.data.escape_withdraw}",
 				init: "{
-					// Normal withdraw verifies against last_finalized; the folded
-					// escape_withdraw path (doc 07 §2.3.2) verifies against the
-					// STALE CANDIDATE's forest at h = last_finalized+1 (S1: no
-					// locked height, or frozen==2 rollback) and never advances
-					// finalization.
-					$ew = trigger.data.escape_withdraw;
+					// escape_withdraw is REMOVED: never-locked candidates cannot
+					// be withdrawn against (a locked height must go through
+					// finalize/escape_finalize, and a failed height is simply
+					// re-submittable). Normal withdraw verifies against
+					// last_finalized only.
+					if (trigger.data.escape_withdraw)
+						bounce('no escape withdraw');
 					$lf = var['last_finalized'];
-					$h = $ew ? $lf + 1 : $lf;
-					if (!$lf AND !$ew)
+					$h = $lf;
+					if (!$lf)
 						bounce('not finalizable');
 					// NOTE: no frozen_ check here — challenges only apply to
 					// locked-but-not-finalized heights, so last_finalized can
@@ -369,27 +324,8 @@
 					if (typeof(trigger.data.shard) == 'boolean' OR $shard < 0 OR $shard > 15
 						OR !is_integer($shard))
 						bounce('bad shard');
-					// Root source: the finalized forest, or the stale candidate's
-					// forest on the escape_withdraw path (one keyed read).
-					$src = var[($ew ? 'cand_aa_root_' : 'aa_root_') || $h];
-					if ($ew){
-						if (!$src)
-							bounce('no candidate');
-						// A locked height must go through finalize/escape_finalize:
-						// withdrawing against its candidate would bypass the
-						// challenge game while a verdict is pending.
-						if (var['root_' || $h])
-							bounce('use finalize');
-						// Dual stall gates (doc 07 §2.2): candidate must be
-						// ESCAPE_STALL_SECS old AND the whole chain stalled.
-						// (M6: stable_at must actually exist — a missing value
-						// is a permanent stall, not a pass.)
-						if (timestamp < var['submitted_at_' || $h] + 604800)
-							bounce('candidate not stalled');
-						$sa = (var['stable_at_' || $lf] otherwise 0);
-						if (!$sa OR timestamp < $sa + 604800)
-							bounce('chain not stalled');
-					}
+					// Root source: the finalized forest (aa_root_<h>).
+					$src = var['aa_root_' || $h];
 					// perp length cap must run BEFORE the subtraction below: a
 					// malformed over-15-digit string would fatal in the
 					// arithmetic instead of bouncing (same short-circuit issue

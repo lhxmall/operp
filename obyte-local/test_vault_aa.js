@@ -1,25 +1,21 @@
 "use strict";
 
-// Full vault-AA lifecycle test (security-hardened, sharded-forest AA):
+// Full vault-AA lifecycle test (security-hardened, sharded-forest AA,
+// challenge-reopen semantics):
 //   deposit -> low-submit bounce ('need submit bond') -> combined
-//   temp_data+submit (50000-byte SUBMIT_BOND_NET, da_unit_<h> pinned) ->
-//   second submit bounces 'height taken' (single-candidate) -> early lock bounce ->
-//   timetravel +600s -> lock -> early withdraw bounce ('not finalizable') ->
-//   challenge + immediate {claim_bond} bounce ('challenge unresolved') ->
-//   locked-height resubmit bounce ('not operator' when frozen;
-//   challenge is post-lock-only, window = stable_at+3600) ->
-//   challenge FAILURE path (silence past the window -> finalize sweep:
-//   frozen=2, last_locked rollback, challenger bond stays credited, submit
-//   bond confiscated, slash reward credited) ->
-//   H1 regression: after the WON challenge a direct re-lock without a fresh
-//   bonded submit bounces 'cannot lock yet' ->
-//   alice reclaims her bond via {claim_bond} ->
-//   frozen==2 unlock: resubmit/lock/finalize height 1 with the REAL sharded
-//   commitment succeeds ->
-//   proof-gated SHARDED withdraw (good proof pays; bad proof bounces;
-//   identical replay bounces via the GLOBAL cumulative wd_<addr> cap).
-//   All payouts (claim_bond, base withdraw, PERP withdraw) are proven by
-//   exact wallet-balance deltas.
+//   temp_data+submit (1000000000000-byte SUBMIT_BOND_NET, da_unit_<h>
+//   pinned) -> second submit bounces 'height taken' (single-candidate,
+//   occupancy window) -> early lock bounce -> timetravel +600s -> lock ->
+//   early withdraw bounce ('not finalizable') -> locked-height challenge
+//   with CHALLENGE_GROSS immediately fails the candidate (frozen=2,
+//   last_locked rollback, 500000000000 slash_reward credited) ->
+//   {claim:"bond"} bounces 'nothing claimable' (challenge coins burned) ->
+//   a DIFFERENT operator re-occupies via a fresh bonded submit (reopen
+//   race) -> lock/3600s/finalize -> proof-gated SHARDED withdraw pays,
+//   replay/bad-proof bounces -> h2 challenge/lock/reopen -> occupancy
+//   timeout on an unlocked height -> escape_finalize after 604800s.
+//   All payouts (base withdraw, PERP withdraw) proven by exact wallet-
+//   balance deltas.
 //
 // All hash-shaped submit fields (state_root / aa_root / prev_state_hash)
 // must be exactly 64 hex chars, and aa_forest exactly 1024 hex chars
@@ -73,6 +69,10 @@ const PREV0 = sha256Hex("prev0");
 // 1024-hex stand-in forest for the placeholder first candidate (16 x 64
 // hex, exactly what the AA's length gate expects; never proven against).
 const FOREST_CAND1 = sha256Hex("aacand1").repeat(16);
+// SUBMIT_BOND_NET 1000 GBYTE + 10000 bounce fee headroom.
+const SUBMIT_GROSS = 1e12 + 10000;
+// CHALLENGE_BOND_NET 1000 GBYTE + 10000 bounce fee headroom.
+const CHALLENGE_GROSS = 1e12 + 10000;
 
 async function trigger(wallet, data, amount) {
 
@@ -551,8 +551,8 @@ let network;
 async function main() {
   network = await Network.create()
     .with.agent({ vault: BOOTSTRAP_AA })
-    .with.wallet({ alice: 1e9, mnemonic: ALICE_MNEMONIC })
-    .with.wallet({ bob: 1e9, mnemonic: BOB_MNEMONIC })
+    .with.wallet({ alice: 1e13, mnemonic: ALICE_MNEMONIC })
+    .with.wallet({ bob: 1e13, mnemonic: BOB_MNEMONIC })
     .run();
 
   let alice, bob, aliceAddr, pv;
@@ -599,17 +599,17 @@ async function main() {
   // ---------- 2. submit height 1: single-candidate + height-taken ----------
   const submit1 = { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_CAND1, aa_root: sha256Hex("aacand1"), aa_forest: FOREST_CAND1 };
   const batch1 = { chain_id: "operp-mvp-1", height: 1, state_root: ROOT_CAND1, unit_ids: ["u1"] };
-  // sub-60000 combined unit cannot post the SUBMIT_BOND_NET (value gate
+  // sub-SUBMIT_GROSS combined unit cannot post the SUBMIT_BOND_NET (value gate
   // sits behind the empty height-taken gate for a first submit).
   await expectBounce(() => sendCombinedSubmit(bob, 20000, submit1, batch1), "need submit bond");
-  const sub1 = await sendCombinedSubmit(bob, 60000, submit1, batch1);
+  const sub1 = await sendCombinedSubmit(bob, SUBMIT_GROSS, submit1, batch1);
   console.log("submit1 response:", JSON.stringify(sub1.response));
   // second combined submit on the same height bounces 'height taken' —
   // even from a bond-sufficient different operator; bob stays the ONLY
   // candidate and da_unit_1 pins bob's unit.
   const submit2 = { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_FINAL1, aa_root: claim.aa_root, aa_forest: claim.aa_forest };
   const batch2 = { chain_id: "operp-mvp-1", height: 1, state_root: ROOT_FINAL1, unit_ids: ["u2"] };
-  await expectBounce(() => sendCombinedSubmit(alice, 60000, submit2, batch2), "height taken");
+  await expectBounce(() => sendCombinedSubmit(alice, SUBMIT_GROSS, submit2, batch2), "height taken");
   st = await vars();
   console.log("cand after race:", st["cand_root_1"], st["cand_aa_root_1"]);
   console.log("var keys:", Object.keys(st));
@@ -641,96 +641,77 @@ async function main() {
     throw new Error("early withdraw did not bounce: " + JSON.stringify(earlyWd).slice(0, 1500));
   console.log("  pre-finalize withdraw bounced as expected");
 
-  // ---------- 6. challenge at height 1 -> FAILURE sweep ----------
-  // The final AA has NO respond-by-resubmit for a LOCKED height: submit
-  // requires h == last_locked + 1, so nobody — impostor or sitting operator
-  // — can answer a challenge on a locked height. Silence past the window
-  // therefore fails the height through the finalize failure sweep. alice is
-  // the challenger; bob's candidate bond gets confiscated.
-  const chalUnit = await alice.triggerAaWithData({ toAddress: vault, amount: 30000, data: { challenge: 1, height: 1 } });
+  // ---------- 6. challenge at height 1 -> immediate reopen ----------
+  // The AA decides a challenge immediately: frozen_1 -> 2, root cleared,
+  // last_locked rolls to 0, 500000000000 slash_reward credited to the
+  // challenger. No 3600s timetravel, no finalize sweep. alice challenges
+  // bob's fake candidate with CHALLENGE_GROSS.
+  const chalUnit = await alice.triggerAaWithData({ toAddress: vault, amount: CHALLENGE_GROSS, data: { challenge: 1, height: 1 } });
   if (chalUnit.error) throw new Error("challenge: " + chalUnit.error);
   await network.witnessUntilStable(chalUnit.unit);
   st = await vars();
-  if (Number(st["frozen_1"]) !== 1) throw new Error("challenge did not freeze");
-  console.log("  frozen_1 =", st.frozen_1);
-  // while a challenge is live its height stays frozen -> {claim_bond} refuses
+  if (Number(st["frozen_1"]) !== 2) throw new Error("challenge did not fail the height: frozen_1=" + st["frozen_1"]);
+  if (Number(st["last_locked"]) !== 0) throw new Error("last_locked did not roll back to 0 on challenge");
+  console.log("  frozen_1 =", st.frozen_1, "last_locked =", st.last_locked, "(immediate reopen, no timetravel)");
+  if (Number(st["slash_reward_" + aliceAddr]) !== 500000000000)
+    throw new Error("slash_reward not 500000000000: " + st["slash_reward_" + aliceAddr]);
+  if (Number(st["active_bond_1"]) !== 0) throw new Error("active_bond_1 not cleared on challenge");
+  // Challenge coins are burned (NOT credited to bond_): claim:"bond" bounces.
   const earlyBondClaim = await triggerRaw(alice, { claim: "bond" }, 30000);
-  if (!JSON.stringify(earlyBondClaim).includes("challenge unresolved"))
-    throw new Error("claim_bond during live challenge did not bounce: " + JSON.stringify(earlyBondClaim).slice(0, 400));
-  console.log("  early claim_bond bounced as expected ('challenge unresolved')");
+  if (!JSON.stringify(earlyBondClaim).includes("nothing claimable"))
+    throw new Error("claim_bond after real challenge did not bounce 'nothing claimable': " + JSON.stringify(earlyBondClaim).slice(0, 300));
+  console.log("  claim_bond after challenge bounced 'nothing claimable' (challenge coins burned)");
 
-  // Locked-height immutability: while the height is FROZEN (frozen_1==1), the
-  // submit case takes the respond-by-resubmit branch, so a root-mismatched
-  // resubmit (state_root != cand_root_1) bounces 'not operator' — the frozen
-  // height cannot be overwritten by either the impostor or the sitting operator.
-  const resub = await triggerRaw(bob, { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_FINAL1, aa_root: claim.aa_root, aa_forest: claim.aa_forest }, 60000);
-  if (!JSON.stringify(resub).includes("not operator"))
-    throw new Error("locked+frozen resubmit not rejected: " + JSON.stringify(resub).slice(0, 300));
-  console.log("  locked+frozen resubmit bounced as expected ('not operator')");
 
-  await network.timetravel({ shift: '3600s' }); // no response possible; window over
-  const failFin = await triggerRaw(alice, { finalize: 1, height: 1 }, 20000);
-  st = await vars();
-  console.log("after failed challenge: frozen_1 =", st.frozen_1, "last_locked =", st.last_locked);
-  if (Number(st.frozen_1) !== 2) throw new Error("failure sweep did not mark frozen=2");
-  if (Number(st.last_locked) !== 0) throw new Error("last_locked did not roll back to 0");
-  const aliceBondCredited = Number(st["bond_" + aliceAddr]);
-  console.log("  alice challenger bond stays credited =", aliceBondCredited,
-    "slash_reward =", st["slash_reward_" + aliceAddr]);
-  if (!(aliceBondCredited > 0)) throw new Error("challenger bond not credited after failed height");
-  if (!(Number(st["slash_reward_" + aliceAddr]) > 0))
-    throw new Error("slash reward not credited after failed height");
-
-  // ---------- 8a. H1 regression: the challenge WON at height 1 (frozen_1 == 2
-  // and the failure sweep cleared root_1/active_bond_1). A direct re-lock
-  // WITHOUT a fresh bonded submit must bounce 'cannot lock yet' — otherwise
-  // the fraudulent candidate could be resurrected for free past the window.
+  // ---------- 8a. H1 regression: a direct re-lock WITHOUT a fresh bonded
+  // submit must bounce 'cannot lock yet'.
   await expectBounce(() => triggerRaw(bob, { lock: 1, height: 1 }), "cannot lock yet");
 
-  // ---------- 8b. challenger reclaims her recorded bond via {claim_bond} ----------
-  // Wallet-balance proof via STAGED snapshots: fee = balance drop caused by
-  // the trigger unit alone (its 30000 trigger bytes + miner fee), then
-  // wallet delta = payout - 30000 - fee. Both snapshots are taken at full
-  // stability, so they are exact.
+  // ---------- 8b. challenger reclaims her slash reward via {claim:"slash"} ----------
+  // The challenge coins were burned, but the half-submit-bond slash_reward
+  // (500000000000) is claimable. Wallet-balance proof via STAGED snapshots.
+  const slashOwed = Number(st["slash_reward_" + aliceAddr]);
+  if (!(slashOwed > 0)) throw new Error("no slash_reward owed after challenge");
   const balBeforeClaim = await balances(alice);
-  const claimUnit = await triggerAwaitUnit(alice, { claim: "bond" }, 30000);
+  const claimUnit = await triggerAwaitUnit(alice, { claim: "slash" }, 30000);
   const balAfterTrigger = await balances(alice);
   const res = await network.getAaResponseToUnit(claimUnit);
   const bondClaim = { unit: claimUnit, response: (res && res.response) || null };
   if (!bondClaim.response || bondClaim.response.bounced !== false)
-    throw new Error("claim_bond bounced: " + JSON.stringify(bondClaim).slice(0, 400));
+    throw new Error("claim slash bounced: " + JSON.stringify(bondClaim).slice(0, 400));
   st = await vars();
-  if (Number(st["bond_" + aliceAddr]) !== 0) throw new Error("bond var not zeroed after claim_bond");
+  if (Number(st["slash_reward_" + aliceAddr]) !== 0) throw new Error("slash_reward not zeroed after claim");
   await network.witnessUntilStable(bondClaim.response.response_unit);
-  const paidBond = await paidToAddress(bondClaim.response.response_unit, aliceAddr, "base");
-  if (paidBond !== aliceBondCredited)
-    throw new Error("claim_bond payout mismatch: paid " + paidBond + ", claimed " + aliceBondCredited);
+  const paidSlash = await paidToAddress(bondClaim.response.response_unit, aliceAddr, "base");
+  if (paidSlash !== slashOwed)
+    throw new Error("claim slash payout mismatch: paid " + paidSlash + ", claimed " + slashOwed);
   const balAfterClaim = await balances(alice);
   const claimFee = balBeforeClaim.base - balAfterTrigger.base - 30000;
   const claimDelta = balAfterClaim.base - balBeforeClaim.base;
-  if (claimDelta !== aliceBondCredited - 30000 - claimFee)
-    throw new Error("claim_bond wallet delta " + claimDelta + " != " + (aliceBondCredited - 30000 - claimFee));
-  console.log("  claim_bond paid exactly", aliceBondCredited,
+  if (claimDelta !== slashOwed - 30000 - claimFee)
+    throw new Error("claim slash wallet delta " + claimDelta + " != " + (slashOwed - 30000 - claimFee));
+  console.log("  claim slash paid exactly", slashOwed,
     "(wallet delta", claimDelta, "= owed - 30000 trigger -", claimFee, "fee)");
-  // ---------- 8c. frozen==2 unlock: fresh bonded combined resubmit / lock /
-  // finalize of height 1 with the REAL sharded commitment ----------
-  // The failed height is recoverable: the failure sweep cleared root_1,
-  // active_bond_1 and cand_aa_root_1, so $old is empty and a fresh COMBINED
-  // unit can re-occupy the height (single-candidate gate passes).
+
+  // ---------- 8c. reopen: fresh bonded combined resubmit / lock / finalize
+  // of height 1 with the REAL sharded commitment ----------
+  // The challenge cleared root_1/active_bond_1/cand_aa_root_1, so a fresh
+  // COMBINED unit can re-occupy the height (reopen race). Different operator
+  // (alice) proves the height is genuinely reopened.
   const reSubmit = { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_FINAL1, aa_root: claim.aa_root, aa_forest: claim.aa_forest };
   const reBatch = { chain_id: "operp-mvp-1", height: 1, state_root: ROOT_FINAL1, unit_ids: ["u3"] };
-  await sendCombinedSubmit(bob, 60000, reSubmit, reBatch);
+  await sendCombinedSubmit(alice, SUBMIT_GROSS, reSubmit, reBatch);
   await network.timetravel({ shift: '700s' });
-  await trigger(bob, { lock: 1, height: 1 });
+  await trigger(alice, { lock: 1, height: 1 });
   st = await vars();
   if (st.root_1 !== ROOT_FINAL1 || Number(st.frozen_1) !== 0)
-    throw new Error("height 1 re-lock after failure failed: root_1=" + st.root_1 + " frozen_1=" + st.frozen_1);
+    throw new Error("height 1 re-lock after challenge failed: root_1=" + st.root_1 + " frozen_1=" + st.frozen_1);
   await network.timetravel({ shift: '3600s' });
   await trigger(alice, { finalize: 1, height: 1 });
   st = await vars();
   if (Number(st.last_finalized) !== 1)
     throw new Error("finalize h1 failed: last_finalized=" + st.last_finalized);
-  console.log("height 1 recovered, re-locked and finalized (frozen==2 unlock works)");
+  console.log("height 1 reopened, re-locked and finalized (reopen race works)");
 
   // ---------- 9. real proof withdraw against height 1 ----------
   // Height 1 was re-submitted, re-locked and finalized by the frozen==2
@@ -852,74 +833,110 @@ async function main() {
     throw new Error("over-W amount did not bounce: " + JSON.stringify(overW).slice(0, 600));
   console.log("OVER-W AMOUNT BOUNCED AS EXPECTED");
 
-  // ---------- 9b. challenge-on-locked-height + respond-by-resubmit ----------
-  // Post-lock-only challenge semantics (challenge window = stable_at+3600):
-  // a challenge on an UNLOCKED candidate (h2 == last_locked+1) must bounce
-  // 'bad height' — a pre-lock freeze would permanently wedge the height.
-  // The honest respond runs on the LOCKED height.
-  console.log("\n--- challenge & respond tests (height 2, locked) ---");
+  // ---------- 9b. challenge-on-locked-height -> immediate reopen ----------
+  // Post-lock-only challenge semantics: a challenge on an UNLOCKED candidate
+  // (h2 == last_locked+1) must bounce 'bad height'. After lock, a challenge
+  // immediately fails the height. A DIFFERENT operator then re-occupies it
+  // with a fresh bonded submit (reopen race).
+  console.log("\n--- challenge & reopen tests (height 2, locked) ---");
   const ROOT_H2 = sha256Hex("rootH2-real");
   const PREV1 = ROOT_FINAL1; // prev of h2 is root_1
   const FOREST_ALT = sha256Hex("altforest").repeat(16);
   const submitH2 = { submit: 1, chain_id: "operp-mvp-1", height: 2, prev_state_hash: PREV1, state_root: ROOT_H2, aa_root: sha256Hex("aa_h2"), aa_forest: claim.aa_forest };
   const batchH2 = { chain_id: "operp-mvp-1", height: 2, state_root: ROOT_H2, unit_ids: ["h2u1"] };
-  const subH2 = await sendCombinedSubmit(bob, 60000, submitH2, batchH2);
+  const subH2 = await sendCombinedSubmit(bob, SUBMIT_GROSS, submitH2, batchH2);
   st = await vars();
-  const submittedAtBefore = st["submitted_at_2"];
-  const daUnitBefore = st["da_unit_2"];
-  const candAaBefore = st["cand_aa_root_2"];
-  const feeWinnerBefore = st["fee_winner_2"];
-  console.log("  h2 submitted_at", submittedAtBefore, "da_unit", daUnitBefore.slice(0,12)+"..");
-  // immediate lock should bounce (600s window)
+  console.log("  h2 submitted_at", st["submitted_at_2"], "da_unit", String(st["da_unit_2"]).slice(0,12)+"..");
   await expectBounce(() => triggerRaw(bob, { lock: 1, height: 2 }), "cannot lock yet");
   console.log("  immediate lock bounced (600s gate)");
-  // challenge on the UNLOCKED candidate (h2 == last_locked+1) must bounce 'bad height'
-  await expectBounce(() => triggerRaw(alice, { challenge: 1, height: 2 }, 30000), "bad height");
+  await expectBounce(() => triggerRaw(alice, { challenge: 1, height: 2 }, CHALLENGE_GROSS), "bad height");
   console.log("  challenge-before-lock bounced 'bad height' (post-lock-only)");
-  // stability window then lock h2 (stable_at_2 anchors the challenge window)
   await network.timetravel({ shift: '700s' });
   const lockH2 = await triggerRaw(bob, { lock: 1, height: 2 });
   if (lockH2.response && lockH2.response.bounced) throw new Error("lock h2 bounced: "+JSON.stringify(lockH2.response).slice(0,400));
   st = await vars();
   if (Number(st["last_locked"]) !== 2) throw new Error("h2 lock failed after 700s");
   console.log("  h2 locked (stable_at_2 set), last_locked = 2");
-  // challenge the LOCKED height -> frozen==1 (inside stable_at+3600)
-  const chalH2 = await alice.triggerAaWithData({ toAddress: vault, amount: 30000, data: { challenge: 1, height: 2 } });
+  const chalH2 = await alice.triggerAaWithData({ toAddress: vault, amount: CHALLENGE_GROSS, data: { challenge: 1, height: 2 } });
   if (chalH2.error) throw new Error("challenge h2: " + chalH2.error);
   await network.witnessUntilStable(chalH2.unit);
   st = await vars();
-  if (Number(st["frozen_2"]) !== 1) throw new Error("h2 not frozen after challenge: "+st["frozen_2"]);
-  console.log("  h2 frozen==1");
-  const bondBefore = Number(st["bond_" + aliceAddr]);
-  if (!(bondBefore > 0)) throw new Error("challenger bond not credited");
-  // --- impostor must bounce before honest respond ---
-  await expectBounce(() => sendCombinedSubmit(alice, 60000, submitH2, batchH2), "not operator");
-  console.log("  impostor resubmit bounced 'not operator'");
-  const forestSwap = { submit: 1, chain_id: "operp-mvp-1", height: 2, prev_state_hash: PREV1, state_root: ROOT_H2, aa_root: sha256Hex("aa_h2"), aa_forest: FOREST_ALT };
-  const batchAlt = { chain_id: "operp-mvp-1", height: 2, state_root: ROOT_H2, unit_ids: ["h2alt"] };
-  await expectBounce(() => sendCombinedSubmit(bob, 60000, forestSwap, batchAlt), "not operator");
-  console.log("  forest-swapped resubmit bounced 'not operator'");
-  // --- honest operator responds with bond exemption (only 10000 headroom) ---
-  const respH2 = await sendCombinedSubmit(bob, 12000, submitH2, batchH2);
-  if (respH2.response && respH2.response.bounced) throw new Error("honest respond bounced: "+JSON.stringify(respH2.response).slice(0,400));
+  if (Number(st["frozen_2"]) !== 2) throw new Error("h2 not failed after challenge: "+st["frozen_2"]);
+  console.log("  h2 frozen_2 == 2 (immediate reopen), last_locked =", st["last_locked"]);
+  if (Number(st["last_locked"]) !== 1) throw new Error("last_locked did not roll back to 1 on h2 challenge");
+  if (Number(st["slash_reward_" + aliceAddr]) !== 500000000000)
+    throw new Error("slash_reward not 500000000000 after h2 challenge");
+  const reH2 = await sendCombinedSubmit(alice, SUBMIT_GROSS, submitH2, batchH2);
+  if (reH2.response && reH2.response.bounced)
+    throw new Error("reopen h2 submit bounced: "+JSON.stringify(reH2.response).slice(0,300));
+  console.log("  reopen h2 submit accepted (alice re-occupied)");
+  await network.timetravel({ shift: '700s' });
+  await trigger(alice, { lock: 1, height: 2 });
   st = await vars();
-  if (Number(st["frozen_2"]) !== 0) throw new Error("h2 not unfrozen after respond: "+st["frozen_2"]);
-  if (Number(st["bond_" + aliceAddr]) !== 0) throw new Error("challenger bond not confiscated");
-  if (st["da_unit_2"] !== daUnitBefore) throw new Error("da_unit_2 changed on respond: "+st["da_unit_2"]+" != "+daUnitBefore);
-  if (String(st["submitted_at_2"]) !== String(submittedAtBefore)) throw new Error("submitted_at_2 reset on respond");
-  if (st["cand_aa_root_2"] !== candAaBefore) throw new Error("cand_aa_root_2 changed on respond");
-  if (st["active_bond_2"] !== bobAddr) throw new Error("active_bond_2 changed");
-  if (st["fee_winner_2"] !== feeWinnerBefore) throw new Error("fee_winner_2 changed on respond");
-  console.log("  honest respond ok: frozen cleared, bond confiscated, da_unit/submitted_at/cand/fee_winner untouched, bond exemption (12000) passed");
-  // respond window is anchored on stable_at_2 (not submitted_at_2): lock set
-  // stable_at_2, and the challenge+respond above both ran inside stable_at+3600,
-  // matching the finalize failure sweep's window exactly.
-  // finalize h2 clean (no challenge) to keep chain healthy for later tests
+  if (Number(st["last_locked"]) !== 2) throw new Error("h2 re-lock failed");
   await network.timetravel({ shift: '3600s' });
   await trigger(alice, { finalize: 1, height: 2 });
   st = await vars();
   if (Number(st["last_finalized"]) !== 2) throw new Error("finalize h2 failed");
-  console.log("  h2 finalized (respond path chain intact)");
+  console.log("  h2 finalized (reopen race chain intact)");
+
+  // ---------- occupancy timeout on an unlocked height ----------
+  // After h2 is finalized, bob submits h3 (fake forest) but does NOT lock.
+  // A second submit bounces 'height taken' while inside the occupancy
+  // window; after 3600s a different operator (alice) may re-occupy.
+  console.log("\n--- occupancy timeout test (height 3, unlocked) ---");
+  const ROOT_H3 = sha256Hex("rootH3-fake");
+  const PREV2 = ROOT_H2;
+  const submitH3 = { submit: 1, chain_id: "operp-mvp-1", height: 3, prev_state_hash: PREV2, state_root: ROOT_H3, aa_root: sha256Hex("aa_h3"), aa_forest: FOREST_ALT };
+  const batchH3 = { chain_id: "operp-mvp-1", height: 3, state_root: ROOT_H3, unit_ids: ["h3u1"] };
+  const subH3 = await sendCombinedSubmit(bob, SUBMIT_GROSS, submitH3, batchH3);
+  if (subH3.response && subH3.response.bounced) throw new Error("h3 submit bounced: "+JSON.stringify(subH3.response).slice(0,300));
+  st = await vars();
+  if (st["active_bond_3"] !== bobAddr) throw new Error("active_bond_3 not bob after h3 submit");
+  await expectBounce(() => sendCombinedSubmit(alice, SUBMIT_GROSS, submitH3, batchH3), "height taken");
+  await network.timetravel({ shift: '3600s' });
+  const reH3 = await sendCombinedSubmit(alice, SUBMIT_GROSS, submitH3, batchH3);
+  if (reH3.response && reH3.response.bounced)
+    throw new Error("h3 reopen submit after occupancy timeout bounced: "+JSON.stringify(reH3.response).slice(0,300));
+  st = await vars();
+  if (st["active_bond_3"] !== aliceAddr) throw new Error("active_bond_3 not alice after occupancy reopen: "+st["active_bond_3"]);
+  console.log("  occupancy timeout worked: h3 re-occupied by alice, active_bond_3 = alice");
+
+  // ---------- escape_withdraw on never-locked candidate must bounce ----------
+  const ew = await triggerRaw(alice, { escape_withdraw: 1, amount: 1000 });
+  if (!JSON.stringify(ew).includes("no escape withdraw"))
+    throw new Error("escape_withdraw did not bounce 'no escape withdraw': " + JSON.stringify(ew).slice(0,400));
+  console.log("  escape_withdraw bounced 'no escape withdraw'");
+
+  // Stepping-stone: lock+finalize h3 so h4 can be submitted (h == last_locked+1).
+  await network.timetravel({ shift: '700s' });
+  await trigger(alice, { lock: 1, height: 3 });
+  st = await vars();
+  if (Number(st["last_locked"]) !== 3) throw new Error("h3 lock failed: last_locked="+st["last_locked"]);
+  await network.timetravel({ shift: '3600s' });
+  await trigger(alice, { finalize: 1, height: 3 });
+  st = await vars();
+  if (Number(st["last_finalized"]) !== 3) throw new Error("finalize h3 failed");
+  console.log("  h3 locked & finalized (stepping-stone for escape_finalize h4)");
+
+  // ---------- escape_finalize on locked h4 after 604800s ----------
+  console.log("\n--- escape_finalize test (height 4) ---");
+  const ROOT_H4 = sha256Hex("rootH4-escape");
+  const submitH4 = { submit: 1, chain_id: "operp-mvp-1", height: 4, prev_state_hash: ROOT_H3, state_root: ROOT_H4, aa_root: claim.aa_root, aa_forest: claim.aa_forest };
+  const batchH4 = { chain_id: "operp-mvp-1", height: 4, state_root: ROOT_H4, unit_ids: ["h4u1"] };
+  const subH4 = await sendCombinedSubmit(bob, SUBMIT_GROSS, submitH4, batchH4);
+  if (subH4.response && subH4.response.bounced) throw new Error("h4 submit bounced: "+JSON.stringify(subH4.response).slice(0,300));
+  await network.timetravel({ shift: '700s' });
+  await trigger(bob, { lock: 1, height: 4 });
+  st = await vars();
+  if (Number(st["last_locked"]) !== 4) throw new Error("h4 lock failed");
+  await network.timetravel({ shift: '604800s' });
+  const escFin = await triggerRaw(alice, { escape_finalize: 1, height: 4 });
+  if (escFin.response && escFin.response.bounced)
+    throw new Error("escape_finalize h4 bounced: "+JSON.stringify(escFin.response).slice(0,400));
+  st = await vars();
+  if (Number(st["last_finalized"]) !== 4) throw new Error("escape_finalize h4 failed: last_finalized="+st["last_finalized"]);
+  console.log("  escape_finalize h4 ok, last_finalized == 4");
 
   PERP_ASSET = await resolvePerpAsset(alice);
 
@@ -1133,7 +1150,7 @@ async function main() {
     // payloads and crashes the core node. Data-availability correctness is
     // covered by the Rust-side settle tests (Batch::temp_data_payload,
     // validate_against); the AA only needs the committed forest below.
-    await pTrigger(alice, { submit: 1, chain_id: "operp-mvp-1", height: HEIGHT, prev_state_hash: batchData.prev_state_hash, state_root: stateRoot, aa_root: aaRoot, aa_forest: forest }, 60000);
+    await pTrigger(alice, { submit: 1, chain_id: "operp-mvp-1", height: HEIGHT, prev_state_hash: batchData.prev_state_hash, state_root: stateRoot, aa_root: aaRoot, aa_forest: forest }, SUBMIT_GROSS);
     await network.timetravel({ shift: '700s' });
     await pTrigger(bob, { lock: 1, height: HEIGHT });
     st = await pVars();
