@@ -549,7 +549,7 @@ submitted_at_h, cand_root_h, cand_aa_root_h, da_unit_h  # 单一候选（首个�
                                                          # DA 绑定：da_unit_h = 该组合单元 hash
 active_bond_h                              # 现任候选的 50000-byte 提交债券持有人
 fee_winner_h, reward_<addr>, sbond_<addr>, slash_reward_<addr>
-root_h, aa_root_h, stable_at_h            # 已锁定；aa_root_ 存 1024-hex 分片森林；stable_at 锚定挑战窗
+root_h, aa_root_h, stable_at_h            # 已锁定；aa_root_ 存 1024-hex 分片森林；stable_at 锚定挑战/应诉/失败扫荡三窗
 frozen_h ∈ {∅/0=正常, 1=已挑战, 2=永久失败}
 challenger_h, bond_<addr>, bond_height_<addr>
 wd_<addr>, wp_<addr>                      # 全局累计提款标记（跨高度共享，防证明重放）
@@ -560,11 +560,22 @@ pperp_<addr>                               # PERP 入账镜像：{deposit_perp} 
 `deposit_perp` 的侧链收益 PERP。诊断账本 `bal_` 已在复杂度腾挪中删除。
 所有领取统一为单一 `{claim:"reward"|"bond"|"sbond"|"slash"}` 字段。
 
+时钟原点（3600 s 窗口只有一个原点 `stable_at`，从不看 `submitted_at`）：
+
+| 门 | 原点 | 时长 |
+|---|---|---|
+| lock | `submitted_at_h` | 600 s |
+| challenge / respond / finalize / 失败扫荡 | `stable_at_h` | 3600 s |
+| escape_finalize | `stable_at_h` | 604800 s |
+| escape_withdraw（候选停滞） | `submitted_at_h` | 604800 s |
+| escape_withdraw（链条停滞） | `stable_at_{last_finalized}` | 604800 s |
+
 ### 10.1 submit(h)
 
-前置：chain_id 正确 ∧ h == last_locked+1 ∧ prev 匹配 root_{h−1}
-∧ 有 64-hex 的 state_root/prev_state_hash ∧ aa_forest 恰 1024 hex
-∧ 未锁定。提交必须是**组合单元**（temp_data + submit data 消息在同一
+前置：chain_id 正确 ∧ (h == last_locked+1 ∨ (frozen==1 ∧ h==last_locked))
+∧ prev 匹配 root_{h−1}（frozen==1 时跳过）
+∧ 有 64-hex 的 state_root/prev_state_hash ∧ aa_forest 恰 1024 hex。
+提交必须是**组合单元**（temp_data + submit data 消息在同一
 unit）；新候选须附 ≥ 60 000 bytes（10 000 bounce 余量 +
 50 000 `SUBMIT_BOND_NET`）。
 **单候选门**：未冻结且 `active_bond_<h>` 已在位 → 一律
@@ -604,12 +615,12 @@ frozen==1 应诉仅解冻（frozen=0）+ 没收挑战 bond（bond_<challenger>=0
 
 `{finalize}` 与 `{escape_finalize: 1}` 共用同一处理分支：
 ```
-失败路: frozen_h == 1 ∧ 已超窗（operator 未应诉）
+失败路: frozen_h == 1 ∧ timestamp ≥ stable_at_h + 3600（operator 未应诉）
         → frozen_h = 2（永久）、root_/aa_root_/active_bond_ 清零、
           last_locked 回退 h−1；50 000 提交债券对半劈：
           slash_reward_<challenger> += 25000（{claim:"slash"} 领取），
           另一半留在金库（烧毁）；挑战者自身债券经 {claim:"bond"} 取回
-正常路: 根存在 ∧ 未冻结 ∧ 超窗 ∧ h == last_finalized+1
+正常路: 根存在 ∧ 未冻结 ∧ timestamp ≥ stable_at_h + 3600 ∧ h == last_finalized+1
         → last_finalized = h；sbond_<持有人> += 50000 可回收；
           fee_winner 累加 20000 bytes 奖励（§11）
 escape: trigger.data.escape_finalize 时窗口阈值改为
@@ -629,11 +640,11 @@ wd_/wp_ 防重放累计。
 未冻结（escape_withdraw 另要求目标高度无 root_ 且候选森林存在）
 $shard ∈ [0,15] 整数（AA 信任标签；错报 shard 折到错误根上必然失败）
 amount > 0 ∧ leaf_account == trigger.address
-wd_ 累计上限：wd_<h>_<addr> 已提累计 + amount
-             ≤ 该高度证明叶子的 collateral（同一证明不可重放，
-               多次提款共享同一累计上限；映射上限 65 536 条目）
+wd_ 累计上限：wd_<addr> 已提累计 + amount
+             ≤ 叶子承诺的 min(collateral, withdrawn)（全局累计，跨高度共享；
+               同一证明不可重放；多次提款共享同一累计上限）
 $perp 为必填 claim 字段（可为 0）；wp_ 累计上限与 wd_ 完全对称：
-             wp_<h>_<addr> 累计 + perp_claimed ≤ 叶子声明的 PERP，
+             wp_<addr> 累计 + perp_claimed ≤ 叶子声明的 PERP，
              超出 bounce('bad perp claim')；$perp_claimed > 0 才发
              PERP asset 输出
 proof 深度 ≤ 16（reduce(...,16,...)，每 shard 最多 2^16 账户 ×
@@ -737,15 +748,15 @@ ingest → Applied{status: Optimistic}     # 立即执行、立即成交
   TWAP 连续偏移罚没已落地（激活门控），但按债券计的多数合谋仍可在两次
   罚没之间偏置中位数；外部价锚（§6.2 末）需治理切到 AggregatedExternal
   且白名单 keeper 持续喂价才生效
-- 在任 operator 每次 resubmit 免费重启稳定计时（M5 处置：接受的活性
-  权衡——只拖延自家高度，竞争者可花债券夺走该高度）
+- ~~在任 operator 每次 resubmit 免费重启稳定计时~~ **已关闭**：单候选
+  组合单元钉死 `da_unit_h`，未冻结的后续 submit bounce `height taken`；frozen==1 应诉不碰钟
 - 大载荷内联 temp_data 会触发 ocore 校验器双回调崩溃：post_batch.js 的
   链上信封字段已直接委托 ocore，但 devnet E2E（test_vault_aa.js）仍跳过
   内联揭示；数据可用性正确性由 Rust 侧 settle 测试覆盖
 - 无第三方安全审计；Oscript 复杂度门恰在上限 **85/100**
-  （ops 1086/2000，`node tools/check_aa_complexity.js`），后续任何 AA
+  （ops 1101/2000，`node tools/check_aa_complexity.js`），后续任何 AA
   改动必须先腾出等额预算
-- 独立 watcher（`crates/operp-watch`）尚未以独立密钥部署，互相牵制未跑通前不对外宣称已具备
+- 独立 watcher（`crates/operp-watch`）已存在、可离线重放 `da_unit_<h>`，尚未以独立密钥部署，互相牵制未跑通前不对外宣称已具备
 ---
 
 ## 15. PERP 治理

@@ -56,7 +56,7 @@ cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
 | `operp-account` | Per-account collateral/positions, VWAP entry price, realized PnL, risk snapshot |
 | | `liquidatable` at equity·10000 ≤ mm·10500, `reduce_only` at ≤ 12000 |
 | `operp-state` | ChainState: accounts/books/marks/withdrawals, byte-level Merkle tree (`state_root`) + hex-string tree (`aa_root`) for the AA |
-| `operp-dag` | Unit DAG with signature verification (`verify_strict`), orphan buffer (4096 cap, salted eviction), salted deterministic linearization (`ready_linearized_with_salt`) |
+| `operp-dag` | Unit DAG with signature verification (`verify_strict`), orphan buffer (4096 cap, salted eviction), lexicographic linearization (`ready_linearized`; salt is eviction-only) |
 | `operp-exec` | The engine: ingest → apply → events; place/cancel/deposit/withdraw/liquidate with full intake validation |
 | `operp-settle` | Batch checkpoints, `validate_against` replay verification, `temp_data` payloads, proof generation |
 | `operp-gossip` | WantUnits/HaveUnits on-demand orphan sync between operators (pure P2P layer, transport-agnostic, never consensus) |
@@ -197,7 +197,7 @@ Lifecycle per height *h*:
    until a fresh bonded submit recreates the candidate. Locking clears a
    previous permanent-failure mark, so a challenge-failed (`frozen = 2`)
    height recovers by fresh submission instead of wedging the chain. Locked
-   roots are immutable. `stable_at_<h>` is set at lock time and anchors the challenge window.
+   roots are immutable. `stable_at_<h>` is set at lock time and is the **single origin** for the challenge window, the respond window, and the finalize / failure-sweep window (all `stable_at+3600`).
 3. **challenge** — within 3600 s of `stable_at_<h>` (post-lock, `stable_at+3600`; `CHALLENGE_SECS` counts from `stable_at`), anyone can freeze a **locked** height *h* (`h ≤ last_locked`, `stable_at_<h>` set) with a ≥ 20 000 byte bond; un-locked heights (`last_locked+1`) cannot be challenged — they go through the normal `submit/lock` path and cannot be pre-frozen. A sender with an outstanding bond cannot open a second challenge, and `{claim: "bond"}` refuses payout while the challenged height is still frozen.
 4. **respond (by resubmit)** — there is no separate respond trigger: the
    ORIGINAL bond holder answers a challenge by re-submitting the **identical
@@ -214,7 +214,7 @@ Lifecycle per height *h*:
    failure sweep clears `active_bond_<h>` so a fresh combined unit can
    re-occupy the height, and the challenger also recovers its own bond
    through `{claim: "bond"}`.
-5. **finalize** — after a clean 3600 s window the root becomes the withdrawal
+5. **finalize** — after a clean `stable_at+3600` window the root becomes the withdrawal
    basis (`last_finalized`), strictly in height order; the submit bond is
    released to its holder and a 20 000-byte race reward accrues to the
    first-stable submitter (`{claim: "reward"}` pays once and zeroes the
@@ -252,6 +252,16 @@ Lifecycle per height *h*:
    never locked or was rolled back `frozen = 2`. Both entries share the
    withdraw path's `wd_`/`wp_` anti-replay keys. Per the doc 07 §4 waiver,
    escape_finalize enforces only the local stall gate.
+
+Clock origins — the 3600 s window has **one** origin (`stable_at`), never `submitted_at`:
+
+| Gate | Origin | Duration |
+|---|---|---|
+| lock | `submitted_at_<h>` | 600 s (`OBYTE_STABILITY_SECS`) |
+| challenge / respond / finalize / failure sweep | `stable_at_<h>` | 3600 s (`CHALLENGE_SECS`) |
+| escape_finalize | `stable_at_<h>` | 604800 s (`ESCAPE_STALL_SECS`) |
+| escape_withdraw (candidate stall) | `submitted_at_<h>` | 604800 s |
+| escape_withdraw (chain stall) | `stable_at_<last_finalized>` | 604800 s |
 
 Proofs are generated off-chain by
 `crates/operp-settle/examples/gen_withdraw_proof.rs` (JSON consumed by the JS
@@ -373,7 +383,7 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    (only the frozen==1 respond-by-resubmit by the original bond holder
    passes, without touching the clock). No incumbent clock-reset exists.
 8. The AA has had no formal security audit. The Oscript complexity gate
-   sits exactly at its ceiling (**85/100**, ops 1075/2000 — run
+   sits exactly at its ceiling (**85/100**, ops 1101/2000 — run
    `node tools/check_aa_complexity.js`), so every further AA change must
    free equal budget first.
 9. **Replay-dedup windows are height-bounded** — legacy 256 heights,
@@ -457,7 +467,7 @@ noted below):
 - [x] **06 Funding external anchor** — funding-index abstraction + activation gate shipped earlier; **operator wiring landed this round**: `Op::UpdateExternalPrice` (tag 17), source allowlist, `AggregatedExternal` mode, staleness fallback external TWAP → bonded-median TWAP → instant median (`FUNDING_EXTERNAL_MAX_STALENESS = 32`)
 - [x] **07 Escape hatch** — **landed this round**, folded into existing cases for budget: `{escape_finalize: 1}` rides the finalize handler (any caller, `ESCAPE_STALL_SECS = 604800` mainnet / 3600 testnet), `{escape_withdraw: 1}` rides withdraw against the stale candidate's forest at `last_finalized + 1`; deviation per doc07 §4 waiver: escape_finalize enforces only the LOCAL stall gate
 - [x] **08 Burn accounting (Rust + checkpoint)** — `perp_burned` in `meta_leaf`, emitted via `Checkpoint.perp_burned` / `temp_data`; AA-side mirror vars dropped for budget, `holdings−supply==burned` stays watcher-verifiable
-- [x] **09 Complexity audit** — single-sha256 fold, unified claim dispatcher (`claim:'kind'`), lock-merge refactor; probe: `node tools/check_aa_complexity.js`. Current **85/100** (ops 1075/2000) — exactly at the gate
+- [x] **09 Complexity audit** — single-sha256 fold, unified claim dispatcher (`claim:'kind'`), lock-merge refactor; probe: `node tools/check_aa_complexity.js`. Current **85/100** (ops 1101/2000) — exactly at the gate
 - [x] **10 AA-tree sharding (v2)** — clean cutover this round: ONE 1024-hex `aa_forest` var = 16 concatenated shard roots (fits `MAX_STATE_VAR_VALUE_LENGTH` exactly), empty-shard sentinel roots, depth stays 16 → ~1M accounts/batch; the doc's v1 depth-18 path is superseded per its own OpenQ3
 - [x] **11 Replay persistence (v1)** — `256→2048` constants + generalized pruning; `GovNonceJournal` WAL — flushed at batch commit (`Batch::from_applied`), max-merge on restart — plus versioned bincode snapshots `chainstate.<height>.snap` via `Engine::load_or_genesis` / `flush_snapshot` / `maybe_flush_snapshot` (every 64 heights). RocksDB (`persist-rocksdb`) stays doc-declared v1.1 backlog
 
@@ -487,27 +497,25 @@ bench_raw`.
 
 * **Rust suite (CI-covered):** `.github/workflows/ci.yml` runs
   `cargo test --workspace` on push/PR (stable toolchain; MSRV pinned at
-  1.85). 124 tests green at HEAD — covers gossip caps, journal CRC +
-  physical truncation, snapshot versioning/fallback, canonical-number
-  hash rules, batch-commit gov-nonce WAL (H2 regression included).
-* **AA complexity gate (manual):** `node obyte-local/tools/check_aa_complexity.js`
-  — currently **85/100** (ops 1086/2000), exactly at the ≤85 CI gate. This
-  check is NOT yet wired into CI; run it before any AA change.
-* **Golden vector (manual):** `node obyte-local/golden_vector_check.js`
+  1.85). Covers gossip caps, journal CRC + physical truncation, snapshot
+  versioning/fallback, canonical-number hash rules, batch-commit gov-nonce
+  WAL (H2 regression included).
+* **AA complexity gate (CI `js-checks`):** `node obyte-local/tools/check_aa_complexity.js`
+  — currently **85/100** (ops 1101/2000), exactly at the ≤85 CI gate. The
+  same job also runs `golden_vector_check.js`.
+* **Golden vector (CI `js-checks`):** `node obyte-local/golden_vector_check.js`
   prints the canonical Obyte JSON source + data_hash for a fixed input
   (incl. `big` string > 2^53 and `eps: 0.001`); the Rust-side unit test
   `golden_vector_matches_ocore_get_json_source` pins the identical hash
-  (`4efa7a37…`), so JS/Rust `get_data_hash` parity is verified by running
-  both sides.
-* **AA devnet E2E (NOT run on this host):** `test_vault_aa.js` needs the
-  vendored aa-testkit's native `rocksdb`/`sqlite3`, which require a C++
-  toolchain (`node-gyp`) — unavailable on Windows dev hosts without Visual
-  Studio Build Tools. The W-gate positives/negatives, respond forest
-  anchoring, escape gates and malformed-input guards are therefore verified
-  statically + by Rust-side golden vectors, not by a live devnet run. Run
-  `cd obyte-local && npm install && node test_vault_aa.js` on a build-tools
-  host or in CI before any testnet/mainnet deploy.
-* **Watcher limitation:** 独立 watcher (`crates/operp-watch`) 尚未以独立密钥部署，互相牵制（operator ↔ watcher）未跑通前不对外宣称已具备（对应 `operp_vault.aa:228-252` 挑战语义与 `docs/PROTOCOL.md` §4）.
+  (`4efa7a37…`), so JS/Rust `get_data_hash` parity is verified on every CI run.
+* **AA devnet E2E (CI `e2e` job):** runs on every `main` push **and** every
+  pull request. Local Windows hosts without Visual Studio Build Tools still
+  cannot compile the vendored aa-testkit's `rocksdb`/`sqlite3`; the live
+  lifecycle is proven in CI, not on this host.
+* **Watcher limitation:** the independent watcher crate (`crates/operp-watch`)
+  exists and can replay `da_unit_<h>` off-chain, but it is not yet deployed
+  with a key separate from the poster — mutual deterrence is not claimed
+  until that happens.
 
 See the commit history for the full security-audit remediation this repo
 went through (proof-gated withdrawals, deposit whitelisting, overflow

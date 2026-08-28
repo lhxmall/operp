@@ -30,9 +30,9 @@ README 是概览；这里是"为什么这样设计"。
   签名者公钥绑定（`account_matches`），Deposit/Place/Cancel/Withdraw 必须由
   账户本人签名，Liquidate 由 keeper 签名——自我清算在密码学层就不可能。
 - **乱序容忍（orphan 缓冲）**：收到父母未知的子单元时不再丢弃，而是进入
-  orphan 缓冲（容量 4096，超出按最小 UnitId 确定性驱逐——驱逐结果只依赖
-  缓冲内容，与到达顺序无关）。父母到达后自动链接进 pending 集合，
-  多级孤儿链按不动点迭代解锁。
+  orphan 缓冲（容量 4096，超出按盐化序 `argmin(sha256(salt ‖ unit_id))`
+  驱逐；盐由最后最终化根与 epoch 派生。执行序本身是 `unit_id` 字典序、
+  已去盐）。父母到达后自动链接进 pending 集合，多级孤儿链按不动点迭代解锁。
 
 ### 1.2 执行语义
 
@@ -154,20 +154,24 @@ meta_leaf    = sha256("meta" ‖ height_le ‖ seq_le ‖ last_unit
 推到 checkpoint.height 再取根——于是 state_root 与高度绑定，
 `prev_state_hash` 链条真正具备防重组性质：改历史高度必然断链。
 
-### 3.2 aa_root（字符串域 Merkle 树，专为 AA 设计）
+### 3.2 aa_root（字符串域分片森林，专为 AA 设计）
 
 Oscript 的 `sha256()` 对参数的 UTF-8 文本做哈希（默认输出 base64！）。
-字节级树无法在 AA 内复算，因此另建一棵**同构但键为字符串**的树：
+字节级树无法在 AA 内复算，因此另建一棵**同构但键为字符串**的树，并打成
+**16 棵 shard 树拼接的 1024-hex `aa_forest`**：
 
 ```
 leaf = sha256_hex("acct:" ++ address ++ ":" ++ collateral十进制串
-                  ++ ":" ++ perp十进制串)
+                  ++ ":" ++ perp十进制串 ++ ":" ++ withdrawn十进制串)
 node = sha256_hex(left ++ right)
+aa_forest = shard0_root ‖ … ‖ shard15_root     # 恰好 1024 hex
 ```
 
-Rust 侧 `aa_root_of(pairs)` / `aa_proof_for(pairs, addr)` 构造与证明；
-AA 侧用纯字符串拼接 + `sha256(x, 'hex')` 复算。两棵树承诺完全相同的
-(地址, 抵押, PERP) 集合。这个设计经过探针 AA 对拍验证：两边 root 逐字节一致。
+Rust 侧 `aa_sharded_forest` / `aa_sharded_proof_for_account` 构造与证明；
+AA 侧用纯字符串拼接 + `sha256(x, 'hex')` 在声明的 shard 内复算，再
+`substring(shard*64, 64)` 取出该 shard 根。两棵承诺完全相同的
+(地址, 抵押, PERP, W) 集合。空 shard 提交哨兵根
+`hex(sha256("empty:<shard>"))`，零证明无法跨 shard 跳动。
 
 ### 3.3 fills_hash / fill_count
 
@@ -175,6 +179,7 @@ AA 侧用纯字符串拼接 + `sha256(x, 'hex')` 复算。两棵树承诺完全�
 `validate_against` 共享 `fills_bytes()`，replay 时重算比对——operator 漏报/
 谎报成交会被直接抓住。
 
+```
 assert chain_id == CHAIN_ID          # ChainMismatch
 assert replay.state_root == prev     # PrevMismatch
 inject deposits_allowed ← batch 内 Deposit ops 的 aa_unit 集合
@@ -216,8 +221,8 @@ proposals, next_proposal_id                 # 提案表与提案游标
 oracle_reports, oracle_bonds, last_index    # 债券注册报价与中位数 index
 ```
 
-AA 侧同步新增：`pperp_<addr>`（PERP 影子账本）、`wp_<h>_<addr>`
-### 生命周期（高度 h，对应 `obyte-local/agents/operp_vault.aa:131-283`）
+AA 侧同步新增：`pperp_<addr>`（PERP 影子账本；提款权威仍是证明叶子）。
+### 生命周期（高度 h，对应 `obyte-local/agents/operp_vault.aa` submit/lock/challenge/finalize）
 
 ```
 submit(h)    h == last_locked+1 ∧ prev==root_{h-1} ∧ 有根 ∧ 组合单元
@@ -278,7 +283,7 @@ Oscript 实现细节（踩过的坑）：
 |---|---|
 | 伪造成交/假根 | 双 Merkle 根 + validate_against 重放审计 + fills_hash |
 | 偷 AA 资金 | 提款只认 finalized aa_root 的 Merkle 证明；leaf 绑定提款人地址；wd_ 累计标记防重放 |
-| operator 锁假根 | 600s 稳定窗 + 3600s 挑战窗 + bond 经济（见 README 局限节） |
+| operator 锁假根 | 600s 稳定窗 + `stable_at+3600` 挑战/应诉/失败扫荡三窗 + bond 经济（见 README 局限节） |
 | 存款自铸 | deposits_allowed 白名单 + replay 交叉注入 |
 | 溢出 DoS | 入口 checked-mul + qty 上限；book 层零量/零价拒绝 |
 | 签名延展 | verify_strict |
@@ -287,9 +292,10 @@ Oscript 实现细节（踩过的坑）：
 ## 6. 已知局限
 
 见 README「Limitations & mainnet readiness」。核心三条：respond 只校验
-operator 重发的根（真欺诈证明缺失）、无费用模型、报价质量取决于债券质押者
-（TWAP 缺位，按债券计的多数可合谋偏置中位数）。主网部署前需解决并做正式
-oscript 审计。
+operator 重发的根与森林（Oscript 无法链上重跑撮合，真欺诈证明缺失）、
+默认执行序是 UnitId 字典序（可磨队；v2 commit-reveal 激活门控）、报价
+质量仍受债券质押多数约束（TWAP 平滑而非消除）。主网部署前需解决并做
+正式 oscript 审计。
 
 ## 7. 治理动机：PERP
 
@@ -313,4 +319,4 @@ PERP 的三个机制接管：
 字段），烧毁只在镜像账本进行——对应真实 PERP 永久滞留 AA，协议整体对
 PERP 超抵押。精确规则见 [MECHANISMS.md](MECHANISMS.md) §15。
 
-> **局限（watcher 未就绪）：** 独立 watcher（`crates/operp-watch`）尚未以独立密钥部署，互相牵制未跑通前不对外宣称已具备。
+> **局限（watcher 未独立部署）：** `crates/operp-watch` 已存在、可离线重放 `da_unit_<h>`，但尚未以独立于 poster 的密钥部署，互相牵制跑通前不对外宣称已具备。

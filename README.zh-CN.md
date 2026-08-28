@@ -38,10 +38,10 @@ cd obyte-local && node deploy_testnet.js   # 把 vault AA 部署到 Obyte 测试
                                      ▼
                     ┌─────────────────────────────────────────────┐
                     │         OBYTE VAULT AA（Oscript）           │
-                    │  submit   → 候选根（lock 前可替换）          │
-                    │  lock     → 600s 稳定窗后锁定               │
-                    │  challenge → 冻结（bond ≥ 20000 bytes）     │
-                    │  resubmit → operator 重发应诉（解冻）        │
+                    │  submit   → 单候选（首个稳定组合单元胜出；da_unit 钉死；height taken；frozen==1 应诉）│
+                    │  lock     → 600s 稳定窗后锁定（钟只设一次）               │
+                    │  challenge → 仅已 lock 高度可冻（stable_at+3600；bond ≥ 20000）│
+                    │  resubmit → 原 bond 持有人应诉（解冻；不改 da_unit/钟/不另收 50k）│
                     │  finalize → 根成为提款依据                  │
                     │  withdraw → 针对 aa_root 的 Merkle 证明     │
                     └─────────────────────────────────────────────┘
@@ -60,6 +60,7 @@ cd obyte-local && node deploy_testnet.js   # 把 vault AA 部署到 Obyte 测试
 | `operp-exec` | 引擎本体：ingest → apply → 事件流；place/cancel/deposit/withdraw/liquidate 全量入口校验 |
 | `operp-settle` | 批次 checkpoint、`validate_against` 重放审计（含独立充值证据验证）、`temp_data` 载荷、提款证明生成 |
 | `operp-gossip` | operator 之间 WantUnits/HaveUnits 按需孤儿同步（纯 P2P 层，传输无关，绝不进共识） |
+| `operp-watch` | 独立 vault-AA watcher：读 `da_unit_<h>`、重放批次、用自己的密钥挑战根不匹配（与 poster 分离） |
 
 ## 协议设计原理
 
@@ -155,29 +156,37 @@ operator。
 
 每个高度 *h* 的生命周期：
 
-1. **submit** — operator 发布 `{height: h, prev_state_hash, state_root,
-   aa_forest}` 并附 ≥ 60 000 bytes：10 000 bounce 余量加每在任候选锁定的
-   **50 000-byte `SUBMIT_BOND_NET`**。高度必须等于 `last_locked + 1`；
-   前根必须匹配；三个哈希字段各恰 64 hex。候选在锁定前**可替换**：替换者
-   接管高度，被替换候选的债券转入 `sbond_<addr>` 经 `{claim: "sbond"}`
-   回收（失败 finalize 改为没收）。在任 operator 重发不重复收费，且稳定
-   计时器每次 submit 都重启——同根刷屏每轮只让攻击者白花一份新债券。
+1. **submit** — operator 发布**一笔组合单元**：OIP-0007 `temp_data` 加
+   `{height: h, prev_state_hash, state_root, aa_root}` data 消息，附 ≥ 60 000
+   bytes：10 000 bounce 余量加 **50 000-byte `SUBMIT_BOND_NET`**。高度必须
+   等于 `last_locked + 1`（frozen==1 应诉例外见下）；前根必须匹配；三个哈希
+   字段各恰 64 hex，`aa_forest` 恰 1024 hex。高度**单候选**：首个稳定组合
+   单元胜出，AA 记下 `da_unit_<h>` = 该 unit hash（根钉死在这份数据包上）；
+   此后该高度任何 submit 一律 bounce `height taken`，直到 finalize 或失败。
+   600 s 稳定钟由胜出 submit 设一次，不可重置。
 2. **lock** — 仅在 600 s 稳定窗（`OBYTE_STABILITY_SECS`）之后、且候选的
    提交债券持有人记录（`active_bond_<h>`）在位时允许：失败 finalize 会
    没收并清零该记录，故被回滚的高度在新的带债券 submit 重建候选之前无法
-   被 re-lock。锁定会清除此前的永久失败标记，挑战失败（`frozen = 2`）
-   的高度靠重新提交恢复而不是卡死链条。锁定后的根不可变。
-3. **challenge** — 锁定后 3600 s 内任何人可以 ≥ 20 000 byte 债券冻结高度
-   *h*；有在途债券者不可开第二枪，且被挑战高度仍冻结时 `{claim: "bond"}`
-   拒绝支付。
-4. **respond（重发应诉）** — 无独立 respond 触发器：operator 在窗口内
-   重发同一根应诉（在任候选人免债券）。成功则解冻并没收记录在案的挑战者
-   债券（两个账本键清零）；冒充者重发 bounce `not operator`。无人应诉
-   超窗后，finalize 将高度标记永久失败（`frozen = 2`）、清根、
+   re-lock。锁定会清除此前的永久失败标记，挑战失败（`frozen = 2`）的高度
+   靠重新提交恢复而不是卡死链条。锁定后的根不可变。`stable_at_<h>` 在
+   lock 时写入，是挑战窗、应诉窗、finalize/失败扫荡窗的**同一原点**
+   （一律 `stable_at+3600`）。
+3. **challenge** — `stable_at_<h>` 起 3600 s 内（post-lock；`CHALLENGE_SECS`
+   从 `stable_at` 起算），任何人可以 ≥ 20 000 byte 债券冻结**已锁定**高度
+   *h*（`h ≤ last_locked`，`stable_at_<h>` 已在）；未 lock 的
+   `last_locked+1` 不可被挑战——走正常 `submit/lock`，无法预 freeze。有在途
+   债券者不可开第二枪，被挑战高度仍冻结时 `{claim: "bond"}` 拒绝支付。
+4. **respond（重发应诉）** — 无独立 respond 触发器：原 bond 持有人在
+   `stable_at+3600` 内重发**同一份 `state_root` + `aa_forest`**（单候选门
+   唯一放行的重提交；不创建新 `da_unit_<h>`、不重置 600 s / escape 钟、
+   **不另收 50k**——只需 10000 bounce 余量）。成功则解冻并没收记录在案的
+   挑战者债券（两个账本键清零）；冒充者或森林不一致 bounce `not operator`。
+   无人应诉超窗后，finalize 将高度标记永久失败（`frozen = 2`）、清根、
    `last_locked` 回滚到 h−1、没收提交债券——**50/50 劈半**：一半计入
-   挑战者的 `{claim: "slash"}`，一半留在金库烧毁——并重启稳定时钟；
-   挑战者另经 `{claim: "bond"}` 取回自己的债券。
-5. **finalize** — 干净度过 3600 s 窗口后根成为提款依据
+   挑战者的 `{claim: "slash"}`，一半留在金库烧毁；失败扫荡清掉
+   `active_bond_<h>` 以便新组合单元重新占位；挑战者另经 `{claim: "bond"}`
+   取回自己的债券。
+5. **finalize** — 干净度过 `stable_at+3600` 窗口后根成为提款依据
    （`last_finalized`），严格按高度顺序；提交债券释放给持有人，首个稳定
    提交者累积 20 000-byte 竞速奖励（`{claim: "reward"}` 一次性支付并清零
    账本）。
@@ -209,6 +218,16 @@ operator。
    入口共享 withdraw 路径的 `wd_`/`wp_` 防重放键。按 doc07 §4 豁免，
    escape_finalize 只做本地停滞门。
 
+时钟原点——3600 s 窗口只有**一个**原点（`stable_at`），从不看 `submitted_at`：
+
+| 门 | 原点 | 时长 |
+|---|---|---|
+| lock | `submitted_at_<h>` | 600 s（`OBYTE_STABILITY_SECS`） |
+| challenge / respond / finalize / 失败扫荡 | `stable_at_<h>` | 3600 s（`CHALLENGE_SECS`） |
+| escape_finalize | `stable_at_<h>` | 604800 s（`ESCAPE_STALL_SECS`） |
+| escape_withdraw（候选停滞） | `submitted_at_<h>` | 604800 s |
+| escape_withdraw（链条停滞） | `stable_at_<last_finalized>` | 604800 s |
+
 证明由 `crates/operp-settle/examples/gen_withdraw_proof.rs` 离线生成
 （JSON 供 JS 工具链消费）。
 
@@ -220,13 +239,16 @@ operator。
 ## 仓库布局
 
 ```
-crates/                  Rust workspace（8 crates，见表）
+crates/                  Rust workspace（9 crates，见表）
 obyte-local/
   agents/operp_vault.aa   金库 autonomous agent（安全加固）
   test_vault_aa.js       完整生命周期集成测试（devnet via aa-testkit）
   deploy_testnet.js      测试网部署脚本（+ 冒烟充值）
-  post_batch.js          operator 提交流程（temp_data 披露、submit、lock、
-                         finalize、claim）
+  post_batch.js          operator 提交流程（一笔组合 temp_data+submit
+                         单元、lock、finalize、claim）。提交前自检
+                         （data_hash/aa_shard_roots/chain_id）只是自检，
+                         不是独立 watcher——互相牵制需要单独的
+                         `crates/operp-watch` 二进制与自己的密钥。
   gen_withdraw_proof     见 crates/operp-settle/examples
 vendor/aa-testkit/       Obyte autonomous-agent testkit（vendored）
 docs/PROTOCOL.md         协议设计叙事
@@ -306,11 +328,13 @@ cd obyte-local && node post_batch.js
 6. **烧毁的 PERP 永久滞留 vault AA。** 烧毁只扣减 `perp_supply`，对应代币
    仍托管在 AA 中（永久超额抵押）——审计时须把「AA 持有量 − perp_supply」
    视为累计烧毁额。
-7. **在任 operator 免费重启稳定计时器。** 每次 resubmit 都把 600 s 时钟
-   归零而在任者毫无成本（`active_bond_` 仍在自己名下）。这是接受的活性
-   权衡：只拖延自家高度，任何竞争者都可花 50 000-byte 债券接管该高度。
+7. ~~**在任 operator 免费重启稳定计时器。**~~
+   **已关闭**（组合 da_unit）：submit 单候选——首个稳定的组合
+   `temp_data`+submit 单元赢得高度，AA 把 `da_unit_<h>` 钉在其上，其余
+   submit 一律 bounce `height taken`（仅 frozen==1 时原 bond 持有人的
+   应诉重提交能过，且不碰钟）。不存在在任者免费清钟。
 8. AA 未做正式安全审计。Oscript 复杂度门恰在其上限（**85/100**，ops
-   1075/2000——运行 `node tools/check_aa_complexity.js`），后续任何改动
+   1101/2000——运行 `node tools/check_aa_complexity.js`），后续任何改动
    都必须先腾出等额预算。
 9. **重放去重窗口按高度有界**——旧版 256 高度，`state.height ≥
    REPLAY_ACTIVATION_HEIGHT`（1 000 000；部署期翻转）后扩展为
@@ -402,7 +426,7 @@ v2 扩展分期；偏差与延期积压见下）：
   `holdings−supply==burned` 保持 watcher 可验证
 - [x] **09 复杂度审计** — 单 sha256 折叠、统一 claim 分发（`claim:'kind'`）、
   lock-merge 重构；探针：`node tools/check_aa_complexity.js`。当前 **85/100**
-  （ops 1075/2000）——恰在门槛
+  （ops 1101/2000）——恰在门槛
 - [x] **10 AA 树分片（v2）** — 本轮干净切换：单个 1024-hex `aa_forest` 变量 =
   16 个拼接的 shard 根（恰好命中 `MAX_STATE_VAR_VALUE_LENGTH`）、空 shard
   哨兵根、深度保持 16 → 每批约 100 万账户；doc 的 v1 depth-18 路径按其
@@ -436,25 +460,24 @@ v2 扩展分期；偏差与延期积压见下）：
 ## 验证状态
 
 - **Rust 套件（CI 覆盖）**：`.github/workflows/ci.yml` 在 push/PR 上运行
-  `cargo test --workspace`（stable 工具链；MSRV 钉在 1.85）。HEAD 上
-  124 个测试全绿——覆盖 gossip 上限、journal CRC + 物理截断、快照
-  版本/回退、canonical-number 哈希规则、批次提交式 gov-nonce WAL
-  （含 H2 回归）。
-- **AA 复杂度门（手动）**：`node obyte-local/tools/check_aa_complexity.js`
-  ——当前 **85/100**（ops 1086/2000），恰在 ≤85 CI 门上。此检查尚未
-  接入 CI；任何 AA 改动前须手动跑。
-- **Golden vector（手动）**：`node obyte-local/golden_vector_check.js`
+  `cargo test --workspace`（stable 工具链；MSRV 钉在 1.85）。覆盖 gossip
+  上限、journal CRC + 物理截断、快照版本/回退、canonical-number 哈希规则、
+  批次提交式 gov-nonce WAL（含 H2 回归）。
+- **AA 复杂度门（CI `js-checks`）**：`node obyte-local/tools/check_aa_complexity.js`
+  ——当前 **85/100**（ops 1101/2000），恰在 ≤85 CI 门上。同 job 还跑
+  `golden_vector_check.js`。
+- **Golden vector（CI `js-checks`）**：`node obyte-local/golden_vector_check.js`
   打印固定输入（含 >2^53 的 `big` 字符串与 `eps: 0.001`）的 canonical
   Obyte JSON source 与 data_hash；Rust 侧单元测试
   `golden_vector_matches_ocore_get_json_source` 钉住同一哈希
-  （`4efa7a37…`），两侧同跑即验证 JS/Rust `get_data_hash` 一致。
-- **AA devnet E2E（本机未运行）**：`test_vault_aa.js` 依赖 vendored
-  aa-testkit 的原生 `rocksdb`/`sqlite3`，需 C++ 工具链（`node-gyp`）——
-  无 Visual Studio Build Tools 的 Windows 开发机无法安装。W 门正/负用例、
-  respond 森林锚定、escape 门与畸形输入防护因此目前只做静态 + Rust 侧
-  golden vector 验证，未经真实 devnet 运行。任何 testnet/mainnet 部署前，
-  必须在具备构建工具的主机或 CI 上执行
-  `cd obyte-local && npm install && node test_vault_aa.js`。
+  （`4efa7a37…`），每次 CI 都验证 JS/Rust `get_data_hash` 一致。
+- **AA devnet E2E（CI `e2e` job）**：每次 `main` push **以及**每个
+  pull request 都会跑。无 Visual Studio Build Tools 的 Windows 开发机
+  仍编不过 vendored aa-testkit 的 `rocksdb`/`sqlite3`；完整生命周期以 CI
+  为准，不在本机证明。
+- **Watcher 局限：** 独立 watcher crate（`crates/operp-watch`）已存在、可
+  离线重放 `da_unit_<h>`，但尚未以独立于 poster 的密钥部署——互相牵制
+  跑通前不对外宣称已具备。
 
 提交历史记录了本仓库经历的完整安全审计整改（proof 门控出金、存款白名单、
 溢出防护、市场白名单、严格签名、孤儿恢复、有界日志、keeper 奖励、坏账
