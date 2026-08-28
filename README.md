@@ -203,11 +203,13 @@ Lifecycle per height *h*:
    a second challenge, and `{claim: "bond"}` refuses payout while the
    challenged height is still frozen.
 4. **respond (by resubmit)** — there is no separate respond trigger: the
-   ORIGINAL bond holder answers a challenge by re-submitting the identical
-   root inside the window (the only resubmit that passes the
-   single-candidate gate; it does not touch `da_unit_<h>` or reset the
-   clock). Success unfreezes and confiscates exactly the recorded challenger bond (zeroing
-   both its ledger keys); an impostor resubmit bounces `not operator`. If
+   ORIGINAL bond holder answers a challenge by re-submitting the **identical
+   `state_root` + `aa_forest`** inside the window (the only resubmit that
+   passes the single-candidate gate; it does not create a new `da_unit_<h>`,
+   does not reset the 600 s / escape clocks, and carries **no extra 50k
+   bond** — only 10000 bounce headroom). Success unfreezes and confiscates
+   exactly the recorded challenger bond (zeroing both its ledger keys); an
+   impostor or a forest-mismatched resubmit bounces `not operator`. If
    nobody responds in time, finalize marks the height permanently failed
    (`frozen = 2`), clears its roots, rolls `last_locked` back to h−1,
    confiscates the submit bond — split **50/50**: half accrues to the

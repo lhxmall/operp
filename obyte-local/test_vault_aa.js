@@ -850,7 +850,73 @@ async function main() {
     throw new Error("over-W amount did not bounce: " + JSON.stringify(overW).slice(0, 600));
   console.log("OVER-W AMOUNT BOUNCED AS EXPECTED");
 
-  // Issue the PERP asset on THIS network while it is still running.
+  // ---------- 9b. frozen==1 respond-by-resubmit (bond豁免, forest校验, 时钟不重置) ----------
+  // Uses height 2 (after h1 finalized, h2 = last_locked+1 candidate path).
+  // This exercises the candidate-challenge path that the single-candidate
+  // refactor enables: submit h2, challenge before lock, respond via submit.
+  console.log("\n--- frozen==1 respond tests (height 2 candidate) ---");
+  const ROOT_H2 = sha256Hex("rootH2-real");
+  const PREV1 = ROOT_FINAL1; // prev of h2 is root_1
+  const FOREST_ALT = sha256Hex("altforest").repeat(16);
+  const submitH2 = { submit: 1, chain_id: "operp-mvp-1", height: 2, prev_state_hash: PREV1, state_root: ROOT_H2, aa_root: sha256Hex("aa_h2"), aa_forest: claim.aa_forest };
+  const batchH2 = { chain_id: "operp-mvp-1", height: 2, state_root: ROOT_H2, unit_ids: ["h2u1"] };
+  const subH2 = await sendCombinedSubmit(bob, 60000, submitH2, batchH2);
+  st = await vars();
+  const submittedAtBefore = st["submitted_at_2"];
+  const daUnitBefore = st["da_unit_2"];
+  const candAaBefore = st["cand_aa_root_2"];
+  const feeWinnerBefore = st["fee_winner_2"];
+  console.log("  h2 submitted_at", submittedAtBefore, "da_unit", daUnitBefore.slice(0,12)+"..");
+  // immediate lock should bounce (600s window)
+  await expectBounce(() => triggerRaw(bob, { lock: 1, height: 2 }), "cannot lock yet");
+  console.log("  immediate lock bounced (600s gate)");
+  // challenge h2 as candidate (frozen==1 path for candidate heights)
+  const chalH2 = await alice.triggerAaWithData({ toAddress: vault, amount: 30000, data: { challenge: 1, height: 2 } });
+  if (chalH2.error) throw new Error("challenge h2: " + chalH2.error);
+  await network.witnessUntilStable(chalH2.unit);
+  st = await vars();
+  if (Number(st["frozen_2"]) !== 1) throw new Error("h2 not frozen after challenge: "+st["frozen_2"]);
+  console.log("  h2 frozen==1");
+  const bondBefore = Number(st["bond_" + aliceAddr]);
+  if (!(bondBefore > 0)) throw new Error("challenger bond not credited");
+  // --- impostor must bounce before honest respond ---
+  await expectBounce(() => sendCombinedSubmit(alice, 60000, submitH2, batchH2), "not operator");
+  console.log("  impostor resubmit bounced 'not operator'");
+  const forestSwap = { submit: 1, chain_id: "operp-mvp-1", height: 2, prev_state_hash: PREV1, state_root: ROOT_H2, aa_root: sha256Hex("aa_h2"), aa_forest: FOREST_ALT };
+  const batchAlt = { chain_id: "operp-mvp-1", height: 2, state_root: ROOT_H2, unit_ids: ["h2alt"] };
+  await expectBounce(() => sendCombinedSubmit(bob, 60000, forestSwap, batchAlt), "not operator");
+  console.log("  forest-swapped resubmit bounced 'not operator'");
+  // --- honest operator responds with bond exemption (only 10000 headroom) ---
+  const respH2 = await sendCombinedSubmit(bob, 12000, submitH2, batchH2);
+  if (respH2.response && respH2.response.bounced) throw new Error("honest respond bounced: "+JSON.stringify(respH2.response).slice(0,400));
+  st = await vars();
+  if (Number(st["frozen_2"]) !== 0) throw new Error("h2 not unfrozen after respond: "+st["frozen_2"]);
+  if (Number(st["bond_" + aliceAddr]) !== 0) throw new Error("challenger bond not confiscated");
+  if (st["da_unit_2"] !== daUnitBefore) throw new Error("da_unit_2 changed on respond: "+st["da_unit_2"]+" != "+daUnitBefore);
+  if (String(st["submitted_at_2"]) !== String(submittedAtBefore)) throw new Error("submitted_at_2 reset on respond");
+  if (st["cand_aa_root_2"] !== candAaBefore) throw new Error("cand_aa_root_2 changed on respond");
+  if (st["active_bond_2"] !== bobAddr) throw new Error("active_bond_2 changed");
+  if (st["fee_winner_2"] !== feeWinnerBefore) throw new Error("fee_winner_2 changed on respond");
+  console.log("  honest respond ok: frozen cleared, bond confiscated, da_unit/submitted_at/cand/fee_winner untouched, bond exemption (12000) passed");
+  // clock not reset: immediate lock should still bounce if <600s since first submit
+  // (we already proved immediate lock bounced before challenge; after respond it must
+  // still bounce if we haven't waited 600s total — but we already challenged after
+  // a short time, so still <600s; verify it still bounces)
+  // Note: we already challenged very quickly, so still <600s; this would still bounce.
+  // Instead prove the positive: after 700s from ORIGINAL submitted_at, lock succeeds.
+  await network.timetravel({ shift: '700s' });
+  const lockH2 = await triggerRaw(bob, { lock: 1, height: 2 });
+  if (lockH2.response && lockH2.response.bounced) throw new Error("lock h2 after respond+700s bounced: "+JSON.stringify(lockH2.response).slice(0,400));
+  st = await vars();
+  if (Number(st["last_locked"]) !== 2) throw new Error("h2 lock failed after respond");
+  console.log("  lock after 700s succeeded (submitted_at not reset)");
+  // finalize h2 clean (no challenge) to keep chain healthy for later tests
+  await network.timetravel({ shift: '3600s' });
+  await trigger(alice, { finalize: 1, height: 2 });
+  st = await vars();
+  if (Number(st["last_finalized"]) !== 2) throw new Error("finalize h2 failed");
+  console.log("  h2 finalized (respond path chain intact)");
+
   PERP_ASSET = await resolvePerpAsset(alice);
 
   console.log("\nOK: full AA lifecycle passed");
