@@ -3012,7 +3012,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_activation_commits_rejected() {
+    fn genesis_commit_is_accepted() {
         let mut eng = Engine::new();
         allow_all(&mut eng);
         let alice = sk(1);
@@ -3023,13 +3023,7 @@ mod tests {
             operp_types::COMMIT_TTL_HEIGHTS,
         );
         let events = eng.ingest(c).unwrap();
-        assert!(matches!(
-            events.last(),
-            Some(ExecEvent::Rejected {
-                reason: RejectReason::BadCommit,
-                ..
-            })
-        ));
+        assert!(matches!(events.last(), Some(ExecEvent::Applied { .. })));
     }
 
     #[test]

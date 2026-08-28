@@ -19,10 +19,9 @@ use operp_settle::{Batch, Checkpoint, DepositEvidence, SettleError};
 use operp_state::AA_SHARD_COUNT;
 use operp_types::UnitId;
 
-/// Challenge bond gross attached to a `challenge` trigger: 20000 gross =
-/// 10000 bounce-fee headroom + 10000 net, matching the AA's bond gate
-/// (`operp_vault.aa` `bond too small`).
-pub const CHALLENGE_BOND_GROSS: u64 = 20_000;
+/// Challenge bond gross attached to a `challenge` trigger.
+/// mirrors operp_types::CHALLENGE_BOND_NET + BOUNCE_FEE_BASE
+pub const CHALLENGE_BOND_GROSS: u64 = 1_000_000_010_000;
 /// Default poll interval in seconds.
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
 
@@ -117,7 +116,7 @@ pub fn fetch_da_unit<H: HubClient>(
         .get_joint(&unit_hash)
         .map_err(WatchError::HubUnavailable)?;
     let data = extract_temp_data(&joint).ok_or_else(|| {
-        WatchError::HubUnavailable("joint has no inline temp_data payload".into())
+        WatchError::BindingMismatch("joint has no inline temp_data payload".into())
     })?;
     Ok(Some(DaUnit {
         height,
@@ -399,6 +398,32 @@ mod tests {
             joints: Default::default(),
         };
         assert!(fetch_da_unit(&hub, "vault", 9).unwrap().is_none());
+    }
+
+    #[test]
+    fn fetch_da_unit_no_temp_data_is_binding_mismatch() {
+        // Joint carries submit data but no inline temp_data message.
+        let joint = serde_json::json!({
+            "unit": {
+                "version": "1.0",
+                "messages": [{ "app": "data", "payload": { "submit": 1, "height": 1 } }],
+                "unit": "u-no-td",
+            },
+            "messages": [{ "app": "data", "payload": { "submit": 1, "height": 1 } }],
+        });
+        let hub = MockHub {
+            vars: std::collections::HashMap::from([(
+                "da_unit_1".into(),
+                serde_json::json!("u-no-td"),
+            )]),
+            joints: std::collections::HashMap::from([("u-no-td".into(), joint)]),
+        };
+        let err = fetch_da_unit(&hub, "vault", 1).unwrap_err();
+        assert!(
+            matches!(err, WatchError::BindingMismatch(_)),
+            "empty DA must be BindingMismatch, not HubUnavailable: {err:?}"
+        );
+        assert!(!matches!(err, WatchError::HubUnavailable(_)));
     }
 
     #[test]

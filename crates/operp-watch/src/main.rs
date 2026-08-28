@@ -19,6 +19,8 @@ use operp_watch::{
 };
 use std::env;
 use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// HTTP-backed hub client over Obyte's JSON-RPC (`getAaStateVars`,
@@ -229,19 +231,26 @@ fn check_height(
     let frozen_val = frozen.and_then(|v| v.as_u64()).unwrap_or(0);
     let in_window = sa_val != 0 && now < sa_val + 3600 && frozen_val == 0;
 
-    // Always attempt to fetch + replay so the engine advances through the
-    // chain (a finalized height's da_unit_<h> persists and replays cleanly;
-    // a sweep-cleared height returns None and leaves a gap the caller accepts
-    // for v1 — the failing height is exactly the surfaced mismatch).
     let da = match fetch_da_unit(hub, &config.vault_address, h) {
         Ok(None) => return Ok(None),
         Ok(Some(da)) => da,
         Err(WatchError::HubUnavailable(_)) => return Ok(None), // backoff, never mis-challenge
+        Err(WatchError::BindingMismatch(msg)) => {
+            let alert = format!("h={} BINDING MISMATCH: {}", h, msg);
+            if in_window {
+                maybe_post_challenge(config, h, &alert);
+            }
+            return Ok(Some(alert));
+        }
         Err(e) => return Ok(Some(format!("h={} WATCH ERROR: {}", h, e))),
     };
 
     if let Err(e) = verify_da_binding(&da) {
-        return Ok(Some(format!("h={} BINDING MISMATCH: {}", h, e)));
+        let alert = format!("h={} BINDING MISMATCH: {}", h, e);
+        if in_window {
+            maybe_post_challenge(config, h, &alert);
+        }
+        return Ok(Some(alert));
     }
 
     let prev_root = engine.state.state_root();
@@ -249,10 +258,12 @@ fn check_height(
         Ok(()) => Ok(None),
         Err(e) => {
             if in_window {
-                Ok(Some(format!(
+                let alert = format!(
                     "h={} ROOT MISMATCH ({}): watcher should challenge with {} bytes bond",
                     h, e, config.challenge_bond_gross
-                )))
+                );
+                maybe_post_challenge(config, h, &alert);
+                Ok(Some(alert))
             } else {
                 Ok(Some(format!(
                     "h={} ROOT MISMATCH ({}): outside challenge window (informational)",
@@ -260,6 +271,48 @@ fn check_height(
                 )))
             }
         }
+    }
+}
+
+/// If `OPERP_WATCH_MNEMONIC` is set, spawn `obyte-local/post_challenge.js`.
+/// Unset mnemonic → print-only (caller already prints the alert).
+fn maybe_post_challenge(config: &WatchConfig, h: u64, alert: &str) {
+    if env::var_os("OPERP_WATCH_MNEMONIC").is_none() {
+        eprintln!(
+            "WATCH ALERT (print-only, no OPERP_WATCH_MNEMONIC): {}",
+            alert
+        );
+        return;
+    }
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../obyte-local/post_challenge.js");
+    let hub = config
+        .hub_url
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:6611".into());
+    let h_s = h.to_string();
+    eprintln!(
+        "spawning: node {} --vault {} --height {} --hub {}",
+        script.display(),
+        config.vault_address,
+        h,
+        hub
+    );
+    match Command::new("node")
+        .args([
+            script.as_os_str(),
+            std::ffi::OsStr::new("--vault"),
+            std::ffi::OsStr::new(&config.vault_address),
+            std::ffi::OsStr::new("--height"),
+            std::ffi::OsStr::new(&h_s),
+            std::ffi::OsStr::new("--hub"),
+            std::ffi::OsStr::new(&hub),
+        ])
+        .status()
+    {
+        Ok(st) if st.success() => {}
+        Ok(st) => eprintln!("post_challenge.js exited {}", st),
+        Err(e) => eprintln!("post_challenge.js spawn failed: {}", e),
     }
 }
 

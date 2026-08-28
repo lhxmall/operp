@@ -176,7 +176,7 @@ async function main() {
 
   network = await Network.create()
     .with.agent({ vault: resolveVaultAa() })
-    .with.wallet({ poster: 5e9 })
+    .with.wallet({ poster: 1e13 })
     .run();
   const vault = network.agent.vault;
   const poster = network.wallet.poster;
@@ -213,10 +213,10 @@ async function main() {
   };
   if (batchData.validity_proof_hash) submitData.validity_proof_hash = batchData.validity_proof_hash;
   if (batchData.perp_burned !== undefined) submitData.perp_burned = String(batchData.perp_burned);
-  // 60000 = 50000 SUBMIT_BOND_NET + 10000 bounce fee headroom.
+  // 10000000010000 = 1000000000000 SUBMIT_BOND_NET + 10000 bounce fee headroom.
   const r = await poster.sendMulti({
     messages: [tempDataMessage(batchData), { app: "data", payload: submitData }],
-    base_outputs: [{ address: vault, amount: 60000 }],
+    base_outputs: [{ address: vault, amount: 10000000010000 }],
   });
   if (r.error) throw new Error("combined da_unit failed: " + r.error);
   const daUnit = r.unit;
