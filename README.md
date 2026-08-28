@@ -335,16 +335,31 @@ Measured on this machine: `bench_raw` ≈ 5 500 ops/s; `hft_onedag` (8 markets,
 This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
 **not mainnet-ready**. Known gaps, roughly in priority order:
 
-1. **Fraud response is freeze-and-rollback, not on-chain re-execution.**
-   Full trade data IS posted on-chain (`post_batch.js` reveals every unit as
-   `temp_data`, so any watcher can re-execute and detect a bad root), and a
-   detected fraud triggers challenge → freeze → height rollback with the
-   50/50 submit-bond slash (`{claim: "slash"}` half, burned half). Deposit
-   endorsements are now verified cryptographically inside
-   `validate_against`, not taken on faith. What remains out of reach:
-   Oscript cannot re-run the matcher on-chain and there is no validity
-   proof, so enforcement of non-deposit state still relies on live watchers
-   plus competing operators.
+1. **A live lying operator confirms a fake root by re-posting it.**
+   Challenge does not verify the root. `{challenge}` only freezes a
+   locked height (`h ≤ last_locked`, `stable_at+3600`, bond ≥ 20 000
+   bytes). Respond-by-resubmit (the submit case when `frozen==1`) checks
+   `trigger.address == active_bond_<h>` and that `state_root`/`aa_forest`
+   equal the already-locked candidate — then unfreezes and confiscates
+   the challenger's bond. A fraudulent operator who stays online answers
+   with the **identical fake forest**, the honest watcher is fined, and
+   after `stable_at+3600` that forest becomes the withdrawal basis.
+   Single-candidate (`height taken`) also forbids any competing honest
+   submit on the same height, so takeover exists only after `frozen=2`,
+   which requires the liar **not** to respond. Closing the incumbent
+   clock-reset (#7) closed the honest-replace path with it.
+   Same structure, more holes:
+   - `da_unit_<h>` stores `trigger.unit`; the AA never reads `temp_data`.
+     A roots-only unit still wins the height.
+   - Unlocked candidates cannot be challenged. After `ESCAPE_STALL_SECS`
+     (7 days), `{escape_withdraw}` pays against
+     `cand_aa_root_(last_finalized+1)` without a lock or a challenge.
+   - Submit/challenge bonds are 50 000 / 20 000 **bytes**
+     (0.00005 / 0.00002 GBYTE) — dust against vault deposits.
+   Deposit joints are checked only in `validate_against` (off-chain).
+   `operp-watch` logs `ROOT MISMATCH … should challenge` and does not
+   broadcast `{challenge:1}`. Wiring a separate watcher key does not
+   fix respond-by-resubmit.
 2. **Funding quality is bounded by its price anchor.** Funding stays
    mark-premium based (capped ±50 bps/tick). The default
    `BondedMedianTwap` index derives from bonded reporters' prices; the
@@ -382,6 +397,8 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    pins `da_unit_<h>` to it, and every other submit bounces `height taken`
    (only the frozen==1 respond-by-resubmit by the original bond holder
    passes, without touching the clock). No incumbent clock-reset exists.
+   **Cost:** the same gate blocks an honest competing root on that height
+   — see #1.
 8. The AA has had no formal security audit. The Oscript complexity gate
    sits exactly at its ceiling (**85/100**, ops 1101/2000 — run
    `node tools/check_aa_complexity.js`), so every further AA change must
@@ -513,9 +530,10 @@ bench_raw`.
   cannot compile the vendored aa-testkit's `rocksdb`/`sqlite3`; the live
   lifecycle is proven in CI, not on this host.
 * **Watcher limitation:** the independent watcher crate (`crates/operp-watch`)
-  exists and can replay `da_unit_<h>` off-chain, but it is not yet deployed
-  with a key separate from the poster — mutual deterrence is not claimed
-  until that happens.
+  exists and can replay `da_unit_<h>` off-chain, but it only prints an alert
+  — it does not broadcast `{challenge:1}`. Even with a key separate from
+  the poster, respond-by-resubmit of the identical fake root still beats
+  the challenge (see Limitations #1). Mutual deterrence is not claimed.
 
 See the commit history for the full security-audit remediation this repo
 went through (proof-gated withdrawals, deposit whitelisting, overflow

@@ -301,13 +301,26 @@ cd obyte-local && node post_batch.js
 当前代码达到“可部署 Obyte 测试网”标准，**尚未达到主网标准**。已知缺口
 （按优先级大致排序）：
 
-1. **欺诈响应是冻结-回滚，不是链上重执行。** 全部交易数据会上链
-   （`post_batch.js` 以 `temp_data` 披露每个 unit，任何 watcher 都能本地
-   重放并检出坏根），检出的欺诈触发 challenge → freeze → 高度回滚，并伴随
-   50/50 提交债券罚没（一半计 `{claim: "slash"}`、一半烧毁）。充值背书现在
-   在 `validate_against` 内做密码学独立验证，不再听信 operator 自述。
-   仍然做不到的：Oscript 无法链上重跑撮合器、也没有有效性证明，所以非
-   充值状态的执法仍依赖 live watcher 加竞争 operator。
+1. **活着的说谎 operator 复读同一份假根即可确认。**
+   挑战不验证根。`{challenge}` 只冻已 lock 高度（`h ≤ last_locked`，
+   `stable_at+3600`，债券 ≥ 20 000 bytes）。应诉（frozen==1 时走 submit）
+   只验 `trigger.address == active_bond_<h>` 且 `state_root`/`aa_forest`
+   与已锁候选相同——然后解冻并没收挑战者债券。活着的作恶者把**同一份
+   假森林**再发一次，诚实 watcher 被罚，`stable_at+3600` 后这份森林成为
+   提款依据。单候选（`height taken`）同时禁止同一高度的诚实根竞争，
+   接管只发生在 frozen=2，而这要求说谎者**不应诉**。关掉在任者清钟
+   （#7）的同时把诚实替换路径也关了。
+   同一结构上的其余洞：
+   - `da_unit_<h>` 只记 `trigger.unit`，AA 不读 `temp_data`；只交根的
+     unit 照样赢高度。
+   - 未 lock 的候选不可被挑战。`ESCAPE_STALL_SECS`（7 天）后
+     `{escape_withdraw}` 针对 `cand_aa_root_(last_finalized+1)` 出门，
+     不经过 lock 或挑战。
+   - 提交/挑战债券是 50 000 / 20 000 **bytes**（0.00005 / 0.00002
+     GBYTE）——相对金库存款是灰尘。
+   充值 joint 只在链下 `validate_against` 里核。`operp-watch` 只打日志
+   `ROOT MISMATCH … should challenge`，不广播 `{challenge:1}`。接上
+   独立 watcher 密钥也修不了应诉复读。
 2. **资金费质量受价格锚限制。** 资金费保持 mark-premium 模型（±50 bps/tick
    封顶）。默认 `BondedMedianTwap` index 来自债券报价者价格；外部锚接线已经
    落地（`Op::UpdateExternalPrice`，tag 17，白名单门控，
@@ -333,6 +346,7 @@ cd obyte-local && node post_batch.js
    `temp_data`+submit 单元赢得高度，AA 把 `da_unit_<h>` 钉在其上，其余
    submit 一律 bounce `height taken`（仅 frozen==1 时原 bond 持有人的
    应诉重提交能过，且不碰钟）。不存在在任者免费清钟。
+   **代价：** 同一门把该高度的诚实竞争根也挡在门外——见 #1。
 8. AA 未做正式安全审计。Oscript 复杂度门恰在其上限（**85/100**，ops
    1101/2000——运行 `node tools/check_aa_complexity.js`），后续任何改动
    都必须先腾出等额预算。
@@ -476,8 +490,9 @@ v2 扩展分期；偏差与延期积压见下）：
   仍编不过 vendored aa-testkit 的 `rocksdb`/`sqlite3`；完整生命周期以 CI
   为准，不在本机证明。
 - **Watcher 局限：** 独立 watcher crate（`crates/operp-watch`）已存在、可
-  离线重放 `da_unit_<h>`，但尚未以独立于 poster 的密钥部署——互相牵制
-  跑通前不对外宣称已具备。
+  离线重放 `da_unit_<h>`，但只打报警、不广播 `{challenge:1}`。即便接上
+  独立于 poster 的密钥，应诉复读同一份假根仍能打赢挑战（见局限 #1）。
+  互相牵制不对外宣称已具备。
 
 提交历史记录了本仓库经历的完整安全审计整改（proof 门控出金、存款白名单、
 溢出防护、市场白名单、严格签名、孤儿恢复、有界日志、keeper 奖励、坏账
