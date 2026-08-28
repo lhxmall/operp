@@ -37,12 +37,11 @@ cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
                     └────────────────┬────────────────────────────┘
                                      │ temp_data unit (batch data on-chain)
                                      ▼
-                    ┌─────────────────────────────────────────────┐
                     │         OBYTE VAULT AA (Oscript)            │
-                    │  submit → candidate (replaceable pre-lock)  │
-                    │  lock    → after 600 s stability window     │
-                    │  challenge → freeze (bond ≥ 20000 bytes)    │
-                    │  resubmit → operator answers a challenge (unfreeze)│
+                    │  submit → single candidate (first stable combined unit wins; da_unit_<h> pinned; height taken; respond-by-resubmit) │
+                    │  lock    → after 600 s stability window (set once by winning submit; cannot be reset)     │
+                    │  challenge → freeze locked height only (stable_at+3600; bond ≥ 20000 bytes)    │
+                    │  resubmit → operator answers a challenge (unfreeze; no new da_unit/fee)│
                     │  finalize → root becomes withdrawal basis   │
                     │  withdraw → Merkle PROOF against aa_root    │
                     └─────────────────────────────────────────────┘
@@ -61,6 +60,7 @@ cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
 | `operp-exec` | The engine: ingest → apply → events; place/cancel/deposit/withdraw/liquidate with full intake validation |
 | `operp-settle` | Batch checkpoints, `validate_against` replay verification, `temp_data` payloads, proof generation |
 | `operp-gossip` | WantUnits/HaveUnits on-demand orphan sync between operators (pure P2P layer, transport-agnostic, never consensus) |
+| `operp-watch` | Independent vault-AA watcher: reads `da_unit_<h>`, replays the batch, flags/challenges root mismatches with its own key (separate from the poster) |
 
 ## Protocol principles
 
@@ -197,14 +197,11 @@ Lifecycle per height *h*:
    until a fresh bonded submit recreates the candidate. Locking clears a
    previous permanent-failure mark, so a challenge-failed (`frozen = 2`)
    height recovers by fresh submission instead of wedging the chain. Locked
-   roots are immutable.
-3. **challenge** — within 3600 s of locking, anyone can freeze height *h*
-   with a ≥ 20 000 byte bond; a sender with an outstanding bond cannot open
-   a second challenge, and `{claim: "bond"}` refuses payout while the
-   challenged height is still frozen.
+   roots are immutable. `stable_at_<h>` is set at lock time and anchors the challenge window.
+3. **challenge** — within 3600 s of `stable_at_<h>` (post-lock, `stable_at+3600`; `CHALLENGE_SECS` counts from `stable_at`), anyone can freeze a **locked** height *h* (`h ≤ last_locked`, `stable_at_<h>` set) with a ≥ 20 000 byte bond; un-locked heights (`last_locked+1`) cannot be challenged — they go through the normal `submit/lock` path and cannot be pre-frozen. A sender with an outstanding bond cannot open a second challenge, and `{claim: "bond"}` refuses payout while the challenged height is still frozen.
 4. **respond (by resubmit)** — there is no separate respond trigger: the
    ORIGINAL bond holder answers a challenge by re-submitting the **identical
-   `state_root` + `aa_forest`** inside the window (the only resubmit that
+   `state_root` + `aa_forest`** inside `stable_at+3600` (the only resubmit that
    passes the single-candidate gate; it does not create a new `da_unit_<h>`,
    does not reset the 600 s / escape clocks, and carries **no extra 50k
    bond** — only 10000 bounce headroom). Success unfreezes and confiscates
@@ -269,13 +266,17 @@ single source of truth.
 ## Repository layout
 
 ```
-crates/                  Rust workspace (8 crates, see table above)
+crates/                  Rust workspace (9 crates, see table above)
 obyte-local/
   agents/operp_vault.aa   the vault autonomous agent (security-hardened)
   test_vault_aa.js       full lifecycle integration test (devnet via aa-testkit)
   deploy_testnet.js      testnet deployment script (+ smoke deposit)
   post_batch.js          operator submission flow (combined temp_data+submit
-                         unit, lock, finalize, claim)
+                         unit, lock, finalize, claim). Its pre-submit checks
+                         (data_hash/aa_shard_roots/chain_id) are self-checks
+                         only — NOT an independent watcher: mutual deterrence
+                         requires the separate `crates/operp-watch` binary with
+                         its own key.
 docs/PROTOCOL.md         protocol design narrative
   docs/MECHANISMS.md     full mechanism reference (zh): every rule, constant,
                          edge case, and the threat-model matrix
@@ -506,6 +507,7 @@ bench_raw`.
   statically + by Rust-side golden vectors, not by a live devnet run. Run
   `cd obyte-local && npm install && node test_vault_aa.js` on a build-tools
   host or in CI before any testnet/mainnet deploy.
+* **Watcher limitation:** 独立 watcher (`crates/operp-watch`) 尚未以独立密钥部署，互相牵制（operator ↔ watcher）未跑通前不对外宣称已具备（对应 `operp_vault.aa:228-252` 挑战语义与 `docs/PROTOCOL.md` §4）.
 
 See the commit history for the full security-audit remediation this repo
 went through (proof-gated withdrawals, deposit whitelisting, overflow

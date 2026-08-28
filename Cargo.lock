@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "base64"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -252,6 +258,23 @@ dependencies = [
  "hex",
  "serde",
  "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "operp-watch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "hex",
+ "operp-dag",
+ "operp-exec",
+ "operp-settle",
+ "operp-state",
+ "operp-types",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

@@ -6,8 +6,8 @@
 //   second submit bounces 'height taken' (single-candidate) -> early lock bounce ->
 //   timetravel +600s -> lock -> early withdraw bounce ('not finalizable') ->
 //   challenge + immediate {claim_bond} bounce ('challenge unresolved') ->
-//   locked-height resubmit bounce ('bad submit': the final AA has NO
-//   respond-by-resubmit for a locked height) ->
+//   locked-height resubmit bounce ('not operator' when frozen;
+//   challenge is post-lock-only, window = stable_at+3600) ->
 //   challenge FAILURE path (silence past the window -> finalize sweep:
 //   frozen=2, last_locked rollback, challenger bond stays credited, submit
 //   bond confiscated, slash reward credited) ->
@@ -659,12 +659,14 @@ async function main() {
     throw new Error("claim_bond during live challenge did not bounce: " + JSON.stringify(earlyBondClaim).slice(0, 400));
   console.log("  early claim_bond bounced as expected ('challenge unresolved')");
 
-  // Locked-height immutability: even a bond-sufficient resubmit (60000) for
-  // h == last_locked bounces 'bad submit' before any identity/bond logic.
+  // Locked-height immutability: while the height is FROZEN (frozen_1==1), the
+  // submit case takes the respond-by-resubmit branch, so a root-mismatched
+  // resubmit (state_root != cand_root_1) bounces 'not operator' — the frozen
+  // height cannot be overwritten by either the impostor or the sitting operator.
   const resub = await triggerRaw(bob, { submit: 1, chain_id: "operp-mvp-1", height: 1, prev_state_hash: PREV0, state_root: ROOT_FINAL1, aa_root: claim.aa_root, aa_forest: claim.aa_forest }, 60000);
-  if (!JSON.stringify(resub).includes("bad submit"))
-    throw new Error("locked-height resubmit not rejected: " + JSON.stringify(resub).slice(0, 300));
-  console.log("  locked-height resubmit bounced as expected ('bad submit')");
+  if (!JSON.stringify(resub).includes("not operator"))
+    throw new Error("locked+frozen resubmit not rejected: " + JSON.stringify(resub).slice(0, 300));
+  console.log("  locked+frozen resubmit bounced as expected ('not operator')");
 
   await network.timetravel({ shift: '3600s' }); // no response possible; window over
   const failFin = await triggerRaw(alice, { finalize: 1, height: 1 }, 20000);
@@ -850,11 +852,12 @@ async function main() {
     throw new Error("over-W amount did not bounce: " + JSON.stringify(overW).slice(0, 600));
   console.log("OVER-W AMOUNT BOUNCED AS EXPECTED");
 
-  // ---------- 9b. frozen==1 respond-by-resubmit (bond豁免, forest校验, 时钟不重置) ----------
-  // Uses height 2 (after h1 finalized, h2 = last_locked+1 candidate path).
-  // This exercises the candidate-challenge path that the single-candidate
-  // refactor enables: submit h2, challenge before lock, respond via submit.
-  console.log("\n--- frozen==1 respond tests (height 2 candidate) ---");
+  // ---------- 9b. challenge-on-locked-height + respond-by-resubmit ----------
+  // Post-lock-only challenge semantics (challenge window = stable_at+3600):
+  // a challenge on an UNLOCKED candidate (h2 == last_locked+1) must bounce
+  // 'bad height' — a pre-lock freeze would permanently wedge the height.
+  // The honest respond runs on the LOCKED height.
+  console.log("\n--- challenge & respond tests (height 2, locked) ---");
   const ROOT_H2 = sha256Hex("rootH2-real");
   const PREV1 = ROOT_FINAL1; // prev of h2 is root_1
   const FOREST_ALT = sha256Hex("altforest").repeat(16);
@@ -870,7 +873,17 @@ async function main() {
   // immediate lock should bounce (600s window)
   await expectBounce(() => triggerRaw(bob, { lock: 1, height: 2 }), "cannot lock yet");
   console.log("  immediate lock bounced (600s gate)");
-  // challenge h2 as candidate (frozen==1 path for candidate heights)
+  // challenge on the UNLOCKED candidate (h2 == last_locked+1) must bounce 'bad height'
+  await expectBounce(() => triggerRaw(alice, { challenge: 1, height: 2 }, 30000), "bad height");
+  console.log("  challenge-before-lock bounced 'bad height' (post-lock-only)");
+  // stability window then lock h2 (stable_at_2 anchors the challenge window)
+  await network.timetravel({ shift: '700s' });
+  const lockH2 = await triggerRaw(bob, { lock: 1, height: 2 });
+  if (lockH2.response && lockH2.response.bounced) throw new Error("lock h2 bounced: "+JSON.stringify(lockH2.response).slice(0,400));
+  st = await vars();
+  if (Number(st["last_locked"]) !== 2) throw new Error("h2 lock failed after 700s");
+  console.log("  h2 locked (stable_at_2 set), last_locked = 2");
+  // challenge the LOCKED height -> frozen==1 (inside stable_at+3600)
   const chalH2 = await alice.triggerAaWithData({ toAddress: vault, amount: 30000, data: { challenge: 1, height: 2 } });
   if (chalH2.error) throw new Error("challenge h2: " + chalH2.error);
   await network.witnessUntilStable(chalH2.unit);
@@ -898,18 +911,9 @@ async function main() {
   if (st["active_bond_2"] !== bobAddr) throw new Error("active_bond_2 changed");
   if (st["fee_winner_2"] !== feeWinnerBefore) throw new Error("fee_winner_2 changed on respond");
   console.log("  honest respond ok: frozen cleared, bond confiscated, da_unit/submitted_at/cand/fee_winner untouched, bond exemption (12000) passed");
-  // clock not reset: immediate lock should still bounce if <600s since first submit
-  // (we already proved immediate lock bounced before challenge; after respond it must
-  // still bounce if we haven't waited 600s total — but we already challenged after
-  // a short time, so still <600s; verify it still bounces)
-  // Note: we already challenged very quickly, so still <600s; this would still bounce.
-  // Instead prove the positive: after 700s from ORIGINAL submitted_at, lock succeeds.
-  await network.timetravel({ shift: '700s' });
-  const lockH2 = await triggerRaw(bob, { lock: 1, height: 2 });
-  if (lockH2.response && lockH2.response.bounced) throw new Error("lock h2 after respond+700s bounced: "+JSON.stringify(lockH2.response).slice(0,400));
-  st = await vars();
-  if (Number(st["last_locked"]) !== 2) throw new Error("h2 lock failed after respond");
-  console.log("  lock after 700s succeeded (submitted_at not reset)");
+  // respond window is anchored on stable_at_2 (not submitted_at_2): lock set
+  // stable_at_2, and the challenge+respond above both ran inside stable_at+3600,
+  // matching the finalize failure sweep's window exactly.
   // finalize h2 clean (no challenge) to keep chain healthy for later tests
   await network.timetravel({ shift: '3600s' });
   await trigger(alice, { finalize: 1, height: 2 });
