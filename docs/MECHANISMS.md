@@ -574,13 +574,13 @@ unit）；新候选须附 ≥ 60 000 bytes（10 000 bounce 余量 +
 50 000 `SUBMIT_BOND_NET`）。
 **单候选门**：未冻结且 `active_bond_<h>` 已在位 → 一律
 bounce('height taken')（含在任者自由重发）；frozen==1 时仅原 bond 持有人
-可复读同一份 state_root（respond-by-resubmit），冒充者
-bounce('not operator')。
+可复读**同一份 `state_root` + `aa_forest`**（respond-by-resubmit），冒充者
+或森林不一致均 bounce('not operator')。
 
-副作用：写候选三元组 + active_bond_<h> + submitted_at_h（仅首交写入，
-不可被覆盖——600s 钟等待且只等待这一笔组合单元）+
-**da_unit_<h> = 该组合单元的 unit hash**（根与数据包的 DA 绑定）；
-竞速判定（§11）。
+副作用：首交才写入候选三元组 + active_bond_<h> + submitted_at_h +
+**da_unit_<h> = 该组合单元的 unit hash**（根与数据包的 DA 绑定，600s 钟仅等待该单元）；
+frozen==1 应诉仅解冻（frozen=0）+ 没收挑战 bond（bond_<challenger>=0），**不改** `da_unit_` /
+`submitted_at_` / 候选根 / fee_winner，不另收 50k 押金；竞速判定见 §11。
 
 ### 10.2 lock(h)
 
@@ -600,17 +600,19 @@ root 已锁 ∧ 未冻结 ∧ now < stable_at_h + 3600 ∧ 输出 ≥ 20000 base
 
 无独立触发器：operator 通过**重发同一根**应诉（submit 路径内识别）。
 身份门：`trigger.address == var['active_bond_' || h]`（frozen==1 期间恒
-等于现任候选人）∧ 窗口内 ∧ 重发根一致 → 解冻，没收 bond_<challenger>
-记录的恰好数额并清零（归 AA 库）。
+等于现任候选人）∧ 窗口内 ∧ `state_root` 与 `aa_forest` 均与候选一致 → 解冻，
+没收 bond_<challenger> 记录的恰好数额并清零（归 AA 库）。应诉**不改**
+`da_unit_` / `submitted_at_` / `cand_root_` / `cand_aa_root_` / `fee_winner_`，
+不重置 600s/escape 计时，不另收 50k 提交押金（仅需 10000 bounce 余量）；
+偷换森林或冒充者均 bounce('not operator')。
 
-已知边界：应诉只校验重发根一致，不能证明根正确——真欺诈 operator
+已知边界：应诉只校验重发根一致（现校验 `state_root` + `aa_forest` 全量），不能证明根正确——真欺诈 operator
 重复自己的假根即可通过。完整方案需要链上重放或有效性证明（README
 Limitations #1）。
 
 ### 10.5 finalize / escape_finalize(h)
 
 `{finalize}` 与 `{escape_finalize: 1}` 共用同一处理分支：
-
 ```
 失败路: frozen_h == 1 ∧ 已超窗（operator 未应诉）
         → frozen_h = 2（永久）、root_/aa_root_/active_bond_ 清零、
