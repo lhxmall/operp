@@ -81,7 +81,11 @@ pub enum WatchError {
 pub trait HubClient {
     /// Read a single AA state variable. `Ok(Some(value))` when set,
     /// `Ok(None)` when the var is absent, `Err` on transport failure.
-    fn get_aa_state_var(&self, address: &str, key: &str) -> Result<Option<serde_json::Value>, String>;
+    fn get_aa_state_var(
+        &self,
+        address: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, String>;
     /// Fetch a unit/joint by its hash as the hub returns it.
     fn get_joint(&self, unit_hash: &str) -> Result<serde_json::Value, String>;
 }
@@ -127,8 +131,8 @@ pub fn fetch_da_unit<H: HubClient>(
 /// `da_unit_<h>` must be exactly the joint we fetched (`get_unit_hash`).
 /// `validate_against` separately proves the root points at this data package.
 pub fn verify_da_binding(da: &DaUnit) -> Result<(), WatchError> {
-    let recomputed = obyte_hash::get_unit_hash(&da.joint)
-        .map_err(|e| WatchError::BindingMismatch(e))?;
+    let recomputed =
+        obyte_hash::get_unit_hash(&da.joint).map_err(|e| WatchError::BindingMismatch(e))?;
     let recomputed_hex = hex::encode(recomputed);
     if recomputed_hex != da.unit_hash {
         return Err(WatchError::BindingMismatch(format!(
@@ -250,10 +254,18 @@ fn units_from_data(data: &serde_json::Value) -> Result<Vec<Unit>, SettleError> {
         }
         let op: Op = serde_json::from_value(u.get("op").cloned().ok_or(SettleError::Replay)?)
             .map_err(|_| SettleError::Replay)?;
-        let pubkey = hex_to_32(&u.get("pubkey").and_then(|v| v.as_str()).ok_or(SettleError::Replay)?)
-            .map_err(|_| SettleError::Replay)?;
-        let sig = hex_to_64(&u.get("sig").and_then(|v| v.as_str()).ok_or(SettleError::Replay)?)
-            .map_err(|_| SettleError::Replay)?;
+        let pubkey = hex_to_32(
+            &u.get("pubkey")
+                .and_then(|v| v.as_str())
+                .ok_or(SettleError::Replay)?,
+        )
+        .map_err(|_| SettleError::Replay)?;
+        let sig = hex_to_64(
+            &u.get("sig")
+                .and_then(|v| v.as_str())
+                .ok_or(SettleError::Replay)?,
+        )
+        .map_err(|_| SettleError::Replay)?;
         units.push(Unit {
             parents,
             op,
@@ -331,7 +343,11 @@ mod tests {
     }
 
     impl HubClient for MockHub {
-        fn get_aa_state_var(&self, _addr: &str, key: &str) -> Result<Option<serde_json::Value>, String> {
+        fn get_aa_state_var(
+            &self,
+            _addr: &str,
+            key: &str,
+        ) -> Result<Option<serde_json::Value>, String> {
             Ok(self.vars.get(key).cloned())
         }
         fn get_joint(&self, unit_hash: &str) -> Result<serde_json::Value, String> {
@@ -378,7 +394,10 @@ mod tests {
 
     #[test]
     fn fetch_da_unit_missing_returns_none() {
-        let hub = MockHub { vars: Default::default(), joints: Default::default() };
+        let hub = MockHub {
+            vars: Default::default(),
+            joints: Default::default(),
+        };
         assert!(fetch_da_unit(&hub, "vault", 9).unwrap().is_none());
     }
 
@@ -387,7 +406,12 @@ mod tests {
         // A joint's recomputed unit hash will not equal a bogus recorded hash.
         let data = serde_json::json!({"height": 1});
         let joint = joint_with(&data, "bogus-hash");
-        let da = DaUnit { height: 1, unit_hash: "bogus-hash".to_string(), data, joint };
+        let da = DaUnit {
+            height: 1,
+            unit_hash: "bogus-hash".to_string(),
+            data,
+            joint,
+        };
         // get_unit_hash over a minimal joint may error or produce a hash that
         // differs from "bogus-hash"; either way it must not return Ok.
         assert!(verify_da_binding(&da).is_err());
@@ -398,7 +422,7 @@ mod tests {
     use operp_dag::{genesis_id, sign_unit, unit_id, Op};
     use operp_settle::Batch;
     use operp_types::{
-        account_id_from_pubkey, BTC_USD, OrderType, PRICE_SCALE, QTY_SCALE, Side, TimeInForce,
+        account_id_from_pubkey, OrderType, Side, TimeInForce, BTC_USD, PRICE_SCALE, QTY_SCALE,
         USD_SCALE,
     };
 
@@ -409,12 +433,16 @@ mod tests {
             .insert(BTC_USD, operp_types::genesis_params());
         // Pre-fund the two accounts so a deposit-free Place batch passes intake.
         let mut a = operp_state::Account::new(account_id_from_pubkey(
-            &SigningKey::from_bytes(&[1u8; 32]).verifying_key().to_bytes(),
+            &SigningKey::from_bytes(&[1u8; 32])
+                .verifying_key()
+                .to_bytes(),
         ));
         a.collateral = 10_000 * USD_SCALE as i128;
         eng.state.accounts.insert(a.id, a);
         let mut b = operp_state::Account::new(account_id_from_pubkey(
-            &SigningKey::from_bytes(&[2u8; 32]).verifying_key().to_bytes(),
+            &SigningKey::from_bytes(&[2u8; 32])
+                .verifying_key()
+                .to_bytes(),
         ));
         b.collateral = 10_000 * USD_SCALE as i128;
         eng.state.accounts.insert(b.id, b);
@@ -427,8 +455,10 @@ mod tests {
         let g = genesis_id();
         let alice = [1u8; 32];
         let bob = [2u8; 32];
-        let alice_id = account_id_from_pubkey(&SigningKey::from_bytes(&alice).verifying_key().to_bytes());
-        let bob_id = account_id_from_pubkey(&SigningKey::from_bytes(&bob).verifying_key().to_bytes());
+        let alice_id =
+            account_id_from_pubkey(&SigningKey::from_bytes(&alice).verifying_key().to_bytes());
+        let bob_id =
+            account_id_from_pubkey(&SigningKey::from_bytes(&bob).verifying_key().to_bytes());
         let mut applied = Vec::new();
         let mut tip = g;
 
@@ -436,7 +466,16 @@ mod tests {
         let qty = QTY_SCALE;
         let ask = sign_unit(
             vec![tip],
-            Op::Place { account: bob_id, market: BTC_USD, side: Side::Ask, typ: OrderType::Limit, tif: TimeInForce::Gtc, price: px, qty, client_seq: 1 },
+            Op::Place {
+                account: bob_id,
+                market: BTC_USD,
+                side: Side::Ask,
+                typ: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: px,
+                qty,
+                client_seq: 1,
+            },
             &bob,
         );
         tip = unit_id(&ask);
@@ -445,7 +484,16 @@ mod tests {
 
         let bid = sign_unit(
             vec![tip],
-            Op::Place { account: alice_id, market: BTC_USD, side: Side::Bid, typ: OrderType::Limit, tif: TimeInForce::Gtc, price: px, qty, client_seq: 1 },
+            Op::Place {
+                account: alice_id,
+                market: BTC_USD,
+                side: Side::Bid,
+                typ: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: px,
+                qty,
+                client_seq: 1,
+            },
             &alice,
         );
         tip = unit_id(&bid);
@@ -458,7 +506,12 @@ mod tests {
         if tamper_root {
             data["state_root"] = serde_json::json!(hex::encode([0xAAu8; 32]));
         }
-        DaUnit { height: batch.checkpoint.height, unit_hash: String::new(), data, joint: serde_json::Value::Null }
+        DaUnit {
+            height: batch.checkpoint.height,
+            unit_hash: String::new(),
+            data,
+            joint: serde_json::Value::Null,
+        }
     }
 
     #[test]

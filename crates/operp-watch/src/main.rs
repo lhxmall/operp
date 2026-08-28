@@ -73,7 +73,9 @@ impl HttpHubClient {
             body.len(),
             body
         );
-        stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|e| e.to_string())?;
 
         let mut resp = Vec::new();
         stream.read_to_end(&mut resp).map_err(|e| e.to_string())?;
@@ -106,7 +108,11 @@ impl HttpHubClient {
 }
 
 impl HubClient for HttpHubClient {
-    fn get_aa_state_var(&self, address: &str, key: &str) -> Result<Option<serde_json::Value>, String> {
+    fn get_aa_state_var(
+        &self,
+        address: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
         let result = self.rpc("getAaStateVars", serde_json::json!([address, key]))?;
         match result {
             serde_json::Value::Null => Ok(None),
