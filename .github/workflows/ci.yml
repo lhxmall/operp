@@ -38,9 +38,10 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
-    # 完整 devnet E2E 要编 rocksdb/sqlite3（~5-8 分钟），只在 push 到 main 跑，PR 上可手动触发
-    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    # Full devnet E2E compiles rocksdb/sqlite3 (~5-8 min). Runs on every push
+    # AND on PRs so a broken AA/test pairing is caught BEFORE merging to main.
     timeout-minutes: 20
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v7
         with:

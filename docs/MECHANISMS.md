@@ -540,25 +540,20 @@ AA 只能做字符串拼接与 sha256——它无法解析 i128 LE、无法遍�
 
 ## 10. vault AA 状态机
 
-AA 地址上的状态变量（`<h>` 为高度数字后缀）：
+AA 地址上的状态变量（`<h>` 为高度数字后缀，对应 `obyte-local/agents/operp_vault.aa:46-78`）：
 
 ```
 boot, chain_id='operp-mvp-1', last_locked, last_finalized
-submitted_at_h, cand_root_h, cand_aa_root_h, cand_prev_h,
-  cand_fills_h, cand_who_h                    # 候选（lock 前可替换）
-active_bond_<h>                              # 现任候选的 50000-byte 提交
-                                             # 债券持有人地址（被替换者的
-                                             # 债券转入 sbond_<old>）
-root_h, aa_root_h, stable_at_h               # 已锁定；aa_root_ 存 1024-hex
-                                             # 分片森林
+submitted_at_h, cand_root_h, cand_aa_root_h, da_unit_h  # 单一候选（首个稳定组合单元胜出；
+                                                         # 后续 submit bounce 'height taken'）
+                                                         # DA 绑定：da_unit_h = 该组合单元 hash
+active_bond_h                              # 现任候选的 50000-byte 提交债券持有人
+fee_winner_h, reward_<addr>, sbond_<addr>, slash_reward_<addr>
+root_h, aa_root_h, stable_at_h            # 已锁定；aa_root_ 存 1024-hex 分片森林；stable_at 锚定挑战窗
 frozen_h ∈ {∅/0=正常, 1=已挑战, 2=永久失败}
-challenger_h, bond_<addr>, fee_winner_h,
-reward_<addr>, sbond_<addr>(可回收提交债券),
-slash_reward_<addr>(罚没分成, {claim:"slash"} 领取),
-wd_<h>_<addr>                                # 抵押提款累计标记（防证明重放）
-wp_<h>_<addr>                                # PERP 提款累计标记（语义与 wd_ 对称）
-pperp_<addr>                                 # PERP 入账镜像：{deposit_perp} 触发把
-                                             # 资产支付记入 trigger.address 名下
+challenger_h, bond_<addr>, bond_height_<addr>
+wd_<addr>, wp_<addr>                      # 全局累计提款标记（跨高度共享，防证明重放）
+pperp_<addr>                               # PERP 入账镜像：{deposit_perp} 触发把资产支付记入 trigger.address 名下
 ```
 `pperp_` 是对账镜像（键与 `wd_`/`wp_` 同为 trigger.address），**不是**支付
 上限——提款权威始终是已证明叶子的 perp 值；不设上限是为了不搁浅从未经过
@@ -590,25 +585,20 @@ frozen==1 应诉仅解冻（frozen=0）+ 没收挑战 bond（bond_<challenger>=0
 → root/aa_forest/winner/stable_at 落定，last_locked = h。锁后不可变。
 
 600s 是 OBYTE_STABILITY_SECS 的模拟（devnet 用 timetravel 测试）。
+### 10.3 challenge(h)（对应 `obyte-local/agents/operp_vault.aa:228-252`）
 
-### 10.3 challenge(h)
+仅已锁定高度可被挑战（`h ≤ last_locked ∧ root_h 存在 ∧ stable_at_h 存在`）∧ 未冻结 (`frozen==0`) ∧ `now < stable_at_h + 3600` (`CHALLENGE_SECS` 自 `stable_at` 起算) ∧ 输出 ≥ 20000 base（含 bounce 费）∧ 无 outstanding bond
+→ frozen_h = 1，记录 challenger，收 bond。未 lock 的 `last_locked+1` 不可被挑战（走正常 submit/lock 路径，无法预 freeze）。
 
-root 已锁 ∧ 未冻结 ∧ now < stable_at_h + 3600 ∧ 输出 ≥ 20000 base
-→ frozen_h = 1，记录 challenger，收 bond。
-
-### 10.4 respond(h)
+### 10.4 respond(h)（对应 `obyte-local/agents/operp_vault.aa:161-168`）
 
 无独立触发器：operator 通过**重发同一根**应诉（submit 路径内识别）。
 身份门：`trigger.address == var['active_bond_' || h]`（frozen==1 期间恒
-等于现任候选人）∧ 窗口内 ∧ `state_root` 与 `aa_forest` 均与候选一致 → 解冻，
+等于现任候选人）∧ `now < stable_at_h + 3600` ∧ `state_root` 与 `aa_forest` 均与候选一致 → 解冻，
 没收 bond_<challenger> 记录的恰好数额并清零（归 AA 库）。应诉**不改**
 `da_unit_` / `submitted_at_` / `cand_root_` / `cand_aa_root_` / `fee_winner_`，
 不重置 600s/escape 计时，不另收 50k 提交押金（仅需 10000 bounce 余量）；
 偷换森林或冒充者均 bounce('not operator')。
-
-已知边界：应诉只校验重发根一致（现校验 `state_root` + `aa_forest` 全量），不能证明根正确——真欺诈 operator
-重复自己的假根即可通过。完整方案需要链上重放或有效性证明（README
-Limitations #1）。
 
 ### 10.5 finalize / escape_finalize(h)
 
@@ -755,7 +745,7 @@ ingest → Applied{status: Optimistic}     # 立即执行、立即成交
 - 无第三方安全审计；Oscript 复杂度门恰在上限 **85/100**
   （ops 1086/2000，`node tools/check_aa_complexity.js`），后续任何 AA
   改动必须先腾出等额预算
-
+- 独立 watcher（`crates/operp-watch`）尚未以独立密钥部署，互相牵制未跑通前不对外宣称已具备
 ---
 
 ## 15. PERP 治理

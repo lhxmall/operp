@@ -7,8 +7,7 @@
 	// single source of truth; Oscript cannot include them):
 	//   'operp-mvp-1'  -> CHAIN_ID
 	//   600           -> OBYTE_STABILITY_SECS (lock stability window)
-	//   3600          -> CHALLENGE_SECS (challenge window before finalize)
-	//   10000         -> BOUNCE_FEES base (deducted from trigger outputs)
+	//   3600          -> CHALLENGE_SECS (challenge window before finalize; counts from stable_at (post-lock))
 	//   20000         -> challenge bond minimum incl. bounce fee headroom
 	//   50000         -> SUBMIT_BOND_NET (submit bond locked per candidate height)
 	//   16            -> MAX_AA_TREE_DEPTH (per-shard withdraw proof depth; Rust mirrors 16)
@@ -163,7 +162,7 @@
 							OR trigger.data.state_root != var['cand_root_' || $h]
 							OR trigger.data.aa_forest != var['cand_aa_root_' || $h])
 							bounce('not operator');
-						if (timestamp >= var['submitted_at_' || $h] + 3600)
+						if (timestamp >= (var['stable_at_' || $h] otherwise 0) + 3600)
 							bounce('response window closed');
 					}
 					// New combined unit needs base >= 60000: 10000 bounce
@@ -229,14 +228,10 @@
 				if: "{trigger.data.challenge}",
 				init: "{
 					$h = trigger.data.height;
-					if (!$h OR $h > (var['last_locked'] otherwise 0) + 1)
-						bounce('bad height');
-					if (var['frozen_' || $h] OR timestamp >= var['submitted_at_' || $h] + 3600)
-						bounce('challenge not possible');
-					if ((var['bond_' || trigger.address] otherwise 0) > 0)
-						bounce('outstanding bond');
-					if (trigger.output[[asset=base]] - 10000 < 10000)
-						bounce('bond too small');
+					if (!$h OR $h > (var['last_locked'] otherwise 0)) bounce('bad height');
+					if (var['frozen_' || $h] OR timestamp >= (var['stable_at_' || $h] otherwise 0) + 3600) bounce('challenge not possible');
+					if ((var['bond_' || trigger.address] otherwise 0) > 0) bounce('outstanding bond');
+					if (trigger.output[[asset=base]] - 10000 < 10000) bounce('bond too small');
 				}",
 				messages: [
 					{

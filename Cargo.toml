@@ -9,6 +9,7 @@ members = [
   "crates/operp-exec",
   "crates/operp-settle",
   "crates/operp-gossip",
+  "crates/operp-watch",
 ]
 
 [workspace.package]
