@@ -38,11 +38,10 @@ cd obyte-local && node deploy_testnet.js   # 把 vault AA 部署到 Obyte 测试
                                      ▼
                     ┌─────────────────────────────────────────────┐
                     │         OBYTE VAULT AA（Oscript）           │
-                    │  submit   → 单候选（首个稳定组合单元胜出；da_unit 钉死；height taken；frozen==1 应诉）│
+                    │  submit   → 单候选（首个稳定组合单元胜出；钉死 da_unit；占用窗内 height taken，OCCUPANCY_SECS 后可替换）│
                     │  lock     → 600s 稳定窗后锁定（钟只设一次）               │
-                    │  challenge → 仅已 lock 高度可冻（stable_at+3600；bond ≥ 20000）│
-                    │  resubmit → 原 bond 持有人应诉（解冻；不改 da_unit/钟/不另收 50k）│
-                    │  finalize → 根成为提款依据                  │
+                    │  challenge → 仅已 lock 高度可挑战（h ≤ last_locked；bond ≥ 1e12）；挑战立即判定失败并重开 │
+                    │  finalize → 仅干净路径；根成为提款依据       │
                     │  withdraw → 针对 aa_root 的 Merkle 证明     │
                     └─────────────────────────────────────────────┘
 ```
@@ -157,39 +156,40 @@ operator。
 每个高度 *h* 的生命周期：
 
 1. **submit** — operator 发布**一笔组合单元**：OIP-0007 `temp_data` 加
-   `{height: h, prev_state_hash, state_root, aa_root}` data 消息，附 ≥ 60 000
-   bytes：10 000 bounce 余量加 **50 000-byte `SUBMIT_BOND_NET`**。高度必须
-   等于 `last_locked + 1`（frozen==1 应诉例外见下）；前根必须匹配；三个哈希
-   字段各恰 64 hex，`aa_forest` 恰 1024 hex。高度**单候选**：首个稳定组合
-   单元胜出，AA 记下 `da_unit_<h>` = 该 unit hash（根钉死在这份数据包上）；
-   此后该高度任何 submit 一律 bounce `height taken`，直到 finalize 或失败。
-   600 s 稳定钟由胜出 submit 设一次，不可重置。
+   `{height: h, prev_state_hash, state_root, aa_root}` data 消息，附
+   ≥ 1 000 000 001 000 bytes：10 000 bounce 余量加 **1 000 000 000 000-byte
+   `SUBMIT_BOND_NET`**（1000 GBYTE）。高度必须等于 `last_locked + 1`；前根
+   必须匹配；三个哈希字段各恰 64 hex。高度**单候选 + 占用超时**：首个稳定
+   组合单元胜出，AA 记下 `da_unit_<h>` = 该 unit hash（根钉死在这份数据包上）；
+   占位者仍存活（已锁，或在 `OCCUPANCY_SECS` = 3600 s 替换窗内）时后续
+   submit 一律 `height taken`；超时后不同 operator 可用新的组合 submit 重新
+   占位，被驱逐者的债券被覆盖（不退还）。600 s 稳定钟由胜出 submit 设一次，
+   不可重置。
+
 2. **lock** — 仅在 600 s 稳定窗（`OBYTE_STABILITY_SECS`）之后、且候选的
-   提交债券持有人记录（`active_bond_<h>`）在位时允许：失败 finalize 会
-   没收并清零该记录，故被回滚的高度在新的带债券 submit 重建候选之前无法
-   re-lock。锁定会清除此前的永久失败标记，挑战失败（`frozen = 2`）的高度
-   靠重新提交恢复而不是卡死链条。锁定后的根不可变。`stable_at_<h>` 在
-   lock 时写入，是挑战窗、应诉窗、finalize/失败扫荡窗的**同一原点**
-   （一律 `stable_at+3600`）。
+   提交债券持有人记录（`active_bond_<h>`）在位时允许。锁定会清除此前的永久
+   失败标记，挑战失败（`frozen = 2`）的高度靠重新提交恢复而不是卡死链条。
+   锁定后的根不可变。`stable_at_<h>` 在 lock 时写入，是挑战与 finalize 窗的
+   **同一原点**（一律 `stable_at+3600`）。
+
 3. **challenge** — `stable_at_<h>` 起 3600 s 内（post-lock；`CHALLENGE_SECS`
-   从 `stable_at` 起算），任何人可以 ≥ 20 000 byte 债券冻结**已锁定**高度
-   *h*（`h ≤ last_locked`，`stable_at_<h>` 已在）；未 lock 的
-   `last_locked+1` 不可被挑战——走正常 `submit/lock`，无法预 freeze。有在途
-   债券者不可开第二枪，被挑战高度仍冻结时 `{claim: "bond"}` 拒绝支付。
-4. **respond（重发应诉）** — 无独立 respond 触发器：原 bond 持有人在
-   `stable_at+3600` 内重发**同一份 `state_root` + `aa_forest`**（单候选门
-   唯一放行的重提交；不创建新 `da_unit_<h>`、不重置 600 s / escape 钟、
-   **不另收 50k**——只需 10000 bounce 余量）。成功则解冻并没收记录在案的
-   挑战者债券（两个账本键清零）；冒充者或森林不一致 bounce `not operator`。
-   无人应诉超窗后，finalize 将高度标记永久失败（`frozen = 2`）、清根、
-   `last_locked` 回滚到 h−1、没收提交债券——**50/50 劈半**：一半计入
-   挑战者的 `{claim: "slash"}`，一半留在金库烧毁；失败扫荡清掉
-   `active_bond_<h>` 以便新组合单元重新占位；挑战者另经 `{claim: "bond"}`
-   取回自己的债券。
-5. **finalize** — 干净度过 `stable_at+3600` 窗口后根成为提款依据
-   （`last_finalized`），严格按高度顺序；提交债券释放给持有人，首个稳定
-   提交者累积 20 000-byte 竞速奖励（`{claim: "reward"}` 一次性支付并清零
-   账本）。
+   从 `stable_at` 起算），任何人可以 ≥ 1 000 000 000 000 byte 债券（净；
+   gross `1e12+10000`）挑战**已锁定**高度 *h*（`h ≤ last_locked`，
+   `stable_at_<h>` 已在）；未 lock 的高度（`last_locked+1`）不可挑战
+   （`bad height`）。有在途债券者不可开第二枪。**挑战由 AA 立即判定**：它把
+   候选永久判为失败（`frozen = 2`、清根、`last_locked` 回滚到 `h-1`），把
+   一半提交债券（`SUBMIT_BOND_SLASH_HALF` = 500 000 000 000）计入挑战者的
+   `slash_reward_<addr>`，清掉 `active_bond_<h>` / `cand_aa_root_<h>` /
+   `fee_winner_<h>`，并重开 `h` 供新的 1000-GBYTE 首个稳定提交占用。
+   **挑战金被烧毁**——从不计入 `bond_<challenger>`，故真实挑战后
+   `{claim:"bond"}` 弹回 `nothing claimable`；挑战者唯一奖励是罚没的一半。
+   **没有应诉重发，也没有应诉窗口。**
+
+4. **finalize** — 干净度过 `stable_at+3600` 窗口后根成为提款依据
+   （`last_finalized`），严格按高度顺序；提交债券释放给持有人
+   （`sbond_<addr> += 1e12`），首个稳定提交者累积 20 000-byte 竞速奖励
+   （`{claim: "reward"}` 一次性支付并清零）。被挑战的高度不会走到干净路径——
+   挑战分支已把它判为失败；**没有 `frozen==1` 失败扫荡**。
    - 提款携带 `{amount, withdrawn, leaf_account, collateral, perp, shard,
      proof[], perp_amount?}`；
    - `perp_amount`（可选）声明少于全部未领 PERP 余额——纯抵押退出不再
@@ -211,24 +211,20 @@ operator。
    余额权威是**证明叶子**，不是可变 AA 变量。
 6. **逃生舱** — 若 finalization 彻底停摆（operator 全部消失），
    `{escape_finalize: 1}` 在 `ESCAPE_STALL_SECS` 后（主网 7 天、devnet
-   timetravel；任意调用者；绝不越过 live challenge——frozen 高度必须走
-   正常失败清扫以退还挑战者）停滞最终化最老的锁定高度；
-   `{escape_withdraw: 1, ...claim 字段}` 在 `h = last_finalized + 1` 从未
-   锁定或已被 `frozen = 2` 回滚时，针对**陈旧候选**的森林支付证明。两条
-   入口共享 withdraw 路径的 `wd_`/`wp_` 防重放键。按 doc07 §4 豁免，
-   escape_finalize 只做本地停滞门。
+   timetravel；任意调用者；绝不越过挑战——冻结高度已被挑战分支判为失败）
+   停滞最终化最老的锁定高度。`{escape_withdraw}` **已移除**：从未锁定的
+   候选不能被提款，弹回 `no escape withdraw`。`escape_finalize` 共享
+   withdraw 路径的 `wd_`/`wp_` 防重放键。按 doc07 §4 豁免，escape_finalize
+   只做本地停滞门。
 
-时钟原点——3600 s 窗口只有**一个**原点（`stable_at`），从不看 `submitted_at`：
+时钟原点——3600 s 窗口只有**一个**原点（`stable_at`），从不看 `submittedat`：
 
 | 门 | 原点 | 时长 |
 |---|---|---|
-| lock | `submitted_at_<h>` | 600 s（`OBYTE_STABILITY_SECS`） |
-| challenge / respond / finalize / 失败扫荡 | `stable_at_<h>` | 3600 s（`CHALLENGE_SECS`） |
-| escape_finalize | `stable_at_<h>` | 604800 s（`ESCAPE_STALL_SECS`） |
-| escape_withdraw（候选停滞） | `submitted_at_<h>` | 604800 s |
-| escape_withdraw（链条停滞） | `stable_at_<last_finalized>` | 604800 s |
-
-证明由 `crates/operp-settle/examples/gen_withdraw_proof.rs` 离线生成
+| lock | `submitted_at_h` | 600 s（`OBYTE_STABILITY_SECS`） |
+| challenge / finalize | `stable_at_h` | 3600 s（`CHALLENGE_SECS`） |
+| 占用超时（未锁定替换） | `submitted_at_h` | 3600 s（`OCCUPANCY_SECS`） |
+| escape_finalize | `stable_at_h` | 604800 s（`ESCAPE_STALL_SECS`） |
 （JSON 供 JS 工具链消费）。
 
 刻意**没有 owner key**：升级意味着部署新 AA 并经由同样的 finalized-root
@@ -249,6 +245,7 @@ obyte-local/
                          （data_hash/aa_shard_roots/chain_id）只是自检，
                          不是独立 watcher——互相牵制需要单独的
                          `crates/operp-watch` 二进制与自己的密钥。
+  post_challenge.js      watcher 挑战广播 CLI（`OPERP_WATCH_MNEMONIC`）
   gen_withdraw_proof     见 crates/operp-settle/examples
 vendor/aa-testkit/       Obyte autonomous-agent testkit（vendored）
 docs/PROTOCOL.md         协议设计叙事
@@ -301,38 +298,34 @@ cd obyte-local && node post_batch.js
 当前代码达到“可部署 Obyte 测试网”标准，**尚未达到主网标准**。已知缺口
 （按优先级大致排序）：
 
-1. **活着的说谎 operator 复读同一份假根即可确认。**
-   挑战不验证根。`{challenge}` 只冻已 lock 高度（`h ≤ last_locked`，
-   `stable_at+3600`，债券 ≥ 20 000 bytes）。应诉（frozen==1 时走 submit）
-   只验 `trigger.address == active_bond_<h>` 且 `state_root`/`aa_forest`
-   与已锁候选相同——然后解冻并没收挑战者债券。活着的作恶者把**同一份
-   假森林**再发一次，诚实 watcher 被罚，`stable_at+3600` 后这份森林成为
-   提款依据。单候选（`height taken`）同时禁止同一高度的诚实根竞争，
-   接管只发生在 frozen=2，而这要求说谎者**不应诉**。关掉在任者清钟
-   （#7）的同时把诚实替换路径也关了。
-   同一结构上的其余洞：
+1. ~~**活着的说谎 operator 复读同一份假根即可确认。**~~
+   **已关闭（challenge-reopen）。** 对已锁定高度的挑战由 AA **立即判定**：
+   失败该高度（`frozen = 2`、清根、`last_locked` 回滚到 `h-1`），把
+   `SUBMIT_BOND_SLASH_HALF`（500 000 000 000）计入挑战者的
+   `slash_reward_<addr>`，并重开 `h` 供新的 1000-GBYTE 首个稳定提交占用。
+   **没有应诉重发**：活着的说谎者无法再用同一份假森林应诉——挑战当场杀掉
+   候选，不同 operator 重新占位。挑战金被烧毁（从不计入 `bond_`），挑战者
+   唯一奖励是罚没的一半。`operp-watch` 现在通过 `post_challenge.js` 在链上
+   广播 `{challenge:1}`（窗口内 ROOT/BINDING 不匹配或缺 `temp_data`）。
+   仍未关闭的洞：
    - `da_unit_<h>` 只记 `trigger.unit`，AA 不读 `temp_data`；只交根的
-     unit 照样赢高度。
-   - 未 lock 的候选不可被挑战。`ESCAPE_STALL_SECS`（7 天）后
-     `{escape_withdraw}` 针对 `cand_aa_root_(last_finalized+1)` 出门，
-     不经过 lock 或挑战。
-   - 提交/挑战债券是 50 000 / 20 000 **bytes**（0.00005 / 0.00002
-     GBYTE）——相对金库存款是灰尘。
-   充值 joint 只在链下 `validate_against` 里核。`operp-watch` 只打日志
-   `ROOT MISMATCH … should challenge`，不广播 `{challenge:1}`。接上
-   独立 watcher 密钥也修不了应诉复读。
+     unit 照样赢高度（由 watcher 强制挑战）。
+   - 未 lock 的候选不可被挑战（`bad height`）；占用超时
+     （`OCCUPANCY_SECS` = 3600 s）后可被替换。
+   - 充值 joint 只在链下 `validate_against` 与 watcher 的
+     `DepositEvidence` 重放失败路径核。
 2. **资金费质量受价格锚限制。** 资金费保持 mark-premium 模型（±50 bps/tick
    封顶）。默认 `BondedMedianTwap` index 来自债券报价者价格；外部锚接线已经
    落地（`Op::UpdateExternalPrice`，tag 17，白名单门控，
    `AggregatedExternal` 模式带过期回退 外部 TWAP → 债券中位数 TWAP →
    即时中位数），但只有在治理切换模式且白名单 keeper 持续喂价后才真正生效。
 3. **预言机操纵需要债券多数。** 报价无许可、只需 50 000 PERP 债券；
-   TWAP 连续偏移罚没已经落地（激活门控），但合谋的债券多数仍能在两次罚没
+   TWAP 连续偏移罚没已经落地（高度 0 起生效），但合谋的债券多数仍能在两次罚没
    之间偏置中位数 mark；TWAP 只是平滑而非消除。
 4. **默认执行序是 UnitId 字典序、可磨队**（插队 MEV）。v2 commit-reveal
    已叠加落地（`Op::Commit`/`Op::Reveal`，tag 18/19，TTL 16 高度、每账户
    8 个存活 commit、`reveal_commit_hash = sha256(op_bytes ‖ salt)`），但与其
-   他 v2 路径一样激活门控——激活高度翻转之前排序不变。费率竞速与确定性
+   他 v2 路径现已高度 0 生效。费率竞速与确定性
    撮合无论何时都在压缩磨队可榨取的空间。
 5. **孤儿驱逐在副本间留下瞬时分叉窗口。** 驱逐盐按 `(finalized_root,
    epoch)` 每 epoch 轮换，但观测到 finalize 的时刻不同的副本在收敛前可能
@@ -344,11 +337,10 @@ cd obyte-local && node post_batch.js
 7. ~~**在任 operator 免费重启稳定计时器。**~~
    **已关闭**（组合 da_unit）：submit 单候选——首个稳定的组合
    `temp_data`+submit 单元赢得高度，AA 把 `da_unit_<h>` 钉在其上，其余
-   submit 一律 bounce `height taken`（仅 frozen==1 时原 bond 持有人的
-   应诉重提交能过，且不碰钟）。不存在在任者免费清钟。
-   **代价：** 同一门把该高度的诚实竞争根也挡在门外——见 #1。
-8. AA 未做正式安全审计。Oscript 复杂度门恰在其上限（**85/100**，ops
-   1101/2000——运行 `node tools/check_aa_complexity.js`），后续任何改动
+   submit 一律 bounce `height taken`（占用超时窗内——见 #1）。不存在在任者免费清钟。
+   **代价：** 同一门把该高度的诚实竞争根也挡在门外——占用窗内见 #1。
+8. AA 未做正式安全审计。Oscript 复杂度门当前 **76/100**（ops
+   976/2000——运行 `node tools/check_aa_complexity.js`），后续任何改动
    都必须先腾出等额预算。
 9. **重放去重窗口按高度有界**——旧版 256 高度，`state.height ≥
    REPLAY_ACTIVATION_HEIGHT`（1 000 000；部署期翻转）后扩展为
@@ -418,29 +410,29 @@ v2 扩展分期；偏差与延期积压见下）：
   为确定性字典序，盐仅用于孤儿驱逐——局限 #13）；**v2 叠加落地**：
   `Op::Commit`（tag 18）/ `Op::Reveal`（tag 19），TTL
   `COMMIT_TTL_HEIGHTS = 16`、每账户 ≤ 8 个存活 commit、
-  `reveal_commit_hash = sha256(inner_op_bytes ‖ salt)`，1 000 000 激活门控
+  `reveal_commit_hash = sha256(inner_op_bytes ‖ salt)`，高度 0 起生效
 - [x] **04 盐化孤儿驱逐 + WantUnits gossip** — `argmin sha256(salt‖unit_id)`，
   `Engine::note_finalized` 每 epoch 轮换盐
   （`sha256(ORDERING_SALT_DOMAIN ‖ root ‖ epoch_le)`）；**gossip 本轮落地**：
   新 `crates/operp-gossip`（WantUnits/HaveUnits、去抖扇出、请求/响应限额），
   纯 operator/P2P 层——传输载体按 doc OQ5 接线
 - [x] **05 预言机罚没 + TWAP** — 50k PERP 质押/解锁（256 高度排队）/罚没、
-  TWAP 环、500 bps ×3 连续采样双条件、`SlashOracle` tag 16、激活门控
-- [x] **06 资金费外部锚** — 资金 index 抽象 + 激活门早前已发；**本轮 operator
+  TWAP 环、500 bps ×3 连续采样双条件、`SlashOracle` tag 16、高度 0 起生效
+- [x] **06 资金费外部锚** — 资金 index 抽象 + 激活高度 0（创世即生效）；**本轮 operator
   接线落地**：`Op::UpdateExternalPrice`（tag 17）、来源白名单、
   `AggregatedExternal` 模式、过期回退 外部 TWAP → 债券中位数 TWAP →
   即时中位数（`FUNDING_EXTERNAL_MAX_STALENESS = 32`）
 - [x] **07 逃生舱** — **本轮落地**，为预算并入既有分支：`{escape_finalize: 1}`
   搭载 finalize 分支（任意调用者，`ESCAPE_STALL_SECS = 604800` 主网 /
-  3600 testnet），`{escape_withdraw: 1}` 搭载 withdraw 针对
-  `last_finalized + 1` 的陈旧候选森林；偏差（doc07 §4 豁免）：escape_finalize
+  3600 testnet)；`{escape_withdraw}` 已移除（弹回 `no escape withdraw`）；偏差（doc07 §4 豁免）：escape_finalize
+  只做本地停滞门
   只做本地停滞门
 - [x] **08 烧毁记账（Rust + checkpoint）** — `meta_leaf` 中 `perp_burned`，
   经 `Checkpoint.perp_burned` / `temp_data` 披露；AA 侧镜像变量为预算删除，
   `holdings−supply==burned` 保持 watcher 可验证
 - [x] **09 复杂度审计** — 单 sha256 折叠、统一 claim 分发（`claim:'kind'`）、
-  lock-merge 重构；探针：`node tools/check_aa_complexity.js`。当前 **85/100**
-  （ops 1101/2000）——恰在门槛
+  lock-merge 重构；探针：`node tools/check_aa_complexity.js`。当前 **76/100**
+  （ops 976/2000）——≤85 门以内
 - [x] **10 AA 树分片（v2）** — 本轮干净切换：单个 1024-hex `aa_forest` 变量 =
   16 个拼接的 shard 根（恰好命中 `MAX_STATE_VAR_VALUE_LENGTH`）、空 shard
   哨兵根、深度保持 16 → 每批约 100 万账户；doc 的 v1 depth-18 路径按其
@@ -456,8 +448,8 @@ v2 扩展分期；偏差与延期积压见下）：
 - **重放窗口 256→2048**：已实现但激活门控（`REPLAY_WINDOW`、
   `REPLAY_ACTIVATION_HEIGHT` 定在 1 000 000），现有测试保持旧版确定性。
   部署时翻转常量。
-- **逃生舱**：已落地（见 07）。respond 路径保持*重发应诉*——operator 重发
-  同一根应诉；冒充者在 submit init bounce `not operator`。
+- **逃生舱**：已落地（见 07）。respond 路径**已删除**——挑战立即判败高度（frozen=2、last_locked 回滚）并重开，
+  没有应诉重发，也没有 `not operator` 路径。
 - **Claim API 破坏性变更**：`{claim_reward|claim_bond|claim_submit_bond}`
   布尔字段替换为单一 `{claim: "reward"|"bond"|"sbond"|"slash"}`；
   `post_batch.js` / `test_vault_aa.js` 已同步迁移。
@@ -478,7 +470,7 @@ v2 扩展分期；偏差与延期积压见下）：
   上限、journal CRC + 物理截断、快照版本/回退、canonical-number 哈希规则、
   批次提交式 gov-nonce WAL（含 H2 回归）。
 - **AA 复杂度门（CI `js-checks`）**：`node obyte-local/tools/check_aa_complexity.js`
-  ——当前 **85/100**（ops 1101/2000），恰在 ≤85 CI 门上。同 job 还跑
+  ——当前 **76/100**（ops 976/2000），≤85 CI 门以内。同 job 还跑
   `golden_vector_check.js`。
 - **Golden vector（CI `js-checks`）**：`node obyte-local/golden_vector_check.js`
   打印固定输入（含 >2^53 的 `big` 字符串与 `eps: 0.001`）的 canonical
@@ -489,10 +481,7 @@ v2 扩展分期；偏差与延期积压见下）：
   pull request 都会跑。无 Visual Studio Build Tools 的 Windows 开发机
   仍编不过 vendored aa-testkit 的 `rocksdb`/`sqlite3`；完整生命周期以 CI
   为准，不在本机证明。
-- **Watcher 局限：** 独立 watcher crate（`crates/operp-watch`）已存在、可
-  离线重放 `da_unit_<h>`，但只打报警、不广播 `{challenge:1}`。即便接上
-  独立于 poster 的密钥，应诉复读同一份假根仍能打赢挑战（见局限 #1）。
-  互相牵制不对外宣称已具备。
+- **Watcher：** 独立 watcher crate（`crates/operp-watch`）离线重放 `da_unit_<h>`，并在窗口内 ROOT/BINDING 不匹配或缺 `temp_data` 时经 `post_challenge.js` 广播 `{challenge:1}`（需 `OPERP_WATCH_MNEMONIC`）；未设助记词仅打报警。互相牵制要求与 poster 分离的密钥。
 
 提交历史记录了本仓库经历的完整安全审计整改（proof 门控出金、存款白名单、
 溢出防护、市场白名单、严格签名、孤儿恢复、有界日志、keeper 奖励、坏账

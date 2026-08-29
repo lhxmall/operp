@@ -38,12 +38,11 @@ cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
                                      │ temp_data unit (batch data on-chain)
                                      ▼
                     │         OBYTE VAULT AA (Oscript)            │
-                    │  submit → single candidate (first stable combined unit wins; da_unit_<h> pinned; height taken; respond-by-resubmit) │
-                    │  lock    → after 600 s stability window (set once by winning submit; cannot be reset)     │
-                    │  challenge → freeze locked height only (stable_at+3600; bond ≥ 20000 bytes)    │
-                    │  resubmit → operator answers a challenge (unfreeze; no new da_unit/fee)│
-                    │  finalize → root becomes withdrawal basis   │
-                    │  withdraw → Merkle PROOF against aa_root    │
+                    │  submit → single candidate (first stable combined unit wins; da_unit_<h> pinned; height taken inside occupancy window, replaceable after OCCUPANCY_SECS) │
+                    │  lock    → after 600 s stability window (set once by winning submit)     │
+                    │  challenge → immediate reopen of a locked height only (h ≤ last_locked; bond ≥ 1e12 net); on success height fails & reopens │
+                    │  finalize → clean-only; becomes withdrawal basis        │
+                    │  withdraw → Merkle PROOF against aa_root               │
                     └─────────────────────────────────────────────┘
 ```
 
@@ -181,15 +180,20 @@ Lifecycle per height *h*:
 
 1. **submit** — operator posts ONE **combined unit** carrying the batch as
    OIP-0007 `temp_data` PLUS the `{height: h, prev_state_hash, state_root,
-   aa_root}` data message, with ≥ 60 000 bytes attached: 10 000 bounce
-   headroom plus a **50 000-byte `SUBMIT_BOND_NET`** locked per live
-   candidate. Height must equal `last_locked + 1`; the previous root must
-   match; all three hash fields must be exactly 64 hex chars. The height is
-   **single-candidate**: the first stable combined unit wins and the AA
-   records `da_unit_<h>` = that unit's hash (the root provably points at
-   exactly that data package); any further submit on the height bounces
-   `height taken` until it is finalized or fails. The 600 s stability clock
-   is set once by the winning submit and cannot be reset.
+   aa_root}` data message, with ≥ 1 000 000 001 000 bytes attached: 10 000
+   bounce headroom plus a **1 000 000 000 000-byte `SUBMIT_BOND_NET`**
+   (1000 GBYTE) locked per live candidate. Height must equal `last_locked + 1`;
+   the previous root must match; all three hash fields must be exactly 64 hex
+   chars. The height is **single-candidate with an occupancy timeout**: the
+   first stable combined unit wins and the AA records `da_unit_<h>` = that
+   unit's hash (the root provably points at exactly that data package). A
+   further submit bounces `height taken` while the current occupant is still
+   live (locked, or inside the `OCCUPANCY_SECS` = 3600 s replacement window);
+   after that timeout a different operator may re-occupy with a fresh
+   combined submit, overwriting the evicted occupant's bond (not refunded).
+   The 600 s stability clock is set once by the winning submit and cannot be
+   reset.
+
 2. **lock** — allowed only after the 600 s stability window
    (`OBYTE_STABILITY_SECS`) and only while the candidate's submit-bond
    holder record (`active_bond_<h>`) is present: a failed finalize
@@ -197,28 +201,33 @@ Lifecycle per height *h*:
    until a fresh bonded submit recreates the candidate. Locking clears a
    previous permanent-failure mark, so a challenge-failed (`frozen = 2`)
    height recovers by fresh submission instead of wedging the chain. Locked
-   roots are immutable. `stable_at_<h>` is set at lock time and is the **single origin** for the challenge window, the respond window, and the finalize / failure-sweep window (all `stable_at+3600`).
-3. **challenge** — within 3600 s of `stable_at_<h>` (post-lock, `stable_at+3600`; `CHALLENGE_SECS` counts from `stable_at`), anyone can freeze a **locked** height *h* (`h ≤ last_locked`, `stable_at_<h>` set) with a ≥ 20 000 byte bond; un-locked heights (`last_locked+1`) cannot be challenged — they go through the normal `submit/lock` path and cannot be pre-frozen. A sender with an outstanding bond cannot open a second challenge, and `{claim: "bond"}` refuses payout while the challenged height is still frozen.
-4. **respond (by resubmit)** — there is no separate respond trigger: the
-   ORIGINAL bond holder answers a challenge by re-submitting the **identical
-   `state_root` + `aa_forest`** inside `stable_at+3600` (the only resubmit that
-   passes the single-candidate gate; it does not create a new `da_unit_<h>`,
-   does not reset the 600 s / escape clocks, and carries **no extra 50k
-   bond** — only 10000 bounce headroom). Success unfreezes and confiscates
-   exactly the recorded challenger bond (zeroing both its ledger keys); an
-   impostor or a forest-mismatched resubmit bounces `not operator`. If
-   nobody responds in time, finalize marks the height permanently failed
-   (`frozen = 2`), clears its roots, rolls `last_locked` back to h−1,
-   confiscates the submit bond — split **50/50**: half accrues to the
-   challenger as `{claim: "slash"}`, half stays burned in the pot; the
-   failure sweep clears `active_bond_<h>` so a fresh combined unit can
-   re-occupy the height, and the challenger also recovers its own bond
-   through `{claim: "bond"}`.
-5. **finalize** — after a clean `stable_at+3600` window the root becomes the withdrawal
-   basis (`last_finalized`), strictly in height order; the submit bond is
-   released to its holder and a 20 000-byte race reward accrues to the
-   first-stable submitter (`{claim: "reward"}` pays once and zeroes the
-   ledger).
+   roots are immutable. `stable_at_<h>` is set at lock time and is the
+   **single origin** for the challenge and finalize windows (all
+   `stable_at+3600`).
+
+3. **challenge** — within 3600 s of `stable_at_<h>` (post-lock;
+   `CHALLENGE_SECS` counts from `stable_at`), anyone can challenge a
+   **locked** height *h* (`h ≤ last_locked`, `stable_at_<h>` set) with a
+   ≥ 1 000 000 000 000 byte bond (net; `1e12+10000` gross). Un-locked
+   heights (`last_locked+1`) cannot be challenged (`bad height`). A sender
+   with an outstanding bond cannot open a second challenge. **The challenge is
+   decided in the AA immediately**: it permanently fails the candidate
+   (`frozen = 2`, roots cleared, `last_locked` rolls back to `h-1`), credits
+   half the submit bond (`SUBMIT_BOND_SLASH_HALF` = 500 000 000 000) to the
+   challenger's `slash_reward_<addr>`, clears `active_bond_<h>` /
+   `cand_aa_root_<h>` / `fee_winner_<h>`, and reopens `h` for a new 1000-GBYTE
+   first-stable submit. **Challenge coins are burned** — they are never
+   credited to `bond_<challenger>`, so `{claim:"bond"}` after a real challenge
+   bounces `nothing claimable`; the only challenger reward is the slash half.
+   There is **no respond-by-resubmit and no response window**.
+
+4. **finalize** — after a clean `stable_at+3600` window the root becomes the
+   withdrawal basis (`last_finalized`), strictly in height order; the submit
+   bond is released to its holder (`sbond_<addr> += 1e12`) and a 20 000-byte
+   race reward accrues to the first-stable submitter (`{claim: "reward"}`
+   pays once and zeroes the ledger). A challenged height never reaches the
+   clean path — the challenge case already failed it; there is no
+   `frozen==1` failure sweep.
    - a withdrawal carries `{amount, withdrawn, leaf_account, collateral,
      perp, shard, proof[], perp_amount?}`;
    - `perp_amount` (optional) claims LESS than the full unclaimed PERP
@@ -245,23 +254,21 @@ Lifecycle per height *h*:
 6. **escape hatch** — if finalization stalls entirely (every operator
    disappears), `{escape_finalize: 1}` stall-finalizes the oldest locked
    height after `ESCAPE_STALL_SECS` (7 days mainnet, timetravel on devnet;
-   any caller; never overrides a live challenge — frozen heights must go
-   through the normal failure sweep so the challenger is refunded), and
-   `{escape_withdraw: 1, ...claim fields}` pays a proof against the *stale
-   candidate's* forest at `h = last_finalized + 1` when that height was
-   never locked or was rolled back `frozen = 2`. Both entries share the
-   withdraw path's `wd_`/`wp_` anti-replay keys. Per the doc 07 §4 waiver,
-   escape_finalize enforces only the local stall gate.
+   any caller; never overrides a challenge — frozen heights are already
+   failed by the challenge case). `{escape_withdraw}` is **removed**:
+   never-locked candidates cannot be withdrawn against it bounces
+   `no escape withdraw`. `escape_finalize` shares the withdraw path's
+   `wd_`/`wp_` anti-replay keys. Per the doc 07 §4 waiver, escape_finalize
+   enforces only the local stall gate.
 
 Clock origins — the 3600 s window has **one** origin (`stable_at`), never `submitted_at`:
 
 | Gate | Origin | Duration |
 |---|---|---|
 | lock | `submitted_at_<h>` | 600 s (`OBYTE_STABILITY_SECS`) |
-| challenge / respond / finalize / failure sweep | `stable_at_<h>` | 3600 s (`CHALLENGE_SECS`) |
+| challenge / finalize | `stable_at_<h>` | 3600 s (`CHALLENGE_SECS`) |
+| occupancy timeout (unlocked replacement) | `submitted_at_<h>` | 3600 s (`OCCUPANCY_SECS`) |
 | escape_finalize | `stable_at_<h>` | 604800 s (`ESCAPE_STALL_SECS`) |
-| escape_withdraw (candidate stall) | `submitted_at_<h>` | 604800 s |
-| escape_withdraw (chain stall) | `stable_at_<last_finalized>` | 604800 s |
 
 Proofs are generated off-chain by
 `crates/operp-settle/examples/gen_withdraw_proof.rs` (JSON consumed by the JS
@@ -287,6 +294,7 @@ obyte-local/
                          only — NOT an independent watcher: mutual deterrence
                          requires the separate `crates/operp-watch` binary with
                          its own key.
+  post_challenge.js      watcher challenge broadcast CLI (`OPERP_WATCH_MNEMONIC`)
 docs/PROTOCOL.md         protocol design narrative
   docs/MECHANISMS.md     full mechanism reference (zh): every rule, constant,
                          edge case, and the threat-model matrix
@@ -335,31 +343,25 @@ Measured on this machine: `bench_raw` ≈ 5 500 ops/s; `hft_onedag` (8 markets,
 This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
 **not mainnet-ready**. Known gaps, roughly in priority order:
 
-1. **A live lying operator confirms a fake root by re-posting it.**
-   Challenge does not verify the root. `{challenge}` only freezes a
-   locked height (`h ≤ last_locked`, `stable_at+3600`, bond ≥ 20 000
-   bytes). Respond-by-resubmit (the submit case when `frozen==1`) checks
-   `trigger.address == active_bond_<h>` and that `state_root`/`aa_forest`
-   equal the already-locked candidate — then unfreezes and confiscates
-   the challenger's bond. A fraudulent operator who stays online answers
-   with the **identical fake forest**, the honest watcher is fined, and
-   after `stable_at+3600` that forest becomes the withdrawal basis.
-   Single-candidate (`height taken`) also forbids any competing honest
-   submit on the same height, so takeover exists only after `frozen=2`,
-   which requires the liar **not** to respond. Closing the incumbent
-   clock-reset (#7) closed the honest-replace path with it.
-   Same structure, more holes:
+1. ~~**A live lying operator confirms a fake root by re-posting it.**~~
+   **RESOLVED (challenge-reopen).** A challenge of a locked height is decided
+   in the AA immediately: it fails the height (`frozen = 2`, roots cleared,
+   `last_locked` rolls back to `h-1`), credits the challenger
+   `SUBMIT_BOND_SLASH_HALF` (500 000 000 000) as `slash_reward_<addr>`, and
+   reopens `h` for a fresh 1000-GBYTE first-stable submit. There is **no
+   respond-by-resubmit**: a live liar can no longer answer a challenge with
+   the identical fake forest — the challenge kills the candidate outright and
+   a different operator re-occupies. Challenge coins are burned (never
+   `bond_`), so the challenger's only reward is the slash half. `operp-watch`
+   now posts `{challenge:1}` on-chain via `post_challenge.js` (any
+   ROOT/BINDING mismatch or missing `temp_data` in-window).
+   Remaining holes:
    - `da_unit_<h>` stores `trigger.unit`; the AA never reads `temp_data`.
-     A roots-only unit still wins the height.
-   - Unlocked candidates cannot be challenged. After `ESCAPE_STALL_SECS`
-     (7 days), `{escape_withdraw}` pays against
-     `cand_aa_root_(last_finalized+1)` without a lock or a challenge.
-   - Submit/challenge bonds are 50 000 / 20 000 **bytes**
-     (0.00005 / 0.00002 GBYTE) — dust against vault deposits.
-   Deposit joints are checked only in `validate_against` (off-chain).
-   `operp-watch` logs `ROOT MISMATCH … should challenge` and does not
-   broadcast `{challenge:1}`. Wiring a separate watcher key does not
-   fix respond-by-resubmit.
+     A roots-only unit still wins the height (enforced by the watcher).
+   - Unlocked candidates cannot be challenged (`bad height`); they are
+     replaced by the occupancy timeout after `OCCUPANCY_SECS` (3600 s).
+   - Deposit joints are checked only in `validate_against` (off-chain) and
+     by the watcher's `DepositEvidence` replay failure.
 2. **Funding quality is bounded by its price anchor.** Funding stays
    mark-premium based (capped ±50 bps/tick). The default
    `BondedMedianTwap` index derives from bonded reporters' prices; the
@@ -370,7 +372,7 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    it.
 3. **Oracle manipulation needs a bond majority.** Reporting is
    permissionless against a 50 000 PERP bond; slashing for TWAP-streak
-   deviations has shipped (height-gated), but a colluding bond majority can
+   deviations has shipped (live at height 0), but a colluding bond majority can
    still bias the median mark between slashes; TWAP smoothing dampens, not
    removes, this.
 4. **Default execution order is UnitId-lexicographic, hence grindable**
@@ -395,12 +397,11 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    **RESOLVED** (combined da_unit): submits are single-candidate — the
    first stable combined `temp_data`+submit unit wins the height, the AA
    pins `da_unit_<h>` to it, and every other submit bounces `height taken`
-   (only the frozen==1 respond-by-resubmit by the original bond holder
-   passes, without touching the clock). No incumbent clock-reset exists.
+   (inside the occupancy timeout — see #1). No incumbent clock-reset exists.
    **Cost:** the same gate blocks an honest competing root on that height
-   — see #1.
+   during the occupancy window — see #1.
 8. The AA has had no formal security audit. The Oscript complexity gate
-   sits exactly at its ceiling (**85/100**, ops 1101/2000 — run
+   currently **76/100** (ops 976/2000 — run
    `node tools/check_aa_complexity.js`), so every further AA change must
    free equal budget first.
 9. **Replay-dedup windows are height-bounded** — legacy 256 heights,
@@ -478,13 +479,13 @@ noted below):
 
 - [x] **01 Fraud slashing** — `01-fraud-slashing.md`: 50%/50% burn/reward split + `validity_proof_hash` plug, no matcher re-execution in Oscript *(AA failed-finalize splits the submit bond into `slash_reward_` + burned half)*
 - [x] **02 Deposit independent verification** — `temp_data.deposit_evidences` carries FULL Obyte joint units; `unit_hash(joint)` recomputed inside `validate_against` via `operp_settle::obyte_hash::get_unit_hash`; payee/asset checked against caller-supplied `expected_vault`/`perp_asset`, failures map to `SettleError::DepositEvidence`; watchers rehydrate via `evidences_from_payload`
-- [x] **03 Commit-reveal ordering** — v1 salted sort shipped earlier and **desalted this round** (execution order is deterministic lex; the salt remains for orphan eviction only — Limitations #13); **v2 additive landed this round**: `Op::Commit` (tag 18) / `Op::Reveal` (tag 19), TTL `COMMIT_TTL_HEIGHTS = 16`, ≤ 8 live commits/account, `reveal_commit_hash = sha256(inner_op_bytes ‖ salt)`, activation-gated at 1 000 000
+- [x] **03 Commit-reveal ordering** — v1 salted sort shipped earlier and **desalted this round** (execution order is deterministic lex; the salt remains for orphan eviction only — Limitations #13); **v2 additive landed this round**: `Op::Commit` (tag 18) / `Op::Reveal` (tag 19), TTL `COMMIT_TTL_HEIGHTS = 16`, ≤ 8 live commits/account, `reveal_commit_hash = sha256(inner_op_bytes ‖ salt)`, live at height 0
 - [x] **04 Salted orphan eviction + WantUnits gossip** — `argmin sha256(salt‖unit_id)` with `Engine::note_finalized` rotating the salt per epoch (`sha256(ORDERING_SALT_DOMAIN ‖ root ‖ epoch_le)`); **gossip landed this round**: new `crates/operp-gossip` (WantUnits/HaveUnits, debounced fanout, bounded requests/responses) as a pure operator/P2P layer — wire transport per doc OQ5
-- [x] **05 Oracle slashing + TWAP** — 50k PERP stake/unstake (256-height unbond)/slash, TWAP rings, 500 bps ×3-streak double condition, `SlashOracle` tag 16, height-gated
-- [x] **06 Funding external anchor** — funding-index abstraction + activation gate shipped earlier; **operator wiring landed this round**: `Op::UpdateExternalPrice` (tag 17), source allowlist, `AggregatedExternal` mode, staleness fallback external TWAP → bonded-median TWAP → instant median (`FUNDING_EXTERNAL_MAX_STALENESS = 32`)
-- [x] **07 Escape hatch** — **landed this round**, folded into existing cases for budget: `{escape_finalize: 1}` rides the finalize handler (any caller, `ESCAPE_STALL_SECS = 604800` mainnet / 3600 testnet), `{escape_withdraw: 1}` rides withdraw against the stale candidate's forest at `last_finalized + 1`; deviation per doc07 §4 waiver: escape_finalize enforces only the LOCAL stall gate
+- [x] **05 Oracle slashing + TWAP** — 50k PERP stake/unstake (256-height unbond)/slash, TWAP rings, 500 bps ×3-streak double condition, `SlashOracle` tag 16, live at height 0
+- [x] **06 Funding external anchor** — funding-index abstraction + activation height 0 (live at genesis); **operator wiring landed this round**: `Op::UpdateExternalPrice` (tag 17), source allowlist, `AggregatedExternal` mode, staleness fallback external TWAP → bonded-median TWAP → instant median (`FUNDING_EXTERNAL_MAX_STALENESS = 32`)
+- [x] **07 Escape hatch** — **landed this round**, folded into existing cases for budget: `{escape_finalize: 1}` rides the finalize handler (any caller, `ESCAPE_STALL_SECS = 604800` mainnet / 3600 testnet), `{escape_withdraw}` removed (bounces `no escape withdraw`); deviation per doc07 §4 waiver: escape_finalize enforces only the LOCAL stall gate
 - [x] **08 Burn accounting (Rust + checkpoint)** — `perp_burned` in `meta_leaf`, emitted via `Checkpoint.perp_burned` / `temp_data`; AA-side mirror vars dropped for budget, `holdings−supply==burned` stays watcher-verifiable
-- [x] **09 Complexity audit** — single-sha256 fold, unified claim dispatcher (`claim:'kind'`), lock-merge refactor; probe: `node tools/check_aa_complexity.js`. Current **85/100** (ops 1101/2000) — exactly at the gate
+- [x] **09 Complexity audit** — single-sha256 fold, unified claim dispatcher (`claim:'kind'`), lock-merge refactor; probe: `node tools/check_aa_complexity.js`. Current **76/100** (ops 976/2000) — ≤85 gate
 - [x] **10 AA-tree sharding (v2)** — clean cutover this round: ONE 1024-hex `aa_forest` var = 16 concatenated shard roots (fits `MAX_STATE_VAR_VALUE_LENGTH` exactly), empty-shard sentinel roots, depth stays 16 → ~1M accounts/batch; the doc's v1 depth-18 path is superseded per its own OpenQ3
 - [x] **11 Replay persistence (v1)** — `256→2048` constants + generalized pruning; `GovNonceJournal` WAL — flushed at batch commit (`Batch::from_applied`), max-merge on restart — plus versioned bincode snapshots `chainstate.<height>.snap` via `Engine::load_or_genesis` / `flush_snapshot` / `maybe_flush_snapshot` (every 64 heights). RocksDB (`persist-rocksdb`) stays doc-declared v1.1 backlog
 
@@ -493,9 +494,9 @@ noted below):
 - **Replay window 256→2048**: shipped but activation-gated
   (`REPLAY_WINDOW`, `REPLAY_ACTIVATION_HEIGHT` at 1 000 000) so existing
   tests replay legacy determinism. Flip the constant at deploy.
-- **Escape hatch**: shipped (see 07). The respond path remains
-  *respond-by-resubmit* — the operator answers a challenge by re-submitting
-  the identical root; impostors bounce `not operator` in submit init.
+- **Escape hatch**: shipped (see 07). The respond path is *removed* — a challenge
+  immediately fails the height (frozen=2, last_locked rollback) and reopens it,
+  so there is no respond-by-resubmit and no `not operator` path.
 - **Claim API break**: `{claim_reward|claim_bond|claim_submit_bond}` booleans
   are replaced by a single `{claim: "reward"|"bond"|"sbond"|"slash"}` field;
   `post_batch.js` / `test_vault_aa.js` migrated in-tree.
@@ -518,7 +519,7 @@ bench_raw`.
   versioning/fallback, canonical-number hash rules, batch-commit gov-nonce
   WAL (H2 regression included).
 * **AA complexity gate (CI `js-checks`):** `node obyte-local/tools/check_aa_complexity.js`
-  — currently **85/100** (ops 1101/2000), exactly at the ≤85 CI gate. The
+  — currently **76/100** (ops 976/2000), ≤85 CI gate. The
   same job also runs `golden_vector_check.js`.
 * **Golden vector (CI `js-checks`):** `node obyte-local/golden_vector_check.js`
   prints the canonical Obyte JSON source + data_hash for a fixed input
@@ -529,11 +530,11 @@ bench_raw`.
   pull request. Local Windows hosts without Visual Studio Build Tools still
   cannot compile the vendored aa-testkit's `rocksdb`/`sqlite3`; the live
   lifecycle is proven in CI, not on this host.
-* **Watcher limitation:** the independent watcher crate (`crates/operp-watch`)
-  exists and can replay `da_unit_<h>` off-chain, but it only prints an alert
-  — it does not broadcast `{challenge:1}`. Even with a key separate from
-  the poster, respond-by-resubmit of the identical fake root still beats
-  the challenge (see Limitations #1). Mutual deterrence is not claimed.
+* **Watcher:** the independent watcher crate (`crates/operp-watch`) replays
+  `da_unit_<h>` off-chain and now posts `{challenge:1}` on-chain via
+  `post_challenge.js` when it detects an in-window ROOT/BINDING mismatch (or a
+  missing `temp_data`) and `OPERP_WATCH_MNEMONIC` is set. Without a mnemonic it
+  prints the alert only. Mutual deterrence requires a key separate from the poster.
 
 See the commit history for the full security-audit remediation this repo
 went through (proof-gated withdrawals, deposit whitelisting, overflow
