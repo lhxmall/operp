@@ -203,10 +203,10 @@ submitted_at_h, cand_root_h, cand_aa_root_h,
                                  # 后续 submit bounce 'height taken'）+
                                  # DA 绑定：da_unit_h = 携带根的那笔
                                  # 组合单元（temp_data+submit 同 unit）的 hash
-active_bond_h                    # 现任候选的 50000-byte 提交债券持有人
+active_bond_h                    # 现任候选的 1000000000000-byte 提交债券持有人
 fee_winner_h, reward_<addr>      # 首个稳定者赢竞速奖励
 root_h, aa_root_h, stable_at_h  # 已锁定根（stable_at 锚定挑战窗）
-frozen_h ∈ {∅/0=正常, 1=已挑战, 2=永久失败}
+frozen_h ∈ {∅/0=正常, 1=已挑战(不持久), 2=失败}
 challenger_h, bond_<addr>, bond_height_<addr>, slash_reward_<addr>, sbond_<addr>
 wd_<addr>, wp_<addr>             # 全局累计提款标记（防证明重放，跨高度共享）
 pperp_<addr>                     # PERP 入账镜像
@@ -226,37 +226,31 @@ AA 侧同步新增：`pperp_<addr>`（PERP 影子账本；提款权威仍是证�
 
 ```
 submit(h)    h == last_locked+1 ∧ prev==root_{h-1} ∧ 有根 ∧ 组合单元
-             → 首交才写 cand_*、da_unit_h = trigger.unit、submitted_at_h = now、active_bond_h = sender、fee_winner_h = 首个稳定者；
-               已占位（未冻结且 active_bond_h 在位）→ bounce('height taken')；
-               frozen==1 时仅原 bond 持有人可重发同一 state_root+aa_forest 应诉（respond-by-resubmit），不改 da_unit/钟/不另收 50k
+             ∧ 输出-10000 ≥ 1000000000000（SUBMIT_BOND_NET）
+             → 写 cand_*、da_unit_h = trigger.unit、submitted_at_h = now、
+               active_bond_h = sender、fee_winner_h = 首个稳定者（空则写）；
+               已占位且（已锁 OR now < submitted_at_h + 3600）→ bounce('height taken')；
+               占用超时后不同 operator 可带新债券覆盖占位（不退还旧债券）
 
 lock(h)      cand 存在 ∧ 未锁 ∧ h == last_locked+1 ∧ now ≥ submitted_at_h + 600s ∧ active_bond_h 在位
              → root_h ← cand，aa_root_h ← cand，stable_at_h = now，last_locked = h，frozen_h 清零
-             （模拟 Obyte 稳定窗口；主网上对应真实的 finality；600s 钟仅首笔设置、不可重置）
 
-challenge(h) 已锁定 (h ≤ last_locked ∧ root_h 存在) ∧ 未冻结 ∧ now < stable_at_h + 3600s
-             ∧ 输出 ≥ 20000 base（含 bounce 费）∧ 无 outstanding bond
-             → frozen_h = 1，记 challenger，收 bond（未 lock 的 last_locked+1 不可被挑战）
+challenge(h) 已锁定 (h ≤ last_locked) ∧ 未冻结 ∧ now < stable_at_h + 3600s
+             ∧ 输出-10000 ≥ 1000000000000 ∧ 无 outstanding bond
+             → 立即失败并重开：frozen_h = 2，root_/aa_root_/active_bond_/cand_aa_root_/fee_winner_ 清零，
+               last_locked 回退 h−1，slash_reward_<challenger> += 500000000000；
+               挑战金烧毁（不记 bond_）；未 lock bounce('bad height')；无 respond 路径
 
-respond(h,r) 无独立 trigger：frozen_h == 1 ∧ trigger.address == active_bond_h ∧ now < stable_at_h + 3600s
-             ∧ state_root == cand_root_h ∧ aa_forest == cand_aa_root_h
-             → 解冻 frozen=0；没收 bond_<challenger> 并清零；不改 da_unit_/submitted_at_/cand_*/fee_winner_，不重置 600s/escape 计时，不另收 50k（仅 10000 bounce 余量）
+finalize(h)  仅干净路：!frozen ∧ root_h 存在 ∧ h ≤ last_locked
+             ∧ timestamp ≥ stable_at_h + (escape_finalize ? 604800 : 3600)
+             ∧ h == last_finalized+1
+             → last_finalized = h；sbond_<持有人> += 1000000000000；reward += 20000
 
-finalize(h)  分两条路（均以 stable_at+3600 为窗）：
-             a) frozen_h == 1 且已超窗（operator 未应诉）
-                → frozen_h = 2（永久）、root_h/aa_root_h 清空、active_bond_h 清零、
-                  last_locked 回退 h−1；50 000 提交债券对半：slash_reward_<challenger> += 25000，另一半烧毁；挑战者自身债券经 {claim:"bond"} 取回
-             b) 正常：!frozen ∧ 超窗 ∧ h == last_finalized+1
-                → last_finalized = h（该根成为提款依据，严格按序）；sbond 释放、reward 累加
-
-withdraw     h = last_finalized；!frozen_h；
+withdraw     h = last_finalized；escape_withdraw 弹回 'no escape withdraw'；
              leaf_account == trigger.address；
-             amount ≤ collateral（proof 叶子声明值）∧ amount + wd_<addr> ≤ min(collateral, withdrawn)；
-             累计标记 wd_<addr>/wp_<addr>：全局累计（跨高度共享）；
+             amount + wd_<addr> ≤ min(collateral, withdrawn)；
              leaf = sha256('acct:'+address+':'+collateral+':'+perp+':'+withdrawn, 'hex')
-             fold proof[]: right ? sha256(acc‖sib) : sha256(sib‖acc)
-               （reduce(...,16,...)，深度上限 16，覆盖 2^16 账户；16 shards ≈ 1M）
-             结果 == substring(var['aa_root_'||h], shard*64, 64) 否则 bounce
+             fold proof[] reduce(...,16,...) == substring(aa_root_h, shard*64, 64)
              → 支付 trigger.address，wd_/wp_ 累加
 ```
 
@@ -283,7 +277,7 @@ Oscript 实现细节（踩过的坑）：
 |---|---|
 | 伪造成交/假根 | 双 Merkle 根 + validate_against 重放审计 + fills_hash |
 | 偷 AA 资金 | 提款只认 finalized aa_root 的 Merkle 证明；leaf 绑定提款人地址；wd_ 累计标记防重放 |
-| operator 锁假根 | 600s 稳定窗 + `stable_at+3600` 挑战/应诉/失败扫荡三窗 + bond 经济（见 README 局限节） |
+| operator 锁假根 | 600s 稳定窗 + `stable_at+3600` 挑战立即重开 + 干净 finalize + bond 经济（见 README 局限节） |
 | 存款自铸 | deposits_allowed 白名单 + replay 交叉注入 |
 | 溢出 DoS | 入口 checked-mul + qty 上限；book 层零量/零价拒绝 |
 | 签名延展 | verify_strict |
@@ -291,11 +285,9 @@ Oscript 实现细节（踩过的坑）：
 
 ## 6. 已知局限
 
-见 README「Limitations & mainnet readiness」。核心三条：respond 只校验
-operator 重发的根与森林（Oscript 无法链上重跑撮合，真欺诈证明缺失）、
-默认执行序是 UnitId 字典序（可磨队；v2 commit-reveal 激活门控）、报价
-质量仍受债券质押多数约束（TWAP 平滑而非消除）。主网部署前需解决并做
-正式 oscript 审计。
+见 README「Limitations & mainnet readiness」。challenge-reopen 已关闭应诉复读洞：挑战立即判败并重开高度。
+仍存在：Oscript 无法链上重跑撮合（空 DA / 坏充值 joint 由 watcher 挑战）、默认执行序 UnitId 字典序（v2 commit-reveal 已高度 0 生效）、
+报价质量仍受债券质押多数约束（TWAP 平滑而非消除）。主网部署前需正式 oscript 审计。
 
 ## 7. 治理动机：PERP
 
@@ -319,4 +311,4 @@ PERP 的三个机制接管：
 字段），烧毁只在镜像账本进行——对应真实 PERP 永久滞留 AA，协议整体对
 PERP 超抵押。精确规则见 [MECHANISMS.md](MECHANISMS.md) §15。
 
-> **局限（watcher 未独立部署）：** `crates/operp-watch` 已存在、可离线重放 `da_unit_<h>`，但尚未以独立于 poster 的密钥部署，互相牵制跑通前不对外宣称已具备。
+> **Watcher：** `crates/operp-watch` 离线重放 `da_unit_<h>`，窗口内 ROOT/BINDING 不匹配或缺 temp_data 时经 `post_challenge.js` 广播 `{challenge:1}`（`OPERP_WATCH_MNEMONIC`）。

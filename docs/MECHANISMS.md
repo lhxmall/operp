@@ -170,7 +170,7 @@ orphan 缓冲容量 4096。驱逐按**盐化序**执行：对缓冲单元取
   commit 作废并剪枝。
 
 与确定性字典序叠加：Commit 阶段外界看不到 op 内容，揭示后按既有全序
-执行。`COMMIT_REVEAL_ACTIVATION_HEIGHT = 1_000_000`，部署期翻转。
+执行。`COMMIT_REVEAL_ACTIVATION_HEIGHT = 0`，部署期翻转。
 
 ### 2.6 WantUnits gossip（纯 P2P 层）
 
@@ -547,9 +547,9 @@ boot, chain_id='operp-mvp-1', last_locked, last_finalized
 submitted_at_h, cand_root_h, cand_aa_root_h, da_unit_h  # 单一候选（首个稳定组合单元胜出；
                                                          # 后续 submit bounce 'height taken'）
                                                          # DA 绑定：da_unit_h = 该组合单元 hash
-active_bond_h                              # 现任候选的 50000-byte 提交债券持有人
+active_bond_h                              # 现任候选的 1000000000000-byte 提交债券持有人
 fee_winner_h, reward_<addr>, sbond_<addr>, slash_reward_<addr>
-root_h, aa_root_h, stable_at_h            # 已锁定；aa_root_ 存 1024-hex 分片森林；stable_at 锚定挑战/应诉/失败扫荡三窗
+root_h, aa_root_h, stable_at_h            # 已锁定；aa_root_ 存 1024-hex 分片森林；stable_at 锚定挑战立即重开 + 干净 finalize 窗
 frozen_h ∈ {∅/0=正常, 1=已挑战, 2=永久失败}
 challenger_h, bond_<addr>, bond_height_<addr>
 wd_<addr>, wp_<addr>                      # 全局累计提款标记（跨高度共享，防证明重放）
@@ -565,28 +565,27 @@ pperp_<addr>                               # PERP 入账镜像：{deposit_perp} 
 | 门 | 原点 | 时长 |
 |---|---|---|
 | lock | `submitted_at_h` | 600 s |
-| challenge / respond / finalize / 失败扫荡 | `stable_at_h` | 3600 s |
+| challenge / finalize | `stable_at_h` | 3600 s |
 | escape_finalize | `stable_at_h` | 604800 s |
-| escape_withdraw（候选停滞） | `submitted_at_h` | 604800 s |
-| escape_withdraw（链条停滞） | `stable_at_{last_finalized}` | 604800 s |
+| 占用超时（未锁定替换） | `submitted_at_h` | 3600 s（OCCUPANCY_SECS） |
+| escape_finalize | `stable_at_h` | 604800 s |
 
 ### 10.1 submit(h)
 
-前置：chain_id 正确 ∧ (h == last_locked+1 ∨ (frozen==1 ∧ h==last_locked))
-∧ prev 匹配 root_{h−1}（frozen==1 时跳过）
+前置：chain_id 正确 ∧ h == last_locked+1
+∧ prev 匹配 root_{h−1}
 ∧ 有 64-hex 的 state_root/prev_state_hash ∧ aa_forest 恰 1024 hex。
 提交必须是**组合单元**（temp_data + submit data 消息在同一
-unit）；新候选须附 ≥ 60 000 bytes（10 000 bounce 余量 +
-50 000 `SUBMIT_BOND_NET`）。
-**单候选门**：未冻结且 `active_bond_<h>` 已在位 → 一律
-bounce('height taken')（含在任者自由重发）；frozen==1 时仅原 bond 持有人
-可复读**同一份 `state_root` + `aa_forest`**（respond-by-resubmit），冒充者
-或森林不一致均 bounce('not operator')。
+unit）；新候选须附 ≥ 1 000 000 001 000 bytes（10 000 bounce 余量 +
+1 000 000 000 000 `SUBMIT_BOND_NET`）。
+**单候选门 + 占用超时**：已占位且（已锁 `root_h` 存在 OR
+`now < submitted_at_h + 3600`）→ bounce('height taken')；占用超时后不同
+operator 可带新债券覆盖占位（旧债券不退还）。无 respond 路径。
 
-副作用：首交才写入候选三元组 + active_bond_<h> + submitted_at_h +
-**da_unit_<h> = 该组合单元的 unit hash**（根与数据包的 DA 绑定，600s 钟仅等待该单元）；
-frozen==1 应诉仅解冻（frozen=0）+ 没收挑战 bond（bond_<challenger>=0），**不改** `da_unit_` /
-`submitted_at_` / 候选根 / fee_winner，不另收 50k 押金；竞速判定见 §11。
+副作用：写候选三元组 + active_bond_<h> + submitted_at_h +
+**da_unit_<h> = 该组合单元的 unit hash**；fee_winner_<h> 仅首次写入
+（首稳定者）；竞速判定见 §11。
+
 
 ### 10.2 lock(h)
 
@@ -596,65 +595,38 @@ frozen==1 应诉仅解冻（frozen=0）+ 没收挑战 bond（bond_<challenger>=0
 → root/aa_forest/winner/stable_at 落定，last_locked = h。锁后不可变。
 
 600s 是 OBYTE_STABILITY_SECS 的模拟（devnet 用 timetravel 测试）。
-### 10.3 challenge(h)（对应 `obyte-local/agents/operp_vault.aa:228-252`）
+### 10.3 challenge(h)（对应 `obyte-local/agents/operp_vault.aa:213-238`）
 
-仅已锁定高度可被挑战（`h ≤ last_locked ∧ root_h 存在 ∧ stable_at_h 存在`）∧ 未冻结 (`frozen==0`) ∧ `now < stable_at_h + 3600` (`CHALLENGE_SECS` 自 `stable_at` 起算) ∧ 输出 ≥ 20000 base（含 bounce 费）∧ 无 outstanding bond
-→ frozen_h = 1，记录 challenger，收 bond。未 lock 的 `last_locked+1` 不可被挑战（走正常 submit/lock 路径，无法预 freeze）。
+仅已锁定高度可被挑战（`h ≤ last_locked`）∧ 未冻结 (`frozen==0`) ∧
+`now < stable_at_h + 3600` ∧ 输出-10000 ≥ 1000000000000 ∧ 无 outstanding bond
+→ **立即失败并重开**：frozen_h=2，root_/aa_root_/active_bond_/cand_aa_root_/
+fee_winner_ 清零，last_locked 回退 h−1，slash_reward_<challenger> +=
+500000000000（SUBMIT_BOND_SLASH_HALF）。挑战金烧毁（不记 bond_）。
+未 lock 的 last_locked+1 bounce('bad height')。**无 respond 路径**。
 
-### 10.4 respond(h)（对应 `obyte-local/agents/operp_vault.aa:161-168`）
+### 10.4 已删除：无应诉通道
 
-无独立触发器：operator 通过**重发同一根**应诉（submit 路径内识别）。
-身份门：`trigger.address == var['active_bond_' || h]`（frozen==1 期间恒
-等于现任候选人）∧ `now < stable_at_h + 3600` ∧ `state_root` 与 `aa_forest` 均与候选一致 → 解冻，
-没收 bond_<challenger> 记录的恰好数额并清零（归 AA 库）。应诉**不改**
-`da_unit_` / `submitted_at_` / `cand_root_` / `cand_aa_root_` / `fee_winner_`，
-不重置 600s/escape 计时，不另收 50k 提交押金（仅需 10000 bounce 余量）；
-偷换森林或冒充者均 bounce('not operator')。
+respond-by-resubmit 已移除。挑战由 AA 立即判定成败，不存在应诉窗口。
 
 ### 10.5 finalize / escape_finalize(h)
 
-`{finalize}` 与 `{escape_finalize: 1}` 共用同一处理分支：
+`{finalize}` 与 `{escape_finalize: 1}` 共用同一处理分支，仅干净路：
 ```
-失败路: frozen_h == 1 ∧ timestamp ≥ stable_at_h + 3600（operator 未应诉）
-        → frozen_h = 2（永久）、root_/aa_root_/active_bond_ 清零、
-          last_locked 回退 h−1；50 000 提交债券对半劈：
-          slash_reward_<challenger> += 25000（{claim:"slash"} 领取），
-          另一半留在金库（烧毁）；挑战者自身债券经 {claim:"bond"} 取回
-正常路: 根存在 ∧ 未冻结 ∧ timestamp ≥ stable_at_h + 3600 ∧ h == last_finalized+1
-        → last_finalized = h；sbond_<持有人> += 50000 可回收；
+干净路: 根存在 ∧ 未冻结 ∧ h ≤ last_locked
+        ∧ timestamp ≥ stable_at_h + (escape_finalize ? 604800 : 3600)
+        ∧ h == last_finalized+1
+        → last_finalized = h；sbond_<持有人> += 1000000000000 可回收；
           fee_winner 累加 20000 bytes 奖励（§11）
-escape: trigger.data.escape_finalize 时窗口阈值改为
-        ESCAPE_STALL_SECS = 604800（主网 7 天 / devnet timetravel）；
-        任意账户可调用；绝不越过 live challenge（frozen==1 必须走
-        失败清扫以退还挑战者）。按 doc07 §4 豁免，只做本地停滞门。
+escape: trigger.data.escape_finalize 时窗口阈值改为 ESCAPE_STALL_SECS
+        = 604800（主网 7 天 / devnet timetravel）；任意账户可调用；
+        绝不越过挑战（frozen 高度已被 challenge 判失败）。
 ```
+被挑战高度不会走到干净路（challenge 已 frozen=2 并回滚 last_locked）。
 
 ### 10.6 withdraw / escape_withdraw
 
 普通 withdraw 验证对象为 `aa_root_last_finalized`；`{escape_withdraw:1}`
-验证对象为 **陈旧候选** `cand_aa_root_(last_finalized+1)`——仅当该高度
-从未锁定或已 frozen==2 回滚时可用，且不推进 finalization。两者共享
-wd_/wp_ 防重放累计。
-
-```
-未冻结（escape_withdraw 另要求目标高度无 root_ 且候选森林存在）
-$shard ∈ [0,15] 整数（AA 信任标签；错报 shard 折到错误根上必然失败）
-amount > 0 ∧ leaf_account == trigger.address
-wd_ 累计上限：wd_<addr> 已提累计 + amount
-             ≤ 叶子承诺的 min(collateral, withdrawn)（全局累计，跨高度共享；
-               同一证明不可重放；多次提款共享同一累计上限）
-$perp 为必填 claim 字段（可为 0）；wp_ 累计上限与 wd_ 完全对称：
-             wp_<addr> 累计 + perp_claimed ≤ 叶子声明的 PERP，
-             超出 bounce('bad perp claim')；$perp_claimed > 0 才发
-             PERP asset 输出
-proof 深度 ≤ 16（reduce(...,16,...)，每 shard 最多 2^16 账户 ×
-             16 shard ≈ 每批 ~1M 账户）
-leaf  = sha256('acct:'+address+':'+collateral+':'+perp+':'+withdrawn,'hex')
-fold proof[]: right ? sha256(acc‖sib,'hex') : sha256(sib‖acc,'hex')
-结果 == substring($src, $shard*64, 64)   否则 bounce('bad merkle root')
-→ 支付 trigger.address amount（+ $perp_claimed 的 PERP）
-```
-
+**已移除**——弹回 `no escape withdraw`。wd_/wp_ 防重放累计保持不变。
 ### 10.7 统一 claim 入口
 
 `{claim: "reward"|"bond"|"sbond"|"slash"}` 四态分发（替代旧的三个布尔
@@ -676,8 +648,8 @@ bounce('height taken')（占位门），不产生安慰金（现状无补贴；�
 
 ```
 submit(h) 竞速:
-  if (!active_bond_h 或 frozen==1 的原持有人): 处理（首交者胜）
-  else: bounce('height taken')            # 单候选,无替换
+  if (!active_bond_h): 处理（首交者胜）
+  else: bounce('height taken')            # 单候选, 占用窗内无替换
   da_unit_h ← trigger.unit                # 根↔数据绑定
   if (!fee_winner_h): fee_winner_h ← trigger.address   # 首个稳定者赢
 ```
@@ -721,7 +693,7 @@ ingest → Applied{status: Optimistic}     # 立即执行、立即成交
 |---|---|
 | 伪造成交 / 锁假根 | 双 Merkle 根 + validate_against 全量重放审计 + fills_hash |
 | 偷 AA 资金 | 提款只认 finalized 分片森林的 Merkle 证明；leaf 绑定提款人地址；wd_/wp_ 累计标记防证明重放；escape_withdraw 只认陈旧候选森林且不推进 finalization |
-| 冒名应诉挑战 | respond 身份门（active_bond_ 绑定，frozen==1 期间恒为现任候选人） |
+| 挑战自发应诉 | challenge 由 AA 立即判定成败并重开，无应诉重发、无“not operator” |
 | 存款凭空铸造 | deposits_allowed 白名单 + replay 注入交叉校验 + validate_against 内独立充值证据验证（unit_hash(joint) 复算 + 实付 vault/资产核对） |
 | qty/名义额溢出 DoS | 入口 checked-mul + i64 上限 |
 | 签名延展 | ed25519 verify_strict |
@@ -749,12 +721,12 @@ ingest → Applied{status: Optimistic}     # 立即执行、立即成交
   罚没之间偏置中位数；外部价锚（§6.2 末）需治理切到 AggregatedExternal
   且白名单 keeper 持续喂价才生效
 - ~~在任 operator 每次 resubmit 免费重启稳定计时~~ **已关闭**：单候选
-  组合单元钉死 `da_unit_h`，未冻结的后续 submit bounce `height taken`；frozen==1 应诉不碰钟
+  组合单元钉死 `da_unit_h`，未冻结的后续 submit bounce `height taken`（占用超时后可被不同 operator 覆盖）
 - 大载荷内联 temp_data 会触发 ocore 校验器双回调崩溃：post_batch.js 的
   链上信封字段已直接委托 ocore，但 devnet E2E（test_vault_aa.js）仍跳过
   内联揭示；数据可用性正确性由 Rust 侧 settle 测试覆盖
-- 无第三方安全审计；Oscript 复杂度门恰在上限 **85/100**
-  （ops 1101/2000，`node tools/check_aa_complexity.js`），后续任何 AA
+- 无第三方安全审计；Oscript 复杂度门当前 **76/100**
+  （ops 976/2000，`node tools/check_aa_complexity.js`），后续任何 AA
   改动必须先腾出等额预算
 - 独立 watcher（`crates/operp-watch`）已存在、可离线重放 `da_unit_<h>`，尚未以独立密钥部署，互相牵制未跑通前不对外宣称已具备
 ---
