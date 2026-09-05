@@ -81,7 +81,7 @@
 					if (!is_integer($k) OR $k < 0 OR $k >= $n)
 						bounce('bad k');
 					$op = trigger.data.op;
-					if (!$trigger.data.ops_proof OR trigger.data.ops_proof.index != $k OR trigger.data.ops_proof.root != trigger.data.ops_root
+					if (!trigger.data.ops_proof OR trigger.data.ops_proof.index != $k OR trigger.data.ops_proof.root != trigger.data.ops_root
 						OR !is_valid_merkle_proof($op, trigger.data.ops_proof))
 						bounce('bad ops proof');
 					$deposit = trigger.data.pred == 'deposit';
