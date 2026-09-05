@@ -150,6 +150,14 @@ const META1 = `meta:1:1:1000:500:5:100:0:100`;
 const GENESIS_LEAVES = [DEP_PRE, FILL_TAKER_PRE, META1].sort();
 const WIT_ROOT = merkle.getMerkleRoot(GENESIS_LEAVES);
 const GEN_WIT_COUNT = GENESIS_LEAVES.length;
+// ocore canonical JSON bans empty arrays: a single-leaf merkle proof has
+// `"siblings":[]` and the whole trigger is uncomposable. Pad every proof
+// array to >= 2 leaves so every proof carries >= 1 sibling. 'pad:' sorts
+// after all leaf domains (acct/f/meta/ord), keeping after-max geometry.
+function pad2(arr, tag) {
+  if (arr.length >= 2) return arr;
+  return arr.concat([`pad:${tag}:${"z".repeat(16)}`]);
+}
 function b6444(seed) {
   const h = crypto.createHash("sha256").update(seed, "utf8").digest("base64");
   return h; // exactly 44 chars
@@ -287,10 +295,10 @@ async function main() {
   const opD = "d:" + acct + ":100000";
   const preLeaf = DEP_PRE;
   const postLeaf = `acct:${acct}:1100000:0:0`;
-  const OPS1 = [opD];
-  const POST1 = [postLeaf];
+  const OPS1 = pad2([opD], "ops1");
+  const POST1 = pad2([postLeaf], "post1");
   const POST_WIT1 = merkle.getMerkleRoot(POST1);
-  const TRACE1 = [POST_WIT1];
+  const TRACE1 = pad2([POST_WIT1], "trace1");
   const OPS_ROOT1 = merkle.getMerkleRoot(OPS1);
   const TRACE_ROOT1 = merkle.getMerkleRoot(TRACE1);
   // Height 2 submit carrying the REAL roots the predicates stale-check.
@@ -349,9 +357,9 @@ async function main() {
   // ---- 7. dishonest deposit → fraud verdict -------------------------------
   // Liar post tree carries the UNCHANGED col; its root is committed as
   // post_wit so post_proof + post_leaf_proof verify, but col math fails.
-  const LIAR_POST1 = [`acct:${acct}:1000000:0:0`];
+  const LIAR_POST1 = pad2([`acct:${acct}:1000000:0:0`], "liar1");
   const LIAR_WIT1 = merkle.getMerkleRoot(LIAR_POST1);
-  const LIAR_TRACE1 = [LIAR_WIT1];
+  const LIAR_TRACE1 = pad2([LIAR_WIT1], "liartrace1");
   const LIAR_TRACE_ROOT1 = merkle.getMerkleRoot(LIAR_TRACE1);
   await submitH2(OPS_ROOT1, LIAR_TRACE_ROOT1, UNITS_SET_ROOT, FILLS_ROOT);
   const fraudProof = {
@@ -384,13 +392,13 @@ async function main() {
   console.log("7. fraud verdict: height failed, slashed, challenger paid");
 
   // ---- 8. P-omit fraud: forced id missing from units_set ------------------
-  // Force id F, then submit h=2 (re-submit after fraud) whose units_set is
-  // the merkle root of ONE other id. Adjacent/min/max geometry: single-leaf
-  // set -> before-min branch with the lone member as left.
-  const forcedOmit = sha256Hex("omit-unit");
+  // forcedOmit < otherId here, so the missing id lies BEFORE the set min:
+  // before-min branch (left index 0, pad leaf sorts last, harmless).
   await trigger(operator, rollup, { force: 1, unit_id: forcedOmit }, 20000);
   const otherId = sha256Hex("other-unit");
-  const SET1 = [otherId];
+  // Pad keeps after-max geometry: pad leaf sorts last, left stays index 0
+  // with unit_count 1 (AA checks index == n-1 == 0).
+  const SET1 = pad2([otherId], "set1");
   const SET_ROOT1 = merkle.getMerkleRoot(SET1);
   await submitH2(OPS_ROOT1, TRACE_ROOT1, SET_ROOT1, FILLS_ROOT);
   const omitProof = {
@@ -433,13 +441,13 @@ async function main() {
   // Liar posts col 0.
   const takerH = FILL_TAKER;
   const fillStr = `f:${"u".repeat(64)}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"e".repeat(64)}:1:100000000:100000000:9:0`;
-  const FILLS1 = [fillStr];
+  const FILLS1 = pad2([fillStr], "fills1");
   const FILLS_ROOT1 = merkle.getMerkleRoot(FILLS1);
   const takerPreIdx = GENESIS_LEAVES.indexOf(FILL_TAKER_PRE);
   const metaPreIdx = GENESIS_LEAVES.indexOf(META1);
   const POST_LEAVES = [`acct:${takerH}:0:0:0`, META1, `pos:${takerH}:1:100000000:100000000`].sort();
   const POST_WIT = merkle.getMerkleRoot(POST_LEAVES);
-  const TRACE_F = [POST_WIT];
+  const TRACE_F = pad2([POST_WIT], "tracef");
   const TRACE_F_ROOT = merkle.getMerkleRoot(TRACE_F);
   await submitH2(OPS_ROOT1, TRACE_F_ROOT, UNITS_SET_ROOT, FILLS_ROOT1);
   const fillBase = {
@@ -471,7 +479,7 @@ async function main() {
   // ---- 11. fill_math honest → 'no fraud' -----------------------------------
   const POST_H = [`acct:${takerH}:-500:0:0`, META1, `pos:${takerH}:1:100000000:100000000`].sort();
   const POST_H_WIT = merkle.getMerkleRoot(POST_H);
-  const TRACE_H = [POST_H_WIT];
+  const TRACE_H = pad2([POST_H_WIT], "traceh");
   const TRACE_H_ROOT = merkle.getMerkleRoot(TRACE_H);
   await submitH2(OPS_ROOT1, TRACE_H_ROOT, UNITS_SET_ROOT, FILLS_ROOT1);
   const fillHonest2 = Object.assign({}, fillBase, {
@@ -533,9 +541,9 @@ async function main() {
   const BETTER_ORD = `ord:${"e".repeat(63)}f:1:1:90:6:9:${"c".repeat(64)}`;
   const SKIP_PRE = [FILL_TAKER_PRE, META1, MAKER_ORD, BETTER_ORD].sort();
   const SKIP_PRE_WIT = merkle.getMerkleRoot(SKIP_PRE);
-  const SKIP_TRACE = [SKIP_PRE_WIT];
+  const SKIP_TRACE = pad2([SKIP_PRE_WIT], "skiptrace");
   const SKIP_TRACE_ROOT = merkle.getMerkleRoot(SKIP_TRACE);
-  const SKIP_FILLS = [`f:${"u".repeat(64)}:0:${FILL_TAKER}:${"c".repeat(64)}:${"d".repeat(64)}:${"d".repeat(64)}:1:100:5:9:0`];
+  const SKIP_FILLS = pad2([`f:${"u".repeat(64)}:0:${FILL_TAKER}:${"c".repeat(64)}:${"d".repeat(64)}:${"d".repeat(64)}:1:100:5:9:0`], "skipfills");
   const SKIP_FILLS_ROOT = merkle.getMerkleRoot(SKIP_FILLS);
   const sd3 = submitData(3, STATE_ROOT, STATE_ROOT);
   sd3.trace_root = SKIP_TRACE_ROOT;
@@ -560,6 +568,34 @@ async function main() {
       base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
     });
     if (r.error) throw new Error("h3 submit failed: " + r.error);
+    await network.witnessUntilStable(r.unit);
+  }
+  // h=4 k=0 anchors pre_wit on wit_root_3 = SKIP_PRE_WIT; post tree is a
+  // padded single leaf (proof needs a sibling).
+  const SKIP_TRACE4 = pad2([`skip-post-wit`], "skiptrace4");
+  const SKIP_TRACE4_ROOT = merkle.getMerkleRoot(SKIP_TRACE4);
+  const sd4 = submitData(4, STATE_ROOT, STATE_ROOT);
+  sd4.trace_root = SKIP_TRACE4_ROOT;
+  sd4.fills_root = SKIP_FILLS_ROOT;
+  sd4.ops_root = OPS_ROOT1;
+  {
+    const h4data = { chain_id: "operp-v2", height: 4 };
+    const r = await operator.sendMulti({
+      messages: [
+        {
+          app: "temp_data",
+          payload_location: "inline",
+          payload: {
+            data_length: require("ocore/object_length.js").getLength(h4data, true),
+            data_hash: require("ocore/object_hash.js").getBase64Hash(h4data, true),
+            data: h4data,
+          },
+        },
+        { app: "data", payload: sd4 },
+      ],
+      base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
+    });
+    if (r.error) throw new Error("h4 submit failed: " + r.error);
     await network.witnessUntilStable(r.unit);
   }
   const skipProof = {
