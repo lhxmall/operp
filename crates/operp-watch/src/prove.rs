@@ -289,12 +289,15 @@ fn fill_proof(
         let maker_hex = parts[4].to_string();
         let maker_order_hex = parts[6].to_string();
         let market = parts[7].to_string();
-        let ghost_hit = !pre_leaves.iter().any(|l| {
-            l.starts_with("ord:") && {
-                let o: Vec<&str> = l.split(':').collect();
-                o.len() == 8 && o[1] == maker_order_hex && o[2] == market && o[7] == maker_hex
-            }
-        });
+        let fill_price = parts[8].to_string();
+        let fill_qty = parts[9].to_string();
+        let fill_seq = parts[10].to_string();
+        let opp_side = if parts[11] == "0" { "1" } else { "0" }.to_string();
+        // Prefix-range ghost: fraud iff NO pre leaf carries this order id.
+        // Any same-id leaf sits inside [$lo,$hi) and breaks every AA
+        // straddle, so only emit then.
+        let ord_prefix = format!("ord:{}:", maker_order_hex);
+        let ghost_hit = !pre_leaves.iter().any(|l| l.starts_with(&ord_prefix));
         if ghost_hit {
             let idx = index_of(&batch.fills, f)?;
             let mut data = serde_json::json!({
@@ -305,12 +308,8 @@ fn fill_proof(
                 "fill": f,
                 "fill_proof": proof_json(&batch.fills, idx),
             });
-            let pre_fields = pre_wit_fields(batch, k, pre_leaves);
-            data.as_object_mut()?
-                .extend(pre_fields.as_object()?.clone());
-            // Non-membership neighbors for the ghost ord leaf: reuse omit
+            // Non-membership neighbors for the [$lo,$hi) range: reuse omit
             // geometry over the pre wit leaves with wit_count bound.
-            let ord_prefix = format!("ord:{}:", maker_order_hex);
             let mut sorted = pre_leaves.to_vec();
             sorted.sort();
             let pos = sorted
@@ -320,7 +319,7 @@ fn fill_proof(
             let obj = data.as_object_mut()?;
             obj.insert(
                 "maker_ord".into(),
-                format!("ord:{}:{}:0:0:0:0:{}", maker_order_hex, market, maker_hex).into(),
+                format!("ord:{}:{}:{}:{}:{}:{}:{}", maker_order_hex, market, opp_side, fill_price, fill_seq, fill_qty, maker_hex).into(),
             );
             if pos > 0 && pos < sorted.len() {
                 obj.insert("left".into(), sorted[pos - 1].clone().into());

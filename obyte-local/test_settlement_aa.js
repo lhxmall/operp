@@ -506,7 +506,7 @@ async function main() {
   // 'ord:' sorts after every genesis leaf -> after-max shape: left is the
   // last genesis leaf (index GEN_WIT_COUNT-1 == wit_count_1-1), no right.
   await submitH2(OPS_ROOT1, TRACE_F_ROOT, UNITS_SET_ROOT, FILLS_ROOT1);
-  const ghostOrd = `ord:${"e".repeat(64)}:1:1:100:9:3:${"c".repeat(64)}`;
+  const ghostOrd = `ord:${"e".repeat(64)}:1:1:100000000:9:3:${"c".repeat(64)}`;
   const gSorted = GENESIS_LEAVES.slice().sort();
   const gLast = gSorted.length - 1;
   if (!(ghostOrd > gSorted[gLast])) throw new Error("ghost fixture not after-max");
