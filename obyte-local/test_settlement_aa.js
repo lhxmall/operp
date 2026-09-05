@@ -400,8 +400,8 @@ async function main() {
   // scenario with the roots that scenario needs.
   console.log("7. (deposit-fraud folds into the per-scenario re-submit flow below)");
 
-  // ---- 8. P-omit fraud: forced id missing from units_set ------------------
-  // The live height-2 candidate (scenario 6's submit) carries a b6444
+  // ---- 8. P-omit: forged roots bounce 'stale roots' ------------------------
+  const forcedOmit = sha256Hex("forced-unit");
   // stand-in units_set_root whose preimage is unknowable, so a REAL
   // non-membership proof cannot be built against it. Instead: this scenario
   // expects the dispute to bounce 'stale roots' — proving the AA rejects
