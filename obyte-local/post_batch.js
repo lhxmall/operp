@@ -6,14 +6,13 @@
 //
 // Reads an exported batch (obyte-local/batch.json from
 // `cargo run -p operp-settle --example export_batch` or stress tooling),
-// then against the deployed vault AA:
+// then against the deployed ROLLUP AA (deployment.json rollup_aa_address):
 //   1. posts the FULL batch as OIP-0007 temp_data PLUS the AA submit data
 //      message in ONE combined unit (data availability for watchers AND
-//      the submit in the same unit — the AA records da_unit_<h>; joins
-//      the operator fee race),
-//   2. travels the 600s stability window, locks,
-//   3. travels the 3600s challenge window, finalizes,
-//   4. claims the operator race reward.
+//      the assertion submit in the same unit — the rollup AA records
+//      da_unit_<h>; joins the operator fee race),
+//   2. travels the 3600s challenge window, finalizes,
+//   3. claims the operator race reward.
 // Usage: cd obyte-local && node post_batch.js [batch.json]
 
 const path = require("path");
@@ -149,9 +148,9 @@ async function buildDepositEvidences(batchData, vaultAddress) {
   return evidences;
 }
 
-async function trigger(wallet, data, amount) {
+async function trigger(wallet, data, amount, toAddress) {
   const r = await wallet.triggerAaWithData({
-    toAddress: network.agent.vault,
+    toAddress: toAddress || network.agent.vault,
     amount: amount === undefined ? 20000 : amount,
     data,
   });
@@ -163,8 +162,10 @@ async function trigger(wallet, data, amount) {
 let network;
 
 async function main() {
-  if (PERP_ASSET_ID === "PERP_ASSET_ID_HERE")
-    throw new Error("Set PERP_ASSET_ID to the issued asset id before posting (testnet/mainnet)");
+  const deploy = JSON.parse(fs.readFileSync(path.join(__dirname, "deployment.json"), "utf8"));
+  const rollup = deploy.rollup_aa_address
+    || process.env.OPERP_ROLLUP_AA;
+  if (!rollup) throw new Error("deployment.json rollup_aa_address (or OPERP_ROLLUP_AA) missing");
   const batchFile = process.argv[2] || path.join(__dirname, "batch.json");
   const batchData = JSON.parse(fs.readFileSync(batchFile, "utf8"));
   // H3 contract visibility: the canonical pair watchers recompute from
@@ -178,10 +179,10 @@ async function main() {
     .with.agent({ vault: resolveVaultAa() })
     .with.wallet({ poster: 1e13 })
     .run();
-  const vault = network.agent.vault;
   const poster = network.wallet.poster;
-  console.log("vault", vault);
-
+  const vault = network.agent.vault;
+  process.env.OPERP_VAULT_AA = vault;
+  console.log("rollup", rollup, "vault", vault);
   // Step4: build deposit_evidences BEFORE posting so the temp_data reveal
   // carries them (watchers verify unit_hash(joint) == aa_unit independently).
   const evidences = await buildDepositEvidences(batchData, vault);
@@ -203,53 +204,57 @@ async function main() {
   const aaForest = shardRoots.join("");
   const submitData = {
     submit: 1,
-    chain_id: batchData.chain_id || "operp-mvp-1",
+    chain_id: batchData.chain_id || "operp-v2",
     height: batchData.height,
     prev_state_hash: batchData.prev_state_hash,
     state_root: batchData.state_root,
-    aa_root: batchData.aa_root,
     aa_forest: aaForest,
-    fills_hash: batchData.fills_hash,
+    assertion_version: batchData.assertion_version || 1,
+    wit_root: batchData.wit_root,
+    trace_root: batchData.trace_root,
+    units_root: batchData.units_root,
+    units_set_root: batchData.units_set_root,
+    ops_root: batchData.ops_root,
+    fills_root: batchData.fills_root,
+    counts_root: batchData.counts_root,
+    unit_count: batchData.unit_count,
+    wit_count: batchData.wit_count,
   };
   if (batchData.validity_proof_hash) submitData.validity_proof_hash = batchData.validity_proof_hash;
   if (batchData.perp_burned !== undefined) submitData.perp_burned = String(batchData.perp_burned);
   // 10000000010000 = 1000000000000 SUBMIT_BOND_NET + 10000 bounce fee headroom.
   const r = await poster.sendMulti({
     messages: [tempDataMessage(batchData), { app: "data", payload: submitData }],
-    base_outputs: [{ address: vault, amount: 10000000010000 }],
+    base_outputs: [{ address: rollup, amount: 10000000010000 }],
   });
   if (r.error) throw new Error("combined da_unit failed: " + r.error);
   const daUnit = r.unit;
   await network.witnessUntilStable(daUnit);
   console.log("combined da_unit posted & stable:", daUnit);
   console.log("da_unit:", daUnit);
-  // 3. stability window then lock
-  await network.timetravel({ shift: "700s" });
-  await trigger(poster, { lock: 1, height: batchData.height });
-
-  // 4. challenge window then finalize
+  // 2. challenge window then finalize (no lock in operp-v2)
   await network.timetravel({ shift: "3600s" });
-  await trigger(poster, { finalize: 1, height: batchData.height });
+  await trigger(poster, { finalize: 1, height: batchData.height }, undefined, rollup);
 
-  // 5. claim the operator race reward
+  // 3. claim the operator race reward
   const claim = await poster.triggerAaWithData({
-    toAddress: vault,
+    toAddress: rollup,
     amount: 20000,
     data: { claim: "reward" },
   });
   if (claim.error) throw new Error("claim failed: " + claim.error);
   await network.witnessUntilStable(claim.unit);
   await new Promise(r => setTimeout(r, 3000));
-  const v = await poster.readAAStateVars(vault);
+  const v = await poster.readAAStateVars(rollup);
   const vars_ = v.vars || v;
   const owed = vars_["reward_" + (await poster.getAddress())];
   if (owed !== undefined && Number(owed) !== 0) {
     throw new Error("reward_ not zeroed after claim: " + owed);
   }
   console.log("post-claim accrued reward remaining: 0 (paid out, var cleared)");
-  console.log("\nOK: batch posted, locked, finalized, reward claimed.");
-  console.log("Watchers re-executing this temp_data within 1 day can detect any");
-  console.log("root mismatch and freeze/rollback the height via challenge.");
+  console.log("\nOK: assertion submitted, finalized, reward claimed.");
+  console.log("Watchers re-executing this temp_data within the 3600s window can");
+  console.log("prove fraud to the dispute AA and fail the height before finalize.");
   await network.stop();
   process.exit(0);
 }
