@@ -12,6 +12,34 @@ use std::collections::HashSet;
 pub mod deposit_verify;
 pub mod obyte_hash;
 pub use operp_state::obyte_merkle;
+/// Test-only vault payee: matches the `payment_joint` fixture payee
+/// ("B"*32) so evidence fixtures verify without env manipulation
+/// (env mutation is process-global and unsafe under parallel tests).
+#[cfg(test)]
+pub const TEST_VAULT_ADDRESS: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+/// Expected vault AA payee for deposit evidences. Env `OPERP_VAULT_AA`
+/// wins (operator-set at deploy); else the baked `VAULT_AA_ADDRESS` when
+/// non-empty; else "" (pre-deploy: batches without evidences skip the
+/// check, batches carrying evidences are rejected). Tests fall back to
+/// `TEST_VAULT_ADDRESS` instead of "" so fixtures stay deterministic.
+pub fn expected_vault() -> String {
+    if let Ok(v) = std::env::var("OPERP_VAULT_AA") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if !VAULT_AA_ADDRESS.is_empty() {
+        return VAULT_AA_ADDRESS.to_string();
+    }
+    #[cfg(test)]
+    {
+        return TEST_VAULT_ADDRESS.to_string();
+    }
+    #[cfg(not(test))]
+    {
+        String::new()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepositEvidence {
@@ -484,10 +512,17 @@ impl Batch {
             // carrying Deposit/GovDeposit ops must present independently
             // verifiable evidence (joint pays the vault the claimed amount
             // in the claimed asset). Any failure maps to DepositEvidence.
+            // Pre-deploy (empty expected vault) evidence checks skip when
+            // there are no evidences; evidences against an empty vault
+            // string are rejected.
+            let vault = expected_vault();
+            if vault.is_empty() && !self.deposit_evidences.is_empty() {
+                return Err(SettleError::DepositEvidence);
+            }
             deposit_verify::verify_all(
                 &self.units,
                 &self.deposit_evidences,
-                VAULT_AA_ADDRESS,
+                &vault,
                 &PERP_ASSET,
             )
             .map_err(|_| SettleError::DepositEvidence)?;
@@ -779,7 +814,7 @@ mod tests {
             aa_unit: hex::encode(h),
             is_perp,
             amount,
-            vault_address: String::new(),
+            vault_address: crate::TEST_VAULT_ADDRESS.to_string(),
             joint: joint.clone(),
         }
     }
@@ -1424,12 +1459,12 @@ mod tests {
         assert!(!eng.state.seen_aa_units.is_empty());
         assert_eq!(rp.state.withdrawals.len(), eng.state.withdrawals.len());
 
-        // --- Fast-forward both sides past the 256-height window. ---
-        eng.state.height = 300;
-        rp.state.height = 300;
+        // --- Fast-forward both sides past the 2048-height window. ---
+        eng.state.height = 2100;
+        rp.state.height = 2100;
 
         // --- Batch B: one filler order; commit prunes old entries on the
-        // producer side (min_height 301). ---
+        // producer side (min_height 2101). ---
         let prev_b = eng.clone();
         let prev_root_b = prev_b.state.state_root();
         let f = sign_unit(

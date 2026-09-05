@@ -148,7 +148,9 @@ const DEP_PRE = `acct:${DEP_ACCT}:1000000:0:0`;
 const FILL_TAKER = "b".repeat(64);
 const FILL_TAKER_PRE = `acct:${FILL_TAKER}:0:0:0`;
 const META1 = `meta:1:1:1000:500:5:100:0:100`;
-const GENESIS_LEAVES = [DEP_PRE, FILL_TAKER_PRE, META1].sort();
+const META2 = `meta:2:1:1000:500:5:100:0:100`;
+const POS2 = `pos:${FILL_TAKER}:2:50000000:90000000`;
+const GENESIS_LEAVES = [DEP_PRE, FILL_TAKER_PRE, META1, META2, POS2].sort();
 const WIT_ROOT = merkle.getMerkleRoot(GENESIS_LEAVES);
 const GEN_WIT_COUNT = GENESIS_LEAVES.length;
 // ocore canonical JSON bans empty arrays: a single-leaf merkle proof has
@@ -477,6 +479,14 @@ async function main() {
     pre_meta: META1,
     pre_meta_proof: merkle.getMerkleProof(GENESIS_LEAVES, metaPreIdx),
     pos_absent: true,
+    // Claimed-absent pre pos (market 1): prefix-range neighbors over the
+    // sorted genesis leaves — META2 < pos:{taker}:1: < POS2(market 2),
+    // adjacent indices (hit1).
+    pleft: META2,
+    pleft_proof: merkle.getMerkleProof(GENESIS_LEAVES, GENESIS_LEAVES.indexOf(META2)),
+    pright: POS2,
+    pright_proof: merkle.getMerkleProof(GENESIS_LEAVES, GENESIS_LEAVES.indexOf(POS2)),
+    who: "taker",
   };
   await trigger(challenger, fill, Object.assign({ pred: "fill_math", height: 2 }, fillBase), 20000);
   st = await vars(rollup);
@@ -501,15 +511,122 @@ async function main() {
   });
   await triggerBounce(challenger, fill, Object.assign({ pred: "fill_math", height: 2 }, fillHonest2), 20000, "no fraud");
   console.log("11. fill_math honest bounced 'no fraud'");
+  // ---- 11b. fill_math same-sign add dishonest → fraud ---------------------
+  // Pre pos 0.5 @0.9e8 (market 2), taker buys 0.5 @1e8: VWAP 0.95e8, fee 250.
+  // Liar posts entry=price (1e8) instead of 95000000.
+  const addFill = `f:${"u".repeat(64)}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"e".repeat(64)}:2:100000000:50000000:9:0`;
+  const ADD_FILLS = pad2([addFill], "addfills");
+  const ADD_FILLS_ROOT = merkle.getMerkleRoot(ADD_FILLS);
+  const meta2Idx = GENESIS_LEAVES.indexOf(META2);
+  const pos2Idx = GENESIS_LEAVES.indexOf(POS2);
+  const POST_ADD_L = [`acct:${takerH}:-250:0:0`, META2, `pos:${takerH}:2:100000000:100000000`].sort();
+  const POST_ADD_L_WIT = merkle.getMerkleRoot(POST_ADD_L);
+  const TRACE_ADD_L = pad2([POST_ADD_L_WIT], "traceaddl");
+  const TRACE_ADD_L_ROOT = merkle.getMerkleRoot(TRACE_ADD_L);
+  await submitH2(OPS_ROOT1, TRACE_ADD_L_ROOT, UNITS_SET_ROOT, ADD_FILLS_ROOT);
+  await trigger(challenger, fill, Object.assign({ pred: "fill_math", height: 2 }, {
+    k: 0,
+    trace_root: TRACE_ADD_L_ROOT,
+    fills_root: ADD_FILLS_ROOT,
+    ops_root: OPS_ROOT1,
+    fill: addFill,
+    fill_proof: merkle.getMerkleProof(ADD_FILLS, 0),
+    pre_wit: WIT_ROOT,
+    post_wit: POST_ADD_L_WIT,
+    post_proof: merkle.getMerkleProof(TRACE_ADD_L, 0),
+    pre_acct: FILL_TAKER_PRE,
+    pre_acct_proof: merkle.getMerkleProof(GENESIS_LEAVES, takerPreIdx),
+    pre_pos: POS2,
+    pre_pos_proof: merkle.getMerkleProof(GENESIS_LEAVES, pos2Idx),
+    post_acct: `acct:${takerH}:-250:0:0`,
+    post_acct_proof: merkle.getMerkleProof(POST_ADD_L, POST_ADD_L.indexOf(`acct:${takerH}:-250:0:0`)),
+    post_pos: `pos:${takerH}:2:100000000:100000000`,
+    post_pos_proof: merkle.getMerkleProof(POST_ADD_L, POST_ADD_L.indexOf(`pos:${takerH}:2:100000000:100000000`)),
+    pre_meta: META2,
+    pre_meta_proof: merkle.getMerkleProof(GENESIS_LEAVES, meta2Idx),
+    who: "taker",
+  }), 20000);
+  st = await vars(rollup);
+  if (Number(st.frozen_2) !== 2) throw new Error("fill_math add fraud did not freeze height");
+  console.log("11b. fill_math same-sign add (bad VWAP) → frozen=2");
+  // ---- 11c. fill_math close dishonest → fraud ------------------------------
+  // Pre long 0.5 @0.9e8, taker sells 0.25 @1e8: pnl +25000, fee 125,
+  // exp col 24875, leftover 0.25 @0.9e8. Liar posts col -125 (fee only).
+  const closeFill = `f:${"u".repeat(64)}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"f".repeat(64)}:2:100000000:25000000:9:1`;
+  const CLOSE_FILLS = pad2([closeFill], "closefills");
+  const CLOSE_FILLS_ROOT = merkle.getMerkleRoot(CLOSE_FILLS);
+  const POST_CLOSE_L = [`acct:${takerH}:-125:0:0`, META2, `pos:${takerH}:2:25000000:90000000`].sort();
+  const POST_CLOSE_L_WIT = merkle.getMerkleRoot(POST_CLOSE_L);
+  const TRACE_CLOSE_L = pad2([POST_CLOSE_L_WIT], "traceclosel");
+  const TRACE_CLOSE_L_ROOT = merkle.getMerkleRoot(TRACE_CLOSE_L);
+  await submitH2(OPS_ROOT1, TRACE_CLOSE_L_ROOT, UNITS_SET_ROOT, CLOSE_FILLS_ROOT);
+  await trigger(challenger, fill, Object.assign({ pred: "fill_math", height: 2 }, {
+    k: 0,
+    trace_root: TRACE_CLOSE_L_ROOT,
+    fills_root: CLOSE_FILLS_ROOT,
+    ops_root: OPS_ROOT1,
+    fill: closeFill,
+    fill_proof: merkle.getMerkleProof(CLOSE_FILLS, 0),
+    pre_wit: WIT_ROOT,
+    post_wit: POST_CLOSE_L_WIT,
+    post_proof: merkle.getMerkleProof(TRACE_CLOSE_L, 0),
+    pre_acct: FILL_TAKER_PRE,
+    pre_acct_proof: merkle.getMerkleProof(GENESIS_LEAVES, takerPreIdx),
+    pre_pos: POS2,
+    pre_pos_proof: merkle.getMerkleProof(GENESIS_LEAVES, pos2Idx),
+    post_acct: `acct:${takerH}:-125:0:0`,
+    post_acct_proof: merkle.getMerkleProof(POST_CLOSE_L, POST_CLOSE_L.indexOf(`acct:${takerH}:-125:0:0`)),
+    post_pos: `pos:${takerH}:2:25000000:90000000`,
+    post_pos_proof: merkle.getMerkleProof(POST_CLOSE_L, POST_CLOSE_L.indexOf(`pos:${takerH}:2:25000000:90000000`)),
+    pre_meta: META2,
+    pre_meta_proof: merkle.getMerkleProof(GENESIS_LEAVES, meta2Idx),
+    who: "taker",
+  }), 20000);
+  st = await vars(rollup);
+  if (Number(st.frozen_2) !== 2) throw new Error("fill_math close fraud did not freeze height");
+  console.log("11c. fill_math close (missing pnl) → frozen=2");
+  // ---- 11d. fill_math honest close → 'no fraud' ----------------------------
+  const POST_CLOSE_H = [`acct:${takerH}:24875:0:0`, META2, `pos:${takerH}:2:25000000:90000000`].sort();
+  const POST_CLOSE_H_WIT = merkle.getMerkleRoot(POST_CLOSE_H);
+  const TRACE_CLOSE_H = pad2([POST_CLOSE_H_WIT], "tracecloseh");
+  const TRACE_CLOSE_H_ROOT = merkle.getMerkleRoot(TRACE_CLOSE_H);
+  await submitH2(OPS_ROOT1, TRACE_CLOSE_H_ROOT, UNITS_SET_ROOT, CLOSE_FILLS_ROOT);
+  await triggerBounce(challenger, fill, Object.assign({ pred: "fill_math", height: 2 }, {
+    k: 0,
+    trace_root: TRACE_CLOSE_H_ROOT,
+    fills_root: CLOSE_FILLS_ROOT,
+    ops_root: OPS_ROOT1,
+    fill: closeFill,
+    fill_proof: merkle.getMerkleProof(CLOSE_FILLS, 0),
+    pre_wit: WIT_ROOT,
+    post_wit: POST_CLOSE_H_WIT,
+    post_proof: merkle.getMerkleProof(TRACE_CLOSE_H, 0),
+    pre_acct: FILL_TAKER_PRE,
+    pre_acct_proof: merkle.getMerkleProof(GENESIS_LEAVES, takerPreIdx),
+    pre_pos: POS2,
+    pre_pos_proof: merkle.getMerkleProof(GENESIS_LEAVES, pos2Idx),
+    post_acct: `acct:${takerH}:24875:0:0`,
+    post_acct_proof: merkle.getMerkleProof(POST_CLOSE_H, POST_CLOSE_H.indexOf(`acct:${takerH}:24875:0:0`)),
+    post_pos: `pos:${takerH}:2:25000000:90000000`,
+    post_pos_proof: merkle.getMerkleProof(POST_CLOSE_H, POST_CLOSE_H.indexOf(`pos:${takerH}:2:25000000:90000000`)),
+    pre_meta: META2,
+    pre_meta_proof: merkle.getMerkleProof(GENESIS_LEAVES, meta2Idx),
+    who: "taker",
+  }), 20000, "no fraud");
+  console.log("11d. fill_math honest close bounced 'no fraud'");
 
   // ---- 12. ghost: maker order absent → fraud --------------------------------
-  // 'ord:' sorts after every genesis leaf -> after-max shape: left is the
-  // last genesis leaf (index GEN_WIT_COUNT-1 == wit_count_1-1), no right.
+  // Ghost range [$lo,$hi) sits in the ord: domain, between meta:* and
+  // pos:* leaves: left=META2, right=POS2 straddle every ord id adjacently.
   await submitH2(OPS_ROOT1, TRACE_F_ROOT, UNITS_SET_ROOT, FILLS_ROOT1);
   const ghostOrd = `ord:${"e".repeat(64)}:1:1:100000000:9:3:${"c".repeat(64)}`;
   const gSorted = GENESIS_LEAVES.slice().sort();
-  const gLast = gSorted.length - 1;
-  if (!(ghostOrd > gSorted[gLast])) throw new Error("ghost fixture not after-max");
+  const gMeta2 = gSorted.indexOf(META2);
+  const gPos2 = gSorted.indexOf(POS2);
+  if (gPos2 !== gMeta2 + 1) throw new Error("ghost fixture not adjacent");
+  const ghostLo = `ord:${"e".repeat(64)}:`;
+  const ghostHi = `ord:${"e".repeat(64)};`;
+  if (!(gSorted[gMeta2] < ghostLo && ghostHi <= gSorted[gPos2])) throw new Error("ghost fixture not straddling");
   const ghostProof = {
     k: 0,
     trace_root: TRACE_F_ROOT,
@@ -519,8 +636,10 @@ async function main() {
     fill_proof: merkle.getMerkleProof(FILLS1, 0),
     pre_wit: WIT_ROOT,
     maker_ord: ghostOrd,
-    left: gSorted[gLast],
-    left_proof: merkle.getMerkleProof(gSorted, gLast),
+    left: gSorted[gMeta2],
+    left_proof: merkle.getMerkleProof(gSorted, gMeta2),
+    right: gSorted[gPos2],
+    right_proof: merkle.getMerkleProof(gSorted, gPos2),
   };
   await trigger(challenger, fill, Object.assign({ pred: "ghost", height: 2 }, ghostProof), 20000);
   st = await vars(rollup);

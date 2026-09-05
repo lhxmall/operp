@@ -15,7 +15,7 @@ pub struct Withdrawal {
     pub amount: Usd,
     pub pending: bool,
     /// Batch height at which this withdrawal was signed in; drives the
-    /// 256-height replay-protection window enforced by `prune_withdrawals`.
+    /// 2048-height replay-protection window enforced by `prune_withdrawals`.
     pub height: Height,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -245,33 +245,19 @@ impl ChainState {
             }
         });
     }
-    /// Legacy wrappers for replay determinism pre-activation (window=256)
+    /// Window prune (2048 from genesis, mainnet launch). Same `window` on
+    /// producer and replay keeps batch commits deterministic.
     pub fn prune_withdrawals(&mut self, min_height: Height) {
-        let window = if self.height >= operp_types::REPLAY_ACTIVATION_HEIGHT {
-            operp_types::REPLAY_WINDOW
-        } else {
-            operp_types::REPLAY_WINDOW_LEGACY
-        };
-        self.prune_withdrawals_at(min_height, window);
+        self.prune_withdrawals_at(min_height, operp_types::REPLAY_WINDOW);
     }
     /// Bounded-window cleanup for AA unit dedup: units observed at height
     /// `h` expire once `min_height >= h + window`. Called at batch commit.
     pub fn prune_aa_units(&mut self, min_height: Height) {
-        let window = if self.height >= operp_types::REPLAY_ACTIVATION_HEIGHT {
-            operp_types::REPLAY_WINDOW
-        } else {
-            operp_types::REPLAY_WINDOW_LEGACY
-        };
-        self.prune_aa_units_at(min_height, window);
+        self.prune_aa_units_at(min_height, operp_types::REPLAY_WINDOW);
     }
     pub fn prune_deposits_allowed(&mut self, min_height: Height) {
-        let window = if self.height >= operp_types::REPLAY_ACTIVATION_HEIGHT {
-            operp_types::REPLAY_WINDOW
-        } else {
-            operp_types::REPLAY_WINDOW_LEGACY
-        };
         // Ensure aa_units pruned first so missing-seen means expired
-        self.prune_deposits_allowed_at(min_height, window);
+        self.prune_deposits_allowed_at(min_height, operp_types::REPLAY_WINDOW);
     }
     pub fn note_finalized(&mut self, root: [u8; 32], height: Height) {
         self.last_finalized_root = root;

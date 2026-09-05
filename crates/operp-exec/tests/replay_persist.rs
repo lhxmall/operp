@@ -6,10 +6,8 @@
 //!   * the gov-nonce watermark surviving a crash via `gov_nonces.journal`
 //!     alone (no snapshot), with no double-apply across the watermark.
 //!
-//! The window expansion (256 → 2048) ships behind the activation gate
-//! (`REPLAY_ACTIVATION_HEIGHT`, flipped at deploy). Tests exercise the new
-//! window path by overriding `state.height` past the gate instead of waiting
-//! for deployment.
+//! The replay window is 2048 from genesis (`REPLAY_ACTIVATION_HEIGHT = 0`,
+//! mainnet launch): no legacy 256 path, no height override needed.
 
 use ed25519_dalek::SigningKey;
 use operp_dag::{genesis_id, sign_unit, unit_id, Op};
@@ -166,10 +164,8 @@ fn duplicate_withdraw_300h_rejected_after_restart() {
     let mut eng = stored(&dir);
     allow_all(&mut eng);
 
-    // Height override: jump past the activation gate so the 2048 window
-    // path runs (deployment flips REPLAY_ACTIVATION_HEIGHT; tests can't wait).
+    // Activation is 0: the 2048 window applies from genesis, no override.
     eng.state.height = REPLAY_ACTIVATION_HEIGHT;
-
     let alice = sk(1);
     let g = genesis_id();
     let d = deposit(vec![g], &alice, 10_000 * USD_SCALE as i128, 1);
@@ -334,7 +330,9 @@ fn aa_unit_reused_after_300h_still_rejected_after_restart() {
 
 #[test]
 fn activation_gate_selects_window_by_height() {
-    // One dedup entry created at h0, re-checked 300 heights later.
+    // Activation is 0 (mainnet launch): the 2048 window applies from
+    // genesis. One dedup entry created at h0 survives a 300-height spread
+    // and expires only past the full 2048 window.
     fn entry_at(h0: Height) -> ChainState {
         let mut st = ChainState::new();
         st.height = h0;
@@ -351,19 +349,7 @@ fn activation_gate_selects_window_by_height() {
         st
     }
 
-    // Below the gate (legacy path): a 300-height-old entry has already
-    // expired under the legacy 256 window...
-    let mut st = entry_at(REPLAY_ACTIVATION_HEIGHT - 10_000);
-    st.height += 300;
-    st.prune_withdrawals(st.height);
-    st.prune_aa_units(st.height);
-    assert!(
-        st.withdrawals.is_empty() && st.seen_aa_units.is_empty(),
-        "below the gate the legacy 256 window must still prune at 256"
-    );
-
-    // ...while above the gate (height override → new window path) the same
-    // 300-height spread is well inside the 2048 window and survives.
+    // 300-height spread is well inside the 2048 window: nothing expires.
     let mut st = entry_at(REPLAY_ACTIVATION_HEIGHT);
     st.height += 300;
     st.prune_withdrawals(st.height);
@@ -371,9 +357,19 @@ fn activation_gate_selects_window_by_height() {
     assert_eq!(
         st.withdrawals.len(),
         1,
-        "above the gate nothing expires before 2048 heights"
+        "300 heights in, nothing expires before 2048 heights"
     );
     assert_eq!(st.seen_aa_units.len(), 1);
+
+    // Past the horizon the same entries are gone (window still bounds memory).
+    let mut st = entry_at(REPLAY_ACTIVATION_HEIGHT);
+    st.height += REPLAY_WINDOW + 1;
+    st.prune_withdrawals(st.height);
+    st.prune_aa_units(st.height);
+    assert!(
+        st.withdrawals.is_empty() && st.seen_aa_units.is_empty(),
+        "entries older than 2048 heights must prune"
+    );
 }
 
 #[test]

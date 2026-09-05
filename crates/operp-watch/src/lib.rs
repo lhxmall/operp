@@ -31,6 +31,8 @@ pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
 pub struct WatchConfig {
     /// Obyte rollup AA address to watch.
     pub rollup_address: String,
+    /// Obyte vault AA address (deposit evidence payee).
+    pub vault_address: String,
     /// Optional dispute AA address (challenge posting target).
     pub dispute_address: Option<String>,
     /// Hub JSON-RPC base URL (e.g. `http://127.0.0.1:6611`).
@@ -43,6 +45,7 @@ impl Default for WatchConfig {
     fn default() -> Self {
         Self {
             rollup_address: String::new(),
+            vault_address: String::new(),
             dispute_address: None,
             hub_url: None,
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,

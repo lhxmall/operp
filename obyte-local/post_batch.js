@@ -180,7 +180,9 @@ async function main() {
     .with.wallet({ poster: 1e13 })
     .run();
   const poster = network.wallet.poster;
-  console.log("rollup", rollup);
+  const vault = network.agent.vault;
+  process.env.OPERP_VAULT_AA = vault;
+  console.log("rollup", rollup, "vault", vault);
   // Step4: build deposit_evidences BEFORE posting so the temp_data reveal
   // carries them (watchers verify unit_hash(joint) == aa_unit independently).
   const evidences = await buildDepositEvidences(batchData, vault);

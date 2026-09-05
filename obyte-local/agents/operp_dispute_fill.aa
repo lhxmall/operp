@@ -56,10 +56,10 @@
 				]
 			},
 			{
-				// P-fill_math (taker-only): the proven post acct/pos legs
-				// disagree with apply_fill math + taker fee on the fill.
-				// Only the old==0 taker branch is covered: a first fill on a
-				// flat account (new_qty=delta, entry=price, col-=fee).
+				// P-fill_math (taker or maker): the proven post acct/pos legs
+				// disagree with apply_fill math (+ taker fee) on the fill.
+				// Covers add (same sign), reduce, flip and full close; close
+				// to flat expects post_pos_absent instead of a post pos leaf.
 				if: "{trigger.data.pred == 'fill_math'}",
 				init: "{
 					$h = trigger.data.height;
@@ -82,13 +82,11 @@
 						bounce('bad fill proof');
 					$F = split($fill, ':');
 					if (array_length($F) != 12) bounce('bad fill');
-					$side = $F[11];
-					if ($side != '0' AND $side != '1') bounce('bad fill');
-					$price = $F[8];
-					$qty = $F[9];
+					if ($F[11] != '0' AND $F[11] != '1') bounce('bad fill');
+					$price = $F[8] + 0;
+					$qty = $F[9] + 0;
 					$market = $F[7];
-					$taker = $F[3];
-					if (length($taker) != 64) bounce('bad fill');
+					if (length($F[3]) != 64 OR length($F[4]) != 64) bounce('bad fill');
 					$pre_wit = trigger.data.pre_wit;
 					if ($k == 0){
 						if ($h == 1){
@@ -104,25 +102,58 @@
 					if (!trigger.data.post_proof OR trigger.data.post_proof.index != $k OR trigger.data.post_proof.root != trigger.data.trace_root
 						OR !is_valid_merkle_proof(trigger.data.post_wit, trigger.data.post_proof))
 						bounce('bad post proof');
-					// Pre acct must show zero collateral-less flat account:
-					// acct leaf col==0 and NO pre position (pos_absent path).
+					$who = trigger.data.who;
+					if ($who != 'taker' AND $who != 'maker') bounce('bad who');
+					$acct_hex = ($who == 'taker') ? $F[3] : $F[4];
+					$side_acct = ($who == 'taker') ? $F[11] : (($F[11] == '0') ? '1' : '0');
+					$delta = ($side_acct == '0') ? $qty : 0 - $qty;
 					$pre_acct = trigger.data.pre_acct;
 					if (typeof($pre_acct) == 'boolean'
 						OR !is_valid_merkle_proof($pre_acct, trigger.data.pre_acct_proof)
 						OR trigger.data.pre_acct_proof.root != $pre_wit)
 						bounce('bad pre acct proof');
 					$A0 = split($pre_acct, ':');
-					if (array_length($A0) != 5 OR $A0[1] != $taker OR $A0[2] != '0') bounce('bad pre acct');
-					if (!trigger.data.pos_absent) bounce('no fraud');
-					$post_acct = trigger.data.post_acct;
-					if (typeof($post_acct) == 'boolean'
-						OR !is_valid_merkle_proof($post_acct, trigger.data.post_acct_proof)
-						OR trigger.data.post_acct_proof.root != trigger.data.post_wit)
-						bounce('bad post acct proof');
-					$A1 = split($post_acct, ':');
-					if (array_length($A1) != 5 OR $A1[1] != $taker) bounce('bad post acct');
+					if (array_length($A0) != 5 OR $A0[1] != $acct_hex) bounce('bad pre acct');
+					$old_col = $A0[2] + 0;
+					if (trigger.data.pos_absent){
+						// Claimed-absent pre pos needs prefix-range
+						// non-membership over [$plo,$phi) (ghost pattern):
+						// ';' sorts after ':' so the range holds at most
+						// this acct+market's pos leaf. Without it a
+						// challenger could claim old_qty=0 on an account
+						// WITH a pre position and freeze honest heights.
+						$plo = 'pos:' || $acct_hex || ':' || $market || ':';
+						$phi = 'pos:' || $acct_hex || ':' || $market || ';';
+						$phit1 = trigger.data.pleft AND is_valid_merkle_proof(trigger.data.pleft, trigger.data.pleft_proof)
+							AND trigger.data.pleft_proof.root == $pre_wit
+							AND trigger.data.pright AND is_valid_merkle_proof(trigger.data.pright, trigger.data.pright_proof)
+							AND trigger.data.pright_proof.root == $pre_wit
+							AND trigger.data.pleft_proof.index + 1 == trigger.data.pright_proof.index
+							AND trigger.data.pleft < $plo AND $phi <= trigger.data.pright;
+						$phit2 = trigger.data.pleft AND is_valid_merkle_proof(trigger.data.pleft, trigger.data.pleft_proof)
+							AND trigger.data.pleft_proof.root == $pre_wit
+							AND trigger.data.pleft_proof.index == 0
+							AND $phi <= trigger.data.pleft;
+						$phit3 = ($k == 0 AND $h > 1) AND trigger.data.pleft AND is_valid_merkle_proof(trigger.data.pleft, trigger.data.pleft_proof)
+							AND trigger.data.pleft_proof.root == $pre_wit
+							AND trigger.data.pleft_proof.index == (var[$rollup]['wit_count_' || ($h - 1)] otherwise 0) - 1
+							AND trigger.data.pleft < $plo;
+						if (!$phit1 AND !$phit2 AND !$phit3) bounce('no fraud');
+						$old_qty = 0;
+						$old_entry = 0;
+					} else {
+						$pre_pos = trigger.data.pre_pos;
+						if (typeof($pre_pos) == 'boolean'
+							OR !is_valid_merkle_proof($pre_pos, trigger.data.pre_pos_proof)
+							OR trigger.data.pre_pos_proof.root != $pre_wit)
+							bounce('bad pre pos proof');
+						$PP = split($pre_pos, ':');
+						if (array_length($PP) != 5 OR $PP[1] != $acct_hex OR $PP[2] != $market) bounce('bad pre pos');
+						$old_qty = $PP[3] + 0;
+						$old_entry = $PP[4] + 0;
+					}
 					// fee = qty*price/1e8*1e6/1e8*taker_fee_bps/1e4 from the
-					// proven meta leaf of this market.
+					// proven meta leaf of this market; maker pays no fee.
 					$pre_meta = trigger.data.pre_meta;
 					if (typeof($pre_meta) == 'boolean'
 						OR !is_valid_merkle_proof($pre_meta, trigger.data.pre_meta_proof)
@@ -130,19 +161,60 @@
 						bounce('bad pre meta proof');
 					$M = split($pre_meta, ':');
 					if (array_length($M) != 9 OR $M[1] != $market) bounce('bad pre meta');
-					$fee_bps = $M[5];
-					$notional = $qty * $price / 100000000 * 1000000 / 100000000;
-					$fee = $notional * $fee_bps / 10000;
-					$exp_col = 0 - $fee;
-					$post_pos = trigger.data.post_pos;
-					if (typeof($post_pos) == 'boolean'
-						OR !is_valid_merkle_proof($post_pos, trigger.data.post_pos_proof)
-						OR trigger.data.post_pos_proof.root != trigger.data.post_wit)
-						bounce('bad post pos proof');
-					$P = split($post_pos, ':');
-					$delta = ($side == '0') ? $qty : 0 - $qty;
-					$pos_ok = (array_length($P) == 5 AND $P[1] == $taker AND $P[2] == $market AND $P[3] == $delta AND $P[4] == $price);
-					if ($A1[2] == $exp_col AND $pos_ok) bounce('no fraud');
+					$fee_bps = $M[5] + 0;
+					// Oscript / is Decimal division; Rust truncates each step.
+					// floor() restores truncation (all legs non-negative here).
+					$notional = floor($qty * $price / 100000000 * 1000000 / 100000000);
+					$fee = floor($notional * $fee_bps / 10000);
+					$post_acct = trigger.data.post_acct;
+					if (typeof($post_acct) == 'boolean'
+						OR !is_valid_merkle_proof($post_acct, trigger.data.post_acct_proof)
+						OR trigger.data.post_acct_proof.root != trigger.data.post_wit)
+						bounce('bad post acct proof');
+					$A1 = split($post_acct, ':');
+					if (array_length($A1) != 5 OR $A1[1] != $acct_hex) bounce('bad post acct');
+					$post_col = $A1[2] + 0;
+					$abs_old = ($old_qty < 0) ? (0 - $old_qty) : $old_qty;
+					$abs_delta = ($delta < 0) ? (0 - $delta) : $delta;
+					$same = ($old_qty == 0 OR (($old_qty > 0 AND $delta > 0) OR ($old_qty < 0 AND $delta < 0)));
+					if ($same){
+						$exp_qty_s = $old_qty + $delta;
+						$exp_entry_s = ($old_qty == 0) ? $price : floor(($abs_old * $old_entry + $qty * $price) / ($abs_old + $qty));
+						$exp_col_s = ($who == 'taker') ? ($old_col - $fee) : $old_col;
+						$post_pos_s = trigger.data.post_pos;
+						if (typeof($post_pos_s) == 'boolean'
+							OR !is_valid_merkle_proof($post_pos_s, trigger.data.post_pos_proof)
+							OR trigger.data.post_pos_proof.root != trigger.data.post_wit)
+							bounce('bad post pos proof');
+						$PS = split($post_pos_s, ':');
+						if (array_length($PS) == 5 AND $PS[1] == $acct_hex AND $PS[2] == $market AND $PS[3] + 0 == $exp_qty_s AND abs($PS[4] + 0 - $exp_entry_s) <= 1 AND abs($post_col - $exp_col_s) <= 1) bounce('no fraud');
+						if (trigger.output[[asset=base]] < 20000) bounce('need fee');
+					} else {
+						$close = ($abs_old < $abs_delta) ? $abs_old : $abs_delta;
+						$signed = ($old_qty > 0) ? ($price - $old_entry) : ($old_entry - $price);
+						$pnl_raw = $signed * $close * 1000000 / 100000000 / 100000000;
+						$pnl = ($pnl_raw < 0) ? ceil($pnl_raw) : floor($pnl_raw);
+						$exp_col_c = ($who == 'taker') ? ($old_col + $pnl - $fee) : ($old_col + $pnl);
+						$leftover = $abs_old - $close;
+						$open = $abs_delta - $close;
+						if ($leftover == 0 AND $open == 0){
+							if (abs($post_col - $exp_col_c) <= 1 AND trigger.data.post_pos_absent) bounce('no fraud');
+							if (trigger.output[[asset=base]] < 20000) bounce('need fee');
+						} else {
+							$exp_qty_flip = ($delta > 0) ? $open : (0 - $open);
+							$exp_qty_red = ($old_qty > 0) ? $leftover : (0 - $leftover);
+							$exp_qty_c = ($leftover == 0) ? $exp_qty_flip : $exp_qty_red;
+							$exp_entry_c = ($leftover == 0) ? $price : $old_entry;
+							$post_pos_c = trigger.data.post_pos;
+							if (typeof($post_pos_c) == 'boolean'
+								OR !is_valid_merkle_proof($post_pos_c, trigger.data.post_pos_proof)
+								OR trigger.data.post_pos_proof.root != trigger.data.post_wit)
+								bounce('bad post pos proof');
+							$PC = split($post_pos_c, ':');
+							if (array_length($PC) == 5 AND $PC[1] == $acct_hex AND $PC[2] == $market AND $PC[3] + 0 == $exp_qty_c AND $PC[4] + 0 == $exp_entry_c AND abs($post_col - $exp_col_c) <= 1) bounce('no fraud');
+							if (trigger.output[[asset=base]] < 20000) bounce('need fee');
+						}
+					}
 					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
 				}",
 				messages: [

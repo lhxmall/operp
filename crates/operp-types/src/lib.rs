@@ -43,11 +43,9 @@ pub const MAX_AA_TREE_DEPTH: usize = 16;
 // Keep legacy constants unchanged for deterministic replay pre-activation.
 // New paths gate on `state.height >= ACTIVATION_HEIGHT`.
 pub const REPLAY_WINDOW: u64 = 2048;
-pub const REPLAY_WINDOW_LEGACY: u64 = 256;
-/// Height at which replay window expands 256→2048. Set high so existing
-/// tests (height 0..few hundred) keep legacy behavior; deployment sets to
-/// `tip+1000` or `next_finalized+1`.
-pub const REPLAY_ACTIVATION_HEIGHT: Height = 1_000_000;
+/// Height at which the 2048 replay window activates. Zero: it applies from
+/// genesis (mainnet launch; no legacy dual path in production).
+pub const REPLAY_ACTIVATION_HEIGHT: Height = 0;
 pub const ORDERING_EPOCH_UNITS: u64 = 512;
 pub const ORDERING_SALT_DOMAIN: &[u8] = b"operp-order-v1";
 pub const ORACLE_SLASH_ACTIVATION_HEIGHT: Height = 0;

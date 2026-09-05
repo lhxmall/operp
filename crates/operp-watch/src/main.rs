@@ -134,15 +134,16 @@ impl HubClient for HttpHubClient {
 
 struct Args {
     rollup: String,
+    vault: String,
     dispute: Option<String>,
     hub: String,
     from_height: u64,
     poll_interval_secs: u64,
     bond: u64,
 }
-
 fn parse_args() -> Result<Args, String> {
     let mut rollup = None;
+    let mut vault = None;
     let mut dispute = None;
     let mut hub = None;
     let mut from_height = 1u64;
@@ -153,6 +154,7 @@ fn parse_args() -> Result<Args, String> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--rollup" => rollup = Some(it.next().ok_or("--rollup needs a value")?),
+            "--vault" => vault = Some(it.next().ok_or("--vault needs a value")?),
             "--dispute" => dispute = Some(it.next().ok_or("--dispute needs a value")?),
             "--hub" => hub = Some(it.next().ok_or("--hub needs a value")?),
             "--from-height" => {
@@ -186,6 +188,7 @@ fn parse_args() -> Result<Args, String> {
 
     Ok(Args {
         rollup: rollup.ok_or("missing --rollup")?,
+        vault: vault.ok_or("missing --vault")?,
         dispute,
         hub: hub.ok_or("missing --hub")?,
         from_height,
@@ -196,9 +199,9 @@ fn parse_args() -> Result<Args, String> {
 
 fn print_usage() {
     eprintln!(
-        "operp-watch --rollup <rollup-aa-addr> --hub <hub-url> [--dispute <dispute-aa-addr>] \
-[--from-height <u64>] [--poll-interval <secs>] [--bond <gross-bytes>]\n\
-\n\
+        "operp-watch --rollup <rollup-aa-addr> --vault <vault-aa-addr> --hub <hub-url> [--dispute <dispute-aa-addr>] \
+ [--from-height <u64>] [--poll-interval <secs>] [--bond <gross-bytes>]\n\
+ \n\
 Polls the rollup's da_unit_<h> assertions, replays each submitted height, and flags any\n\
 root mismatch inside the submitted_at+3600 dispute window for a watcher-owned\n\
 wallet to challenge via post_challenge.js (one-shot fraud predicates, no bond)."
@@ -364,9 +367,13 @@ fn maybe_post_challenge(
 
 fn main() -> anyhow::Result<()> {
     let args = parse_args().map_err(|e| anyhow::anyhow!(e))?;
+    // Vault is the evidence payee; rollup is the assertion AA. Replay reads
+    // it via operp_settle::expected_vault() (env OPERP_VAULT_AA).
+    std::env::set_var("OPERP_VAULT_AA", &args.vault);
     let hub = HttpHubClient::new(&args.hub)?;
     let config = WatchConfig {
         rollup_address: args.rollup.clone(),
+        vault_address: args.vault.clone(),
         dispute_address: args.dispute.clone(),
         hub_url: Some(args.hub.clone()),
         poll_interval_secs: args.poll_interval_secs,
