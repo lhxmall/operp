@@ -316,7 +316,7 @@ async function main() {
   // same live height bounces 'height taken' and the AA keeps the ORIGINAL
   // committed roots, so every predicate would stale-root. Pattern: submit →
   // prove fraud (frozen=2, height reopens) → next scenario re-submits.
-  async function submitH2(opsRoot, traceRoot, unitsSetRoot, fillsRoot) {
+  async function submitH2(opsRoot, traceRoot, unitsSetRoot, fillsRoot, witRoot, witCount) {
     const sd = submitData(2, STATE_ROOT, STATE_ROOT);
     sd.ops_root = opsRoot;
     sd.trace_root = traceRoot;
@@ -324,8 +324,8 @@ async function main() {
     sd.units_set_root = unitsSetRoot;
     sd.fills_root = fillsRoot;
     sd.unit_count = 1;
-    sd.wit_count = GEN_WIT_COUNT;
-    const h2data = { chain_id: "operp-v2", height: 2 };
+    sd.wit_root = witRoot || WIT_ROOT;
+    sd.wit_count = witCount || GEN_WIT_COUNT;
     const r = await operator.sendMulti({
       messages: [
         {
@@ -347,12 +347,86 @@ async function main() {
     if (res && res.response && res.response.bounced)
       throw new Error("h2 submit bounced: " + JSON.stringify(res.response).slice(0, 200));
   }
-  // Force BEFORE the h2 submit so the forced id is older than
-  // inbox_upto_2 (= the submit timestamp) — the AA's P-omit staleness gate.
+  // H3 pre-tree (genesis leaves + two live orders) is hoisted here because
+  // scenario 8's honest h2 submit must ALREADY commit it as wit_root_2:
+  // every h3 k=0 predicate anchors pre_wit on wit_root_2.
+  const MAKER_ORD = `ord:${"d".repeat(64)}:1:1:100000000:7:5:${"c".repeat(64)}`;
+  const BETTER_ORD = `ord:${"e".repeat(63)}f:1:1:90000000:6:9:${"c".repeat(64)}`;
+  const H3_PRE = [DEP_PRE, FILL_TAKER_PRE, META1, META2, POS2, MAKER_ORD, BETTER_ORD].sort();
+  const H3_PRE_WIT = merkle.getMerkleRoot(H3_PRE);
+  const H3_PRE_IDX = {};
+  H3_PRE.forEach((l, i) => { H3_PRE_IDX[l] = i; });
   const forcedOmit = sha256Hex("forced-unit");
   await trigger(operator, rollup, { force: 1, unit_id: forcedOmit }, 20000);
-  await submitH2(OPS_ROOT1, TRACE_ROOT1, UNITS_SET_ROOT, FILLS_ROOT);
+  const otherId = sha256Hex("other-unit");
+  const SET1 = pad2([otherId], "set1");
+  const SET_ROOT1 = merkle.getMerkleRoot(SET1);
+  if (!(forcedOmit < otherId)) throw new Error("omit fixture: forced id not before member");
+  async function triggerVerdict(wallet, to, data, amount, what) {
+    const t = await trigger(wallet, to, data, amount);
+    const r = await network.getAaResponseToUnit(t.unit).catch(() => null);
+    if (r && r.response && r.response.bounced)
+      throw new Error(what + " bounced: " + JSON.stringify(r.response).slice(0, 300));
+    await network.witnessUntilStable(r.response.response_unit);
+  }
+  // ---- 6. omit fraud on a REAL committed tree → verdict freezes h2 --------
+  await submitH2(OPS_ROOT1, TRACE_ROOT1, SET_ROOT1, FILLS_ROOT);
+  const omitProof = {
+    trace_root: TRACE_ROOT1,
+    ops_root: OPS_ROOT1,
+    units_root: UNITS_SET_ROOT,
+    units_set_root: SET_ROOT1,
+    fills_root: FILLS_ROOT,
+    unit_id: forcedOmit,
+    left: otherId,
+    left_proof: merkle.getMerkleProof(SET1, 0),
+  };
+  await triggerVerdict(challenger, dispute, Object.assign({ pred: "omit", height: 2 }, omitProof), 20000, "omit predicate");
+  st = await vars(rollup);
+  if (Number(st.frozen_2) !== 2) throw new Error("omit fraud did not freeze height");
+  console.log("6. omit fraud: missing forced id failed the height");
+
   const depPreIdx = GENESIS_LEAVES.indexOf(preLeaf);
+
+  // ---- 7. deposit fraud on a LIAR trace (h2 reopened) → verdict, slash ----
+  const LIAR_POST1 = pad2([`acct:${acct}:1000000:0:0`], "liar1");
+  const LIAR_WIT1 = merkle.getMerkleRoot(LIAR_POST1);
+  const LIAR_TRACE1 = pad2([LIAR_WIT1], "liartrace1");
+  const LIAR_TRACE_ROOT1 = merkle.getMerkleRoot(LIAR_TRACE1);
+  await submitH2(OPS_ROOT1, LIAR_TRACE_ROOT1, SET_ROOT1, FILLS_ROOT);
+  const fraudProof = {
+    k: 0,
+    op: opD,
+    ops_proof: merkle.getMerkleProof(OPS1, 0),
+    trace_root: LIAR_TRACE_ROOT1,
+    ops_root: OPS_ROOT1,
+    units_root: UNITS_SET_ROOT,
+    units_set_root: SET_ROOT1,
+    fills_root: FILLS_ROOT,
+    pre_wit: WIT_ROOT,
+    post_wit: LIAR_WIT1,
+    post_proof: merkle.getMerkleProof(LIAR_TRACE1, 0),
+    pre_leaf: preLeaf,
+    post_leaf: LIAR_POST1[0], // col unchanged despite +100 deposit
+    pre_leaf_proof: merkle.getMerkleProof(GENESIS_LEAVES, depPreIdx),
+    post_leaf_proof: merkle.getMerkleProof(LIAR_POST1, 0),
+  };
+  await triggerVerdict(challenger, dispute, Object.assign({ pred: "deposit", height: 2 }, fraudProof), 20000, "deposit fraud predicate");
+  st = await vars(rollup);
+  if (Number(st.frozen_2) !== 2) throw new Error("fraud verdict did not freeze height: " + JSON.stringify(st.frozen_2));
+  if (Number(st.last_submitted) !== 1) throw new Error("last_submitted did not roll back");
+  const chAddr = await challenger.getAddress();
+  if (Number(st["slash_reward_" + chAddr] || 0) !== SLASH_HALF)
+    throw new Error("slash reward wrong: " + JSON.stringify(st["slash_reward_" + chAddr]));
+  await trigger(challenger, rollup, { claim: "slash" }, 20000);
+  st = await vars(rollup);
+  if (Number(st["slash_reward_" + chAddr] || 0) !== 0) throw new Error("slash not paid out");
+  console.log("7. deposit fraud verdict: height failed, slashed, challenger paid");
+
+  // ---- 8. honest deposit → 'no fraud' (height stays live) ------------------
+  // This assertion ALSO commits wit_root_2 = H3_PRE_WIT: every h3 k=0
+  // predicate anchors pre_wit on it.
+  await submitH2(OPS_ROOT1, TRACE_ROOT1, SET_ROOT1, FILLS_ROOT, H3_PRE_WIT, H3_PRE.length);
   const honestProof = {
     k: 0,
     op: opD,
@@ -360,7 +434,7 @@ async function main() {
     trace_root: TRACE_ROOT1,
     ops_root: OPS_ROOT1,
     units_root: UNITS_SET_ROOT,
-    units_set_root: UNITS_SET_ROOT,
+    units_set_root: SET_ROOT1,
     fills_root: FILLS_ROOT,
     pre_wit: WIT_ROOT, // k=0, h=2 -> wit_root_1 (genesis tree)
     post_wit: POST_WIT1,
@@ -373,106 +447,25 @@ async function main() {
   await triggerBounce(challenger, dispute, Object.assign({ pred: "deposit", height: 2 }, honestProof), 20000, "no fraud");
   st = await vars(rollup);
   if (Number(st.frozen_2 || 0) !== 0) throw new Error("honest predicate froze the height!");
-  console.log("6. honest deposit predicate bounced 'no fraud' — height live");
+  console.log("8. honest deposit predicate bounced 'no fraud' — height live");
 
-  // ---- 7. dishonest deposit → fraud verdict -------------------------------
-  // Liar post tree carries the UNCHANGED col; its root is committed as
-  // post_wit so post_proof + post_leaf_proof verify, but col math fails.
-  // Height 2 is still live from scenario 6 (honest bounce), so this fraud
-  // verdict ALSO clears the height for the next scenario's re-submit.
-  const LIAR_POST1 = pad2([`acct:${acct}:1000000:0:0`], "liar1");
-  const LIAR_WIT1 = merkle.getMerkleRoot(LIAR_POST1);
-  const LIAR_TRACE1 = pad2([LIAR_WIT1], "liartrace1");
-  const LIAR_TRACE_ROOT1 = merkle.getMerkleRoot(LIAR_TRACE1);
-  // Can't re-submit the live height — the honest candidate's roots are the
-  // committed ones. Fire the fraud predicate against THOSE (the liar's post
-  // leg is a member of the honest post tree? no — build the fraud case from
-  // the honest assertion itself: the honest post leaf exists, math checks
-  // pass, so no fraud fires there. Instead: freeze 2 first via a KNOWN-bad
-  // claim on the honest candidate: claim post col UNCHANGED (1000000) —
-  // that leaf is NOT in POST1, so its post_leaf_proof fails 'bad leaf proof'
-  // and bounces... which is honest-safe, not a freeze.
-  // => Correct flow: this fraud scenario runs on a FRESH height-2 after
-  // finalizing the live one? finalize needs 3600s. Simplest: keep ONE
-  // height-2 assertion and run all predicate scenarios against it, using
-  // predicates that genuinely match its committed roots:
-  //   deposit-honest (done, no fraud)
-  //   deposit-fraud needs a LIAR trace_root committed — impossible on the
-  //   same live height.
-  // => Use the AA's own reopen: fire P-omit (committed roots say otherId
-  // present, forced id missing) to fail height 2, then re-submit per
-  // scenario with the roots that scenario needs.
-  console.log("7. (deposit-fraud folds into the per-scenario re-submit flow below)");
-
-  // ---- 8. P-omit: staleness + forged-roots defenses -------------------------
-  // (a) The forced id is older than inbox_upto_2, but the committed
-  //     units_set_root is a b6444 stand-in with unknowable preimage: a real
-  //     non-membership tree can't be built, and the AA's stale-root compare
-  //     rejects the forged left/right the challenger does control.
-  //     Expect 'stale roots'.
-  const otherId = sha256Hex("other-unit");
-  const omitProof = {
-    trace_root: TRACE_ROOT1,
-    ops_root: OPS_ROOT1,
-    units_root: UNITS_SET_ROOT,
-    units_set_root: UNITS_SET_ROOT,
-    fills_root: FILLS_ROOT,
-    unit_id: forcedOmit,
-    left: sha256Hex("units-set-0"),
-    left_proof: merkle.getMerkleProof(pad2([sha256Hex("units-set-0")], "set0"), 0),
-  };
-  await triggerBounce(challenger, dispute, Object.assign({ pred: "omit", height: 2 }, omitProof), 20000, "stale roots");
-  console.log("8. omit with forged geometry bounced 'stale roots'");
-
-  // ---- 9. omit fraud on a REAL committed tree → verdict freezes h2 ---------
-  // Re-submitting the live height bounces 'height taken', so the fraud is
-  // proven against the stand-in roots? No — stale roots again. The AA keeps
-  // the ORIGINAL roots for the live height; a genuine on-chain omit freeze
-  // therefore needs the assertion to have committed a REAL tree. The honest
-  // scenario-6 assertion DID commit stand-ins, so instead freeze h2 the
-  // honest way — via the deposit LIAR post leg? that also needs a liar
-  // trace_root... which is exactly what scenario 6's submit already carries
-  // (TRACE_ROOT1 = honest trace). A REAL freeze requires committing a liar
-  // assertion BEFORE the window: impossible post-hoc.
-  // => Correct design lesson recorded in docs: assertions must commit REAL
-  //    trees; stand-ins cannot be challenged. E2E proves the defense
-  //    (stale-roots rejection) and moves on: reopen h2 by proving nothing —
-  //    wait out the window instead, then re-submit fresh REAL trees for the
-  //    fill scenarios (they commit real roots already).
-  console.log("9. skipped: stand-in assertions are unchallengeable by design (see docs)");
-
-  // Reopen h2: wait out the challenge window, finalize the honest candidate,
-  // then continue on h3 with REAL committed trees for the fill predicates.
+  // ---- 9. finalize h2, proceed on h3 with real trees -----------------------
   await network.timetravel({ shift: "3600s" });
   await trigger(operator, rollup, { finalize: 1, height: 2 }, 20000);
   st = await vars(rollup);
-  if (Number(st.last_finalized) !== 2) throw new Error("h2 finalize failed");
-  console.log("9b. h2 finalized honestly; proceeding on h3 with real trees");
-  // ---- 10-12: fill predicates move to the h3 chain (built in scenario 13)
-  // because every earlier h2 assertion committed stand-in roots that no real
-  // proof can anchor. The fill scenarios below commit REAL trees and freeze
-  // their heights via genuine verdicts.
-  // ---- 10. submit h3 with REAL witness trees (genesis + two live orders) --
-  const MAKER_ORD = `ord:${"d".repeat(64)}:1:1:100000000:7:5:${"c".repeat(64)}`;
-  const BETTER_ORD = `ord:${"e".repeat(63)}f:1:1:90000000:6:9:${"c".repeat(64)}`;
-  const H3_PRE = [DEP_PRE, FILL_TAKER_PRE, META1, META2, POS2, MAKER_ORD, BETTER_ORD].sort();
-  const H3_PRE_WIT = merkle.getMerkleRoot(H3_PRE);
+  // ---- 10. submit h3 committing a LIAR post tree (taker col 0, real -500) --
   const takerH = FILL_TAKER;
   const fillStr = `f:${"u".repeat(64)}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"e".repeat(64)}:1:100000000:100000000:9:0`;
   const FILLS1 = pad2([fillStr], "fills1");
   const FILLS_ROOT1 = merkle.getMerkleRoot(FILLS1);
-  const takerPreIdx = GENESIS_LEAVES.indexOf(FILL_TAKER_PRE);
-  const metaPreIdx = GENESIS_LEAVES.indexOf(META1);
-  const meta2Idx = GENESIS_LEAVES.indexOf(META2);
-  const pos2Idx = GENESIS_LEAVES.indexOf(POS2);
-  const POST_LEAVES = [`acct:${takerH}:-500:0:0`, META1, `pos:${takerH}:1:100000000:100000000`].sort();
-  const POST_WIT = merkle.getMerkleRoot(POST_LEAVES);
-  const TRACE_F = pad2([POST_WIT], "tracef");
-  const TRACE_F_ROOT = merkle.getMerkleRoot(TRACE_F);
+  const POST_LIAR = [`acct:${takerH}:0:0:0`, META1, `pos:${takerH}:1:100000000:100000000`].sort();
+  const POST_LIAR_WIT = merkle.getMerkleRoot(POST_LIAR);
+  const TRACE_LIAR = pad2([POST_LIAR_WIT], "traceliar");
+  const TRACE_LIAR_ROOT = merkle.getMerkleRoot(TRACE_LIAR);
   const sd3 = submitData(3, STATE_ROOT, STATE_ROOT);
   sd3.wit_root = H3_PRE_WIT;
   sd3.wit_count = H3_PRE.length;
-  sd3.trace_root = TRACE_F_ROOT;
+  sd3.trace_root = TRACE_LIAR_ROOT;
   sd3.fills_root = FILLS_ROOT1;
   sd3.ops_root = OPS_ROOT1;
   {
@@ -495,34 +488,35 @@ async function main() {
   }
 
   // ---- 11. fill_math dishonest (taker col 0 instead of -500) → fraud -------
+  // price=1e8 qty=1e8 -> notional 1e6, fee 5bps=500 -> exp col -500.
   const fillBase = {
     k: 0,
-    trace_root: TRACE_F_ROOT,
+    trace_root: TRACE_LIAR_ROOT,
     fills_root: FILLS_ROOT1,
     ops_root: OPS_ROOT1,
     fill: fillStr,
     fill_proof: merkle.getMerkleProof(FILLS1, 0),
     pre_wit: H3_PRE_WIT,
-    post_wit: POST_WIT,
-    post_proof: merkle.getMerkleProof(TRACE_F, 0),
+    post_wit: POST_LIAR_WIT,
+    post_proof: merkle.getMerkleProof(TRACE_LIAR, 0),
     pre_acct: FILL_TAKER_PRE,
-    pre_acct_proof: merkle.getMerkleProof(GENESIS_LEAVES, takerPreIdx),
+    pre_acct_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[FILL_TAKER_PRE]),
     post_acct: `acct:${takerH}:0:0:0`, // liar: col 0, expected -500
-    post_acct_proof: merkle.getMerkleProof(POST_LEAVES, POST_LEAVES.indexOf(`acct:${takerH}:0:0:0`)),
+    post_acct_proof: merkle.getMerkleProof(POST_LIAR, POST_LIAR.indexOf(`acct:${takerH}:0:0:0`)),
     post_pos: `pos:${takerH}:1:100000000:100000000`,
-    post_pos_proof: merkle.getMerkleProof(POST_LEAVES, POST_LEAVES.indexOf(`pos:${takerH}:1:100000000:100000000`)),
+    post_pos_proof: merkle.getMerkleProof(POST_LIAR, POST_LIAR.indexOf(`pos:${takerH}:1:100000000:100000000`)),
     pre_meta: META1,
-    pre_meta_proof: merkle.getMerkleProof(GENESIS_LEAVES, metaPreIdx),
+    pre_meta_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[META1]),
     pos_absent: true,
-    pleft: META2,
-    pleft_proof: merkle.getMerkleProof(GENESIS_LEAVES, GENESIS_LEAVES.indexOf(META2)),
+    // Claimed-absent pre pos (market 1): prefix-range neighbors over H3_PRE —
+    // BETTER_ORD < pos:{taker}:1: < POS2(market 2)? No: ord < pos always
+    // ('o'<'p'), and the pos range sits between BETTER_ORD and POS2.
+    pleft: BETTER_ORD,
+    pleft_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[BETTER_ORD]),
     pright: POS2,
-    pright_proof: merkle.getMerkleProof(GENESIS_LEAVES, GENESIS_LEAVES.indexOf(POS2)),
+    pright_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[POS2]),
     who: "taker",
   };
-  const fillTrig = await trigger(challenger, fill, Object.assign({ pred: "fill_math", height: 3 }, fillBase), 20000);
-  const fillRes = await network.getAaResponseToUnit(fillTrig.unit).catch(() => null);
-  if (fillRes && fillRes.response && fillRes.response.bounced)
     throw new Error("fill_math predicate bounced: " + JSON.stringify(fillRes.response).slice(0, 300));
   await network.witnessUntilStable(fillRes.response.response_unit);
   st = await vars(rollup);
@@ -531,25 +525,61 @@ async function main() {
   console.log("11. fill_math dishonest → frozen=3 via fill AA");
 
   // ---- 11a. fill_math honest → 'no fraud' ---------------------------------
-  const TRACE_H = pad2([POST_WIT], "traceh");
+  // h3 reopened by scenario 11's verdict: re-submit with the HONEST post
+  // tree (col -500) and prove honest math bounces.
+  const POST_H = [`acct:${takerH}:-500:0:0`, META1, `pos:${takerH}:1:100000000:100000000`].sort();
+  const POST_H_WIT = merkle.getMerkleRoot(POST_H);
+  const TRACE_H = pad2([POST_H_WIT], "traceh");
   const TRACE_H_ROOT = merkle.getMerkleRoot(TRACE_H);
-  await sendCombinedSubmit(operator, 3, STATE_ROOT, STATE_ROOT);
-  const fillHonest2 = Object.assign({}, fillBase, { trace_root: TRACE_H_ROOT });
+  async function submitH3(traceRoot, fillsRoot) {
+    const s = submitData(3, STATE_ROOT, STATE_ROOT);
+    s.wit_root = H3_PRE_WIT;
+    s.wit_count = H3_PRE.length;
+    s.trace_root = traceRoot;
+    s.fills_root = fillsRoot;
+    s.ops_root = OPS_ROOT1;
+    const h3data = { chain_id: "operp-v2", height: 3 };
+    const r = await operator.sendMulti({
+      messages: [
+        { app: "temp_data", payload_location: "inline", payload: {
+          data_length: require("ocore/object_length.js").getLength(h3data, true),
+          data_hash: require("ocore/object_hash.js").getBase64Hash(h3data, true),
+          data: h3data } },
+        { app: "data", payload: s },
+      ],
+      base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
+    });
+    if (r.error) throw new Error("h3 submit failed: " + r.error);
+    await network.witnessUntilStable(r.unit);
+    const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
+    if (res && res.response && res.response.bounced)
+      throw new Error("h3 submit bounced: " + JSON.stringify(res.response).slice(0, 200));
+  }
+  await submitH3(TRACE_H_ROOT, FILLS_ROOT1);
+  const fillHonest2 = Object.assign({}, fillBase, {
+    trace_root: TRACE_H_ROOT,
+    post_wit: POST_H_WIT,
+    post_proof: merkle.getMerkleProof(TRACE_H, 0),
+    post_acct: `acct:${takerH}:-500:0:0`,
+    post_acct_proof: merkle.getMerkleProof(POST_H, POST_H.indexOf(`acct:${takerH}:-500:0:0`)),
+    post_pos: `pos:${takerH}:1:100000000:100000000`,
+    post_pos_proof: merkle.getMerkleProof(POST_H, POST_H.indexOf(`pos:${takerH}:1:100000000:100000000`)),
+  });
   await triggerBounce(challenger, fill, Object.assign({ pred: "fill_math", height: 3 }, fillHonest2), 20000, "no fraud");
   console.log("11a. fill_math honest bounced 'no fraud'");
 
   // ---- 12. ghost: maker order absent → fraud -------------------------------
-  // maker id "e"*64 has no ord leaf in H3_PRE. After sorting, META2 (idx 3)
-  // and MAKER_ORD (idx 4, ord:d...) are adjacent, and the whole
-  // ord:{e*64}: range sits between them: META2 < lo and hi <= ord:d...
+  // maker id "e"*64 has no ord leaf in H3_PRE. Sorted H3_PRE runs
+  // ... MAKER_ORD(ord:d, idx4), BETTER_ORD(ord:eee..f, idx5), POS2(idx6):
+  // the whole ord:{e*64}: range sits between MAKER_ORD and BETTER_ORD.
   const ghostOrd = `ord:${"e".repeat(64)}:1:1:100000000:9:3:${"c".repeat(64)}`;
   const gSorted = H3_PRE;
-  const gMeta2 = gSorted.indexOf(META2);
   const gMaker = gSorted.indexOf(MAKER_ORD);
-  if (gMaker !== gMeta2 + 1) throw new Error("ghost fixture not adjacent");
+  const gBetter = gSorted.indexOf(BETTER_ORD);
+  if (gBetter !== gMaker + 1) throw new Error("ghost fixture not adjacent");
   const ghostLo = `ord:${"e".repeat(64)}:`;
   const ghostHi = `ord:${"e".repeat(64)};`;
-  if (!(gSorted[gMeta2] < ghostLo && ghostHi <= gSorted[gMaker])) throw new Error("ghost fixture not straddling");
+  if (!(gSorted[gMaker] < ghostLo && ghostHi <= gSorted[gBetter])) throw new Error("ghost fixture not straddling");
   const ghostProof = {
     k: 0,
     trace_root: TRACE_H_ROOT,
@@ -559,10 +589,10 @@ async function main() {
     fill_proof: merkle.getMerkleProof(FILLS1, 0),
     pre_wit: H3_PRE_WIT,
     maker_ord: ghostOrd,
-    left: gSorted[gMeta2],
-    left_proof: merkle.getMerkleProof(gSorted, gMeta2),
-    right: gSorted[gMaker],
-    right_proof: merkle.getMerkleProof(gSorted, gMaker),
+    left: gSorted[gMaker],
+    left_proof: merkle.getMerkleProof(gSorted, gMaker),
+    right: gSorted[gBetter],
+    right_proof: merkle.getMerkleProof(gSorted, gBetter),
   };
   const ghostTrig = await trigger(challenger, fill, Object.assign({ pred: "ghost", height: 3 }, ghostProof), 20000);
   const ghostRes = await network.getAaResponseToUnit(ghostTrig.unit).catch(() => null);
@@ -577,7 +607,8 @@ async function main() {
   const SKIP_TRACE4 = pad2([`skip-post-wit`], "skiptrace4");
   const SKIP_TRACE4_ROOT = merkle.getMerkleRoot(SKIP_TRACE4);
   const SKIP_FILLS = pad2([`f:${"u".repeat(64)}:0:${FILL_TAKER}:${"c".repeat(64)}:${"d".repeat(64)}:${"d".repeat(64)}:1:100000000:50000000:7:0`], "skipfills");
-  const SKIP_FILLS_ROOT = merkle.getMerkleRoot(SKIP_FILLS);
+  // h3 was frozen by ghost: re-submit carrying the skip assertion's roots.
+  await submitH3(SKIP_TRACE4_ROOT, SKIP_FILLS_ROOT);
   const skipProof = {
     k: 0,
     trace_root: SKIP_TRACE4_ROOT,
