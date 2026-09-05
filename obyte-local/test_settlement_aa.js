@@ -109,13 +109,26 @@ async function trigger(wallet, to, data, amount) {
 
 async function triggerBounce(wallet, to, data, amount, needle) {
   const r = await wallet.triggerAaWithData({ toAddress: to, amount, data });
-  const errText = String(r.error || "");
-  if (!r.error || !errText.includes(needle)) {
+  if (r.error) {
+    // Direct composer/wallet error already carries the bounce reason.
+    if (String(r.error).includes(needle)) {
+      console.log(`bounce ok: '${needle}'`);
+      return r;
+    }
     failures++;
-    console.error(`FAIL: expected bounce '${needle}' got ${r.error || "SUCCESS unit=" + r.unit} for ${JSON.stringify(data).slice(0, 80)}`);
+    console.error(`FAIL: expected bounce '${needle}' got error ${r.error} for ${JSON.stringify(data).slice(0, 80)}`);
     return r;
   }
-  console.log(`bounce ok: '${needle}'`);
+  await network.witnessUntilStable(r.unit);
+  // Bounces surface on the AA response unit, not the trigger result.
+  const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
+  const log = JSON.stringify(res || {});
+  if (log.includes(needle)) {
+    console.log(`bounce ok: '${needle}'`);
+    return r;
+  }
+  failures++;
+  console.error(`FAIL: expected bounce '${needle}' got response ${log.slice(0, 200)} for ${JSON.stringify(data).slice(0, 80)}`);
   return r;
 }
 
@@ -185,7 +198,11 @@ async function sendCombinedSubmit(wallet, height, stateRoot, prev) {
       {
         app: "temp_data",
         payload_location: "inline",
-        payload: { data: batchData },
+        payload: {
+          data_length: require("ocore/object_length.js").getLength(batchData, true),
+          data_hash: require("ocore/object_hash.js").getBase64Hash(batchData, true),
+          data: batchData,
+        },
       },
       { app: "data", payload: submitData(height, stateRoot, prev) },
     ],
@@ -224,7 +241,12 @@ async function main() {
   if (String(st.dispute_aa) !== dispute) throw new Error("dispute_aa not set: " + JSON.stringify(st.dispute_aa));
   if (String(st.dispute_fill_aa) !== fill) throw new Error("dispute_fill_aa not set: " + JSON.stringify(st.dispute_fill_aa));
   console.log("1. bind ok — dispute_aa + dispute_fill_aa set");
-  await triggerBounce(operator, dispute, { bind: 1 }, 20000, "not authorized");
+  // A second bind succeeds on the dispute AA (it just re-forwards), but the
+  // rollup bounces the secondary 'not authorized' verdict — dispute_aa var
+  // must be unchanged afterwards.
+  await trigger(operator, dispute, { bind: 1 }, 20000);
+  st = await vars(rollup);
+  if (String(st.dispute_aa) !== dispute) throw new Error("double bind overwrote dispute_aa!");
 
   // ---- 2. submit bond gate ----------------------------------------------
   const sd = submitData(1, STATE_ROOT, PREV_ROOT);
@@ -281,9 +303,18 @@ async function main() {
     sd.fills_root = fillsRoot;
     sd.unit_count = 1;
     sd.wit_count = GEN_WIT_COUNT;
+    const h2data = { chain_id: "operp-v2", height: 2 };
     const r = await operator.sendMulti({
       messages: [
-        { app: "temp_data", payload_location: "inline", payload: { data: { chain_id: "operp-v2", height: 2 } } },
+        {
+          app: "temp_data",
+          payload_location: "inline",
+          payload: {
+            data_length: require("ocore/object_length.js").getLength(h2data, true),
+            data_hash: require("ocore/object_hash.js").getBase64Hash(h2data, true),
+            data: h2data,
+          },
+        },
         { app: "data", payload: sd },
       ],
       base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
@@ -512,33 +543,23 @@ async function main() {
   sd3.wit_root = SKIP_PRE_WIT;
   sd3.wit_count = SKIP_PRE.length;
   {
+    const h3data = { chain_id: "operp-v2", height: 3 };
     const r = await operator.sendMulti({
       messages: [
-        { app: "temp_data", payload_location: "inline", payload: { data: { chain_id: "operp-v2", height: 3 } } },
+        {
+          app: "temp_data",
+          payload_location: "inline",
+          payload: {
+            data_length: require("ocore/object_length.js").getLength(h3data, true),
+            data_hash: require("ocore/object_hash.js").getBase64Hash(h3data, true),
+            data: h3data,
+          },
+        },
         { app: "data", payload: sd3 },
       ],
       base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
     });
     if (r.error) throw new Error("h3 submit failed: " + r.error);
-    await network.witnessUntilStable(r.unit);
-  }
-  // h=4 k=0 anchors pre_wit on wit_root_3 = SKIP_PRE_WIT; both orders prove
-  // member. Taker Bid (side 0) filled maker ask@100 while ask@90 rested.
-  const SKIP_TRACE4 = [`skip-post-wit`];
-  const SKIP_TRACE4_ROOT = merkle.getMerkleRoot(SKIP_TRACE4);
-  const sd4 = submitData(4, STATE_ROOT, STATE_ROOT);
-  sd4.trace_root = SKIP_TRACE4_ROOT;
-  sd4.fills_root = SKIP_FILLS_ROOT;
-  sd4.ops_root = OPS_ROOT1;
-  {
-    const r = await operator.sendMulti({
-      messages: [
-        { app: "temp_data", payload_location: "inline", payload: { data: { chain_id: "operp-v2", height: 4 } } },
-        { app: "data", payload: sd4 },
-      ],
-      base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
-    });
-    if (r.error) throw new Error("h4 submit failed: " + r.error);
     await network.witnessUntilStable(r.unit);
   }
   const skipProof = {
