@@ -118,25 +118,23 @@
 					if (substring($post_leaf, 5, 64) != $acct) bounce('bad leaf');
 					// Pre leg: either the acct leaf proves member (old
 					// account), or pre_absent non-membership proves a fresh
-					// account (pre col = 0). Non-membership reuses the omit
-					// geometry over the pre wit leaves, bounded by wit_count.
-					$col0 = 0;
+					// account (pre col = 0). Oscript locals are single-
+					// assignment, so each branch runs its own final math
+					// check and falls through to the shared fee gate.
 					if (trigger.data.pre_absent){
 						$ghost = 'acct:' || $acct || ':';
-						$hit = 0;
-						if (trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+						$hit1 = trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
 							AND trigger.data.right AND is_valid_merkle_proof(trigger.data.right, trigger.data.right_proof)
-							AND trigger.data.left < $ghost AND $ghost < trigger.data.right) { $hit = 1; }
-						if (!$hit AND trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+							AND trigger.data.left < $ghost AND $ghost < trigger.data.right;
+						$hit2 = trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
 							AND trigger.data.left_proof.index == 0
-							AND $ghost < trigger.data.left) { $hit = 1; }
-						if ($k == 0 AND $h > 1){
-							$wn = var[$rollup]['wit_count_' || ($h - 1)];
-							if (!$hit AND trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
-								AND trigger.data.left_proof.index == $wn - 1
-								AND $ghost > trigger.data.left) { $hit = 1; }
-						}
-						if (!$hit) bounce('no fraud');
+							AND $ghost < trigger.data.left;
+						$hit3 = ($k == 0 AND $h > 1) AND trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+							AND trigger.data.left_proof.index == (var[$rollup]['wit_count_' || ($h - 1)] otherwise 0) - 1
+							AND $ghost > trigger.data.left;
+						if (!$hit1 AND !$hit2 AND !$hit3) bounce('no fraud');
+						if ($deposit ? (0 + $amount == $col1) : (0 - $amount == $col1))
+							bounce('no fraud');
 					} else {
 						if (typeof($pre_leaf) == 'boolean'
 							OR !is_valid_merkle_proof($pre_leaf, trigger.data.pre_leaf_proof)
@@ -145,9 +143,9 @@
 						if (substring($pre_leaf, 5, 64) != $acct) bounce('bad leaf');
 						$tail0 = substring($pre_leaf, 70, length($pre_leaf));
 						$col0 = substring($tail0, 0, index_of($tail0, ':'));
+						if ($deposit ? ($col0 + $amount == $col1) : ($col0 - $amount == $col1))
+							bounce('no fraud');
 					}
-					if ($deposit ? ($col0 + $amount == $col1) : ($col0 - $amount == $col1))
-						bounce('no fraud');
 					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
 				}",
 				messages: [
@@ -203,22 +201,21 @@
 					$ts = var[$rollup]['inbox_' || $id];
 					if (!$ts OR $ts >= var[$rollup]['inbox_upto_' || $h]) bounce('no fraud');
 					$root = trigger.data.units_set_root;
-					$hit = 0;
-					if (trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+					$hit1 = trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
 						AND trigger.data.left_proof.root == $root
 						AND trigger.data.right AND is_valid_merkle_proof(trigger.data.right, trigger.data.right_proof)
 						AND trigger.data.right_proof.root == $root
 						AND trigger.data.left_proof.index + 1 == trigger.data.right_proof.index
-						AND trigger.data.left < $id AND $id < trigger.data.right) { $hit = 1; }
-					if (!$hit AND trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+						AND trigger.data.left < $id AND $id < trigger.data.right;
+					$hit2 = trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
 						AND trigger.data.left_proof.root == $root
 						AND trigger.data.left_proof.index == 0
-						AND $id < trigger.data.left) { $hit = 1; }
-					if (!$hit AND trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+						AND $id < trigger.data.left;
+					$hit3 = trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
 						AND trigger.data.left_proof.root == $root
 						AND trigger.data.left_proof.index == $n - 1
-						AND $id > trigger.data.left) { $hit = 1; }
-					if (!$hit) bounce('no fraud');
+						AND $id > trigger.data.left;
+					if (!$hit1 AND !$hit2 AND !$hit3) bounce('no fraud');
 					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
 				}",
 				messages: [

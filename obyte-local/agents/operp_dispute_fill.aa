@@ -219,20 +219,16 @@
 					// (wit_count_(h-1)) when k==0, unavailable when k>0
 					// (trace stores roots only) — then only adjacent and
 					// before-min apply. Fail-closed toward 'no fraud'.
-					$hit = 0;
-					if (trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+					$hit1 = trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
 						AND trigger.data.right AND is_valid_merkle_proof(trigger.data.right, trigger.data.right_proof)
-						AND trigger.data.left < $ord AND $ord < trigger.data.right) { $hit = 1; }
-					if (!$hit AND trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+						AND trigger.data.left < $ord AND $ord < trigger.data.right;
+					$hit2 = trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
 						AND trigger.data.left_proof.index == 0
-						AND $ord < trigger.data.left) { $hit = 1; }
-					if ($k == 0 AND $h > 1){
-						$wn = var[$rollup]['wit_count_' || ($h - 1)];
-						if (!$hit AND trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
-							AND trigger.data.left_proof.index == $wn - 1
-							AND $ord > trigger.data.left) { $hit = 1; }
-					}
-					if (!$hit) bounce('no fraud');
+						AND $ord < trigger.data.left;
+					$hit3 = ($k == 0 AND $h > 1) AND trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+						AND trigger.data.left_proof.index == (var[$rollup]['wit_count_' || ($h - 1)] otherwise 0) - 1
+						AND $ord > trigger.data.left;
+					if (!$hit1 AND !$hit2 AND !$hit3) bounce('no fraud');
 					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
 				}",
 				messages: [
@@ -323,17 +319,13 @@
 					$bo_rem = $BO[6] + 0;
 					$fill_price = $F[8] + 0;
 					if ($MO[1] != $F[6] OR $bo_rem <= 0) bounce('no fraud');
-					$better_first = 0;
-					if ($side == '0'){
-						if ($BO[3] != '1') bounce('no fraud');
-						if ($bo_price < $mo_price OR ($bo_price == $mo_price AND $bo_seq < $mo_seq)) { $better_first = 1; }
-						if ($bo_price > $fill_price) bounce('no fraud');
-					} else {
-						if ($BO[3] != '0') bounce('no fraud');
-						if ($bo_price > $mo_price OR ($bo_price == $mo_price AND $bo_seq < $mo_seq)) { $better_first = 1; }
-						if ($bo_price < $fill_price) bounce('no fraud');
-					}
-					if (!$better_first) bounce('no fraud');
+					$bid_better = ($side == '0') AND $BO[3] == '1'
+						AND ($bo_price < $mo_price OR ($bo_price == $mo_price AND $bo_seq < $mo_seq))
+						AND !($bo_price > $fill_price);
+					$ask_better = ($side == '1') AND $BO[3] == '0'
+						AND ($bo_price > $mo_price OR ($bo_price == $mo_price AND $bo_seq < $mo_seq))
+						AND !($bo_price < $fill_price);
+					if (!$bid_better AND !$ask_better) bounce('no fraud');
 					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
 				}",
 				messages: [
