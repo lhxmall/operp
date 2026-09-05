@@ -107,8 +107,11 @@
 					$post_leaf = trigger.data.post_leaf;
 					$post_wit = trigger.data.post_wit;
 					$acct = substring($op, 2, 64);
-					$rest = substring($op, 67, length($op));
-					$amount = substring($rest, 0, index_of($rest, ':'));
+					// op = 'd:' || 64-hex || ':' || amount[:nonce]; the colon
+					// after the hex sits at index 66, so start the tail there.
+					// substring(s, start, length): length caps at the rest.
+					$rest = substring($op, 66, length($op));
+					$amount = substring($rest, 1, index_of($rest, ':') < 0 ? length($rest) : index_of($rest, ':'));
 					$tail1 = substring($post_leaf, 70, length($post_leaf));
 					$col1 = substring($tail1, 0, index_of($tail1, ':'));
 					if (typeof($post_leaf) == 'boolean' OR typeof($post_wit) == 'boolean'
