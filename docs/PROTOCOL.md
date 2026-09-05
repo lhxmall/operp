@@ -192,76 +192,67 @@ assert last_unit 一致 ∧ replay.state_root == root   # RootMismatch
 
 TooManyUnits 上限（512）在 from_applied 就挡住超大批次。
 
-## 4. 治理层：vault AA
+## 4. 结算层：三个 AA（CHAIN_ID=operp-v2）
 
-状态变量（Oscript，对应 `obyte-local/agents/operp_vault.aa:46-78`）：
-
-```
-boot, chain_id, last_locked, last_finalized
-submitted_at_h, cand_root_h, cand_aa_root_h,
-  da_unit_h                      # 单一候选（首个稳定组合单元胜出；
-                                 # 后续 submit bounce 'height taken'）+
-                                 # DA 绑定：da_unit_h = 携带根的那笔
-                                 # 组合单元（temp_data+submit 同 unit）的 hash
-active_bond_h                    # 现任候选的 1000000000000-byte 提交债券持有人
-fee_winner_h, reward_<addr>      # 首个稳定者赢竞速奖励
-root_h, aa_root_h, stable_at_h  # 已锁定根（stable_at 锚定挑战窗）
-frozen_h ∈ {∅/0=正常, 1=已挑战(不持久), 2=失败}
-challenger_h, bond_<addr>, bond_height_<addr>, slash_reward_<addr>, sbond_<addr>
-wd_<addr>, wp_<addr>             # 全局累计提款标记（防证明重放，跨高度共享）
-pperp_<addr>                     # PERP 入账镜像
-```
-
-侧链 ChainState 新增（PERP 治理，§7）：
+状态变量（rollup AA；`<h>` 为高度后缀）：
 
 ```
-markets, next_market_id                     # 无许可市场表与上架游标
-perp_balances, perp_supply, perp_burned     # PERP 镜像账本与烧毁统计
-proposals, next_proposal_id                 # 提案表与提案游标
-oracle_reports, oracle_bonds, last_index    # 债券注册报价与中位数 index
+last_submitted, last_finalized, dispute_aa, dispute_fill_aa
+submitted_at_h, state_root_h, aa_forest_h (1024 hex), prev_h,
+  wit_root_h, trace_root_h, units_root_h, units_set_root_h,
+  ops_root_h, fills_root_h, unit_count_h, wit_count_h
+da_unit_h                     # DA 绑定 = 组合单元 hash
+active_bond_h, fee_winner_h, frozen_h ∈ {∅=live, 2=failed}
+inbox_<unit_id_hex>, inbox_upto_h
+sbond_<addr>, reward_<addr>, slash_reward_<addr>
 ```
 
-AA 侧同步新增：`pperp_<addr>`（PERP 影子账本；提款权威仍是证明叶子）。
-### 生命周期（高度 h，对应 `obyte-local/agents/operp_vault.aa` submit/lock/challenge/finalize）
+侧链 ChainState（PERP 治理，§7）不变：markets、perp_balances/supply/burned、
+proposals、oracle 账本。金库 vault AA 只有 `deposit` / `withdraw`，提款读
+`var[ROLLUP]['aa_forest_'||last_finalized]`。
+
+### 生命周期（高度 h）
 
 ```
-submit(h)    h == last_locked+1 ∧ prev==root_{h-1} ∧ 有根 ∧ 组合单元
+submit(h)    h == last_submitted+1 ∧ chain_id='operp-v2' ∧ 双根 + 六个 44-char
+             承诺根 ∧ 组合单元（temp_data 在同一 unit）
              ∧ 输出-10000 ≥ 1000000000000（SUBMIT_BOND_NET）
-             → 写 cand_*、da_unit_h = trigger.unit、submitted_at_h = now、
-               active_bond_h = sender、fee_winner_h = 首个稳定者（空则写）；
-               已占位且（已锁 OR now < submitted_at_h + 3600）→ bounce('height taken')；
-               占用超时后不同 operator 可带新债券覆盖占位（不退还旧债券）
+             → 写全部 <h> 键、da_unit_h=trigger.unit、last_submitted=h；
+               已占位且 frozen≠2 → bounce('height taken')；
+               prev 必须等于上一高度 state_root（除非上一高度已 frozen=2）
 
-lock(h)      cand 存在 ∧ 未锁 ∧ h == last_locked+1 ∧ now ≥ submitted_at_h + 600s ∧ active_bond_h 在位
-             → root_h ← cand，aa_root_h ← cand，stable_at_h = now，last_locked = h，frozen_h 清零
+fraud(h)     窗内（submitted_at+3600）任何人打 dispute / dispute_fill：
+             deposit | withdraw | omit | fill_math | ghost | skip
+             验不过 → bounce('no fraud')，高度不动；
+             验过 → dispute 付 10000 bytes + {verdict:'fraud',height,challenger}
+               → rollup frozen_h=2、清根、last_submitted=h-1、
+                 slash_reward_<challenger> += 500000000000
 
-challenge(h) 已锁定 (h ≤ last_locked) ∧ 未冻结 ∧ now < stable_at_h + 3600s
-             ∧ 输出-10000 ≥ 1000000000000 ∧ 无 outstanding bond
-             → 立即失败并重开：frozen_h = 2，root_/aa_root_/active_bond_/cand_aa_root_/fee_winner_ 清零，
-               last_locked 回退 h−1，slash_reward_<challenger> += 500000000000；
-               挑战金烧毁（不记 bond_）；未 lock bounce('bad height')；无 respond 路径
+finalize(h)  !frozen ∧ h == last_finalized+1 ∧ now ≥ submitted_at_h+3600
+             （escape_finalize 用 604800）
+             → last_finalized=h；sbond_<active_bond> += 1e12；reward += 20000
 
-finalize(h)  仅干净路：!frozen ∧ root_h 存在 ∧ h ≤ last_locked
-             ∧ timestamp ≥ stable_at_h + (escape_finalize ? 604800 : 3600)
-             ∧ h == last_finalized+1
-             → last_finalized = h；sbond_<持有人> += 1000000000000；reward += 20000
-
-withdraw     h = last_finalized；escape_withdraw 弹回 'no escape withdraw'；
-             leaf_account == trigger.address；
+withdraw     vault：leaf_account==trigger.address；
              amount + wd_<addr> ≤ min(collateral, withdrawn)；
-             leaf = sha256('acct:'+address+':'+collateral+':'+perp+':'+withdrawn, 'hex')
-             fold proof[] reduce(...,16,...) == substring(aa_root_h, shard*64, 64)
-             → 支付 trigger.address，wd_/wp_ 累加
+             leaf = sha256('acct:'+address+':'+collateral+':'+perp+':'+withdrawn,'hex')
+             reduce(...,16,...) == substring(aa_forest_h, shard*64, 64)
+             → 支付并累加 wd_/wp_
+
+force(id)    rollup：{force, unit_id 64hex} → inbox_<id>=timestamp；
+             主张必须把 inbox_upto 之前的 id 全收进 units_set_root，
+             漏收 = P-omit 欺诈
 ```
+
+**没有 lock，没有 `{challenge:1}`，没有应诉。** 揭发必须算对那一笔；
+诚实根杀不掉。债券是资本门槛，不是许可名单。
 
 关键安全性质：
 
-- **余额权威是 proof 叶子，不是 bal_ 变量**——即使 operator 或内部账本被腐化，
-  提款上限仍被最终化的 Merkle 根钉死。
-- **leaf_account == trigger.address**：只能为自己证明，看到别人的证明也无法盗用。
-- **无 owner key**：升级 = 部署新 AA + 通过同样的 finalized-root 出金路径迁移。
-- 常量注释映射 Rust 权威定义（CHAIN_ID / OBYTE_STABILITY_SECS / CHALLENGE_SECS /
-  BOUNCE_FEES / challenge bond），避免双源漂移。
+- **余额权威是 proof 叶子**——operator 腐化也改不了提款上限。
+- **leaf_account == trigger.address**：只能为自己证明。
+- **无 owner key**：升级 = 部署新 AA + 同一 finalized 提款路径迁资金。
+- 常量注释映射 Rust 权威定义（CHAIN_ID / SUBMIT_BOND_NET / CHALLENGE_SECS /
+  ESCAPE_STALL_SECS），避免双源漂移。
 
 Oscript 实现细节（踩过的坑）：
 
@@ -275,20 +266,20 @@ Oscript 实现细节（踩过的坑）：
 
 | 攻击 | 防线 |
 |---|---|
-| 伪造成交/假根 | 双 Merkle 根 + validate_against 重放审计 + fills_hash |
-| 偷 AA 资金 | 提款只认 finalized aa_root 的 Merkle 证明；leaf 绑定提款人地址；wd_ 累计标记防重放 |
-| operator 锁假根 | 600s 稳定窗 + `stable_at+3600` 挑战立即重开 + 干净 finalize + bond 经济（见 README 局限节） |
-| 存款自铸 | deposits_allowed 白名单 + replay 交叉注入 |
-| 溢出 DoS | 入口 checked-mul + qty 上限；book 层零量/零价拒绝 |
-| 签名延展 | verify_strict |
-| 乱序/丢包丢单元 | orphan 缓冲 |
+| 伪造成交/假根 | 双 Merkle 根 + validate_against 重放 + 一枪谓词（含 fill_math/ghost/skip） |
+| 偷 AA 资金 | 提款只认 finalized 森林的 Merkle 证明；leaf 绑定地址；wd_/wp_ 防重放 |
+| 付钱杀根 | 已删除：challenge 无 case；假证明 bounce `no fraud` |
+| 审查 | rollup inbox `{force}` + P-omit |
+| 存款自铸 | deposits_allowed 白名单 + replay 交叉注入 + evidence 绑定 `OPERP_VAULT_AA` |
+| 溢出 DoS / 签名延展 / 乱序 | 入口 checked-mul / verify_strict / orphan 缓冲 |
 
 ## 6. 已知局限
 
-见 README「Limitations & mainnet readiness」。challenge-reopen 已关闭应诉复读洞：挑战立即判败并重开高度。
-仍存在：Oscript 无法链上重跑撮合（空 DA / 坏充值 joint 由 watcher 挑战）、默认执行序 UnitId 字典序（v2 commit-reveal 已高度 0 生效）、
-报价质量仍受债券质押多数约束（TWAP 平滑而非消除）。主网部署前需正式 oscript 审计。
-结算层推倒与「纯永续 → 以后图灵完备」升级路径见 [ROLLUP-UPGRADE.md](ROLLUP-UPGRADE.md)（设计，未实现）。
+见 README「局限与主网就绪度」。付钱否决已删；仍未链上验：保险钳制、
+fill_math ±1 容差、24h temp_data 正文。默认执行序 UnitId 字典序
+（v2 commit-reveal 高度 0 生效）；报价质量受债券多数约束。
+主网部署前需正式 oscript 审计。「纯永续 → 图灵完备」升级路径见
+[ROLLUP-UPGRADE.md](ROLLUP-UPGRADE.md)。
 
 ## 7. 治理动机：PERP
 
@@ -312,4 +303,6 @@ PERP 的三个机制接管：
 字段），烧毁只在镜像账本进行——对应真实 PERP 永久滞留 AA，协议整体对
 PERP 超抵押。精确规则见 [MECHANISMS.md](MECHANISMS.md) §15。
 
-> **Watcher：** `crates/operp-watch` 离线重放 `da_unit_<h>`，窗口内 ROOT/BINDING 不匹配或缺 temp_data 时经 `post_challenge.js` 广播 `{challenge:1}`（`OPERP_WATCH_MNEMONIC`）。
+> **Watcher：** `crates/operp-watch` 离线重放 `da_unit_<h>`，定位第一处分歧后组
+> `proof.json`，经 `post_challenge.js` 打 dispute AA（`--pred --proof`；
+> `OPERP_WATCH_MNEMONIC`，与 poster 分钥）。
