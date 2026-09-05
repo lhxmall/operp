@@ -288,6 +288,7 @@ Oscript 实现细节（踩过的坑）：
 见 README「Limitations & mainnet readiness」。challenge-reopen 已关闭应诉复读洞：挑战立即判败并重开高度。
 仍存在：Oscript 无法链上重跑撮合（空 DA / 坏充值 joint 由 watcher 挑战）、默认执行序 UnitId 字典序（v2 commit-reveal 已高度 0 生效）、
 报价质量仍受债券质押多数约束（TWAP 平滑而非消除）。主网部署前需正式 oscript 审计。
+结算层推倒与「纯永续 → 以后图灵完备」升级路径见 [ROLLUP-UPGRADE.md](ROLLUP-UPGRADE.md)（设计，未实现）。
 
 ## 7. 治理动机：PERP
 

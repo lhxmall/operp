@@ -21,17 +21,31 @@ const fs = require("fs");
 const PERP_ASSET_ID = "PERP_ASSET_ID_HERE";
 // ====================================================================
 
-// Chain id baked into the AA definition and echoed into deployment.json.
-const CHAIN_ID = "operp-mvp-1";
+// Chain id baked into the AA definitions and echoed into deployment.json.
+const CHAIN_ID = "operp-v2";
 
-// The .aa source carries the PERP_ASSET_ID_HERE placeholder; aa-testkit
-// reads agent definitions from disk, so materialize a substituted copy
-// and deploy that instead of the raw source.
-function resolveVaultAa() {
-  const src = fs.readFileSync(path.join(__dirname, "agents/operp_vault.aa"), "utf8");
-  const out = path.join(__dirname, "agents", ".operp_vault.resolved.aa");
-  fs.writeFileSync(out, src.replace(/PERP_ASSET_ID_HERE/g, PERP_ASSET_ID));
+// The .aa sources carry PERP_ASSET_ID_HERE and ROLLUP_AA_HERE placeholders;
+// aa-testkit reads agent definitions from disk, so materialize substituted
+// copies and deploy those. The rollup AA has no placeholders; dispute and
+// vault are substituted with the deployed rollup address.
+function resolveAa(agentFile, subs, outName) {
+  let src = fs.readFileSync(path.join(__dirname, "agents", agentFile), "utf8");
+  for (const [k, v] of Object.entries(subs)) src = src.split(k).join(v);
+  const out = path.join(__dirname, "agents", outName);
+  fs.writeFileSync(out, src);
   return out;
+}
+function resolveRollupAa() {
+  return resolveAa("operp_rollup.aa", {}, ".operp_rollup.resolved.aa");
+}
+function resolveDisputeAa(rollupAddress) {
+  return resolveAa("operp_dispute.aa", { ROLLUP_AA_HERE: rollupAddress }, ".operp_dispute.resolved.aa");
+}
+function resolveVaultAa(rollupAddress, perpAssetId) {
+  return resolveAa("operp_vault.aa", { ROLLUP_AA_HERE: rollupAddress, PERP_ASSET_ID_HERE: perpAssetId }, ".operp_vault.resolved.aa");
+}
+function resolveFillAa(rollupAddress) {
+  return resolveAa("operp_dispute_fill.aa", { ROLLUP_AA_HERE: rollupAddress }, ".operp_dispute_fill.resolved.aa");
 }
 const aaRoot = path.join(__dirname, "..", "vendor", "aa-testkit");
 const nm = path.join(aaRoot, "node_modules");
@@ -48,55 +62,76 @@ const { Network } = Testkit({
 async function main() {
   if (PERP_ASSET_ID === "PERP_ASSET_ID_HERE")
     throw new Error("Set PERP_ASSET_ID to the issued asset id before deploying");
-  console.log("deploying operp_vault.aa to TESTNET ...");
+  console.log("deploying operp_rollup.aa / operp_dispute.aa / operp_vault.aa to TESTNET ...");
+  // Order matters: rollup first (no placeholders), then dispute and vault
+  // carry the deployed rollup address.
   const network = await Network.create()
-    .with.agent({ vault: resolveVaultAa() })
-    .with.wallet({ operator: 1e13 })
+    .with.agent({ rollup: resolveRollupAa() })
+    .with.wallet({ operator: 1e14 })
     .run();
-
-  const vault = network.agent.vault;
+  const rollup = network.agent.rollup;
   const operator = network.wallet.operator;
-  console.log("\n=== DEPLOYED ===");
-  console.log("vault AA address:", vault);
-  console.log("operator wallet :", await operator.getAddress());
+  console.log("rollup AA address:", rollup);
 
-  // smoke deposit: proves the AA accepts triggers on the deployed definition.
-  // Success criterion is simply that the trigger did not bounce — the AA
-  // returns { unit, error }; a bounce surfaces as error (or missing unit).
+  const network2 = await Network.create()
+    .with.agent({ dispute: resolveDisputeAa(rollup) })
+    .with.agent({ fill: resolveFillAa(rollup) })
+    .with.agent({ vault: resolveVaultAa(rollup, PERP_ASSET_ID) })
+    .with.wallet({ operator: 1e14 })
+    .run();
+  const dispute = network2.agent.dispute;
+  const fill = network2.agent.fill;
+  const vault = network2.agent.vault;
+  console.log("dispute AA address:", dispute);
+  console.log("fill AA address   :", fill);
+  console.log("vault AA address  :", vault);
+  // Bind both dispute AAs; the rollup refuses verdicts from any other
+  // address afterwards.
   const { unit, error } = await operator.triggerAaWithData({
-    toAddress: vault,
-    amount: 1e6,
-    data: { deposit: 1 },
+    toAddress: dispute,
+    amount: 20000,
+    data: { bind: 1 },
   });
-  if (error || !unit) throw new Error("smoke deposit failed: " + error);
-  await network.witnessUntilStable(unit);
-  console.log("smoke deposit OK; unit =", unit);
+  if (error || !unit) throw new Error("dispute bind failed: " + error);
+  await network2.witnessUntilStable(unit);
+  console.log("dispute bound; unit =", unit);
+  const op2 = network2.wallet.operator;
+  const fb = await op2.triggerAaWithData({
+    toAddress: fill,
+    amount: 20000,
+    data: { bind_fill: 1 },
+  });
+  if (fb.error || !fb.unit) throw new Error("fill bind failed: " + fb.error);
+  await network2.witnessUntilStable(fb.unit);
+  console.log("fill bound; unit =", fb.unit);
 
-  // boot heights are zero until the first submit; assert only when the vars
-  // exist at all.
-  const v = await operator.readAAStateVars(vault);
+  const v = await operator.readAAStateVars(rollup);
   const vars_ = v.vars || v;
-  if (vars_.last_locked !== undefined && Number(vars_.last_locked) !== 0)
-    throw new Error("boot last_locked wrong");
-  if (vars_.last_finalized !== undefined && Number(vars_.last_finalized) !== 0)
+  if (String(vars_.dispute_aa) !== String(dispute))
+    throw new Error("dispute_aa not bound: " + JSON.stringify(vars_.dispute_aa));
+  if (String(vars_.dispute_fill_aa) !== String(fill))
+    throw new Error("dispute_fill_aa not bound: " + JSON.stringify(vars_.dispute_fill_aa));
+  if (Number(vars_.last_submitted || 0) !== 0)
+    throw new Error("boot last_submitted wrong");
+  if (Number(vars_.last_finalized || 0) !== 0)
     throw new Error("boot last_finalized wrong");
 
   // persist deployment info for the operator tooling
   const info = {
     network: "testnet",
+    rollup_aa_address: rollup,
+    dispute_aa_address: dispute,
+    dispute_fill_aa_address: fill,
     vault_aa_address: vault,
-    stability_secs: 600,
     perp_asset_id: PERP_ASSET_ID,
     challenge_secs: 3600,
     chain_id: CHAIN_ID,
-    challenge_bond_min: 10000000010000,
+    submit_bond_gross: 10000000010000,
     deployed_at: new Date().toISOString(),
   };
-  fs.writeFileSync(path.join(__dirname, "deployment.json"), JSON.stringify(info, null, 2));
-  console.log("\nwrote deployment.json — pass this address to batch-posting tooling.");
-  console.log("NOTE: mainnet deployment requires closing plan-section-E gaps");
-  console.log("(fee model, real fraud proofs, TWAP oracle) and a formal AA audit.");
+  console.log("NOTE: mainnet deployment requires a formal AA audit.");
   await network.stop();
+  await network2.stop();
   process.exit(0);
 }
 

@@ -37,6 +37,18 @@ pub struct Engine {
     /// commits (`Batch::from_applied`); dropped (never persisted) if the
     /// batch is abandoned — no more burning nonces on uncommitted batches.
     pub pending_gov_wal: Vec<(AccountId, u64)>,
+    /// Per-unit witness roots in log order (one `wit_root` per `apply_one`,
+    /// applied or rejected). `Batch::from_applied` takes the last
+    /// `applied.len()` entries as the batch trace.
+    pub wit_trace: Vec<String>,
+    /// Leaf counts paired with `wit_trace` (one per `apply_one`, in order).
+    /// Lets dispute predicates prove witness-tree non-membership at any unit.
+    pub wit_count_trace: Vec<u32>,
+    /// Full witness leaf sets paired with `wit_trace` (one per `apply_one`,
+    /// in order). `Batch::from_applied` takes the last `applied.len()`
+    /// entries as `leaf_trace` DA for watcher proof building. Unbounded
+    /// per-unit growth is capped by pruning alongside `wit_trace`.
+    pub wit_leaf_trace: Vec<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +112,9 @@ impl Engine {
             store_dir: None,
             validating: false,
             pending_gov_wal: Vec::new(),
+            wit_trace: Vec::new(),
+            wit_count_trace: Vec::new(),
+            wit_leaf_trace: Vec::new(),
         }
     }
 
@@ -129,6 +144,9 @@ impl Engine {
             store_dir: Some(dir.to_path_buf()),
             validating: false,
             pending_gov_wal: Vec::new(),
+            wit_trace: Vec::new(),
+            wit_count_trace: Vec::new(),
+            wit_leaf_trace: Vec::new(),
         })
     }
 
@@ -218,10 +236,23 @@ impl Engine {
     /// cutting a batch so the log stays bounded without losing pending events.
     pub fn prune_below(&mut self, unit_ids: &[UnitId]) {
         let gone: HashSet<UnitId> = unit_ids.iter().copied().collect();
+        let before = self.log.len();
         self.log.retain(|e| match e {
             ExecEvent::Applied { unit, .. } => !gone.contains(unit),
             ExecEvent::Rejected { unit, .. } => !gone.contains(unit),
         });
+        // wit_trace stays aligned with the log (one entry per apply_one, in
+        // order): batches commit oldest-first, so drop the same count from
+        // the front.
+        let dropped = before.saturating_sub(self.log.len());
+        if dropped > 0 {
+            let n = dropped.min(self.wit_trace.len());
+            self.wit_trace.drain(..n);
+            let m = dropped.min(self.wit_count_trace.len());
+            self.wit_count_trace.drain(..m);
+            let l = dropped.min(self.wit_leaf_trace.len());
+            self.wit_leaf_trace.drain(..l);
+        }
     }
 
     /// Promote log entries for units contained in a FINALIZED batch height
@@ -282,6 +313,10 @@ impl Engine {
         };
         self.dag.mark_executed(id);
         self.state.last_unit = id;
+        self.wit_trace.push(operp_state::wit_root(&self.state));
+        let leaves = operp_state::wit_leaves(&self.state);
+        self.wit_count_trace.push(leaves.len() as u32);
+        self.wit_leaf_trace.push(leaves);
         event
     }
 

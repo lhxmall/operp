@@ -1,0 +1,243 @@
+{
+	// OPERP rollup AA (operp-v2) — custody-free assertion log.
+	//
+	// Trust model: NO owner key. This AA stores one bonded assertion per
+	// height and finalizes it after CHALLENGE_SECS unless a bound dispute AA
+	// reports fraud via {verdict:'fraud'}. There is NO pay-to-kill challenge
+	// path: {challenge:1} is not a case here and never freezes anything.
+	// Constants mirror Rust (crates/operp-types/src/lib.rs):
+	//   'operp-v2'      -> CHAIN_ID
+	//   1               -> ASSERTION_VERSION
+	//   3600            -> CHALLENGE_SECS (finalize clean window from submit)
+	//   604800          -> ESCAPE_STALL_SECS (escape hatch)
+	//   1000000000000   -> SUBMIT_BOND_NET (per-height submit bond)
+	//   500000000000    -> SUBMIT_BOND_SLASH_HALF (fraud slash to challenger)
+	//   20000           -> RACE_REWARD (first-submitter reward)
+	//   10000           -> BOUNCE_FEE_BASE
+	// DA convention (social, enforced by watchers off-chain): the submit
+	// trigger unit carries a temp_data message with the batch JSON
+	// (trace/ops/fills arrays); da_unit_<h> pins that unit. The AA does NOT
+	// inspect unit[trigger.unit].messages (fragile at eval time).
+	// State vars:
+	//   last_submitted, last_finalized, dispute_aa, dispute_fill_aa
+	//   submitted_at_<h>, state_root_<h>, aa_forest_<h> (1024 hex),
+	//   prev_<h>, wit_root_<h>, trace_root_<h>, units_root_<h>,
+	//   units_set_root_<h>, ops_root_<h>, fills_root_<h>,
+	//   unit_count_<h>, wit_count_<h>, da_unit_<h>, active_bond_<h>,
+	//   fee_winner_<h>, frozen_<h> (absent/0 live, 2 failed),
+	//   inbox_upto_<h> (submit timestamp: forces older than this belong here)
+	//   sbond_<addr>, reward_<addr>, slash_reward_<addr>
+	//   inbox_<unit_id_hex> = force timestamp
+	bounce_fees: { base: 10000 },
+	messages: {
+		cases: [
+			{
+				if: "{trigger.data.set_dispute}",
+				init: "{
+					if (!is_aa(trigger.address) OR var['dispute_aa'])
+						bounce('not authorized');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							var['dispute_aa'] = trigger.address;
+						}"
+					}
+				]
+			},
+			{
+				if: "{trigger.data.set_dispute_fill}",
+				init: "{
+					if (!is_aa(trigger.address) OR var['dispute_fill_aa'])
+						bounce('not authorized');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							var['dispute_fill_aa'] = trigger.address;
+						}"
+					}
+				]
+			},
+			{
+				// Force-include: pin a sidechain unit id (64 hex) with its
+				// timestamp. Batches submitted later must include every id
+				// forced before their submit (a missing one is P-omit fraud).
+				if: "{trigger.data.force}",
+				init: "{
+					$id = trigger.data.unit_id;
+					if (typeof($id) == 'boolean' OR length($id) != 64)
+						bounce('bad unit_id');
+					if (var['inbox_' || $id])
+						bounce('already forced');
+					if (trigger.output[[asset=base]] < 10000)
+						bounce('need fee');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							var['inbox_' || trigger.data.unit_id] = timestamp;
+						}"
+					}
+				]
+			},
+			{
+				if: "{trigger.data.submit}",
+				init: "{
+					$h = trigger.data.height;
+					$ls = (var['last_submitted'] otherwise 0);
+					if (trigger.data.chain_id != 'operp-v2'
+						OR !$h OR $h != $ls + 1
+						OR trigger.data.assertion_version != 1
+						OR !trigger.data.state_root OR length(trigger.data.state_root) != 64
+						OR !trigger.data.prev_state_hash OR length(trigger.data.prev_state_hash) != 64
+						OR !trigger.data.aa_forest OR length(trigger.data.aa_forest) != 1024
+						OR !trigger.data.wit_root OR length(trigger.data.wit_root) != 44
+						OR !trigger.data.trace_root OR length(trigger.data.trace_root) != 44
+						OR !trigger.data.units_root OR length(trigger.data.units_root) != 44
+						OR !trigger.data.units_set_root OR length(trigger.data.units_set_root) != 44
+						OR !trigger.data.ops_root OR length(trigger.data.ops_root) != 44
+						OR !trigger.data.fills_root OR length(trigger.data.fills_root) != 44
+						OR !is_integer(trigger.data.unit_count) OR trigger.data.unit_count < 1 OR trigger.data.unit_count > 512
+						OR !is_integer(trigger.data.wit_count) OR trigger.data.wit_count < 1)
+						bounce('bad submit');
+					if ($ls > 0 AND (var['frozen_' || $ls] otherwise 0) != 2
+						AND trigger.data.prev_state_hash != var['state_root_' || $ls])
+						bounce('prev mismatch');
+					if (var['active_bond_' || $h])
+						bounce('height taken');
+					if (trigger.output[[asset=base]] - 10000 < 1000000000000)
+						bounce('need submit bond');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							var['submitted_at_' || trigger.data.height] = timestamp;
+							var['state_root_' || trigger.data.height] = trigger.data.state_root;
+							var['aa_forest_' || trigger.data.height] = trigger.data.aa_forest;
+							var['prev_' || trigger.data.height] = trigger.data.prev_state_hash;
+							var['wit_root_' || trigger.data.height] = trigger.data.wit_root;
+							var['trace_root_' || trigger.data.height] = trigger.data.trace_root;
+							var['units_root_' || trigger.data.height] = trigger.data.units_root;
+							var['units_set_root_' || trigger.data.height] = trigger.data.units_set_root;
+							var['ops_root_' || trigger.data.height] = trigger.data.ops_root;
+							var['fills_root_' || trigger.data.height] = trigger.data.fills_root;
+							var['unit_count_' || trigger.data.height] = trigger.data.unit_count;
+							var['wit_count_' || trigger.data.height] = trigger.data.wit_count;
+							var['da_unit_' || trigger.data.height] = trigger.unit || '';
+							var['inbox_upto_' || trigger.data.height] = timestamp;
+							var['active_bond_' || trigger.data.height] = trigger.address;
+							var['last_submitted'] = trigger.data.height;
+							if (!var['fee_winner_' || trigger.data.height]){
+								var['fee_winner_' || trigger.data.height] = trigger.address;
+							}
+						}"
+					}
+				]
+			},
+			{
+				if: "{trigger.data.finalize OR trigger.data.escape_finalize}",
+				init: "{
+					$h = trigger.data.height;
+					if (!$h)
+						bounce('no height');
+					if ($h > (var['last_submitted'] otherwise 0) OR !var['state_root_' || $h])
+						bounce('not submitted');
+					if (var['frozen_' || $h])
+						bounce('challenged');
+					$lf = (var['last_finalized'] otherwise 0);
+					$sa = (var['submitted_at_' || $h] otherwise 0);
+					if (timestamp < $sa + (trigger.data.escape_finalize ? 604800 : 3600)
+						OR $h != $lf + 1)
+						bounce('cannot finalize');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							var['last_finalized'] = trigger.data.height;
+							$ab = var['active_bond_' || trigger.data.height];
+							if ($ab){
+								var['sbond_' || $ab] += 1000000000000;
+							}
+							$fw = var['fee_winner_' || trigger.data.height];
+							if ($fw){
+								var['reward_' || $fw] += 20000;
+							}
+						}"
+					}
+				]
+			},
+			{
+				// Fraud verdict from a bound dispute AA: fail the height,
+				// slash half the submit bond to the challenger, reopen h.
+				if: "{trigger.data.verdict}",
+				init: "{
+					$da = (var['dispute_aa'] otherwise 0);
+					$df = (var['dispute_fill_aa'] otherwise 0);
+					if (trigger.address != $da AND trigger.address != $df)
+						bounce('not dispute');
+					if (trigger.data.verdict != 'fraud')
+						bounce('bad verdict');
+					$h = trigger.data.height;
+					$ch = trigger.data.challenger;
+					if (!$h OR !var['state_root_' || $h] OR var['frozen_' || $h]
+						OR timestamp >= (var['submitted_at_' || $h] otherwise 0) + 3600)
+						bounce('challenge not possible');
+					if (typeof($ch) == 'boolean' OR length($ch) != 32 OR !is_valid_address($ch))
+						bounce('bad challenger');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							var['frozen_' || trigger.data.height] = 2;
+							var['state_root_' || trigger.data.height] = 0;
+							var['aa_forest_' || trigger.data.height] = 0;
+							var['active_bond_' || trigger.data.height] = 0;
+							var['fee_winner_' || trigger.data.height] = 0;
+							var['last_submitted'] = trigger.data.height - 1;
+							var['slash_reward_' || trigger.data.challenger] += 500000000000;
+						}"
+					}
+				]
+			},
+			{
+				if: "{trigger.data.claim}",
+				init: "{
+					$k = trigger.data.claim;
+					if ($k != 'reward' AND $k != 'sbond' AND $k != 'slash')
+						bounce('bad claim kind');
+					$key = ($k == 'reward' ? 'reward_' : ($k == 'sbond' ? 'sbond_' : 'slash_reward_'));
+					$owed = (var[$key || trigger.address] otherwise 0);
+					if (!$owed OR trigger.output[[asset=base]] < 10000)
+						bounce('nothing claimable');
+				}",
+				messages: [
+					{
+						app: "payment",
+						payload: {
+							asset: "base",
+							outputs: [
+								{
+									address: "{trigger.address}",
+									amount: "{$owed}"
+								}
+							]
+						}
+					},
+					{
+						app: "state",
+						state: "{
+							var[$key || trigger.address] = 0;
+						}"
+					}
+				]
+			}
+		]
+	}
+}

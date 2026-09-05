@@ -8,6 +8,7 @@ use operp_types::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 pub mod journal;
+pub mod obyte_merkle;
 pub mod persist;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Withdrawal {
@@ -1340,6 +1341,71 @@ pub fn aa_sharded_proof_for_account(
 ) -> Option<(u8, Vec<(String, bool)>, String)> {
     let addr = state.aa_addresses.get(id)?;
     aa_sharded_proof_for(&aa_pairs_of(state), addr)
+}
+/// ---- Rollup witness tree (Obyte-merkle domain, dispute predicates) ----
+///
+/// Leaves are sorted lexicographically before `obyte_merkle::root`.
+/// Decimal strings use `format!("{}", n)` (no scientific notation).
+/// Hex is lowercase `hex::encode` of the 32-byte id.
+pub fn wit_leaves(state: &ChainState) -> Vec<String> {
+    let mut leaves = Vec::new();
+    for (id, acct) in &state.accounts {
+        let perp = state.perp_balances.get(id).copied().unwrap_or(0);
+        let w = state.withdrawn_total.get(id).copied().unwrap_or(0);
+        leaves.push(format!(
+            "acct:{}:{}:{}:{}",
+            hex::encode(id.0),
+            acct.collateral,
+            perp,
+            w
+        ));
+        for (market, pos) in &acct.positions {
+            leaves.push(format!(
+                "pos:{}:{}:{}:{}",
+                hex::encode(id.0),
+                market.0,
+                pos.qty,
+                pos.entry_price
+            ));
+        }
+    }
+    for book in state.books.values() {
+        for o in book.live_orders() {
+            leaves.push(format!(
+                "ord:{}:{}:{}:{}:{}:{}:{}",
+                hex::encode(o.id.0),
+                o.market.0,
+                o.side.as_u8(),
+                o.price,
+                o.seq,
+                o.remaining,
+                hex::encode(o.account.0)
+            ));
+        }
+    }
+    for (market, params) in &state.markets {
+        let mark = state.marks.get(market).copied().unwrap_or(0);
+        leaves.push(format!(
+            "meta:{}:{}:{}:{}:{}:{}:{}:{}",
+            market.0,
+            params.tick_size,
+            params.im_bps,
+            params.mm_bps,
+            params.taker_fee_bps,
+            params.keeper_reward_bps,
+            if params.delisted { 1 } else { 0 },
+            mark
+        ));
+    }
+    leaves.sort();
+    if leaves.is_empty() {
+        leaves.push(operp_types::WIT_EMPTY_ELEMENT.to_string());
+    }
+    leaves
+}
+/// Witness root after the current state (Obyte-merkle domain).
+pub fn wit_root(state: &ChainState) -> String {
+    obyte_merkle::root(&wit_leaves(state))
 }
 
 #[cfg(test)]

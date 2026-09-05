@@ -298,6 +298,7 @@ obyte-local/
 docs/PROTOCOL.md         protocol design narrative
   docs/MECHANISMS.md     full mechanism reference (zh): every rule, constant,
                          edge case, and the threat-model matrix
+  docs/ROLLUP-UPGRADE.md settlement rebuild (design): perp now, Turing-complete later
 ```
 
 ## Build prerequisites

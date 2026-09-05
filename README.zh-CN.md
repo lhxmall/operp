@@ -251,6 +251,7 @@ vendor/aa-testkit/       Obyte autonomous-agent testkit（vendored）
 docs/PROTOCOL.md         协议设计叙事
   docs/MECHANISMS.md     完整机制参考（中文）：每条规则、常量、边界情况
                          与威胁模型矩阵
+  docs/ROLLUP-UPGRADE.md 结算层重做（设计）：纯永续现在怎么验，以后怎么升到任意合约
 ```
 
 ## 构建前提

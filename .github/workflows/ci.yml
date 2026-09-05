@@ -33,7 +33,7 @@ jobs:
           node-version: "20"
       - name: Install aa-testkit deps (for AA complexity gate)
         run: npm install --prefix vendor/aa-testkit --no-audit --no-fund || npm install --prefix vendor/aa-testkit
-      - run: node obyte-local/tools/check_aa_complexity.js
+      - run: node obyte-local/tools/check_aa_complexity.js agents/operp_vault.aa agents/operp_rollup.aa agents/operp_dispute.aa agents/operp_dispute_fill.aa
       - run: node obyte-local/golden_vector_check.js
 
   e2e:
@@ -57,4 +57,4 @@ jobs:
       - name: Regenerate fixture
         run: cargo run -p operp-settle --example gen_withdraw_proof -- I6X2KSUJJJC5D5T6ARVT7OH5Z7XMSMYG 2000000 0 1000000
       - name: Run AA devnet E2E
-        run: node obyte-local/test_vault_aa.js
+        run: node obyte-local/test_settlement_aa.js
