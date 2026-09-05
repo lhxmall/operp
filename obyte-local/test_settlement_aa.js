@@ -389,7 +389,13 @@ async function main() {
     pre_leaf_proof: merkle.getMerkleProof(GENESIS_LEAVES, depPreIdx),
     post_leaf_proof: merkle.getMerkleProof(LIAR_POST1, 0),
   };
-  await trigger(challenger, dispute, Object.assign({ pred: "deposit", height: 2 }, fraudProof), 20000);
+  // trigger() waits for the trigger unit only; the dispute's secondary
+  // verdict unit needs its own stability wait before the rollup vars move.
+  const fraudTrig = await trigger(challenger, dispute, Object.assign({ pred: "deposit", height: 2 }, fraudProof), 20000);
+  const fraudRes = await network.getAaResponseToUnit(fraudTrig.unit).catch(() => null);
+  if (fraudRes && fraudRes.response && fraudRes.response.bounced)
+    throw new Error("fraud predicate bounced: " + JSON.stringify(fraudRes.response).slice(0, 300));
+  await network.witnessUntilStable(fraudRes.response.response_unit);
   st = await vars(rollup);
   if (Number(st.frozen_2) !== 2) throw new Error("fraud verdict did not freeze height: " + JSON.stringify(st.frozen_2));
   if (Number(st.last_submitted) !== 1) throw new Error("last_submitted did not roll back");
