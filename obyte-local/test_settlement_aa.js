@@ -129,6 +129,7 @@ async function triggerBounce(wallet, to, data, amount, needle) {
   }
   failures++;
   console.error(`FAIL: expected bounce '${needle}' got response ${log.slice(0, 200)} for ${JSON.stringify(data).slice(0, 80)}`);
+  console.error(`FULL RESPONSE: ${log.slice(0, 2000)}`);
   return r;
 }
 
