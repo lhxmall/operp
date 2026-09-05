@@ -319,7 +319,11 @@ fn fill_proof(
             let obj = data.as_object_mut()?;
             obj.insert(
                 "maker_ord".into(),
-                format!("ord:{}:{}:{}:{}:{}:{}:{}", maker_order_hex, market, opp_side, fill_price, fill_seq, fill_qty, maker_hex).into(),
+                format!(
+                    "ord:{}:{}:{}:{}:{}:{}:{}",
+                    maker_order_hex, market, opp_side, fill_price, fill_seq, fill_qty, maker_hex
+                )
+                .into(),
             );
             if pos > 0 && pos < sorted.len() {
                 obj.insert("left".into(), sorted[pos - 1].clone().into());
@@ -532,8 +536,7 @@ fn fill_proof(
             // Expected legs: Account::apply_fill + taker fee, no clamp.
             let abs_old = old_qty.abs() as i128;
             let abs_delta = delta.abs() as i128;
-            let same =
-                old_qty == 0 || (old_qty > 0 && delta > 0) || (old_qty < 0 && delta < 0);
+            let same = old_qty == 0 || (old_qty > 0 && delta > 0) || (old_qty < 0 && delta < 0);
             let (exp_qty, exp_entry, exp_col, exp_pos_absent) = if same {
                 let eq = old_qty + delta;
                 let ee = if old_qty == 0 {
@@ -638,12 +641,7 @@ fn fill_proof(
                 Some(a) => a.clone(),
                 None => continue,
             };
-            let posted_col: i128 = match posted_acct
-                .split(':')
-                .nth(2)
-                .unwrap_or("")
-                .parse()
-            {
+            let posted_col: i128 = match posted_acct.split(':').nth(2).unwrap_or("").parse() {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -927,7 +925,8 @@ mod tests {
         let id4 = unit_id(&ask2);
         eng.ingest(ask2).unwrap();
         let mut eng2 = eng.clone();
-        let mut batch = Batch::from_applied(&prev, &mut eng2, &[id1, id2, id3, id4]).expect("batch");
+        let mut batch =
+            Batch::from_applied(&prev, &mut eng2, &[id1, id2, id3, id4]).expect("batch");
         // Liar drops the realized pnl from the taker's posted post col.
         let alice_hex = hex::encode(alice_id.0);
         if let Some(leaves) = batch.leaf_trace.get_mut(3) {

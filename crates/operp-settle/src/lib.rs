@@ -519,13 +519,8 @@ impl Batch {
             if vault.is_empty() && !self.deposit_evidences.is_empty() {
                 return Err(SettleError::DepositEvidence);
             }
-            deposit_verify::verify_all(
-                &self.units,
-                &self.deposit_evidences,
-                &vault,
-                &PERP_ASSET,
-            )
-            .map_err(|_| SettleError::DepositEvidence)?;
+            deposit_verify::verify_all(&self.units, &self.deposit_evidences, &vault, &PERP_ASSET)
+                .map_err(|_| SettleError::DepositEvidence)?;
         }
         for u in &self.units {
             match &u.op {
