@@ -110,13 +110,13 @@
 					// op = 'd:' || 64-hex || ':' || amount[:nonce]; the colon
 					// after the hex sits at index 66, so start the tail there.
 					// substring(s, start, length): length caps at the rest.
-					$rest = substring($op, 66, length($op));
-					// rest = ':' || amount[:nonce]. ocore's index_of has no
+					$tail = substring($op, 66, length($op));
+					// tail = ':' || amount[:nonce]. ocore's index_of has no
 					// start arg, so drop the leading colon first, then cut at
 					// the next colon (withdraw/gov) or take the remainder.
-					$rest = substring($rest, 1, length($rest));
-					$next = index_of($rest, ':');
-					$amount = substring($rest, 0, $next < 0 ? length($rest) : $next);
+					$amt = substring($tail, 1, length($tail));
+					$next = index_of($amt, ':');
+					$amount = substring($amt, 0, $next < 0 ? length($amt) : $next);
 					$tail1 = substring($post_leaf, 70, length($post_leaf));
 					$col1 = substring($tail1, 0, index_of($tail1, ':'));
 					if (typeof($post_leaf) == 'boolean' OR typeof($post_wit) == 'boolean'
