@@ -313,16 +313,25 @@
 					$BO = split($better_ord, ':');
 					if (array_length($MO) != 8 OR array_length($BO) != 8) bounce('bad ord');
 					if ($MO[2] != $F[7] OR $BO[2] != $F[7]) bounce('no fraud');
-					if ($MO[1] != $F[6] OR $BO[6] <= 0) bounce('no fraud');
+					// Ordinal fields arrive as strings; Oscript forbids
+					// ordered comparison on strings (fatal, not false), so
+					// coerce via +0 (numeric strings -> Decimal) first.
+					$mo_price = $MO[4] + 0;
+					$mo_seq = $MO[5] + 0;
+					$bo_price = $BO[4] + 0;
+					$bo_seq = $BO[5] + 0;
+					$bo_rem = $BO[6] + 0;
+					$fill_price = $F[8] + 0;
+					if ($MO[1] != $F[6] OR $bo_rem <= 0) bounce('no fraud');
 					$better_first = 0;
 					if ($side == '0'){
 						if ($BO[3] != '1') bounce('no fraud');
-						if ($BO[4] < $MO[4] OR ($BO[4] == $MO[4] AND $BO[5] < $MO[5])) { $better_first = 1; }
-						if ($BO[4] > $F[8]) bounce('no fraud');
+						if ($bo_price < $mo_price OR ($bo_price == $mo_price AND $bo_seq < $mo_seq)) { $better_first = 1; }
+						if ($bo_price > $fill_price) bounce('no fraud');
 					} else {
 						if ($BO[3] != '0') bounce('no fraud');
-						if ($BO[4] > $MO[4] OR ($BO[4] == $MO[4] AND $BO[5] < $MO[5])) { $better_first = 1; }
-						if ($BO[4] < $F[8]) bounce('no fraud');
+						if ($bo_price > $mo_price OR ($bo_price == $mo_price AND $bo_seq < $mo_seq)) { $better_first = 1; }
+						if ($bo_price < $fill_price) bounce('no fraud');
 					}
 					if (!$better_first) bounce('no fraud');
 					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
