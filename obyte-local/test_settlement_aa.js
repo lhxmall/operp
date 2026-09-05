@@ -219,6 +219,13 @@ async function sendCombinedSubmit(wallet, height, stateRoot, prev) {
   });
   if (r.error) throw new Error("combined submit failed: " + r.error);
   await network.witnessUntilStable(r.unit);
+  // sendMulti reports composer errors only; the AA bounce surfaces on the
+  // response unit — fail fast here instead of cascading 'no height' later.
+  const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
+  const log = JSON.stringify(res || {});
+  if (log.includes('"bounced":true')) {
+    throw new Error("combined submit bounced: " + log.slice(0, 500));
+  }
   return r;
 }
 
