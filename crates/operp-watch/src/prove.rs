@@ -628,4 +628,70 @@ mod tests {
         assert_eq!(proof.pred, "deposit");
         assert!(!proof.fill_aa);
     }
+
+    #[test]
+    fn omit_missing_forced_id_builds_proof() {
+        // Batch with one honest deposit unit; the forced id is absent.
+        let secret = sk(7);
+        let acct = acct_of(&secret);
+        let g = genesis_id();
+        let aa = [9u8; 32];
+        let u = sign_unit(
+            vec![g],
+            Op::Deposit {
+                account: acct,
+                addr: test_addr(),
+                amount: 100,
+                aa_unit: aa,
+            },
+            &secret,
+        );
+        let id = unit_id(&u);
+        let mut eng = Engine::new();
+        eng.state.deposits_allowed.insert((aa, false));
+        eng.ingest(u).unwrap();
+        let prev = operp_state::ChainState::new();
+        let mut eng2 = eng.clone();
+        let batch = Batch::from_applied(&prev, &mut eng2, &[id]).expect("batch");
+        let forced = hex::encode([0xabu8; 32]);
+        let mut replay = Engine::new();
+        let proof = build_proof(&batch, &mut replay, &[(forced.clone(), 0)], 999).expect("proof");
+        assert_eq!(proof.pred, "omit");
+        assert!(!proof.fill_aa);
+        assert_eq!(
+            proof.data.get("unit_id").and_then(|v| v.as_str()),
+            Some(forced.as_str())
+        );
+    }
+
+    #[test]
+    fn honest_batch_builds_no_proof() {
+        // Clean deposit batch, no inbox, untampered leaves: None.
+        let secret = sk(7);
+        let acct = acct_of(&secret);
+        let g = genesis_id();
+        let aa = [9u8; 32];
+        let u = sign_unit(
+            vec![g],
+            Op::Deposit {
+                account: acct,
+                addr: test_addr(),
+                amount: 100,
+                aa_unit: aa,
+            },
+            &secret,
+        );
+        let id = unit_id(&u);
+        let mut eng = Engine::new();
+        eng.state.deposits_allowed.insert((aa, false));
+        eng.ingest(u).unwrap();
+        let prev = operp_state::ChainState::new();
+        let mut eng2 = eng.clone();
+        let batch = Batch::from_applied(&prev, &mut eng2, &[id]).expect("batch");
+        let mut replay = Engine::new();
+        // Replay on a fresh engine at genesis prev root: the deposit
+        // replays honestly, no divergence.
+        replay.state.deposits_allowed.insert((aa, false));
+        assert!(build_proof(&batch, &mut replay, &[], 0).is_none());
+    }
 }
