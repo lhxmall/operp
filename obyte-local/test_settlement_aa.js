@@ -415,6 +415,7 @@ async function main() {
   };
   await triggerVerdict(challenger, dispute, Object.assign({ pred: "deposit", height: 2 }, fraudProof), 20000, "deposit fraud predicate");
   st = await vars(rollup);
+  const chAddr = await challenger.getAddress();
   // Cumulative: scenario 6's omit verdict already banked one half.
   if (Number(st["slash_reward_" + chAddr] || 0) !== SLASH_HALF * 2)
     throw new Error("slash reward wrong: " + JSON.stringify(st["slash_reward_" + chAddr]));
