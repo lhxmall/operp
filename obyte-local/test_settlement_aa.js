@@ -357,8 +357,8 @@ async function main() {
   const H3_PRE_WIT = merkle.getMerkleRoot(H3_PRE);
   const H3_PRE_IDX = {};
   H3_PRE.forEach((l, i) => { H3_PRE_IDX[l] = i; });
-  const forcedOmit = sha256Hex("forced-unit");
   await trigger(operator, rollup, { force: 1, unit_id: forcedOmit }, 20000);
+  await network.timetravel({ shift: "60s" }); // force ts strictly < inbox_upto_2
   const otherId = sha256Hex("other-unit");
   const SET1 = pad2([otherId], "set1");
   const SET_ROOT1 = merkle.getMerkleRoot(SET1);
