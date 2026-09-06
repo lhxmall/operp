@@ -326,6 +326,7 @@ async function main() {
     sd.unit_count = 1;
     sd.wit_root = witRoot || WIT_ROOT;
     sd.wit_count = witCount || GEN_WIT_COUNT;
+    const h2data = { chain_id: "operp-v2", height: 2 };
     const r = await operator.sendMulti({
       messages: [
         {
