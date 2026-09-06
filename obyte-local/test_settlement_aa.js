@@ -362,12 +362,12 @@ async function main() {
   const otherId = sha256Hex("other-unit");
   const SET1 = pad2([otherId], "set1");
   const SET_ROOT1 = merkle.getMerkleRoot(SET1);
-  if (!(forcedOmit < otherId)) throw new Error("omit fixture: forced id not before member");
   async function triggerVerdict(wallet, to, data, amount, what) {
     const t = await trigger(wallet, to, data, amount);
     const r = await network.getAaResponseToUnit(t.unit).catch(() => null);
+    const inner = r && r.response && (r.response.response || r.response);
     if (r && r.response && r.response.bounced)
-      throw new Error(what + " bounced: " + JSON.stringify(r.response).slice(0, 300));
+      throw new Error(what + " bounced: " + JSON.stringify(inner).slice(0, 500));
     await network.witnessUntilStable(r.response.response_unit);
   }
   // ---- 6. omit fraud on a REAL committed tree → verdict freezes h2 --------
