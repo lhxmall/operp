@@ -565,7 +565,7 @@ mod tests {
         let mut applied = Vec::new();
         let mut tip = g;
 
-        let px = 100_000 * PRICE_SCALE;
+        let px = 100_000 * PRICE_SCALE as i64;
         let qty = QTY_SCALE;
         let ask = sign_unit(
             vec![tip],

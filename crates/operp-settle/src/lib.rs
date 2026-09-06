@@ -862,7 +862,7 @@ mod tests {
         );
         applied.push(unit_id(&d2));
         eng.ingest(d2).unwrap();
-        let px = 100_000 * PRICE_SCALE;
+        let px = 100_000 * PRICE_SCALE as i64;
         let ask = sign_unit(
             vec![applied[1]],
             Op::Place {
@@ -1081,7 +1081,7 @@ mod tests {
         );
         assert_eq!(
             *eng.state.marks.get(&BTC_USD).unwrap(),
-            100_000 * PRICE_SCALE
+            100_000 * PRICE_SCALE as i64
         );
         let fills: Vec<_> = eng
             .log
@@ -1470,7 +1470,7 @@ mod tests {
                 side: Side::Bid,
                 typ: OrderType::Limit,
                 tif: TimeInForce::Gtc,
-                price: PRICE_SCALE,
+                price: PRICE_SCALE as i64,
                 qty: QTY_SCALE,
                 client_seq: 99,
             },
@@ -1544,7 +1544,7 @@ mod tests {
             side: Side::Bid,
             typ: OrderType::Limit,
             tif: TimeInForce::Gtc,
-            price: 100 * PRICE_SCALE,
+            price: 100 * PRICE_SCALE as i64,
             qty: QTY_SCALE / 1000,
             client_seq: 1,
         };

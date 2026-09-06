@@ -34,7 +34,7 @@
 
 | 类型 | 底层 | 缩放 | 例子 |
 |---|---|---|---|
-| `Price` | u64 | 1e8 | BTC 价格 $100,000 = `10_000_000_000_000` |
+| `Price` | i64 | 1e8 | 可为负（穿仓/归零附近定价）；正数 canonical 字节与 u64 时代逐字节相同 |
 | `Qty` | u64 | 1e8 | 1 BTC = `100_000_000` |
 | `Usd` | i128 | 1e6 | $1 = `1_000_000`（微美元） |
 
@@ -391,7 +391,7 @@ slash_reward_bps 归挑战者、余下烧毁。
 - 有效报价者集合 = 有债券且有最新报价的账户；对同一市场取全部价格的
   **中位数**：奇数取正中，偶数取较小中间值（确定性，任何副本一致）
 - `last_index[market] = 中位数`（未钳位，资金费率 index 用）
-- spot 写入 `marks[market]` 前过 ±10% 帽（首个报价无条件设定）
+- spot 写入 `marks[market]` 前过 ±10% 帽（首个报价无条件设定；帽按旧 mark 量级度量，负 mark 同样可步进）
 - 该市场有效报告数 ≥ 2 时，每次 report 触发一次资金费结算（§6.2）
 
 解锁到期的债券经 unstake 路径回到 `perp_balances`，走与其他 PERP 相同的
@@ -508,6 +508,10 @@ meta_leaf    = sha256(b"meta" ‖ height ‖ seq ‖ last_unit
                # 覆盖账户树之外的全部共识状态，重放无法在价格/资金费/
                # 治理/承诺状态上分叉。此为 state_root 格式的破坏性变更。
 ```
+共识破坏记录（主网未发，无迁移）：`CreateMarket` canonical 尾部追加
+`spot_only_u8`；book 叶市场参数承诺 57B→58B；`Price` 由 u64 改为 i64
+（`tick_size` 同为 i64 但恒为正；`price == 0` 仍拒绝/忽略）。
+正数 canonical 字节逐字节不变。
 
 meta_leaf 绑定 height（from_applied 先把 engine.state.height 推到
 checkpoint.height 再取根），使 state_root 跨批次成链：改历史高度必然断链。

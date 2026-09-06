@@ -178,7 +178,7 @@ fn decode_op(r: &mut Reader, depth: u32) -> Result<operp_dag::Op, GossipError> {
             side: Side::from_u8(r.u8()?).ok_or(GossipError::Malformed)?,
             typ: OrderType::from_u8(r.u8()?).ok_or(GossipError::Malformed)?,
             tif: TimeInForce::from_u8(r.u8()?).ok_or(GossipError::Malformed)?,
-            price: r.u64()?,
+            price: r.i64()?,
             qty: r.u64()?,
             client_seq: r.u64()?,
         },
@@ -206,7 +206,7 @@ fn decode_op(r: &mut Reader, depth: u32) -> Result<operp_dag::Op, GossipError> {
         6 => Op::ReportPrice {
             oracle: AccountId(r.arr32()?),
             market: MarketId(r.u32()?),
-            price: r.u64()?,
+            price: r.i64()?,
         },
         7 => Op::Liquidate {
             caller: AccountId(r.arr32()?),
@@ -233,7 +233,7 @@ fn decode_op(r: &mut Reader, depth: u32) -> Result<operp_dag::Op, GossipError> {
         10 => Op::CreateMarket {
             creator: AccountId(r.arr32()?),
             symbol: r.arr::<16>()?,
-            tick_size: r.u64()?,
+            tick_size: r.i64()?,
             im_bps: r.u64()?,
             mm_bps: r.u64()?,
             taker_fee_bps: r.u64()?,
@@ -282,7 +282,7 @@ fn decode_op(r: &mut Reader, depth: u32) -> Result<operp_dag::Op, GossipError> {
         operp_types::UPDATE_EXTERNAL_PRICE_TAG => Op::UpdateExternalPrice {
             source: AccountId(r.arr32()?),
             market: MarketId(r.u32()?),
-            price: r.u64()?,
+            price: r.i64()?,
             source_id: r.u8()?,
         },
         operp_types::COMMIT_TAG => Op::Commit {
@@ -345,6 +345,11 @@ impl<'a> Reader<'a> {
         let mut a = [0u8; 8];
         a.copy_from_slice(self.take(8)?);
         Ok(u64::from_le_bytes(a))
+    }
+    fn i64(&mut self) -> Result<i64, GossipError> {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(self.take(8)?);
+        Ok(i64::from_le_bytes(a))
     }
     fn u128(&mut self) -> Result<u128, GossipError> {
         let mut a = [0u8; 16];
@@ -586,7 +591,7 @@ mod tests {
                 side: operp_types::Side::Ask,
                 typ: operp_types::OrderType::Market,
                 tif: operp_types::TimeInForce::Ioc,
-                price: u64::MAX,
+                price: i64::MAX,
                 qty: 7,
                 client_seq: 42,
             },

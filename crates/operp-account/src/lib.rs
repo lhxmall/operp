@@ -149,7 +149,7 @@ impl Account {
         let mut has_unmarked = false;
         for (m, pos) in &self.positions {
             let mark = match marks.get(m).copied() {
-                Some(p) if p > 0 => p,
+                Some(p) if p != 0 => p,
                 _ => {
                     has_unmarked = true;
                     continue;
@@ -157,7 +157,7 @@ impl Account {
             };
             upnl +=
                 signed_notional_usd(pos.qty, mark) - signed_notional_usd(pos.qty, pos.entry_price);
-            let abs_n = notional_usd(pos.qty.unsigned_abs() as u64, mark);
+            let abs_n = notional_usd(pos.qty.unsigned_abs(), mark).abs();
             mm += bps(abs_n, MM_RATE_BPS);
             im += bps(abs_n, IM_RATE_BPS);
         }
@@ -221,8 +221,10 @@ fn same_sign(a: i64, b: i64) -> bool {
 }
 
 fn vwap(old_qty: Qty, old_px: Price, fill_qty: Qty, fill_px: Price) -> Price {
-    let num = u128::from(old_qty) * u128::from(old_px) + u128::from(fill_qty) * u128::from(fill_px);
-    let den = u128::from(old_qty) + u128::from(fill_qty);
+    // Signed i128 math: prices may print negative while quantities stay
+    // non-negative; truncation toward zero matches `realize` below.
+    let num = i128::from(old_qty) * i128::from(old_px) + i128::from(fill_qty) * i128::from(fill_px);
+    let den = i128::from(old_qty) + i128::from(fill_qty);
     (num / den) as Price
 }
 
@@ -254,21 +256,61 @@ mod tests {
     fn long_then_mark_up_increases_equity() {
         let mut a = Account::new(AccountId([1; 32]));
         a.credit(10_000 * USD_SCALE as i128).unwrap();
-        a.apply_fill(Side::Bid, true, 100_000 * PRICE_SCALE, QTY_SCALE, BTC_USD)
-            .unwrap();
-        let before = a.snapshot(&marks(100_000 * PRICE_SCALE)).equity;
-        let after = a.snapshot(&marks(110_000 * PRICE_SCALE)).equity;
+        a.apply_fill(
+            Side::Bid,
+            true,
+            100_000 * PRICE_SCALE as i64,
+            QTY_SCALE,
+            BTC_USD,
+        )
+        .unwrap();
+        let before = a.snapshot(&marks(100_000 * PRICE_SCALE as i64)).equity;
+        let after = a.snapshot(&marks(110_000 * PRICE_SCALE as i64)).equity;
         assert!(after > before);
+    }
+    #[test]
+    fn negative_mark_keeps_margin_positive() {
+        let mut a = Account::new(AccountId([1; 32]));
+        a.credit(100_000 * USD_SCALE as i128).unwrap();
+        a.apply_fill(
+            Side::Bid,
+            true,
+            -100_000 * PRICE_SCALE as i64,
+            QTY_SCALE,
+            BTC_USD,
+        )
+        .unwrap();
+        // Long 1 @ -100k, mark -90k: upnl = (-90k) - (-100k) = +10k.
+        let s = a.snapshot(&marks(-90_000 * PRICE_SCALE as i64));
+        assert_eq!(s.equity, 110_000 * USD_SCALE as i128);
+        // Margin is charged on |notional| = 90k: mm = 5% = 4500, im = 9000.
+        assert_eq!(s.mm, 4_500 * USD_SCALE as i128);
+        assert_eq!(s.im, 9_000 * USD_SCALE as i128);
+        // A negative mark is a real mark: no unmarked flag, no liquidation.
+        assert!(!s.reduce_only);
+        assert!(!s.liquidatable);
     }
 
     #[test]
     fn close_long_at_profit() {
         let mut a = Account::new(AccountId([1; 32]));
         a.credit(10_000 * USD_SCALE as i128).unwrap();
-        a.apply_fill(Side::Bid, true, 100_000 * PRICE_SCALE, QTY_SCALE, BTC_USD)
-            .unwrap();
-        a.apply_fill(Side::Ask, true, 110_000 * PRICE_SCALE, QTY_SCALE, BTC_USD)
-            .unwrap();
+        a.apply_fill(
+            Side::Bid,
+            true,
+            100_000 * PRICE_SCALE as i64,
+            QTY_SCALE,
+            BTC_USD,
+        )
+        .unwrap();
+        a.apply_fill(
+            Side::Ask,
+            true,
+            110_000 * PRICE_SCALE as i64,
+            QTY_SCALE,
+            BTC_USD,
+        )
+        .unwrap();
         assert!(a.positions.is_empty());
         // PnL settles into collateral: 10k deposit + 10k profit.
         assert_eq!(a.collateral, 20_000 * USD_SCALE as i128);
@@ -278,11 +320,23 @@ mod tests {
     fn profitable_pnl_is_withdrawable() {
         let mut a = Account::new(AccountId([1; 32]));
         a.credit(10_000 * USD_SCALE as i128).unwrap();
-        a.apply_fill(Side::Bid, true, 100_000 * PRICE_SCALE, QTY_SCALE, BTC_USD)
-            .unwrap();
-        a.apply_fill(Side::Ask, true, 110_000 * PRICE_SCALE, QTY_SCALE, BTC_USD)
-            .unwrap();
-        let m = marks(110_000 * PRICE_SCALE);
+        a.apply_fill(
+            Side::Bid,
+            true,
+            100_000 * PRICE_SCALE as i64,
+            QTY_SCALE,
+            BTC_USD,
+        )
+        .unwrap();
+        a.apply_fill(
+            Side::Ask,
+            true,
+            110_000 * PRICE_SCALE as i64,
+            QTY_SCALE,
+            BTC_USD,
+        )
+        .unwrap();
+        let m = marks(110_000 * PRICE_SCALE as i64);
         // Full balance (deposit + settled profit) is withdrawable.
         a.debit(20_000 * USD_SCALE as i128, &m).unwrap();
         assert_eq!(a.collateral, 0);
@@ -290,9 +344,15 @@ mod tests {
     #[test]
     fn margin_ratio_liq_boundary() {
         let mut a = Account::new(AccountId([1; 32]));
-        a.apply_fill(Side::Bid, true, 2_000 * PRICE_SCALE, QTY_SCALE, BTC_USD)
-            .unwrap();
-        let mark = 2_000 * PRICE_SCALE;
+        a.apply_fill(
+            Side::Bid,
+            true,
+            2_000 * PRICE_SCALE as i64,
+            QTY_SCALE,
+            BTC_USD,
+        )
+        .unwrap();
+        let mark = 2_000 * PRICE_SCALE as i64;
         let mm = a.snapshot(&marks(mark)).mm;
         assert_eq!(mm, 100 * USD_SCALE as i128);
         a.collateral = 105 * USD_SCALE as i128;
@@ -310,9 +370,15 @@ mod tests {
     fn withdraw_blocked_in_reduce_only() {
         let mut a = Account::new(AccountId([1; 32]));
         a.credit(6 * USD_SCALE as i128).unwrap();
-        a.apply_fill(Side::Bid, true, 100 * PRICE_SCALE, QTY_SCALE, BTC_USD)
-            .unwrap();
-        let m = marks(100 * PRICE_SCALE);
+        a.apply_fill(
+            Side::Bid,
+            true,
+            100 * PRICE_SCALE as i64,
+            QTY_SCALE,
+            BTC_USD,
+        )
+        .unwrap();
+        let m = marks(100 * PRICE_SCALE as i64);
         let s = a.snapshot(&m);
         assert!(s.reduce_only);
         assert!(a.debit(1, &m).is_err());
@@ -322,8 +388,14 @@ mod tests {
     fn unmarked_position_forces_reduce_only() {
         let mut a = Account::new(AccountId([1; 32]));
         a.credit(10_000 * USD_SCALE as i128).unwrap();
-        a.apply_fill(Side::Bid, true, 100_000 * PRICE_SCALE, QTY_SCALE, BTC_USD)
-            .unwrap();
+        a.apply_fill(
+            Side::Bid,
+            true,
+            100_000 * PRICE_SCALE as i64,
+            QTY_SCALE,
+            BTC_USD,
+        )
+        .unwrap();
         // Empty marks map: the position's market has no mark.
         let empty = BTreeMap::new();
         let s = a.snapshot(&empty);

@@ -2,8 +2,8 @@ use ed25519_dalek::SigningKey;
 use operp_dag::{genesis_id, sign_unit, unit_id, Op};
 use operp_exec::{Engine, ExecEvent};
 use operp_types::{
-    account_id_from_pubkey, AccountId, OrderType, Qty, Side, TimeInForce, UnitId, Usd, BTC_USD,
-    PRICE_SCALE, QTY_SCALE, USD_SCALE,
+    account_id_from_pubkey, AccountId, OrderType, Price, Qty, Side, TimeInForce, UnitId, Usd,
+    BTC_USD, PRICE_SCALE, QTY_SCALE, USD_SCALE,
 };
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ fn ingest_place(
     secret: &[u8; 32],
     side: Side,
     tif: TimeInForce,
-    price: u64,
+    price: Price,
     qty: Qty,
     client_seq: u64,
 ) -> (UnitId, Vec<ExecEvent>) {
@@ -57,7 +57,7 @@ fn main() {
         .insert(BTC_USD, operp_types::genesis_params());
     let mut secrets: Vec<[u8; 32]> = (1..=N as u8).map(sk).collect();
     let mut seqs = vec![1u64; N];
-    let px = 100_000 * PRICE_SCALE;
+    let px = 100_000 * PRICE_SCALE as i64;
     let qty = QTY_SCALE / 100;
     let mut tip = genesis_id();
 

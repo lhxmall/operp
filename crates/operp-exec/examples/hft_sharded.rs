@@ -55,7 +55,7 @@ fn run_shard(shard_idx: usize, cfg: &Cfg) -> (u64, u64, u64) {
         .map(|i| sk((((shard_idx * TRADERS + i + 3) * 41 + 7) % 251) as u8))
         .collect();
     let mut seqs = vec![1u64; TRADERS];
-    let px = 100_000 * PRICE_SCALE;
+    let px = 100_000 * PRICE_SCALE as i64;
     let qty = QTY_SCALE / 100;
     let mut tip = genesis_id();
 

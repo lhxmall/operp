@@ -96,7 +96,7 @@ mod tests {
         let mut book = OrderBook::new(BTC_USD);
         let maker = acct(1);
         let taker = acct(2);
-        let px = 100 * PRICE_SCALE;
+        let px = 100 * PRICE_SCALE as i64;
         let qty = QTY_SCALE;
         book.submit(order(
             maker,
@@ -116,7 +116,7 @@ mod tests {
                 Side::Bid,
                 OrderType::Limit,
                 TimeInForce::Gtc,
-                px + PRICE_SCALE,
+                px + PRICE_SCALE as i64,
                 qty * 2,
                 2,
             ))
@@ -126,7 +126,7 @@ mod tests {
         assert_eq!(r.fills[0].qty, qty);
         assert!(r.taker_resting);
         assert_eq!(r.taker_remaining, qty);
-        assert_eq!(book.best_bid().unwrap().0, px + PRICE_SCALE);
+        assert_eq!(book.best_bid().unwrap().0, px + PRICE_SCALE as i64);
     }
 
     #[test]
@@ -134,7 +134,7 @@ mod tests {
         let mut book = OrderBook::new(BTC_USD);
         let maker = acct(1);
         let taker = acct(2);
-        let px = 50 * PRICE_SCALE;
+        let px = 50 * PRICE_SCALE as i64;
         book.submit(order(
             maker,
             1,
@@ -174,7 +174,7 @@ mod tests {
             Side::Ask,
             OrderType::Limit,
             TimeInForce::Gtc,
-            100 * PRICE_SCALE,
+            100 * PRICE_SCALE as i64,
             QTY_SCALE,
             1,
         ))
@@ -185,7 +185,7 @@ mod tests {
             Side::Ask,
             OrderType::Limit,
             TimeInForce::Gtc,
-            101 * PRICE_SCALE,
+            101 * PRICE_SCALE as i64,
             QTY_SCALE,
             2,
         ))
@@ -203,8 +203,8 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(r.fills.len(), 2);
-        assert_eq!(r.fills[0].price, 100 * PRICE_SCALE);
-        assert_eq!(r.fills[1].price, 101 * PRICE_SCALE);
+        assert_eq!(r.fills[0].price, 100 * PRICE_SCALE as i64);
+        assert_eq!(r.fills[1].price, 101 * PRICE_SCALE as i64);
         assert!(!r.taker_resting);
         assert_eq!(book.best_ask(), None);
     }
@@ -219,7 +219,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            10 * PRICE_SCALE,
+            10 * PRICE_SCALE as i64,
             QTY_SCALE,
             1,
         );
@@ -234,7 +234,7 @@ mod tests {
         let mut book = OrderBook::new(BTC_USD);
         let a = acct(1);
         let b = acct(2);
-        let px = 100 * PRICE_SCALE;
+        let px = 100 * PRICE_SCALE as i64;
         // Own resting ask at the front of the queue...
         book.submit(order(
             a,
@@ -292,7 +292,7 @@ mod tests {
         let m1 = acct(1);
         let m2 = acct(2);
         let t = acct(3);
-        let px = 100 * PRICE_SCALE;
+        let px = 100 * PRICE_SCALE as i64;
         book.submit(order(
             m1,
             1,
@@ -345,7 +345,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            99 * PRICE_SCALE,
+            99 * PRICE_SCALE as i64,
             QTY_SCALE,
             1,
         ))
@@ -356,7 +356,7 @@ mod tests {
             Side::Ask,
             OrderType::Limit,
             TimeInForce::Gtc,
-            101 * PRICE_SCALE,
+            101 * PRICE_SCALE as i64,
             QTY_SCALE,
             1,
         ))
@@ -367,7 +367,7 @@ mod tests {
             Side::Ask,
             OrderType::Limit,
             TimeInForce::Gtc,
-            100 * PRICE_SCALE,
+            100 * PRICE_SCALE as i64,
             QTY_SCALE,
             2,
         ))
@@ -385,7 +385,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(r.fills.len(), 1);
-        assert_eq!(r.fills[0].price, 100 * PRICE_SCALE);
+        assert_eq!(r.fills[0].price, 100 * PRICE_SCALE as i64);
         // The resting bid @99 must still be live and matchable.
         let r2 = book
             .submit(order(
@@ -400,7 +400,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(r2.fills.len(), 1);
-        assert_eq!(r2.fills[0].price, 99 * PRICE_SCALE);
+        assert_eq!(r2.fills[0].price, 99 * PRICE_SCALE as i64);
     }
 
     #[test]
@@ -412,7 +412,7 @@ mod tests {
             Side::Ask,
             OrderType::Limit,
             TimeInForce::Gtc,
-            100 * PRICE_SCALE,
+            100 * PRICE_SCALE as i64,
             QTY_SCALE,
             1,
         );
@@ -422,16 +422,22 @@ mod tests {
             Side::Ask,
             OrderType::Limit,
             TimeInForce::Gtc,
-            100 * PRICE_SCALE,
+            100 * PRICE_SCALE as i64,
             QTY_SCALE * 3,
             2,
         );
         book.submit(a1.clone()).unwrap();
         book.submit(a2.clone()).unwrap();
-        assert_eq!(book.best_ask().unwrap(), (100 * PRICE_SCALE, QTY_SCALE * 4));
+        assert_eq!(
+            book.best_ask().unwrap(),
+            (100 * PRICE_SCALE as i64, QTY_SCALE * 4)
+        );
         // Cancel the non-head order (acct2): visible qty must drop to X only.
         book.cancel(a2.id).unwrap();
-        assert_eq!(book.best_ask().unwrap(), (100 * PRICE_SCALE, QTY_SCALE));
+        assert_eq!(
+            book.best_ask().unwrap(),
+            (100 * PRICE_SCALE as i64, QTY_SCALE)
+        );
         // Drain the head too: level disappears entirely (no phantom qty).
         book.cancel(a1.id).unwrap();
         assert_eq!(book.best_ask(), None);
@@ -446,7 +452,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            99 * PRICE_SCALE,
+            99 * PRICE_SCALE as i64,
             QTY_SCALE * 2,
             1,
         );
@@ -456,15 +462,21 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            99 * PRICE_SCALE,
+            99 * PRICE_SCALE as i64,
             QTY_SCALE,
             2,
         );
         book.submit(b1.clone()).unwrap();
         book.submit(b2.clone()).unwrap();
-        assert_eq!(book.best_bid().unwrap(), (99 * PRICE_SCALE, QTY_SCALE * 3));
+        assert_eq!(
+            book.best_bid().unwrap(),
+            (99 * PRICE_SCALE as i64, QTY_SCALE * 3)
+        );
         book.cancel(b2.id).unwrap();
-        assert_eq!(book.best_bid().unwrap(), (99 * PRICE_SCALE, QTY_SCALE * 2));
+        assert_eq!(
+            book.best_bid().unwrap(),
+            (99 * PRICE_SCALE as i64, QTY_SCALE * 2)
+        );
         book.cancel(b1.id).unwrap();
         assert_eq!(book.best_bid(), None);
     }

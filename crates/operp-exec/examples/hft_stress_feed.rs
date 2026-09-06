@@ -49,7 +49,7 @@ fn main() {
         .insert(BTC_USD, operp_types::genesis_params());
     let secrets: Vec<[u8; 32]> = (1..=N as u8).map(sk).collect();
     let mut seqs = vec![1u64; N];
-    let px = 100_000 * PRICE_SCALE;
+    let px = 100_000 * PRICE_SCALE as i64;
     let qty = QTY_SCALE / 100; // 0.01 BTC
     let mut tip = genesis_id();
 

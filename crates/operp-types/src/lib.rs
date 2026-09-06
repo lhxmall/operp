@@ -157,7 +157,7 @@ pub struct ExternalSample {
 }
 pub type FundingTwapSample = TwapSample;
 
-pub type Price = u64;
+pub type Price = i64;
 pub type Qty = u64;
 pub type Usd = i128;
 pub type Seq = u64;

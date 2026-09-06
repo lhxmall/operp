@@ -359,7 +359,7 @@ fn fill_proof(
         }
         let maker_order_hex = parts[6].to_string();
         let market = parts[7].to_string();
-        let price: u64 = parts[8].parse().ok()?;
+        let price: i64 = parts[8].parse().ok()?;
         let side = parts[11];
         let maker_ord = pre_leaves
             .iter()
@@ -371,7 +371,7 @@ fn fill_proof(
             })?
             .clone();
         let mo: Vec<&str> = maker_ord.split(':').collect();
-        let (mo_side, mo_price, mo_seq): (u8, u64, u64) = (
+        let (mo_side, mo_price, mo_seq): (u8, i64, u64) = (
             mo[3].parse().ok()?,
             mo[4].parse().ok()?,
             mo[5].parse().ok()?,
@@ -384,7 +384,7 @@ fn fill_proof(
             if o[1] == maker_order_hex {
                 continue;
             }
-            let (c_side, c_price, c_seq): (u8, u64, u64) =
+            let (c_side, c_price, c_seq): (u8, i64, u64) =
                 match (o[3].parse(), o[4].parse(), o[5].parse()) {
                     (Ok(a), Ok(b), Ok(c)) => (a, b, c),
                     _ => continue,
@@ -452,7 +452,7 @@ fn fill_proof(
         let taker_hex = parts[3].to_string();
         let maker_hex = parts[4].to_string();
         let market = parts[7].to_string();
-        let price: u64 = match parts[8].parse() {
+        let price: i64 = match parts[8].parse() {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -480,7 +480,8 @@ fn fill_proof(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let notional = qty as u128 * price as u128 / 100_000_000 * 1_000_000 / 100_000_000;
+        let notional =
+            qty as u128 * (price as i128).abs() as u128 / 100_000_000 * 1_000_000 / 100_000_000;
         let fee = (notional * fee_bps / 10_000) as i128;
         // Posted post legs: the commitments the AA checks proofs against.
         let posted_post: Vec<String> = batch
@@ -523,7 +524,7 @@ fn fill_proof(
                 })
                 .cloned();
             let pos_absent = pre_pos_opt.is_none();
-            let (old_qty, old_entry): (i64, u64) = match &pre_pos_opt {
+            let (old_qty, old_entry): (i64, i64) = match &pre_pos_opt {
                 None => (0, 0),
                 Some(p) => {
                     let o: Vec<&str> = p.split(':').collect();
@@ -542,8 +543,8 @@ fn fill_proof(
                 let ee = if old_qty == 0 {
                     price
                 } else {
-                    ((abs_old as u128 * old_entry as u128 + qty as u128 * price as u128)
-                        / (abs_old as u128 + qty as u128)) as u64
+                    ((abs_old * i128::from(old_entry) + i128::from(qty) * i128::from(price))
+                        / (abs_old + i128::from(qty))) as i64
                 };
                 let ec = if who == "taker" {
                     old_col - fee
@@ -622,7 +623,7 @@ fn fill_proof(
                             Some(p) => {
                                 let o: Vec<&str> = p.split(':').collect();
                                 o[3].parse::<i64>().ok() == Some(exp_qty)
-                                    && o[4].parse::<u64>().ok() == Some(exp_entry)
+                                    && o[4].parse::<i64>().ok() == Some(exp_entry)
                             }
                             None => false,
                         }
@@ -663,7 +664,7 @@ fn fill_proof(
                     Some(p) => {
                         let o: Vec<&str> = p.split(':').collect();
                         o[3].parse::<i64>().ok() == Some(exp_qty)
-                            && o[4].parse::<u64>().ok() == Some(exp_entry)
+                            && o[4].parse::<i64>().ok() == Some(exp_entry)
                     }
                     None => false,
                 }
@@ -882,15 +883,15 @@ mod tests {
         fund(&mut eng);
         let prev = eng.state.clone();
         let g = genesis_id();
-        let px1 = 100_000 * PRICE_SCALE;
-        let px2 = 105_000 * PRICE_SCALE;
+        let px1 = 100_000 * PRICE_SCALE as i64;
+        let px2 = 105_000 * PRICE_SCALE as i64;
         let q1 = QTY_SCALE;
         let q2 = QTY_SCALE / 2;
         let place = |parents: Vec<UnitId>,
                      secret: &[u8; 32],
                      account: AccountId,
                      side: Side,
-                     price: u64,
+                     price: i64,
                      qty: u64,
                      seq: u64| {
             sign_unit(

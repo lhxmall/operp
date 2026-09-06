@@ -62,7 +62,7 @@ fn generator(
         .map(|i| sk((((idx * TRADERS_PER_ENGINE + i + 1) * 37 + 11) % 251) as u8))
         .collect();
     let mut seqs = vec![1u64; TRADERS_PER_ENGINE];
-    let px = 100_000 * PRICE_SCALE;
+    let px = 100_000 * PRICE_SCALE as i64;
     let qty = QTY_SCALE / 100;
     let mut tip = genesis_id();
 
