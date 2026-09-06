@@ -518,8 +518,7 @@ async function main() {
     pright_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[POS2]),
     who: "taker",
   };
-    throw new Error("fill_math predicate bounced: " + JSON.stringify(fillRes.response).slice(0, 300));
-  await network.witnessUntilStable(fillRes.response.response_unit);
+  await triggerVerdict(challenger, fill, Object.assign({ pred: "fill_math", height: 3 }, fillBase), 20000, "fill_math predicate");
   st = await vars(rollup);
   if (Number(st.frozen_3) !== 2) throw new Error("fill_math fraud did not freeze height");
   if (String(st.dispute_fill_aa) !== fill) throw new Error("verdict not from fill AA");
@@ -595,11 +594,7 @@ async function main() {
     right: gSorted[gBetter],
     right_proof: merkle.getMerkleProof(gSorted, gBetter),
   };
-  const ghostTrig = await trigger(challenger, fill, Object.assign({ pred: "ghost", height: 3 }, ghostProof), 20000);
-  const ghostRes = await network.getAaResponseToUnit(ghostTrig.unit).catch(() => null);
-  if (ghostRes && ghostRes.response && ghostRes.response.bounced)
-    throw new Error("ghost predicate bounced: " + JSON.stringify(ghostRes.response).slice(0, 300));
-  await network.witnessUntilStable(ghostRes.response.response_unit);
+  await triggerVerdict(challenger, fill, Object.assign({ pred: "ghost", height: 3 }, ghostProof), 20000, "ghost predicate");
   st = await vars(rollup);
   if (Number(st.frozen_3) !== 2) throw new Error("ghost fraud did not freeze height");
   console.log("12. ghost (absent maker) → frozen=3");
@@ -623,11 +618,7 @@ async function main() {
     better_ord: BETTER_ORD,
     better_proof: merkle.getMerkleProof(H3_PRE, H3_PRE.indexOf(BETTER_ORD)),
   };
-  const skipTrig = await trigger(challenger, fill, Object.assign({ pred: "skip", height: 3 }, skipProof), 20000);
-  const skipRes = await network.getAaResponseToUnit(skipTrig.unit).catch(() => null);
-  if (skipRes && skipRes.response && skipRes.response.bounced)
-    throw new Error("skip predicate bounced: " + JSON.stringify(skipRes.response).slice(0, 300));
-  await network.witnessUntilStable(skipRes.response.response_unit);
+  await triggerVerdict(challenger, fill, Object.assign({ pred: "skip", height: 3 }, skipProof), 20000, "skip predicate");
   st = await vars(rollup);
   if (Number(st.frozen_3) !== 2) throw new Error("skip fraud did not freeze height");
   console.log("13. skip (better order ignored) → frozen=3");
