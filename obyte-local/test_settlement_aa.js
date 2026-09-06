@@ -624,6 +624,34 @@ async function main() {
   st = await vars(rollup);
   if (Number(st.frozen_3) !== 2) throw new Error("skip fraud did not freeze height");
   console.log("13. skip (better order ignored) → frozen=3");
+  // ---- 13a. fill_math with NEGATIVE price (signed fills) → fraud --------
+  // price=-1e8 qty=1e8 -> |notional| 1e6, fee 5bps=500 -> exp col -500.
+  // Liar posts -499: proves Oscript string math holds for negatives.
+  // Market stays 1 (no pre pos -> exact expectation, no averaging division).
+  const NEG_FILL = `f:${"u".repeat(64)}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"e".repeat(64)}:1:-100000000:100000000:9:0`;
+  const NEG_FILLS = pad2([NEG_FILL], "negfills");
+  const NEG_FILLS_ROOT = merkle.getMerkleRoot(NEG_FILLS);
+  const NEG_POST_LIAR = [`acct:${takerH}:-499:0:0`, META1, `pos:${takerH}:1:100000000:-100000000`].sort();
+  const NEG_POST_LIAR_WIT = merkle.getMerkleRoot(NEG_POST_LIAR);
+  const NEG_TRACE = pad2([NEG_POST_LIAR_WIT], "negtrace");
+  const NEG_TRACE_ROOT = merkle.getMerkleRoot(NEG_TRACE);
+  await submitH3(NEG_TRACE_ROOT, NEG_FILLS_ROOT);
+  const negBase = Object.assign({}, fillBase, {
+    trace_root: NEG_TRACE_ROOT,
+    fills_root: NEG_FILLS_ROOT,
+    fill: NEG_FILL,
+    fill_proof: merkle.getMerkleProof(NEG_FILLS, 0),
+    post_wit: NEG_POST_LIAR_WIT,
+    post_proof: merkle.getMerkleProof(NEG_TRACE, 0),
+    post_acct: `acct:${takerH}:-499:0:0`, // liar: col -499, expected -500
+    post_acct_proof: merkle.getMerkleProof(NEG_POST_LIAR, NEG_POST_LIAR.indexOf(`acct:${takerH}:-499:0:0`)),
+    post_pos: `pos:${takerH}:1:100000000:-100000000`,
+    post_pos_proof: merkle.getMerkleProof(NEG_POST_LIAR, NEG_POST_LIAR.indexOf(`pos:${takerH}:1:100000000:-100000000`)),
+  });
+  await triggerVerdict(challenger, fill, Object.assign({ pred: "fill_math", height: 3 }, negBase), 20000, "negative-price fill_math predicate");
+  st = await vars(rollup);
+  if (Number(st.frozen_3) !== 2) throw new Error("negative-price fill_math fraud did not freeze height");
+  console.log("13a. fill_math negative-price dishonest → frozen=3 via fill AA");
 
   // ---- 14. re-submit + finalize after fraud works -------------------------
   await sendCombinedSubmit(operator, 3, STATE_ROOT, STATE_ROOT);

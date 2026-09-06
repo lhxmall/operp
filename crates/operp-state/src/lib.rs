@@ -180,7 +180,7 @@ impl ChainState {
         let mut books = BTreeMap::new();
         books.insert(BTC_USD, OrderBook::new(BTC_USD));
         let mut marks = BTreeMap::new();
-        marks.insert(BTC_USD, 100_000 * PRICE_SCALE);
+        marks.insert(BTC_USD, 100_000 * PRICE_SCALE as i64);
         let mut accounts = BTreeMap::new();
         // Insurance fund seeded at genesis; absorbs bad debt and pays keepers.
         let mut insurance = Account::new(INSURANCE_ACCOUNT);
@@ -509,7 +509,10 @@ impl ChainState {
                     return Err(StateError::SlashNotEligible);
                 }
             }
-            let dev = ((sample.price as i128 - twap as i128).abs() * 10_000 / twap as i128) as u64;
+            // Magnitude on both sides: a negative TWAP must not flip the
+            // sign (or wrap the `as u64`) of the deviation measure.
+            let dev = ((sample.price as i128 - twap as i128).abs() * 10_000 / (twap as i128).abs())
+                as u64;
             if dev < deviation_bps {
                 return Err(StateError::SlashNotEligible);
             }
@@ -615,10 +618,12 @@ impl ChainState {
         // Funding index: unclamped median, so the premium reflects true
         // reporter consensus even while the spot mark lags behind the cap.
         self.last_index.insert(market, median);
+        // Signed marks: the ±10% band is measured on the old mark's
+        // magnitude, so a negative mark can still move by capped steps.
         let capped = match self.marks.get(&market) {
-            Some(&old) if old > 0 => {
+            Some(&old) if old != 0 => {
                 let dev = (median as i128 - old as i128).abs();
-                if dev <= old as i128 / 10 {
+                if dev <= (old as i128).abs() / 10 {
                     median
                 } else {
                     old
@@ -638,7 +643,7 @@ impl ChainState {
             let funding_index = self.effective_funding_index(market, median);
             let index = funding_index as i128;
             let spot = capped as i128;
-            if index > 0 {
+            if index != 0 {
                 let diff_bps = ((spot - index) * 10_000 / index).clamp(
                     -(operp_types::FUNDING_CAP_BPS as i128),
                     operp_types::FUNDING_CAP_BPS as i128,
@@ -770,18 +775,18 @@ impl ChainState {
         }
         // Mark oracle guards: fills move the mark only for markets where NO
         // bonded reporter has spoken yet (oracles are authoritative once
-        // present), the notional is >= 100 USD, and the move is within ±10%
+        // present), the notional magnitude is >= 100 USD, and the move is within ±10%
         // of the previous mark (first qualifying fill sets unconditionally).
-        if notional_usd(fill.qty, fill.price) >= 100 * USD_SCALE as i128
+        if notional_usd(fill.qty, fill.price).abs() >= 100 * USD_SCALE as i128
             && !self
                 .oracle_reports
                 .keys()
                 .any(|(m, o)| *m == fill.market && self.oracle_bonds.contains_key(o))
         {
             let capped = match self.marks.get(&fill.market) {
-                Some(&old) if old > 0 => {
+                Some(&old) if old != 0 => {
                     let dev = (fill.price as i128 - old as i128).abs();
-                    if dev <= old as i128 / 10 {
+                    if dev <= (old as i128).abs() / 10 {
                         fill.price
                     } else {
                         old
@@ -1424,7 +1429,7 @@ mod tests {
         s.account_mut(maker)
             .credit(1_000_000 * USD_SCALE as i128)
             .unwrap();
-        let px = 100_000 * operp_types::PRICE_SCALE;
+        let px = 100_000 * operp_types::PRICE_SCALE as i64;
         let fill = Fill {
             taker_id: operp_types::OrderId([0u8; 32]),
             maker_id: operp_types::OrderId([0u8; 32]),
@@ -1464,18 +1469,18 @@ mod tests {
             taker_side: operp_types::Side::Bid,
         };
         // +200% spike: rejected by the ±10% cap — mark stays at genesis.
-        s.apply_fill_pair(&mk_fill(300_000 * operp_types::PRICE_SCALE))
+        s.apply_fill_pair(&mk_fill(300_000 * operp_types::PRICE_SCALE as i64))
             .unwrap();
         assert_eq!(
             *s.marks.get(&BTC_USD).unwrap(),
-            100_000 * operp_types::PRICE_SCALE
+            100_000 * operp_types::PRICE_SCALE as i64
         );
         // +5% move: within the band — mark updates.
-        s.apply_fill_pair(&mk_fill(105_000 * operp_types::PRICE_SCALE))
+        s.apply_fill_pair(&mk_fill(105_000 * operp_types::PRICE_SCALE as i64))
             .unwrap();
         assert_eq!(
             *s.marks.get(&BTC_USD).unwrap(),
-            105_000 * operp_types::PRICE_SCALE
+            105_000 * operp_types::PRICE_SCALE as i64
         );
     }
 
@@ -1492,7 +1497,7 @@ mod tests {
             .unwrap();
 
         // Both open 1 BTC at 100_000 via a fill (spot mark = index initially).
-        let px = 100_000 * operp_types::PRICE_SCALE;
+        let px = 100_000 * operp_types::PRICE_SCALE as i64;
         let fill = Fill {
             taker_id: operp_types::OrderId([0u8; 32]),
             maker_id: operp_types::OrderId([0u8; 32]),
@@ -1513,7 +1518,7 @@ mod tests {
         let ob = AccountId([6; 32]);
         s.oracle_bonds.insert(oa, operp_types::ORACLE_BOND_PERP);
         s.oracle_bonds.insert(ob, operp_types::ORACLE_BOND_PERP);
-        s.apply_report(oa, BTC_USD, 100_000 * operp_types::PRICE_SCALE, 1)
+        s.apply_report(oa, BTC_USD, 100_000 * operp_types::PRICE_SCALE as i64, 1)
             .unwrap();
         let pre_funding = s.accounts[&long].collateral + s.accounts[&short].collateral;
 
@@ -1521,7 +1526,7 @@ mod tests {
         // (the smaller middle when even). |89k − 100k| = 11k > 10k, so the
         // ±10% cap holds the spot mark at 100k while the index drops to
         // 89k: premium > 0 → long pays short.
-        s.apply_report(ob, BTC_USD, 89_000 * operp_types::PRICE_SCALE, 2)
+        s.apply_report(ob, BTC_USD, 89_000 * operp_types::PRICE_SCALE as i64, 2)
             .unwrap();
 
         let long_bal = s.accounts[&long].collateral;
@@ -1551,21 +1556,22 @@ mod tests {
             .apply_fill(
                 operp_types::Side::Bid,
                 false,
-                100_000 * operp_types::PRICE_SCALE,
+                100_000 * operp_types::PRICE_SCALE as i64,
                 operp_types::QTY_SCALE,
                 BTC_USD,
             )
             .unwrap();
         // Taker dumps at 10k: the maker closes with a 90k realized loss
         // settled into only 50k of collateral → bankrupt.
-        s.marks.insert(BTC_USD, 10_000 * operp_types::PRICE_SCALE);
+        s.marks
+            .insert(BTC_USD, 10_000 * operp_types::PRICE_SCALE as i64);
         let fill = Fill {
             taker_id: operp_types::OrderId([0u8; 32]),
             maker_id: operp_types::OrderId([0u8; 32]),
             taker,
             maker,
             market: BTC_USD,
-            price: 10_000 * operp_types::PRICE_SCALE,
+            price: 10_000 * operp_types::PRICE_SCALE as i64,
             qty: operp_types::QTY_SCALE,
             seq: 1,
             taker_side: operp_types::Side::Bid,
@@ -1598,14 +1604,14 @@ mod tests {
         let mut s = ChainState::new();
         let keeper = AccountId([7; 32]);
         // One sample: below FUNDING_TWAP_MIN_SAMPLES → None.
-        s.apply_external_price(keeper, BTC_USD, 90_000 * PRICE_SCALE, 0, 1);
+        s.apply_external_price(keeper, BTC_USD, 90_000 * PRICE_SCALE as i64, 0, 1);
         assert_eq!(s.external_twap(BTC_USD), None);
         // Second distinct-height sample: TWAP forms.
         s.height += 1;
-        s.apply_external_price(keeper, BTC_USD, 92_000 * PRICE_SCALE, 0, 2);
+        s.apply_external_price(keeper, BTC_USD, 92_000 * PRICE_SCALE as i64, 0, 2);
         assert_eq!(
             s.external_twap(BTC_USD),
-            Some((90_000 * PRICE_SCALE + 92_000 * PRICE_SCALE) / 2)
+            Some((90_000 * PRICE_SCALE as i64 + 92_000 * PRICE_SCALE as i64) / 2)
         );
         // Feed dies: past FUNDING_EXTERNAL_MAX_STALENESS the ring reads as
         // stale (None) so effective_funding_index falls back (doc 06 §2.6).
@@ -1614,7 +1620,7 @@ mod tests {
         // Window cap holds the ring bounded at FUNDING_TWAP_WINDOW samples.
         for i in 0..(operp_types::FUNDING_TWAP_WINDOW + 10) {
             s.height += 1;
-            s.apply_external_price(keeper, BTC_USD, 50_000 * PRICE_SCALE, 0, i);
+            s.apply_external_price(keeper, BTC_USD, 50_000 * PRICE_SCALE as i64, 0, i);
         }
         assert_eq!(
             s.external_price_ring[&BTC_USD].len(),
@@ -1662,19 +1668,50 @@ mod tests {
         s.oracle_bonds.insert(oa, operp_types::ORACLE_BOND_PERP);
         s.oracle_bonds.insert(ob, operp_types::ORACLE_BOND_PERP);
         // Two reporters, same height, same median → one funding sample.
-        s.apply_report(oa, BTC_USD, 90_000 * PRICE_SCALE, 1)
+        s.apply_report(oa, BTC_USD, 90_000 * PRICE_SCALE as i64, 1)
             .unwrap();
-        s.apply_report(ob, BTC_USD, 90_000 * PRICE_SCALE, 2)
+        s.apply_report(ob, BTC_USD, 90_000 * PRICE_SCALE as i64, 2)
             .unwrap();
         assert_eq!(s.funding_twap[&BTC_USD].len(), 1);
         // New height, new median → new sample with that height's seq.
         s.height += 1;
-        s.apply_report(oa, BTC_USD, 91_000 * PRICE_SCALE, 7)
+        s.apply_report(oa, BTC_USD, 91_000 * PRICE_SCALE as i64, 7)
             .unwrap();
         let q = &s.funding_twap[&BTC_USD];
         assert_eq!(q.len(), 2);
         assert_eq!(q.back().unwrap().seq, 7);
         assert_eq!(q.back().unwrap().height, 1);
+    }
+    #[test]
+    fn negative_mark_moves_by_capped_steps() {
+        let mut s = ChainState::new();
+        let oa = AccountId([5; 32]);
+        let ob = AccountId([6; 32]);
+        s.oracle_bonds.insert(oa, operp_types::ORACLE_BOND_PERP);
+        s.oracle_bonds.insert(ob, operp_types::ORACLE_BOND_PERP);
+        // Seed a negative mark directly (fills can print negative; oracles
+        // never saw this market, so no median exists yet).
+        s.marks.insert(BTC_USD, -100_000 * PRICE_SCALE as i64);
+        // Two +5%-magnitude steps: each median sits inside the ±10% band
+        // measured on |old|, so the negative mark keeps moving instead of
+        // freezing (the pre-signed bug: `dev <= negative` never held).
+        for (px, seq) in [
+            (-105_000 * PRICE_SCALE as i64, 1),
+            (-110_250 * PRICE_SCALE as i64, 2),
+        ] {
+            s.apply_report(oa, BTC_USD, px, seq).unwrap();
+            s.apply_report(ob, BTC_USD, px, seq + 10).unwrap();
+            assert_eq!(*s.marks.get(&BTC_USD).unwrap(), px);
+        }
+        // A jump beyond the band still clamps: +200% spike rejected.
+        s.apply_report(oa, BTC_USD, -300_000 * PRICE_SCALE as i64, 3)
+            .unwrap();
+        s.apply_report(ob, BTC_USD, -300_000 * PRICE_SCALE as i64, 13)
+            .unwrap();
+        assert_eq!(
+            *s.marks.get(&BTC_USD).unwrap(),
+            -110_250 * PRICE_SCALE as i64
+        );
     }
     #[test]
     fn aa_shard_of_is_deterministic_and_bounded() {

@@ -2,8 +2,8 @@ use ed25519_dalek::SigningKey;
 use operp_dag::{genesis_id, sign_unit, unit_id, Op};
 use operp_exec::{Engine, ExecEvent};
 use operp_types::{
-    account_id_from_pubkey, AccountId, OrderType, Qty, Side, TimeInForce, UnitId, Usd, BTC_USD,
-    PRICE_SCALE, QTY_SCALE, USD_SCALE,
+    account_id_from_pubkey, AccountId, OrderType, Price, Qty, Side, TimeInForce, UnitId, Usd,
+    BTC_USD, PRICE_SCALE, QTY_SCALE, USD_SCALE,
 };
 
 fn sk(n: u8) -> [u8; 32] {
@@ -31,7 +31,7 @@ fn place(
     parents: Vec<UnitId>,
     secret: &[u8; 32],
     side: Side,
-    price: u64,
+    price: Price,
     qty: Qty,
     client_seq: u64,
 ) -> operp_dag::Unit {
@@ -66,7 +66,7 @@ fn main() {
     let g = genesis_id();
     let alice = sk(1);
     let bob = sk(2);
-    let px = 100_000 * PRICE_SCALE;
+    let px = 100_000 * PRICE_SCALE as i64;
     let qty = QTY_SCALE;
 
     let d1 = deposit(vec![g], &alice, 10_000 * USD_SCALE as i128, 1);
@@ -136,7 +136,7 @@ fn main() {
         "book bid={:?} ask={:?} mark={}",
         eng.state.books[&BTC_USD].best_bid(),
         eng.state.books[&BTC_USD].best_ask(),
-        eng.state.marks[&BTC_USD] / PRICE_SCALE
+        eng.state.marks[&BTC_USD] / PRICE_SCALE as i64
     );
 
     assert_eq!(qa, qty as i64);

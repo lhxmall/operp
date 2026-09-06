@@ -512,8 +512,17 @@ impl Engine {
             Some(p) if !p.delisted => {}
             _ => return Err(RejectReason::Risk),
         }
-        let px_est = px_for_notional.max(mark);
-        if (px_est as u128)
+        // Signed prices: margin must cover the larger *magnitude* — a plain
+        // max() would let a short at -100 post margin against mark -1.
+        let px_est = if px_for_notional.abs() >= mark.abs() {
+            px_for_notional
+        } else {
+            mark
+        };
+        // unsigned_abs is exact (no MIN-wrap): negative estimates feed the
+        // guard as magnitudes.
+        let px_abs: u128 = px_est.unsigned_abs() as u128;
+        if px_abs
             .checked_mul(qty as u128)
             .map(|n| n > i128::MAX as u128)
             .unwrap_or(true)
@@ -919,7 +928,9 @@ impl Engine {
         keeper_reward_bps: Bps,
         spot_only: bool,
     ) -> Result<Vec<Fill>, RejectReason> {
-        if tick_size == 0
+        // Signed price grid: tick stays strictly positive; a zero or
+        // negative grid would break limit alignment (`price % tick_size`).
+        if tick_size <= 0
             || im_bps == 0
             || mm_bps == 0
             || taker_fee_bps == 0
@@ -1414,7 +1425,7 @@ mod tests {
         let d2 = deposit(vec![id1], &bob, 10_000 * USD_SCALE as i128, 2);
         let id2 = unit_id(&d2);
         eng.ingest(d2).unwrap();
-        let px = 100_000 * PRICE_SCALE;
+        let px = 100_000 * PRICE_SCALE as i64;
         let qty = QTY_SCALE;
         let ask = place(
             vec![id2],
@@ -1471,7 +1482,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            90_000 * PRICE_SCALE,
+            90_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             1,
         );
@@ -1483,7 +1494,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            91_000 * PRICE_SCALE,
+            91_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             1,
         );
@@ -1537,7 +1548,7 @@ mod tests {
         let d2 = deposit(vec![id1], &bob, 1_000_000 * USD_SCALE as i128, 2);
         let id2 = unit_id(&d2);
         eng.ingest(d2).unwrap();
-        let px = 100_000 * PRICE_SCALE;
+        let px = 100_000 * PRICE_SCALE as i64;
         let ask = place(
             vec![id2],
             &bob,
@@ -1562,7 +1573,7 @@ mod tests {
         );
         let id4 = unit_id(&bid);
         eng.ingest(bid).unwrap();
-        eng.state.marks.insert(BTC_USD, 1 * PRICE_SCALE);
+        eng.state.marks.insert(BTC_USD, 1 * PRICE_SCALE as i64);
         let a = acct_of(&alice);
         assert!(
             eng.state
@@ -1578,7 +1589,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            1 * PRICE_SCALE,
+            1 * PRICE_SCALE as i64,
             QTY_SCALE,
             2,
         );
@@ -1616,7 +1627,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            u64::MAX / 2,
+            i64::MAX / 2,
             u64::MAX,
             1,
         );
@@ -1733,7 +1744,7 @@ mod tests {
         let d2 = deposit(vec![id1], &bob, 1_000_000 * USD_SCALE as i128, 2);
         let id2 = unit_id(&d2);
         eng.ingest(d2).unwrap();
-        let px = 100_000 * PRICE_SCALE;
+        let px = 100_000 * PRICE_SCALE as i64;
         let ask = place(
             vec![id2],
             &bob,
@@ -1761,7 +1772,7 @@ mod tests {
         // crash to 80k: alice goes underwater (shortfall 5k absorbed by the
         // 10k-seeded insurance) and the liq fill notional (80k USD) yields a
         // 1% keeper reward of 800 USD that the fund can actually pay.
-        eng.state.marks.insert(BTC_USD, 80_000 * PRICE_SCALE);
+        eng.state.marks.insert(BTC_USD, 80_000 * PRICE_SCALE as i64);
         let a = acct_of(&alice);
         let ask2 = place(
             vec![id4],
@@ -1769,7 +1780,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            80_000 * PRICE_SCALE,
+            80_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             2,
         );
@@ -1846,7 +1857,7 @@ mod tests {
             Op::ReportPrice {
                 oracle: acct_of(&sk(5)),
                 market: BTC_USD,
-                price: 100_000 * PRICE_SCALE,
+                price: 100_000 * PRICE_SCALE as i64,
             },
             &sk(5),
         );
@@ -1873,7 +1884,7 @@ mod tests {
             .oracle_bonds
             .insert(ob, operp_types::ORACLE_BOND_PERP);
         let g = genesis_id();
-        let mk = |secret: &[u8; 32], px: u64| {
+        let mk = |secret: &[u8; 32], px: Price| {
             sign_unit(
                 vec![g],
                 Op::ReportPrice {
@@ -1884,14 +1895,16 @@ mod tests {
                 secret,
             )
         };
-        eng.ingest(mk(&sk(5), 100_000 * PRICE_SCALE)).unwrap();
-        eng.ingest(mk(&sk(6), 110_000 * PRICE_SCALE)).unwrap();
+        eng.ingest(mk(&sk(5), 100_000 * PRICE_SCALE as i64))
+            .unwrap();
+        eng.ingest(mk(&sk(6), 110_000 * PRICE_SCALE as i64))
+            .unwrap();
         // Effective mark = median across reporters; median of two is the
         // lower middle, i.e. 100_000 (which equals the genesis mark, so the
         // clamp keeps it).
         assert_eq!(
             eng.state.marks.get(&BTC_USD).copied().unwrap(),
-            100_000 * PRICE_SCALE
+            100_000 * PRICE_SCALE as i64
         );
         // Once an oracle has spoken, fills must NOT move the mark.
         let alice = sk(1);
@@ -1907,14 +1920,14 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            150_000 * PRICE_SCALE,
+            150_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             1,
         );
         eng.ingest(p).unwrap();
         assert_eq!(
             eng.state.marks.get(&BTC_USD).copied().unwrap(),
-            100_000 * PRICE_SCALE,
+            100_000 * PRICE_SCALE as i64,
             "oracle-authoritative mark must ignore fills"
         );
     }
@@ -2208,7 +2221,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            50_000 * PRICE_SCALE,
+            50_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             1,
         ))
@@ -2237,7 +2250,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            51_000 * PRICE_SCALE,
+            51_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             2,
         );
@@ -2277,7 +2290,7 @@ mod tests {
         let d2 = deposit(vec![tip], &bob, 1_000_000 * USD_SCALE as i128, 2);
         tip = unit_id(&d2);
         eng.ingest(d2).unwrap();
-        let px = 100_000 * PRICE_SCALE;
+        let px = 100_000 * PRICE_SCALE as i64;
         let ask = place(
             vec![tip],
             &bob,
@@ -2387,7 +2400,7 @@ mod tests {
             Op::ReportPrice {
                 oracle: acct_of(&sk(5)),
                 market: meme,
-                price: 100 * PRICE_SCALE,
+                price: 100 * PRICE_SCALE as i64,
             },
             &sk(5),
         );
@@ -2406,7 +2419,7 @@ mod tests {
             Op::ReportPrice {
                 oracle: acct_of(&sk(5)),
                 market: BTC_USD,
-                price: 100_000 * PRICE_SCALE,
+                price: 100_000 * PRICE_SCALE as i64,
             },
             &sk(5),
         );
@@ -2422,7 +2435,7 @@ mod tests {
             Op::UpdateExternalPrice {
                 source: acct_of(&sk(9)),
                 market: meme,
-                price: 100 * PRICE_SCALE,
+                price: 100 * PRICE_SCALE as i64,
                 source_id: 0,
             },
             &sk(9),
@@ -2461,7 +2474,7 @@ mod tests {
         let d2 = deposit(vec![tip], &bob, 1_000_000 * USD_SCALE as i128, 2);
         tip = unit_id(&d2);
         eng.ingest(d2).unwrap();
-        let px = 100_000 * PRICE_SCALE;
+        let px = 100_000 * PRICE_SCALE as i64;
         let ask = place_on(
             vec![tip],
             &bob,
@@ -2517,11 +2530,160 @@ mod tests {
             Op::ReportPrice {
                 oracle: acct_of(&sk(5)),
                 market: meme,
-                price: 200_000 * PRICE_SCALE,
+                price: 200_000 * PRICE_SCALE as i64,
             },
             &sk(5),
         );
         eng.ingest(r).unwrap();
+        assert_eq!(eng.state.marks.get(&meme).copied(), Some(px));
+        assert!(!eng.state.last_index.contains_key(&meme));
+    }
+    #[test]
+    fn negative_price_short_lifecycle_pnl_sign() {
+        // Short 1 @ -100k, cover @ -110k: falling deeper-negative is a
+        // profit for the short, +10k into the maker's collateral exactly
+        // (maker pays no taker fee).
+        let mut eng = activated_engine();
+        let g = genesis_id();
+        // Fresh plain market (id 2, no genesis mark): the first negative
+        // fill sets the mark unconditionally; stepping from the +100k
+        // mkt genesis mark would need dozens of capped reports.
+        let gd = gov_dep(vec![g], &sk(3), CREATE_MARKET_FEE_PERP, 7);
+        let mut tip = unit_id(&gd);
+        eng.ingest(gd).unwrap();
+        let cm = list_market_with(vec![tip], &sk(3), false);
+        tip = unit_id(&cm);
+        eng.ingest(cm).unwrap();
+        let mkt = MarketId(2);
+        let alice = sk(1);
+        let bob = sk(2);
+        let d1 = deposit(vec![tip], &alice, 1_000_000 * USD_SCALE as i128, 1);
+        tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![tip], &bob, 1_000_000 * USD_SCALE as i128, 2);
+        tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+        let open = -100_000 * PRICE_SCALE as i64;
+        let ask = place_on(
+            vec![tip],
+            &bob,
+            mkt,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            open,
+            QTY_SCALE,
+            1,
+        );
+        tip = unit_id(&ask);
+        eng.ingest(ask).unwrap();
+        let bid = place_on(
+            vec![tip],
+            &alice,
+            mkt,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            open,
+            QTY_SCALE,
+            1,
+        );
+        tip = unit_id(&bid);
+        eng.ingest(bid).unwrap();
+        assert_eq!(eng.state.marks.get(&mkt).copied(), Some(open));
+        // Cover leg 10k lower (more negative).
+        let cover = -110_000 * PRICE_SCALE as i64;
+        // Bob rests the cover bid first so he stays maker on both legs;
+        // alice takes twice.
+        let bid2 = place_on(
+            vec![tip],
+            &bob,
+            mkt,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            cover,
+            QTY_SCALE,
+            2,
+        );
+        tip = unit_id(&bid2);
+        eng.ingest(bid2).unwrap();
+        let ask2 = place_on(
+            vec![tip],
+            &alice,
+            mkt,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            cover,
+            QTY_SCALE,
+            2,
+        );
+        eng.ingest(ask2).unwrap();
+        assert_eq!(eng.state.marks.get(&mkt).copied(), Some(cover));
+        assert!(eng.state.accounts[&acct_of(&bob)].positions.is_empty());
+        assert!(eng.state.accounts[&acct_of(&alice)].positions.is_empty());
+        // Bob (maker both legs): 1M + 10k realized, no fee legs.
+        assert_eq!(
+            eng.state.accounts[&acct_of(&bob)].collateral,
+            1_010_000 * USD_SCALE as i128
+        );
+        // Alice (taker both legs): 1M - 10k PnL - both taker fees.
+        assert!(eng.state.accounts[&acct_of(&alice)].collateral < 990_000 * USD_SCALE as i128);
+    }
+
+    #[test]
+    fn spot_only_negative_fill_sets_mark_without_funding() {
+        // Joint regression: spot_only gate × signed prices. A negative fill
+        // on a spot market writes a negative mark and still accrues no
+        // funding index.
+        let mut eng = activated_engine();
+        let g = genesis_id();
+        let d = gov_dep(vec![g], &sk(3), CREATE_MARKET_FEE_PERP, 7);
+        let mut tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let cm = list_market_with(vec![tip], &sk(3), true);
+        tip = unit_id(&cm);
+        eng.ingest(cm).unwrap();
+        let meme = MarketId(2);
+        let alice = sk(1);
+        let bob = sk(2);
+        let d1 = deposit(vec![tip], &alice, 1_000_000 * USD_SCALE as i128, 1);
+        tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![tip], &bob, 1_000_000 * USD_SCALE as i128, 2);
+        tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+        let px = -100_000 * PRICE_SCALE as i64;
+        let ask = place_on(
+            vec![tip],
+            &bob,
+            meme,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
+        tip = unit_id(&ask);
+        eng.ingest(ask).unwrap();
+        let bid = place_on(
+            vec![tip],
+            &alice,
+            meme,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
+        let evs = eng.ingest(bid).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Applied { fills, .. } if !fills.is_empty()
+        )));
         assert_eq!(eng.state.marks.get(&meme).copied(), Some(px));
         assert!(!eng.state.last_index.contains_key(&meme));
     }
@@ -2534,7 +2696,7 @@ mod tests {
             BTC_USD,
             operp_types::MarketParams {
                 symbol: [0u8; 16],
-                tick_size: 100 * operp_types::PRICE_SCALE,
+                tick_size: 100 * operp_types::PRICE_SCALE as i64,
                 im_bps: operp_types::IM_RATE_BPS,
                 mm_bps: operp_types::MM_RATE_BPS,
                 taker_fee_bps: operp_types::TAKER_FEE_BPS,
@@ -2557,7 +2719,7 @@ mod tests {
                 Side::Bid,
                 OrderType::Limit,
                 TimeInForce::Gtc,
-                150_500 * PRICE_SCALE / 1000,
+                150_500 * PRICE_SCALE as i64 / 1000,
                 QTY_SCALE,
                 1,
             ))
@@ -2590,7 +2752,7 @@ mod tests {
                 side: Side::Bid,
                 typ: OrderType::Limit,
                 tif: TimeInForce::Gtc,
-                price: 90_000 * PRICE_SCALE,
+                price: 90_000 * PRICE_SCALE as i64,
                 qty: QTY_SCALE,
                 client_seq: 99,
             },
@@ -2614,7 +2776,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            90_000 * PRICE_SCALE,
+            90_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             1,
         );
@@ -2948,7 +3110,7 @@ mod tests {
                         side: Side::Bid,
                         typ: OrderType::Limit,
                         tif: TimeInForce::Gtc,
-                        price: operp_types::PRICE_SCALE * u64::from(n),
+                        price: operp_types::PRICE_SCALE as i64 * i64::from(n),
                         qty: QTY_SCALE,
                         client_seq: u64::from(n),
                     },
@@ -3027,7 +3189,7 @@ mod tests {
             side: Side::Bid,
             typ: OrderType::Limit,
             tif: TimeInForce::Gtc,
-            price: 100 * PRICE_SCALE,
+            price: 100 * PRICE_SCALE as i64,
             qty: QTY_SCALE / 1000,
             client_seq: 1,
         };
@@ -3078,7 +3240,7 @@ mod tests {
             side: Side::Bid,
             typ: OrderType::Limit,
             tif: TimeInForce::Gtc,
-            price: 100 * PRICE_SCALE,
+            price: 100 * PRICE_SCALE as i64,
             qty: QTY_SCALE / 1000,
             client_seq: 1,
         };
@@ -3131,7 +3293,7 @@ mod tests {
             side: Side::Bid,
             typ: OrderType::Limit,
             tif: TimeInForce::Gtc,
-            price: 100 * PRICE_SCALE,
+            price: 100 * PRICE_SCALE as i64,
             qty: QTY_SCALE / 1000,
             client_seq: 1,
         };
@@ -3181,7 +3343,7 @@ mod tests {
             side: Side::Bid,
             typ: OrderType::Limit,
             tif: TimeInForce::Gtc,
-            price: 100 * PRICE_SCALE,
+            price: 100 * PRICE_SCALE as i64,
             qty: QTY_SCALE / 1000,
             client_seq: 1,
         };
@@ -3234,7 +3396,7 @@ mod tests {
             side: Side::Bid,
             typ: OrderType::Limit,
             tif: TimeInForce::Gtc,
-            price: 100 * PRICE_SCALE,
+            price: 100 * PRICE_SCALE as i64,
             qty: QTY_SCALE / 1000,
             client_seq: seq,
         };
@@ -3312,7 +3474,7 @@ mod tests {
                 side: Side::Bid,
                 typ: OrderType::Limit,
                 tif: TimeInForce::Gtc,
-                price: 100 * PRICE_SCALE,
+                price: 100 * PRICE_SCALE as i64,
                 qty: QTY_SCALE / 1000,
                 client_seq: 1,
             };
@@ -3427,23 +3589,29 @@ mod tests {
         eng.state.external_sources.insert(acct_of(&keeper));
 
         let mut tip = genesis_id();
-        prime_bonded_twap(&mut eng, &mut tip, &oa, &ob, 90_000 * PRICE_SCALE, 4);
-        assert_eq!(eng.state.funding_index_twap[&BTC_USD], 90_000 * PRICE_SCALE);
+        prime_bonded_twap(&mut eng, &mut tip, &oa, &ob, 90_000 * PRICE_SCALE as i64, 4);
+        assert_eq!(
+            eng.state.funding_index_twap[&BTC_USD],
+            90_000 * PRICE_SCALE as i64
+        );
 
         // Keeper posts an external anchor at 95k through the real dispatch
         // path; it lands in the ring but needs >= MIN_SAMPLES to drive index.
-        let e1 = external_price_unit(vec![tip], &keeper, 95_000 * PRICE_SCALE, 0);
+        let e1 = external_price_unit(vec![tip], &keeper, 95_000 * PRICE_SCALE as i64, 0);
         tip = unit_id(&e1);
         let events = eng.ingest(e1).unwrap();
         assert!(matches!(events.last(), Some(ExecEvent::Applied { .. })));
-        let e2 = external_price_unit(vec![tip], &keeper, 95_000 * PRICE_SCALE, 0);
+        let e2 = external_price_unit(vec![tip], &keeper, 95_000 * PRICE_SCALE as i64, 0);
         let _ = unit_id(&e2);
         eng.ingest(e2).unwrap();
-        assert_eq!(eng.state.external_twap(BTC_USD), Some(95_000 * PRICE_SCALE));
+        assert_eq!(
+            eng.state.external_twap(BTC_USD),
+            Some(95_000 * PRICE_SCALE as i64)
+        );
         assert_eq!(
             eng.state
-                .effective_funding_index(BTC_USD, 90_000 * PRICE_SCALE),
-            95_000 * PRICE_SCALE,
+                .effective_funding_index(BTC_USD, 90_000 * PRICE_SCALE as i64),
+            95_000 * PRICE_SCALE as i64,
             "fresh external ring must override the bonded-median TWAP"
         );
 
@@ -3452,8 +3620,8 @@ mod tests {
         eng.state.height += operp_types::FUNDING_EXTERNAL_MAX_STALENESS + 1;
         assert_eq!(
             eng.state
-                .effective_funding_index(BTC_USD, 90_000 * PRICE_SCALE),
-            90_000 * PRICE_SCALE
+                .effective_funding_index(BTC_USD, 90_000 * PRICE_SCALE as i64),
+            90_000 * PRICE_SCALE as i64
         );
     }
 
@@ -3466,7 +3634,12 @@ mod tests {
         let stranger = sk(11);
         eng.state.external_sources.insert(acct_of(&keeper));
         // Not on the allowlist.
-        let u = external_price_unit(vec![genesis_id()], &stranger, 95_000 * PRICE_SCALE, 0);
+        let u = external_price_unit(
+            vec![genesis_id()],
+            &stranger,
+            95_000 * PRICE_SCALE as i64,
+            0,
+        );
         let events = eng.ingest(u).unwrap();
         assert!(matches!(
             events.last(),
@@ -3480,7 +3653,7 @@ mod tests {
         let mut eng2 = activated_engine();
         eng2.state.height = operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT;
         eng2.state.external_sources.insert(acct_of(&keeper));
-        let u2 = external_price_unit(vec![genesis_id()], &keeper, 95_000 * PRICE_SCALE, 0);
+        let u2 = external_price_unit(vec![genesis_id()], &keeper, 95_000 * PRICE_SCALE as i64, 0);
         let events2 = eng2.ingest(u2).unwrap();
         assert!(matches!(
             events2.last(),
@@ -3516,7 +3689,7 @@ mod tests {
         let d2 = deposit(vec![tip], &bob, 1_000_000 * USD_SCALE as i128, 2);
         tip = unit_id(&d2);
         eng.ingest(d2).unwrap();
-        let px = 100_000 * PRICE_SCALE;
+        let px = 100_000 * PRICE_SCALE as i64;
         let ask = place(
             vec![tip],
             &bob,
@@ -3544,19 +3717,26 @@ mod tests {
 
         // External keepers anchor the index at 50k while bonded reports push
         // medians (and thus the capped mark) to 100k: longs must pay shorts.
-        let e1 = external_price_unit(vec![tip], &keeper, 50_000 * PRICE_SCALE, 0);
+        let e1 = external_price_unit(vec![tip], &keeper, 50_000 * PRICE_SCALE as i64, 0);
         tip = unit_id(&e1);
         eng.ingest(e1).unwrap();
-        let e2 = external_price_unit(vec![tip], &keeper, 50_000 * PRICE_SCALE, 0);
+        let e2 = external_price_unit(vec![tip], &keeper, 50_000 * PRICE_SCALE as i64, 0);
         tip = unit_id(&e2);
         eng.ingest(e2).unwrap();
-        prime_bonded_twap(&mut eng, &mut tip, &oa, &ob, 100_000 * PRICE_SCALE, 3);
+        prime_bonded_twap(
+            &mut eng,
+            &mut tip,
+            &oa,
+            &ob,
+            100_000 * PRICE_SCALE as i64,
+            3,
+        );
 
         let pre_long = eng.state.accounts[&acct_of(&alice)].collateral;
         let pre_short = eng.state.accounts[&acct_of(&bob)].collateral;
         // One more report tick fires funding against the external index.
         eng.state.height += 1;
-        let r = report_unit(vec![tip], &oa, 100_000 * PRICE_SCALE);
+        let r = report_unit(vec![tip], &oa, 100_000 * PRICE_SCALE as i64);
         let _ = unit_id(&r);
         let events = eng.ingest(r).unwrap();
         assert!(matches!(events.last(), Some(ExecEvent::Applied { .. })));
@@ -3571,7 +3751,7 @@ mod tests {
         let moved = pre_long - eng.state.accounts[&acct_of(&alice)].collateral;
         // Per-tick cap: 50 bps of notional(qty, 50k).
         let cap = operp_types::bps(
-            i128::from(QTY_SCALE / 1000) * (50_000 * PRICE_SCALE as i128),
+            i128::from(QTY_SCALE / 1000) * (50_000 * PRICE_SCALE as i64 as i128),
             operp_types::FUNDING_CAP_BPS as u64,
         );
         assert!(moved <= cap as i128 + USD_SCALE as i128, "cap holds");

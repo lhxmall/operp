@@ -2,8 +2,8 @@ use ed25519_dalek::SigningKey;
 use operp_dag::{genesis_id, sign_unit, unit_id, Op};
 use operp_exec::{Engine, ExecEvent};
 use operp_types::{
-    account_id_from_pubkey, AccountId, OrderType, Qty, Side, TimeInForce, UnitId, Usd, BTC_USD,
-    PRICE_SCALE, QTY_SCALE, USD_SCALE,
+    account_id_from_pubkey, AccountId, OrderType, Price, Qty, Side, TimeInForce, UnitId, Usd,
+    BTC_USD, PRICE_SCALE, QTY_SCALE, USD_SCALE,
 };
 use std::time::{Duration, Instant};
 
@@ -36,7 +36,7 @@ fn place(
     secret: &[u8; 32],
     side: Side,
     tif: TimeInForce,
-    price: u64,
+    price: Price,
     qty: Qty,
     client_seq: u64,
 ) -> operp_dag::Unit {
@@ -67,7 +67,7 @@ fn main() {
     let g = genesis_id();
     let alice = sk(1);
     let bob = sk(2);
-    let px = 100_000 * PRICE_SCALE;
+    let px = 100_000 * PRICE_SCALE as i64;
     let qty = QTY_SCALE / 100;
 
     let d1 = deposit(vec![g], &alice, 1_000_000 * USD_SCALE as i128, 1);

@@ -42,7 +42,7 @@ fn main() {
         tip = unit_id(&u);
         eng.ingest(u).unwrap();
     }
-    let px = 100_000 * PRICE_SCALE;
+    let px = 100_000 * PRICE_SCALE as i64;
     let qty = QTY_SCALE / 100;
     let seqs = std::cell::RefCell::new([1u64; 4]);
     // single-threaded open/close pairs on one market, direct ingest

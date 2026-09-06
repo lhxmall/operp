@@ -136,7 +136,7 @@ fn main() {
                 .map(|i| sk((((g * TRADERS + i + 5) * 43 + 3) % 251) as u8))
                 .collect();
             let mut seqs = vec![1u64; TRADERS];
-            let px = 100_000 * PRICE_SCALE;
+            let px = 100_000 * PRICE_SCALE as i64;
             let qty = QTY_SCALE / 100;
 
             let mut dep_tip = genesis_id();
