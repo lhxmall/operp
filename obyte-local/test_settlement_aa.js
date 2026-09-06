@@ -277,13 +277,14 @@ async function main() {
   if (Number(st.last_submitted) !== 1) throw new Error("last_submitted != 1: " + st.last_submitted);
   if (st.state_root_1 !== STATE_ROOT) throw new Error("state_root_1 mismatch");
   if (st.da_unit_1 === undefined) throw new Error("da_unit_1 not pinned");
-  // resubmit same height → 'height taken'
-  await triggerBounce(operator, rollup, submitData(1, STATE_ROOT, PREV_ROOT), SUBMIT_GROSS, "height taken");
+  // resubmit same height → 'bad submit' (h != last_submitted+1; the
+  // 'height taken' gate only applies to a fresh h == last_submitted+1)
+  await triggerBounce(operator, rollup, submitData(1, STATE_ROOT, PREV_ROOT), SUBMIT_GROSS, "bad submit");
   console.log("3. combined submit ok, resubmit rejected");
 
   // ---- 4. lock/challenge are dead paths ---------------------------------
-  await triggerBounce(operator, rollup, { lock: 1, height: 1 }, 20000, "formula");
-  await triggerBounce(operator, rollup, { challenge: 1, height: 1 }, 1000000000000, "formula");
+  await triggerBounce(operator, rollup, { lock: 1, height: 1 }, 20000, "neither case is true in messages");
+  await triggerBounce(operator, rollup, { challenge: 1, height: 1 }, 1000000000000, "neither case is true in messages");
   st = await vars(rollup);
   if (Number(st.frozen_1 || 0) !== 0) throw new Error("height 1 frozen by dead path!");
   console.log("4. lock/challenge have no cases — assertion untouched");
