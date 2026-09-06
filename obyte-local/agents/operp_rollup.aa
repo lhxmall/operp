@@ -131,6 +131,7 @@
 							var['da_unit_' || trigger.data.height] = trigger.unit || '';
 							var['inbox_upto_' || trigger.data.height] = timestamp;
 							var['active_bond_' || trigger.data.height] = trigger.address;
+							var['frozen_' || trigger.data.height] = 0;
 							var['last_submitted'] = trigger.data.height;
 							if (!var['fee_winner_' || trigger.data.height]){
 								var['fee_winner_' || trigger.data.height] = trigger.address;
