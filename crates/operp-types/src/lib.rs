@@ -244,6 +244,9 @@ pub struct MarketParams {
     pub taker_fee_bps: Bps,
     pub keeper_reward_bps: Bps,
     pub delisted: bool,
+    /// Meme/contract-only market: fixed at creation, no ParamKey flips it.
+    /// Spot-only markets reject every price report and never accrue funding.
+    pub spot_only: bool,
 }
 
 /// Genesis market BTC_USD: same values as the pre-governance globals.
@@ -258,6 +261,7 @@ pub fn genesis_params() -> MarketParams {
         taker_fee_bps: TAKER_FEE_BPS,
         keeper_reward_bps: KEEPER_REWARD_BPS,
         delisted: false,
+        spot_only: false,
     }
 }
 
