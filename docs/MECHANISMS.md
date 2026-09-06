@@ -100,7 +100,7 @@ Unit {
 | Liquidate | 7 | caller, target, market_le4 |
 | GovDeposit | 8 | account, amount_le16, aa_unit_32 |
 | GovWithdraw | 9 | account, amount_le16, nonce_le8 |
-| CreateMarket | 10 | creator, symbol16, tick_size_le8, im_bps_le8, mm_bps_le8, taker_fee_bps_le8, keeper_reward_bps_le8 |
+| CreateMarket | 10 | creator, symbol16, tick_size_le8, im_bps_le8, mm_bps_le8, taker_fee_bps_le8, keeper_reward_bps_le8, spot_only_u8（0/1） |
 | CreateProposal | 11 | creator, market_le4, key_u8（ParamKey）, value_le8 |
 | Vote | 12 | voter, proposal_id_le8, approve_u8（0/1） |
 | FinalizeProposal | 13 | caller, proposal_id_le8 |
@@ -348,6 +348,9 @@ spot > index：正 payment → 多头付，空头收；反向镜像。
 TWAP；环空或最新样本超过 `FUNDING_EXTERNAL_MAX_STALENESS = 32` 个高度
 即视为过期，逐级回退 债券中位数 TWAP → 即时中位数——喂价死亡不会冻结
 资金费。环与白名单、资金源选择器均进 meta 叶承诺（§9.1）。
+`spot_only` 市场（§16.2）拒绝一切报价（`ReportPrice` 与
+`UpdateExternalPrice` 均以 `NotFound` 驳回），有效报告数恒为 0，
+资金费永不触发。
 
 ### 6.3 dust 说明
 
@@ -482,11 +485,11 @@ account_leaf = sha256("acct" ‖ id32 ‖ collateral_i128le16
                       ‖ perp_u128le16)
                # perp 取自 perp_balances（PERP 治理余额，§16），
                # 与 collateral 并列进入承诺
-book_leaf    = sha256(params_57B ‖ b"book" ‖ market_le4 ‖ [price_le8 ‖
+book_leaf    = sha256(params_58B ‖ b"book" ‖ market_le4 ‖ [price_le8 ‖
                (order_id32 ‖ remaining_le8)*]*)
-               # params_57B = symbol16 ‖ tick_size_le8 ‖ im_bps_le8
+               # params_58B = symbol16 ‖ tick_size_le8 ‖ im_bps_le8
                #   ‖ mm_bps_le8 ‖ taker_fee_bps_le8 ‖ keeper_reward_bps_le8
-               #   ‖ delisted_u8（定宽 57 字节）——市场参数本身成为被承诺
+               #   ‖ delisted_u8 ‖ spot_only_u8（定宽 58 字节）——市场参数本身成为被承诺
                #   的共识状态；同时提交每一个价格档与每个活单，
                #   簿深度与参数都逃不过审计
 meta_leaf    = sha256(b"meta" ‖ height ‖ seq ‖ last_unit
@@ -740,14 +743,17 @@ asset id。发币时只需改一个常量并重新部署 AA。
 
 `perp_supply` 定义为可赎回流通量：Σ 充值 − 提款 − 烧毁。
 
-### 16.2 无许可市场上架
-
 **CreateMarket**（tag 10）：任何人可上架，代价是烧毁
 `CREATE_MARKET_FEE_PERP = 10_000` PERP 上架费。市场参数随 op 提交
-（symbol、tick_size、im_bps、mm_bps、taker_fee_bps、keeper_reward_bps），
+（symbol、tick_size、im_bps、mm_bps、taker_fee_bps、keeper_reward_bps、
+`spot_only`），
 存入 `markets[market_id]`——IM/MM/taker fee/keeper 奖励从全局常量变为
 **每市场参数**（§4.2/§5.2/§6.1 相应改为读参数）。tick_size 或任一 bps
 为 0 → Risk 拒绝。簿不预建，沿用 `book_mut` 惰性创建。
+
+`spot_only` 建时定死：无 `ParamKey` 可翻转。`true` 的市场为纯合约/meme
+市场——拒收一切报价（双通道 `NotFound`，见 §6.2）、永无资金费；
+成交仍可定 mark（首笔合格 fill 写 `marks`）。可 delist 照旧（与 spot 正交）。
 
 delisted 市场（见 16.3 Delist 提案）拒绝新挂单；撤单与清算平仓仍允许
 (清算路径不经 place 校验)。MVP 不做强制拍卖：存量仓位只能平仓或被清算。

@@ -372,6 +372,17 @@ impl Engine {
                 if !self.state.markets.contains_key(market) {
                     return Err(RejectReason::NotFound);
                 }
+                // Spot-only markets have no oracle feed: same signal as
+                // unknown markets so watchers need no new error path.
+                if self
+                    .state
+                    .markets
+                    .get(market)
+                    .map(|p| p.spot_only)
+                    .unwrap_or(false)
+                {
+                    return Err(RejectReason::NotFound);
+                }
                 // Doc 06 §2.7: pass the pre-increment global seq so TWAP
                 // samples carry intra-height ordering without wall clocks.
                 let caller_seq = self.state.seq;
@@ -399,6 +410,7 @@ impl Engine {
                 mm_bps,
                 taker_fee_bps,
                 keeper_reward_bps,
+                spot_only,
             } => self.create_market(
                 *creator,
                 *symbol,
@@ -407,6 +419,7 @@ impl Engine {
                 *mm_bps,
                 *taker_fee_bps,
                 *keeper_reward_bps,
+                *spot_only,
             ),
             Op::CreateProposal {
                 creator,
@@ -904,6 +917,7 @@ impl Engine {
         mm_bps: Bps,
         taker_fee_bps: Bps,
         keeper_reward_bps: Bps,
+        spot_only: bool,
     ) -> Result<Vec<Fill>, RejectReason> {
         if tick_size == 0
             || im_bps == 0
@@ -952,6 +966,7 @@ impl Engine {
                 mm_bps,
                 taker_fee_bps,
                 keeper_reward_bps,
+                spot_only,
                 delisted: false,
             },
         );
@@ -1243,6 +1258,15 @@ impl Engine {
         if !self.state.markets.contains_key(&market) || price == 0 {
             return Err(RejectReason::NotFound);
         }
+        if self
+            .state
+            .markets
+            .get(&market)
+            .map(|p| p.spot_only)
+            .unwrap_or(false)
+        {
+            return Err(RejectReason::NotFound);
+        }
         self.state
             .apply_external_price(source, market, price, source_id, caller_seq);
         Ok(Vec::new())
@@ -1316,6 +1340,35 @@ mod tests {
                 addr: test_addr(aa),
                 amount,
                 aa_unit: [aa; 32],
+            },
+            secret,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn place_on(
+        parents: Vec<UnitId>,
+        secret: &[u8; 32],
+        market: MarketId,
+        side: Side,
+        typ: OrderType,
+        tif: TimeInForce,
+        price: operp_types::Price,
+        qty: Qty,
+        client_seq: u64,
+    ) -> Unit {
+        let account = acct_of(secret);
+        sign_unit(
+            parents,
+            Op::Place {
+                account,
+                market,
+                side,
+                typ,
+                tif,
+                price,
+                qty,
+                client_seq,
             },
             secret,
         )
@@ -1904,6 +1957,27 @@ mod tests {
                 mm_bps: 500,
                 taker_fee_bps: 5,
                 keeper_reward_bps: 100,
+                spot_only: false,
+            },
+            secret,
+        )
+    }
+    /// Permissionless listing with an explicit `spot_only` flag; the new
+    /// market takes the next id (2 on a fresh engine).
+    fn list_market_with(parents: Vec<UnitId>, secret: &[u8; 32], spot_only: bool) -> Unit {
+        let mut symbol = [0u8; 16];
+        symbol[..6].copy_from_slice(b"MEMEUS");
+        sign_unit(
+            parents,
+            Op::CreateMarket {
+                creator: acct_of(secret),
+                symbol,
+                tick_size: 1,
+                im_bps: 1000,
+                mm_bps: 500,
+                taker_fee_bps: 5,
+                keeper_reward_bps: 100,
+                spot_only,
             },
             secret,
         )
@@ -2273,6 +2347,7 @@ mod tests {
                 mm_bps: 500,
                 taker_fee_bps: 5,
                 keeper_reward_bps: 20_000, // 200% — unbounded keeper drain
+                spot_only: false,
             },
             &sk(1),
         );
@@ -2290,6 +2365,166 @@ mod tests {
             CREATE_MARKET_FEE_PERP
         );
     }
+    #[test]
+    fn spot_only_market_rejects_all_price_reports() {
+        let mut eng = activated_engine();
+        let g = genesis_id();
+        let d = gov_dep(vec![g], &sk(1), CREATE_MARKET_FEE_PERP, 7);
+        let tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let cm = list_market_with(vec![tip], &sk(1), true);
+        let tip = unit_id(&cm);
+        let evs = eng.ingest(cm).unwrap();
+        assert!(!evs.iter().any(|e| matches!(e, ExecEvent::Rejected { .. })));
+        let meme = MarketId(2);
+        assert!(eng.state.markets[&meme].spot_only);
+        // Bonded reporter: ReportPrice on the spot market bounces as NotFound.
+        eng.state
+            .oracle_bonds
+            .insert(acct_of(&sk(5)), ORACLE_BOND_PERP);
+        let r = sign_unit(
+            vec![tip],
+            Op::ReportPrice {
+                oracle: acct_of(&sk(5)),
+                market: meme,
+                price: 100 * PRICE_SCALE,
+            },
+            &sk(5),
+        );
+        let evs = eng.ingest(r).unwrap();
+        assert!(matches!(
+            evs.last(),
+            Some(ExecEvent::Rejected {
+                reason: RejectReason::NotFound,
+                ..
+            })
+        ));
+        // Same reporter on the genesis market still reports fine: the gate
+        // is per-market, not per-reporter.
+        let r2 = sign_unit(
+            vec![tip],
+            Op::ReportPrice {
+                oracle: acct_of(&sk(5)),
+                market: BTC_USD,
+                price: 100_000 * PRICE_SCALE,
+            },
+            &sk(5),
+        );
+        let evs2 = eng.ingest(r2).unwrap();
+        assert!(!evs2.iter().any(|e| matches!(e, ExecEvent::Rejected { .. })));
+        // Allowlisted keeper: UpdateExternalPrice on the spot market bounces
+        // as NotFound once the external anchor is live.
+        eng.state.height = operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT;
+        eng.state.funding_source = operp_types::FundingSourceKind::AggregatedExternal;
+        eng.state.external_sources.insert(acct_of(&sk(9)));
+        let x = sign_unit(
+            vec![tip],
+            Op::UpdateExternalPrice {
+                source: acct_of(&sk(9)),
+                market: meme,
+                price: 100 * PRICE_SCALE,
+                source_id: 0,
+            },
+            &sk(9),
+        );
+        let evs3 = eng.ingest(x).unwrap();
+        assert!(matches!(
+            evs3.last(),
+            Some(ExecEvent::Rejected {
+                reason: RejectReason::NotFound,
+                ..
+            })
+        ));
+        assert!(eng.state.external_price_ring.is_empty());
+    }
+
+    #[test]
+    fn spot_only_market_fill_sets_mark_without_funding() {
+        let mut eng = activated_engine();
+        let g = genesis_id();
+        // Fresh creator (sk(3)): gov_dep binds its withdrawal address, so it
+        // must not double as a collateral depositor below.
+        let d = gov_dep(vec![g], &sk(3), CREATE_MARKET_FEE_PERP, 7);
+        let mut tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let cm = list_market_with(vec![tip], &sk(3), true);
+        tip = unit_id(&cm);
+        eng.ingest(cm).unwrap();
+        let meme = MarketId(2);
+        // Collateral for both sides, then crossing limit orders on the spot
+        // market with notional far above the 100 USD mark-setting floor.
+        let alice = sk(1);
+        let bob = sk(2);
+        let d1 = deposit(vec![tip], &alice, 1_000_000 * USD_SCALE as i128, 1);
+        tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![tip], &bob, 1_000_000 * USD_SCALE as i128, 2);
+        tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+        let px = 100_000 * PRICE_SCALE;
+        let ask = place_on(
+            vec![tip],
+            &bob,
+            meme,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
+        tip = unit_id(&ask);
+        let ask_evs = eng.ingest(ask).unwrap();
+        assert!(
+            ask_evs
+                .iter()
+                .all(|e| !matches!(e, ExecEvent::Rejected { .. })),
+            "ask rejected: {ask_evs:?}"
+        );
+        let bid = place_on(
+            vec![tip],
+            &alice,
+            meme,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
+        tip = unit_id(&bid);
+        let evs = eng.ingest(bid).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                ExecEvent::Applied { fills, .. } if !fills.is_empty()
+            )),
+            "no fill; events={evs:?}"
+        );
+        // First qualifying fill writes the mark even though no oracle ever
+        // speaks for this market.
+        assert_eq!(eng.state.marks.get(&meme).copied(), Some(px));
+        // No funding index exists for the market: with every report
+        // rejected, `prices.len() >= 2` can never hold, so funding stays
+        // silent by construction.
+        assert!(!eng.state.last_index.contains_key(&meme));
+        // A rejected report moves neither mark nor funding state.
+        eng.state
+            .oracle_bonds
+            .insert(acct_of(&sk(5)), ORACLE_BOND_PERP);
+        let r = sign_unit(
+            vec![tip],
+            Op::ReportPrice {
+                oracle: acct_of(&sk(5)),
+                market: meme,
+                price: 200_000 * PRICE_SCALE,
+            },
+            &sk(5),
+        );
+        eng.ingest(r).unwrap();
+        assert_eq!(eng.state.marks.get(&meme).copied(), Some(px));
+        assert!(!eng.state.last_index.contains_key(&meme));
+    }
 
     #[test]
     fn misaligned_tick_limit_rejected() {
@@ -2305,6 +2540,7 @@ mod tests {
                 taker_fee_bps: operp_types::TAKER_FEE_BPS,
                 keeper_reward_bps: operp_types::KEEPER_REWARD_BPS,
                 delisted: false,
+                spot_only: false,
             },
         );
         eng.state

@@ -238,6 +238,11 @@ fn decode_op(r: &mut Reader, depth: u32) -> Result<operp_dag::Op, GossipError> {
             mm_bps: r.u64()?,
             taker_fee_bps: r.u64()?,
             keeper_reward_bps: r.u64()?,
+            spot_only: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(GossipError::Malformed),
+            },
         },
         11 => Op::CreateProposal {
             creator: AccountId(r.arr32()?),
@@ -629,6 +634,7 @@ mod tests {
                 mm_bps: 50,
                 taker_fee_bps: 5,
                 keeper_reward_bps: 1,
+                spot_only: false,
             },
             Op::CreateProposal {
                 creator: acct,
