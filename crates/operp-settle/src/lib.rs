@@ -3,14 +3,43 @@ use operp_dag::Unit;
 use operp_exec::Engine;
 use operp_state::{verify_proof, MerkleProof};
 use operp_types::{
-    sha256, AccountId, Height, Seq, UnitId, Usd, BATCH_MAX_UNITS, CHAIN_ID, PERP_ASSET,
-    VAULT_AA_ADDRESS,
+    sha256, AccountId, Height, Seq, UnitId, Usd, ASSERTION_VERSION, BATCH_MAX_UNITS, CHAIN_ID,
+    PERP_ASSET, VAULT_AA_ADDRESS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub mod deposit_verify;
 pub mod obyte_hash;
+pub use operp_state::obyte_merkle;
+/// Test-only vault payee: matches the `payment_joint` fixture payee
+/// ("B"*32) so evidence fixtures verify without env manipulation
+/// (env mutation is process-global and unsafe under parallel tests).
+#[cfg(test)]
+pub const TEST_VAULT_ADDRESS: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+/// Expected vault AA payee for deposit evidences. Env `OPERP_VAULT_AA`
+/// wins (operator-set at deploy); else the baked `VAULT_AA_ADDRESS` when
+/// non-empty; else "" (pre-deploy: batches without evidences skip the
+/// check, batches carrying evidences are rejected). Tests fall back to
+/// `TEST_VAULT_ADDRESS` instead of "" so fixtures stay deterministic.
+pub fn expected_vault() -> String {
+    if let Ok(v) = std::env::var("OPERP_VAULT_AA") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if !VAULT_AA_ADDRESS.is_empty() {
+        return VAULT_AA_ADDRESS.to_string();
+    }
+    #[cfg(test)]
+    {
+        return TEST_VAULT_ADDRESS.to_string();
+    }
+    #[cfg(not(test))]
+    {
+        String::new()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepositEvidence {
@@ -42,6 +71,26 @@ pub struct Checkpoint {
     pub unit_ids: Vec<UnitId>,
     pub fills_hash: [u8; 32],
     pub fill_count: u32,
+    /// Dispute-predicate commitment (rollup v2): always ASSERTION_VERSION.
+    pub assertion_version: u32,
+    /// Witness root after the last unit (44-char base64, Obyte-merkle domain).
+    pub wit_root: String,
+    /// Merkle roots over per-unit descriptor strings in batch order
+    /// (44-char base64 each): trace = post-unit wit roots, units = unit-id
+    /// hex, units_set = same ids sorted, ops = op descriptors, fills = fill
+    /// descriptors in execution order.
+    pub trace_root: String,
+    pub units_root: String,
+    pub units_set_root: String,
+    pub ops_root: String,
+    pub fills_root: String,
+    /// Merkle root over per-unit witness-leaf counts (decimal strings, batch
+    /// order): makes intermediate pre-tree sizes provable for non-membership.
+    pub counts_root: String,
+    /// Number of units in the batch (== unit_ids.len()).
+    pub unit_count: u32,
+    /// Number of witness leaves committed by wit_root (bounds non-membership).
+    pub wit_count: u32,
     /// Optional 64-hex validity proof hash (sha256 of validate_against trace).
     /// None on legacy batches; Some(64 hex) when fraud-provable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,8 +108,19 @@ pub struct Batch {
     pub units: Vec<Unit>,
     #[allow(dead_code)]
     pub deposit_evidences: Vec<DepositEvidence>,
+    /// DA arrays for watchers (AA stores only the roots): per-unit wit roots
+    /// in batch order, op descriptors in batch order, fill descriptors in
+    /// execution order.
+    pub trace: Vec<String>,
+    pub ops: Vec<String>,
+    pub fills: Vec<String>,
+    /// Per-unit witness-leaf counts in batch order (DA for counts_root).
+    pub counts: Vec<String>,
+    /// Per-unit full witness leaf sets in batch order (DA for watcher
+    /// proof building). Empty on oversize batches (>4MB serialized source).
+    /// `validate_against` checks each entry against the replay when present.
+    pub leaf_trace: Vec<Vec<String>>,
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TempDataPayload {
     pub data_length: u64,
@@ -137,6 +197,88 @@ pub fn fills_bytes(fills: &[Fill]) -> Vec<u8> {
     }
     buf
 }
+/// Op-descriptor string committed by `ops_root` (dispute predicates parse
+/// these; `unit_hex` covers non-financial ops verbatim).
+pub fn ops_element(unit_hex: &str, op: &operp_dag::Op) -> String {
+    use operp_dag::Op::*;
+    match op {
+        Deposit {
+            account, amount, ..
+        } => {
+            format!("d:{}:{}", hex::encode(account.0), amount)
+        }
+        GovDeposit {
+            account, amount, ..
+        } => {
+            format!("D:{}:{}", hex::encode(account.0), amount)
+        }
+        Withdraw {
+            account,
+            amount,
+            nonce,
+        } => {
+            format!("w:{}:{}:{}", hex::encode(account.0), amount, nonce)
+        }
+        GovWithdraw {
+            account,
+            amount,
+            nonce,
+        } => {
+            format!("W:{}:{}:{}", hex::encode(account.0), amount, nonce)
+        }
+        Place {
+            account,
+            market,
+            side,
+            price,
+            qty,
+            ..
+        } => {
+            format!(
+                "p:{}:{}:{}:{}:{}",
+                hex::encode(account.0),
+                market.0,
+                side.as_u8(),
+                price,
+                qty
+            )
+        }
+        Cancel { account, order_id } => {
+            format!("c:{}:{}", hex::encode(account.0), hex::encode(order_id.0))
+        }
+        Liquidate {
+            caller,
+            target,
+            market,
+        } => {
+            format!(
+                "L:{}:{}:{}",
+                hex::encode(caller.0),
+                hex::encode(target.0),
+                market.0
+            )
+        }
+        _ => format!("x:{}", unit_hex),
+    }
+}
+/// Fill-descriptor string committed by `fills_root`. `fill_index_in_unit`
+/// starts at 0 per unit.
+pub fn fills_element(unit_hex: &str, fill_index_in_unit: usize, fill: &Fill) -> String {
+    format!(
+        "f:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        unit_hex,
+        fill_index_in_unit,
+        hex::encode(fill.taker.0),
+        hex::encode(fill.maker.0),
+        hex::encode(fill.taker_id.0),
+        hex::encode(fill.maker_id.0),
+        fill.market.0,
+        fill.price,
+        fill.qty,
+        fill.seq,
+        fill.taker_side.as_u8()
+    )
+}
 
 impl Batch {
     pub fn from_applied(
@@ -158,15 +300,50 @@ impl Batch {
         let applied_set: HashSet<&UnitId> = applied.iter().collect();
         let mut fills_buf = Vec::new();
         let mut fill_count = 0u32;
+        let mut fill_elements: Vec<String> = Vec::new();
+        let mut per_unit_counts: std::collections::HashMap<UnitId, usize> =
+            std::collections::HashMap::new();
         for ev in &engine.log {
             if let operp_exec::ExecEvent::Applied { unit, fills, .. } = ev {
                 if applied_set.contains(unit) {
                     fill_count += fills.len() as u32;
                     fills_buf.extend_from_slice(&fills_bytes(fills));
+                    let unit_hex = hex::encode(unit.0);
+                    for f in fills {
+                        let idx = per_unit_counts.entry(*unit).or_insert(0);
+                        fill_elements.push(fills_element(&unit_hex, *idx, f));
+                        *idx += 1;
+                    }
                 }
             }
         }
         let fills_hash = sha256(&fills_buf);
+        if engine.wit_trace.len() < applied.len() || engine.wit_count_trace.len() < applied.len() {
+            return Err(SettleError::Replay);
+        }
+        let trace: Vec<String> =
+            engine.wit_trace[engine.wit_trace.len() - applied.len()..].to_vec();
+        let wit_root = trace.last().cloned().ok_or(SettleError::Replay)?;
+        let counts: Vec<String> = engine.wit_count_trace
+            [engine.wit_count_trace.len() - applied.len()..]
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        let unit_hexes: Vec<String> = applied.iter().map(|id| hex::encode(id.0)).collect();
+        let mut units_set_sorted = unit_hexes.clone();
+        units_set_sorted.sort();
+        let ops: Vec<String> = units
+            .iter()
+            .zip(unit_hexes.iter())
+            .map(|(u, h)| ops_element(h, &u.op))
+            .collect();
+        let wit_leaves = operp_state::wit_leaves(&engine.state);
+        let trace_root = obyte_merkle::root(&trace);
+        let units_root = obyte_merkle::root(&unit_hexes);
+        let units_set_root = obyte_merkle::root(&units_set_sorted);
+        let ops_root = obyte_merkle::root(&ops);
+        let fills_root = obyte_merkle::root(&fill_elements);
+        let counts_root = obyte_merkle::root(&counts);
         // Height binding: adopt the next height BEFORE hashing state, so
         // meta_leaf commits the batch height and the checkpoint root is only
         // reproducible by a replay that lands on that same height
@@ -207,11 +384,27 @@ impl Batch {
                 aa_shard_roots,
                 fills_hash,
                 fill_count,
+                assertion_version: ASSERTION_VERSION,
+                wit_root,
+                trace_root,
+                units_root,
+                units_set_root,
+                ops_root,
+                fills_root,
+                counts_root,
+                unit_count: applied.len() as u32,
+                wit_count: wit_leaves.len() as u32,
                 validity_proof_hash: None,
                 perp_burned: Some(engine.state.perp_burned),
             },
             units,
             deposit_evidences: Vec::new(),
+            trace,
+            ops,
+            fills: fill_elements,
+            counts,
+            leaf_trace: engine.wit_leaf_trace[engine.wit_leaf_trace.len() - applied.len()..]
+                .to_vec(),
         })
     }
     pub fn temp_data_payload(&self) -> TempDataPayload {
@@ -239,8 +432,37 @@ impl Batch {
             "unit_ids": self.checkpoint.unit_ids.iter().map(|u| hex::encode(u.0)).collect::<Vec<_>>(),
             "fill_count": self.checkpoint.fill_count,
             "fills_hash": hex::encode(self.checkpoint.fills_hash),
+            "assertion_version": self.checkpoint.assertion_version,
+            "wit_root": self.checkpoint.wit_root,
+            "trace_root": self.checkpoint.trace_root,
+            "units_root": self.checkpoint.units_root,
+            "units_set_root": self.checkpoint.units_set_root,
+            "unit_count": self.checkpoint.unit_count,
+            "wit_count": self.checkpoint.wit_count,
+            "ops_root": self.checkpoint.ops_root,
+            "fills_root": self.checkpoint.fills_root,
+            "counts_root": self.checkpoint.counts_root,
+            "trace": self.trace,
+            "ops": self.ops,
+            "counts": self.counts,
             "units": units_json,
         });
+        // `leaf_trace` is watcher DA only (never read by the AA): cap the
+        // serialized source at 4MB — oversize batches carry an empty vec and
+        // the watcher falls back to print-only.
+        let leaf_trace_capped = if crate::obyte_hash::get_json_source(&data).len() > 4_000_000 {
+            Vec::new()
+        } else {
+            self.leaf_trace.clone()
+        };
+        if !leaf_trace_capped.is_empty() {
+            data["leaf_trace"] = serde_json::to_value(&leaf_trace_capped).unwrap();
+        }
+        // Obyte canonical JSON rejects empty arrays: omit `fills` when the
+        // batch has none (its root is the empty-sentinel either way).
+        if !self.fills.is_empty() {
+            data["fills"] = serde_json::to_value(&self.fills).unwrap();
+        }
         if !self.deposit_evidences.is_empty() {
             let mut evidences = self.deposit_evidences.clone();
             evidences.sort_by(|a, b| a.aa_unit.cmp(&b.aa_unit));
@@ -290,13 +512,15 @@ impl Batch {
             // carrying Deposit/GovDeposit ops must present independently
             // verifiable evidence (joint pays the vault the claimed amount
             // in the claimed asset). Any failure maps to DepositEvidence.
-            deposit_verify::verify_all(
-                &self.units,
-                &self.deposit_evidences,
-                VAULT_AA_ADDRESS,
-                &PERP_ASSET,
-            )
-            .map_err(|_| SettleError::DepositEvidence)?;
+            // Pre-deploy (empty expected vault) evidence checks skip when
+            // there are no evidences; evidences against an empty vault
+            // string are rejected.
+            let vault = expected_vault();
+            if vault.is_empty() && !self.deposit_evidences.is_empty() {
+                return Err(SettleError::DepositEvidence);
+            }
+            deposit_verify::verify_all(&self.units, &self.deposit_evidences, &vault, &PERP_ASSET)
+                .map_err(|_| SettleError::DepositEvidence)?;
         }
         for u in &self.units {
             match &u.op {
@@ -316,15 +540,24 @@ impl Batch {
         for u in &self.units {
             replay.ingest(u.clone()).map_err(|_| SettleError::Replay)?;
         }
-        // Fill integrity: recompute hash/count from replay events.
+        // Fill integrity: recompute hash/count/descriptors from replay events.
         let applied_set: HashSet<&UnitId> = self.checkpoint.unit_ids.iter().collect();
         let mut fills_buf = Vec::new();
         let mut fill_count = 0u32;
+        let mut fill_elements: Vec<String> = Vec::new();
+        let mut per_unit_counts: std::collections::HashMap<UnitId, usize> =
+            std::collections::HashMap::new();
         for ev in replay.log.iter().skip(pre_len) {
             if let operp_exec::ExecEvent::Applied { unit, fills, .. } = ev {
                 if applied_set.contains(unit) {
                     fill_count += fills.len() as u32;
                     fills_buf.extend_from_slice(&fills_bytes(fills));
+                    let unit_hex = hex::encode(unit.0);
+                    for f in fills {
+                        let idx = per_unit_counts.entry(*unit).or_insert(0);
+                        fill_elements.push(fills_element(&unit_hex, *idx, f));
+                        *idx += 1;
+                    }
                 }
             }
         }
@@ -332,6 +565,55 @@ impl Batch {
             || fill_count != self.checkpoint.fill_count
         {
             return Err(SettleError::FillsMismatch);
+        }
+        // Assertion commitment: version gate plus descriptor roots recomputed
+        // from the replay (trace from the replay wit_trace, ops/units from
+        // the batch units, fills from the replay events above).
+        if self.checkpoint.assertion_version != ASSERTION_VERSION {
+            return Err(SettleError::RootMismatch);
+        }
+        if replay.wit_trace.len() < self.units.len()
+            || replay.wit_count_trace.len() < self.units.len()
+        {
+            return Err(SettleError::Replay);
+        }
+        let replay_trace: Vec<String> =
+            replay.wit_trace[replay.wit_trace.len() - self.units.len()..].to_vec();
+        let replay_counts: Vec<String> = replay.wit_count_trace
+            [replay.wit_count_trace.len() - self.units.len()..]
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        let unit_hexes: Vec<String> = self
+            .checkpoint
+            .unit_ids
+            .iter()
+            .map(|id| hex::encode(id.0))
+            .collect();
+        let mut units_set_sorted = unit_hexes.clone();
+        units_set_sorted.sort();
+        let replay_ops: Vec<String> = self
+            .units
+            .iter()
+            .zip(unit_hexes.iter())
+            .map(|(u, h)| ops_element(h, &u.op))
+            .collect();
+        if obyte_merkle::root(&replay_trace) != self.checkpoint.trace_root
+            || obyte_merkle::root(&unit_hexes) != self.checkpoint.units_root
+            || obyte_merkle::root(&units_set_sorted) != self.checkpoint.units_set_root
+            || obyte_merkle::root(&replay_ops) != self.checkpoint.ops_root
+            || obyte_merkle::root(&fill_elements) != self.checkpoint.fills_root
+            || obyte_merkle::root(&replay_counts) != self.checkpoint.counts_root
+        {
+            return Err(SettleError::RootMismatch);
+        }
+        if replay_trace.last().cloned().unwrap_or_default() != self.checkpoint.wit_root {
+            return Err(SettleError::RootMismatch);
+        }
+        if self.checkpoint.unit_count as usize != self.units.len()
+            || self.checkpoint.unit_count as usize != self.checkpoint.unit_ids.len()
+        {
+            return Err(SettleError::RootMismatch);
         }
         // Height + last-unit binding: the replay must land exactly one block
         // below the claimed checkpoint height and end on the same last unit;
@@ -364,6 +646,30 @@ impl Batch {
         }
         if replay.state.state_root() != self.checkpoint.state_root {
             return Err(SettleError::RootMismatch);
+        }
+        // Witness arbor: leaf count matches, and the DA arrays carried for
+        // watchers hash back to the committed roots.
+        if operp_state::wit_leaves(&replay.state).len() as u32 != self.checkpoint.wit_count
+            || obyte_merkle::root(&self.trace) != self.checkpoint.trace_root
+            || obyte_merkle::root(&self.ops) != self.checkpoint.ops_root
+            || obyte_merkle::root(&self.fills) != self.checkpoint.fills_root
+            || obyte_merkle::root(&self.counts) != self.checkpoint.counts_root
+        {
+            return Err(SettleError::RootMismatch);
+        }
+        // `leaf_trace` (watcher DA): when present, each entry must equal the
+        // replayed witness leaves after that unit — catches a liar post leaf
+        // set before the watcher builds a predicate on it.
+        if !self.leaf_trace.is_empty() {
+            if self.leaf_trace.len() != self.units.len() {
+                return Err(SettleError::RootMismatch);
+            }
+            let base = replay.wit_leaf_trace.len() - self.units.len();
+            for (i, leaves) in self.leaf_trace.iter().enumerate() {
+                if *leaves != replay.wit_leaf_trace[base + i] {
+                    return Err(SettleError::RootMismatch);
+                }
+            }
         }
         Ok(())
     }
@@ -503,7 +809,7 @@ mod tests {
             aa_unit: hex::encode(h),
             is_perp,
             amount,
-            vault_address: String::new(),
+            vault_address: crate::TEST_VAULT_ADDRESS.to_string(),
             joint: joint.clone(),
         }
     }
@@ -603,6 +909,67 @@ mod tests {
         batch.deposit_evidences = evidences;
         batch.validate_against(prev_root, &mut pre).unwrap();
         assert_eq!(pre.state.state_root(), eng.state.state_root());
+    }
+    #[test]
+    fn assertion_roots_committed_and_verified() {
+        let (mut eng, mut pre, applied, prev_root, evidences) = seed_trade();
+        let mut batch = Batch::from_applied(&pre.state, &mut eng, &applied).unwrap();
+        batch.deposit_evidences = evidences;
+        let cp = &batch.checkpoint;
+        assert_eq!(cp.assertion_version, operp_types::ASSERTION_VERSION);
+        for r in [
+            &cp.wit_root,
+            &cp.trace_root,
+            &cp.units_root,
+            &cp.units_set_root,
+            &cp.ops_root,
+            &cp.fills_root,
+        ] {
+            assert_eq!(r.len(), operp_types::OBYTE_MERKLE_ROOT_LEN);
+        }
+        assert_eq!(cp.unit_count as usize, applied.len());
+        assert_eq!(cp.unit_count as usize, batch.trace.len());
+        assert_eq!(cp.unit_count as usize, batch.ops.len());
+        assert_eq!(
+            cp.wit_count as usize,
+            operp_state::wit_leaves(&eng.state).len()
+        );
+        assert_eq!(cp.wit_root, *batch.trace.last().unwrap());
+        let payload = batch.temp_data_payload();
+        for k in [
+            "assertion_version",
+            "wit_root",
+            "trace_root",
+            "units_root",
+            "units_set_root",
+            "unit_count",
+            "wit_count",
+            "ops_root",
+            "fills_root",
+            "trace",
+            "ops",
+        ] {
+            assert!(payload.data.get(k).is_some(), "missing temp_data key {k}");
+        }
+        batch.validate_against(prev_root, &mut pre).unwrap();
+    }
+    #[test]
+    fn tampered_assertion_roots_are_root_mismatch() {
+        for field in ["trace", "wit", "count"] {
+            let (mut eng, mut pre, applied, prev_root, evidences) = seed_trade();
+            let mut batch = Batch::from_applied(&pre.state, &mut eng, &applied).unwrap();
+            batch.deposit_evidences = evidences;
+            match field {
+                "trace" => batch.checkpoint.trace_root = batch.checkpoint.ops_root.clone(),
+                "wit" => batch.checkpoint.wit_root = batch.checkpoint.trace_root.clone(),
+                _ => batch.checkpoint.unit_count += 1,
+            }
+            assert_eq!(
+                batch.validate_against(prev_root, &mut pre),
+                Err(SettleError::RootMismatch),
+                "field {field} must be committed"
+            );
+        }
     }
 
     #[test]
@@ -1087,12 +1454,12 @@ mod tests {
         assert!(!eng.state.seen_aa_units.is_empty());
         assert_eq!(rp.state.withdrawals.len(), eng.state.withdrawals.len());
 
-        // --- Fast-forward both sides past the 256-height window. ---
-        eng.state.height = 300;
-        rp.state.height = 300;
+        // --- Fast-forward both sides past the 2048-height window. ---
+        eng.state.height = 2100;
+        rp.state.height = 2100;
 
         // --- Batch B: one filler order; commit prunes old entries on the
-        // producer side (min_height 301). ---
+        // producer side (min_height 2101). ---
         let prev_b = eng.clone();
         let prev_root_b = prev_b.state.state_root();
         let f = sign_unit(

@@ -13,6 +13,7 @@
 //! The core [`HubClient`] is abstracted so the replay/verify logic is fully
 //! unit-testable without a live hub; the binary supplies an HTTP client.
 
+pub mod prove;
 use operp_dag::{Op, Unit};
 use operp_exec::Engine;
 use operp_settle::{Batch, Checkpoint, DepositEvidence, SettleError};
@@ -28,8 +29,12 @@ pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
 /// Watcher configuration.
 #[derive(Clone, Debug)]
 pub struct WatchConfig {
-    /// Obyte vault AA address to watch.
+    /// Obyte rollup AA address to watch.
+    pub rollup_address: String,
+    /// Obyte vault AA address (deposit evidence payee).
     pub vault_address: String,
+    /// Optional dispute AA address (challenge posting target).
+    pub dispute_address: Option<String>,
     /// Hub JSON-RPC base URL (e.g. `http://127.0.0.1:6611`).
     pub hub_url: Option<String>,
     pub poll_interval_secs: u64,
@@ -39,7 +44,9 @@ pub struct WatchConfig {
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
+            rollup_address: String::new(),
             vault_address: String::new(),
+            dispute_address: None,
             hub_url: None,
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
             challenge_bond_gross: CHALLENGE_BOND_GROSS,
@@ -158,7 +165,7 @@ pub fn replay_and_check(
 /// Rebuild a [`Batch`] from the temp_data payload's `data` value. The wire
 /// format stores hashes as hex strings and `perp_burned` as a decimal string,
 /// so `Checkpoint`'s serde representation does not match — reconstruct it.
-fn batch_from_data(data: &serde_json::Value) -> Result<Batch, SettleError> {
+pub fn batch_from_data(data: &serde_json::Value) -> Result<Batch, SettleError> {
     let chain_id = data
         .get("chain_id")
         .and_then(|v| v.as_str())
@@ -167,11 +174,20 @@ fn batch_from_data(data: &serde_json::Value) -> Result<Batch, SettleError> {
     let checkpoint = checkpoint_from_data(data)?;
     let units = units_from_data(data)?;
     let deposit_evidences: Vec<DepositEvidence> = operp_settle::evidences_from_payload(data)?;
+    let trace = get_str_array(data, "trace")?;
+    let ops = get_str_array(data, "ops")?;
+    let counts = get_str_array_opt(data, "counts")?;
+    let fills = get_str_array_opt(data, "fills")?;
     Ok(Batch {
         chain_id,
         checkpoint,
         units,
         deposit_evidences,
+        trace,
+        ops,
+        fills,
+        counts,
+        leaf_trace: get_leaf_trace_opt(data)?,
     })
 }
 
@@ -184,6 +200,17 @@ fn checkpoint_from_data(data: &serde_json::Value) -> Result<Checkpoint, SettleEr
     let seq = get_u64(data, "seq")?;
     let fill_count = get_u64(data, "fill_count")? as u32;
     let fills_hash = get_hex32(data, "fills_hash")?;
+    let assertion_version = get_u64(data, "assertion_version")? as u32;
+    let wit_root = get_str(data, "wit_root")?.to_string();
+    let trace_root = get_str(data, "trace_root")?.to_string();
+    let units_root = get_str(data, "units_root")?.to_string();
+    let units_set_root = get_str(data, "units_set_root")?.to_string();
+    let ops_root = get_str(data, "ops_root")?.to_string();
+    let fills_root = get_str(data, "fills_root")?.to_string();
+    let unit_count = get_u64(data, "unit_count")? as u32;
+    let counts_root = get_str(data, "counts_root")?.to_string();
+
+    let wit_count = get_u64(data, "wit_count")? as u32;
     let validity_proof_hash = data
         .get("validity_proof_hash")
         .and_then(|v| v.as_str())
@@ -228,6 +255,16 @@ fn checkpoint_from_data(data: &serde_json::Value) -> Result<Checkpoint, SettleEr
         unit_ids,
         fills_hash,
         fill_count,
+        assertion_version,
+        wit_root,
+        trace_root,
+        units_root,
+        units_set_root,
+        ops_root,
+        fills_root,
+        counts_root,
+        unit_count,
+        wit_count,
         validity_proof_hash,
         perp_burned,
     })
@@ -304,9 +341,50 @@ fn get_u64(data: &serde_json::Value, key: &str) -> Result<u64, SettleError> {
         .and_then(|v| v.as_u64())
         .ok_or(SettleError::RootMismatch)
 }
+fn get_str_array(data: &serde_json::Value, key: &str) -> Result<Vec<String>, SettleError> {
+    let arr = data
+        .get(key)
+        .and_then(|v| v.as_array())
+        .ok_or(SettleError::RootMismatch)?;
+    arr.iter()
+        .map(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .ok_or(SettleError::RootMismatch)
+        })
+        .collect()
+}
 
 fn get_hex32(data: &serde_json::Value, key: &str) -> Result<[u8; 32], SettleError> {
     hex_to_32(get_str(data, key)?).map_err(|_| SettleError::RootMismatch)
+}
+fn get_str_array_opt(data: &serde_json::Value, key: &str) -> Result<Vec<String>, SettleError> {
+    match data.get(key) {
+        None => Ok(Vec::new()),
+        Some(_) => get_str_array(data, key),
+    }
+}
+fn get_leaf_trace_opt(data: &serde_json::Value) -> Result<Vec<Vec<String>>, SettleError> {
+    match data.get("leaf_trace") {
+        None => Ok(Vec::new()),
+        Some(v) => {
+            let arr = v.as_array().ok_or(SettleError::RootMismatch)?;
+            arr.iter()
+                .map(|inner| {
+                    inner
+                        .as_array()
+                        .ok_or(SettleError::RootMismatch)?
+                        .iter()
+                        .map(|s| {
+                            s.as_str()
+                                .map(|x| x.to_string())
+                                .ok_or(SettleError::RootMismatch)
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+    }
 }
 
 fn hex_to_32(s: &str) -> Result<[u8; 32], hex::FromHexError> {

@@ -11,7 +11,11 @@ use serde::{Deserialize, Serialize};
 pub const PRICE_SCALE: u64 = 100_000_000;
 pub const QTY_SCALE: u64 = 100_000_000;
 pub const USD_SCALE: u64 = 1_000_000;
-pub const CHAIN_ID: &str = "operp-mvp-1";
+pub const CHAIN_ID: &str = "operp-v2";
+pub const ASSERTION_VERSION: u32 = 1;
+pub const OBYTE_MERKLE_ROOT_LEN: usize = 44;
+pub const INBOX_LAG_SECS: u64 = 600;
+pub const WIT_EMPTY_ELEMENT: &str = "empty";
 pub const IM_RATE_BPS: u64 = 1000;
 pub const MM_RATE_BPS: u64 = 500;
 pub const LIQ_RATIO_BPS: u64 = 10_500;
@@ -39,11 +43,9 @@ pub const MAX_AA_TREE_DEPTH: usize = 16;
 // Keep legacy constants unchanged for deterministic replay pre-activation.
 // New paths gate on `state.height >= ACTIVATION_HEIGHT`.
 pub const REPLAY_WINDOW: u64 = 2048;
-pub const REPLAY_WINDOW_LEGACY: u64 = 256;
-/// Height at which replay window expands 256→2048. Set high so existing
-/// tests (height 0..few hundred) keep legacy behavior; deployment sets to
-/// `tip+1000` or `next_finalized+1`.
-pub const REPLAY_ACTIVATION_HEIGHT: Height = 1_000_000;
+/// Height at which the 2048 replay window activates. Zero: it applies from
+/// genesis (mainnet launch; no legacy dual path in production).
+pub const REPLAY_ACTIVATION_HEIGHT: Height = 0;
 pub const ORDERING_EPOCH_UNITS: u64 = 512;
 pub const ORDERING_SALT_DOMAIN: &[u8] = b"operp-order-v1";
 pub const ORACLE_SLASH_ACTIVATION_HEIGHT: Height = 0;

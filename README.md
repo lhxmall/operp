@@ -8,17 +8,17 @@ periodic state roots to the [Obyte](https://obyte.org) ledger through an
 autonomous agent (AA) vault. Withdrawals from the vault are **proof-gated**:
 users must present a Merkle proof of their balance against a finalized root.
 
-> **Status: testnet-ready MVP.** All workspace tests pass; the full AA
-> lifecycle (deposit → submit → lock → challenge → finalize → proof withdrawal)
-> is verified end-to-end on an aa-testkit devnet. Mainnet deployment requires
-> closing the gaps listed in [Limitations](#limitations--mainnet-readiness).
+> **Status: settlement v2 landed, mainnet not yet deployed.** Workspace tests
+> green; devnet E2E (`test_settlement_aa.js`) covers submit → predicate fraud
+> → finalize → proof withdrawal. Mainnet script: `deploy_mainnet.js`
+> (mnemonic required); fund users only after an AA audit and an independent watcher.
 
 ```
 cargo test --workspace          # all green
 cargo run --release -p operp-exec --example bench_raw        # ~5.5k ops/s
 cargo run --release -p operp-exec --example hft_onedag -- 20000 8 4   # ~9k TPS, 0 rejects
-cd obyte-local && node test_vault_aa.js    # full AA lifecycle on devnet
-cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
+cd obyte-local && node test_settlement_aa.js  # Linux/CI: three-AA lifecycle (win32 skips)
+cd obyte-local && node deploy_mainnet.js      # deploy the four AAs (needs OPERP_DEPLOY_MNEMONIC)
 ```
 
 ## Architecture
@@ -37,12 +37,12 @@ cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
                     └────────────────┬────────────────────────────┘
                                      │ temp_data unit (batch data on-chain)
                                      ▼
-                    │         OBYTE VAULT AA (Oscript)            │
-                    │  submit → single candidate (first stable combined unit wins; da_unit_<h> pinned; height taken inside occupancy window, replaceable after OCCUPANCY_SECS) │
-                    │  lock    → after 600 s stability window (set once by winning submit)     │
-                    │  challenge → immediate reopen of a locked height only (h ≤ last_locked; bond ≥ 1e12 net); on success height fails & reopens │
-                    │  finalize → clean-only; becomes withdrawal basis        │
-                    │  withdraw → Merkle PROOF against aa_root               │
+                    ┌─────────────────────────────────────────────┐
+                    │  OBYTE SETTLEMENT (Oscript, CHAIN_ID=operp-v2)│
+                    │  rollup  submit/finalize/force/verdict      │
+                    │  dispute one-shot predicates (deposits/     │
+                    │  omissions/fills/ghost/skip)                │
+                    │  vault   custody only: deposit / withdraw   │
                     └─────────────────────────────────────────────┘
 ```
 
@@ -59,7 +59,7 @@ cd obyte-local && node deploy_testnet.js   # deploy vault AA to Obyte testnet
 | `operp-exec` | The engine: ingest → apply → events; place/cancel/deposit/withdraw/liquidate with full intake validation |
 | `operp-settle` | Batch checkpoints, `validate_against` replay verification, `temp_data` payloads, proof generation |
 | `operp-gossip` | WantUnits/HaveUnits on-demand orphan sync between operators (pure P2P layer, transport-agnostic, never consensus) |
-| `operp-watch` | Independent vault-AA watcher: reads `da_unit_<h>`, replays the batch, flags/challenges root mismatches with its own key (separate from the poster) |
+| `operp-watch` | Independent rollup watcher: replays `da_unit_<h>`, builds predicate `proof.json`, posts via `post_challenge.js` (separate key from the poster) |
 
 ## Protocol principles
 
@@ -174,130 +174,51 @@ recover evidences from the revealed `temp_data` via
 window rules as batch application before roots are compared — any honest
 replica can audit the operator.
 
-### 5. The vault AA: optimistic finality + proof-gated exits
+### 5. Settlement AAs: optimistic finality + proof-gated exits
 
-Lifecycle per height *h*:
+Three AAs (`CHAIN_ID=operp-v2`). **No lock, no pay-to-kill.** Collateral is GBYTE.
 
-1. **submit** — operator posts ONE **combined unit** carrying the batch as
-   OIP-0007 `temp_data` PLUS the `{height: h, prev_state_hash, state_root,
-   aa_root}` data message, with ≥ 1 000 000 001 000 bytes attached: 10 000
-   bounce headroom plus a **1 000 000 000 000-byte `SUBMIT_BOND_NET`**
-   (1000 GBYTE) locked per live candidate. Height must equal `last_locked + 1`;
-   the previous root must match; all three hash fields must be exactly 64 hex
-   chars. The height is **single-candidate with an occupancy timeout**: the
-   first stable combined unit wins and the AA records `da_unit_<h>` = that
-   unit's hash (the root provably points at exactly that data package). A
-   further submit bounces `height taken` while the current occupant is still
-   live (locked, or inside the `OCCUPANCY_SECS` = 3600 s replacement window);
-   after that timeout a different operator may re-occupy with a fresh
-   combined submit, overwriting the evicted occupant's bond (not refunded).
-   The 600 s stability clock is set once by the winning submit and cannot be
-   reset.
-
-2. **lock** — allowed only after the 600 s stability window
-   (`OBYTE_STABILITY_SECS`) and only while the candidate's submit-bond
-   holder record (`active_bond_<h>`) is present: a failed finalize
-   confiscates and zeroes it, so a rolled-back height cannot be re-locked
-   until a fresh bonded submit recreates the candidate. Locking clears a
-   previous permanent-failure mark, so a challenge-failed (`frozen = 2`)
-   height recovers by fresh submission instead of wedging the chain. Locked
-   roots are immutable. `stable_at_<h>` is set at lock time and is the
-   **single origin** for the challenge and finalize windows (all
-   `stable_at+3600`).
-
-3. **challenge** — within 3600 s of `stable_at_<h>` (post-lock;
-   `CHALLENGE_SECS` counts from `stable_at`), anyone can challenge a
-   **locked** height *h* (`h ≤ last_locked`, `stable_at_<h>` set) with a
-   ≥ 1 000 000 000 000 byte bond (net; `1e12+10000` gross). Un-locked
-   heights (`last_locked+1`) cannot be challenged (`bad height`). A sender
-   with an outstanding bond cannot open a second challenge. **The challenge is
-   decided in the AA immediately**: it permanently fails the candidate
-   (`frozen = 2`, roots cleared, `last_locked` rolls back to `h-1`), credits
-   half the submit bond (`SUBMIT_BOND_SLASH_HALF` = 500 000 000 000) to the
-   challenger's `slash_reward_<addr>`, clears `active_bond_<h>` /
-   `cand_aa_root_<h>` / `fee_winner_<h>`, and reopens `h` for a new 1000-GBYTE
-   first-stable submit. **Challenge coins are burned** — they are never
-   credited to `bond_<challenger>`, so `{claim:"bond"}` after a real challenge
-   bounces `nothing claimable`; the only challenger reward is the slash half.
-   There is **no respond-by-resubmit and no response window**.
-
-4. **finalize** — after a clean `stable_at+3600` window the root becomes the
-   withdrawal basis (`last_finalized`), strictly in height order; the submit
-   bond is released to its holder (`sbond_<addr> += 1e12`) and a 20 000-byte
-   race reward accrues to the first-stable submitter (`{claim: "reward"}`
-   pays once and zeroes the ledger). A challenged height never reaches the
-   clean path — the challenge case already failed it; there is no
-   `frozen==1` failure sweep.
-   - a withdrawal carries `{amount, withdrawn, leaf_account, collateral,
-     perp, shard, proof[], perp_amount?}`;
-   - `perp_amount` (optional) claims LESS than the full unclaimed PERP
-     remainder — collateral-only exits no longer force-drain the proven
-     balance; default remains the full remainder;
-   - `shard` (0..15) selects which committed shard root the proof must fold
-     to; the AA extracts it from the 1024-hex forest via
-     `substring(shard*64, 64)` and trusts only the leaf preimage — a
-     mis-claimed shard folds to the wrong root;
-   - the AA recomputes
-     `sha256("acct:"‖address‖":"‖collateral‖":"‖perp‖":"‖withdrawn)` and
-     folds the sibling path, requiring the result to equal the claimed
-     shard's root of `var['aa_root_' ‖ last_finalized]`;
-   - `leaf_account == trigger.address` (you can only prove your own address);
-   - the sibling path folds via a fixed-depth `reduce(..., 16, ...)`, so each
-     proof covers a shard tree of up to 2^16 accounts (16 shards ≈ 1M
-     accounts per batch commitment); empty-shard sentinel roots keep
-     zero-proofs from hopping shards.
-   - withdrawals are **anti-replay via the proven W**: global cumulative
-     markers `wd_<addr>` / `wp_<addr>` cap total collateral / PERP ever
-     withdrawn (across ALL heights) at the leaf's committed `W` /
-     `perp` balance — replays at any height bounce.
-   Balance authority is the **proven leaf**, never mutable AA variables.
-6. **escape hatch** — if finalization stalls entirely (every operator
-   disappears), `{escape_finalize: 1}` stall-finalizes the oldest locked
-   height after `ESCAPE_STALL_SECS` (7 days mainnet, timetravel on devnet;
-   any caller; never overrides a challenge — frozen heights are already
-   failed by the challenge case). `{escape_withdraw}` is **removed**:
-   never-locked candidates cannot be withdrawn against it bounces
-   `no escape withdraw`. `escape_finalize` shares the withdraw path's
-   `wd_`/`wp_` anti-replay keys. Per the doc 07 §4 waiver, escape_finalize
-   enforces only the local stall gate.
-
-Clock origins — the 3600 s window has **one** origin (`stable_at`), never `submitted_at`:
+1. **submit (rollup)** — combined unit `temp_data` + `{submit, height, roots,
+   trace/units/ops/fills roots}` with the 1000 GBYTE submit bond.
+   `h == last_submitted+1`; an occupied, un-failed height bounces
+   `height taken`. Window: `submitted_at + 3600 s`.
+2. **Fraud (dispute / dispute_fill)** — inside the window anyone submits a
+   one-shot predicate (deposit/withdraw/omit/fill_math/ghost/skip). Failing
+   predicates bounce `no fraud` and leave the height alone; a proven one
+   forwards `{verdict:'fraud'}` and the rollup slashes half the submit bond
+   and reopens the height. No response rounds.
+3. **finalize (rollup)** — after `submitted_at+3600` with no verdict:
+   `last_finalized=h`, bond released, 20 000-byte race reward.
+   `{escape_finalize}` remains the 7-day stall hatch.
+4. **withdraw (vault)** — reads `var[ROLLUP]['aa_forest_'||last_finalized]`;
+   the 16-deep Merkle fold and the W anti-replay cap are unchanged.
+   `{escape_withdraw}` still bounces `no escape withdraw`.
+5. **force (rollup inbox)** — `{force, unit_id}` censorship escape; omission
+   is provable via P-omit.
 
 | Gate | Origin | Duration |
 |---|---|---|
-| lock | `submitted_at_<h>` | 600 s (`OBYTE_STABILITY_SECS`) |
-| challenge / finalize | `stable_at_<h>` | 3600 s (`CHALLENGE_SECS`) |
-| occupancy timeout (unlocked replacement) | `submitted_at_<h>` | 3600 s (`OCCUPANCY_SECS`) |
-| escape_finalize | `stable_at_<h>` | 604800 s (`ESCAPE_STALL_SECS`) |
+| fraud / finalize | `submitted_at_<h>` | 3600 s |
+| escape_finalize | `submitted_at_<h>` | 604800 s |
 
-Proofs are generated off-chain by
-`crates/operp-settle/examples/gen_withdraw_proof.rs` (JSON consumed by the JS
-tooling).
+No owner key. Upgrading = deploy new AAs + migrate funds through the same
+finalized-root withdrawal path.
 
-There is deliberately **no owner key**: upgrading means deploying a new AA
-and migrating funds through the same finalized-root withdrawal path. All
-protocol constants in the AA are annotated with their Rust counterparts
-(`CHAIN_ID`, `OBYTE_STABILITY_SECS`, `CHALLENGE_SECS`, …) since Rust is the
-single source of truth.
 
 ## Repository layout
 
 ```
 crates/                  Rust workspace (9 crates, see table above)
 obyte-local/
-  agents/operp_vault.aa   the vault autonomous agent (security-hardened)
-  test_vault_aa.js       full lifecycle integration test (devnet via aa-testkit)
-  deploy_testnet.js      testnet deployment script (+ smoke deposit)
-  post_batch.js          operator submission flow (combined temp_data+submit
-                         unit, lock, finalize, claim). Its pre-submit checks
-                         (data_hash/aa_shard_roots/chain_id) are self-checks
-                         only — NOT an independent watcher: mutual deterrence
-                         requires the separate `crates/operp-watch` binary with
-                         its own key.
-  post_challenge.js      watcher challenge broadcast CLI (`OPERP_WATCH_MNEMONIC`)
-docs/PROTOCOL.md         protocol design narrative
-  docs/MECHANISMS.md     full mechanism reference (zh): every rule, constant,
-                         edge case, and the threat-model matrix
+  agents/operp_vault.aa          custody (deposit/withdraw)
+  agents/operp_rollup.aa         assertion chain
+  agents/operp_dispute.aa        deposit/withdraw/omit predicates
+  agents/operp_dispute_fill.aa   fill predicates
+  test_settlement_aa.js          three-AA E2E (Linux/CI; win32 skips)
+  deploy_mainnet.js / issue_perp.js  mainnet AA deploy / PERP issuance
+  post_batch.js                  combined temp_data+submit → finalize → claim
+  post_challenge.js              predicate CLI (`--pred --proof`)
+docs/PROTOCOL.md / MECHANISMS.md / ROLLUP-UPGRADE.md
 ```
 
 ## Build prerequisites
@@ -343,25 +264,13 @@ Measured on this machine: `bench_raw` ≈ 5 500 ops/s; `hft_onedag` (8 markets,
 This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
 **not mainnet-ready**. Known gaps, roughly in priority order:
 
-1. ~~**A live lying operator confirms a fake root by re-posting it.**~~
-   **RESOLVED (challenge-reopen).** A challenge of a locked height is decided
-   in the AA immediately: it fails the height (`frozen = 2`, roots cleared,
-   `last_locked` rolls back to `h-1`), credits the challenger
-   `SUBMIT_BOND_SLASH_HALF` (500 000 000 000) as `slash_reward_<addr>`, and
-   reopens `h` for a fresh 1000-GBYTE first-stable submit. There is **no
-   respond-by-resubmit**: a live liar can no longer answer a challenge with
-   the identical fake forest — the challenge kills the candidate outright and
-   a different operator re-occupies. Challenge coins are burned (never
-   `bond_`), so the challenger's only reward is the slash half. `operp-watch`
-   now posts `{challenge:1}` on-chain via `post_challenge.js` (any
-   ROOT/BINDING mismatch or missing `temp_data` in-window).
-   Remaining holes:
-   - `da_unit_<h>` stores `trigger.unit`; the AA never reads `temp_data`.
-     A roots-only unit still wins the height (enforced by the watcher).
-   - Unlocked candidates cannot be challenged (`bad height`); they are
-     replaced by the occupancy timeout after `OCCUPANCY_SECS` (3600 s).
-   - Deposit joints are checked only in `validate_against` (off-chain) and
-     by the watcher's `DepositEvidence` replay failure.
+1. ~~**Money can kill an honest root.**~~ **RESOLVED (settlement v2).** Fraud
+   must pass a dispute predicate; `{challenge:1}` has no case on rollup or
+   vault. Bogus proofs bounce `no fraud`. Still open: the insurance clamp is
+   not on-chain verifiable; fill_math carries a ±1 tolerance; `temp_data`
+   bodies vanish after 24 h; deposit joints are mainly checked off-chain in
+   `validate_against` (an empty `OPERP_VAULT_AA` with evidences present is
+   rejected).
 2. **Funding quality is bounded by its price anchor.** Funding stays
    mark-premium based (capped ±50 bps/tick). The default
    `BondedMedianTwap` index derives from bonded reporters' prices; the
@@ -394,24 +303,13 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    permanently over-collateralized) — auditors must treat
    `vault holdings − perp_supply` as the cumulative burn figure.
 7. ~~**The sitting operator resets the stability timer for free.**~~
-   **RESOLVED** (combined da_unit): submits are single-candidate — the
-   first stable combined `temp_data`+submit unit wins the height, the AA
-   pins `da_unit_<h>` to it, and every other submit bounces `height taken`
-   (inside the occupancy timeout — see #1). No incumbent clock-reset exists.
-   **Cost:** the same gate blocks an honest competing root on that height
-   during the occupancy window — see #1.
-8. The AA has had no formal security audit. The Oscript complexity gate
-   currently **76/100** (ops 976/2000 — run
-   `node tools/check_aa_complexity.js`), so every further AA change must
-   free equal budget first.
-9. **Replay-dedup windows are height-bounded** — legacy 256 heights,
-   expanding to `REPLAY_WINDOW = 2048` once `state.height ≥
-   REPLAY_ACTIVATION_HEIGHT` (1 000 000; flip at deploy). A duplicate op
-   arriving outside the window escapes sidechain dedup (AA-side global
-   `wd_`/`wp_` caps still hold). Gov nonces additionally use a strict
-   watermark journalled to disk at batch commit (see #14), so an
-   out-of-order lower nonce is rejected permanently — including across
-   restarts.
+   **RESOLVED**: single-candidate combined units; further submits bounce
+   `height taken`; only a proven fraud reopens the height.
+8. No formal AA audit. Every AA must stay ≤100 complexity (fill AA ≈ 21).
+   Probe: `node obyte-local/tools/check_aa_complexity.js agents/*.aa`.
+9. **Replay-dedup window is 2048** (`REPLAY_ACTIVATION_HEIGHT = 0`).
+   Duplicates outside the window escape sidechain dedup; AA-side `wd_`/`wp_`
+   caps still hold.
 10. AA enforces `amount + wd_ <= min(collateral, withdrawn)`, and leaf
     numeric fields are capped at 15 decimal digits (< 2^53).
 11. Single-account shard proof generation requires registering PAD decoy
@@ -491,57 +389,26 @@ noted below):
 
 **Known deviations / deferred backlog:**
 
-- **Replay window 256→2048**: shipped but activation-gated
-  (`REPLAY_WINDOW`, `REPLAY_ACTIVATION_HEIGHT` at 1 000 000) so existing
-  tests replay legacy determinism. Flip the constant at deploy.
-- **Escape hatch**: shipped (see 07). The respond path is *removed* — a challenge
-  immediately fails the height (frozen=2, last_locked rollback) and reopens it,
-  so there is no respond-by-resubmit and no `not operator` path.
-- **Claim API break**: `{claim_reward|claim_bond|claim_submit_bond}` booleans
-  are replaced by a single `{claim: "reward"|"bond"|"sbond"|"slash"}` field;
-  `post_batch.js` / `test_vault_aa.js` migrated in-tree.
-- **Per-shard depth stays 16**: sharding v2 delivers ~1M accounts/batch at
-  depth 16 per shard; the planned global 16→18 bump stays superseded.
-- **Proposal table capped at 64 concurrent** (`create_proposal` → `Risk`),
-  closing the unbounded-state DoS.
+- **Replay window 2048** is live from height 0 (`REPLAY_ACTIVATION_HEIGHT = 0`).
+- **Settlement v2**: no lock / no pay-to-kill; predicate fraud; claims live on
+  the rollup AA (`reward|sbond|slash`).
+- **Per-shard depth stays 16**; the proposal table is capped at 64 concurrent.
 
-See [`docs/mainnet/README.md`](docs/mainnet/README.md) for the 11-doc index.
-Validation gates for every item above: `cargo test --workspace`,
-`cd obyte-local && node tools/check_aa_complexity.js` (≤85),
-`node test_vault_aa.js`, and `cargo run --release -p operp-exec --example
-bench_raw`.
+See [`docs/mainnet/`](docs/mainnet/) (historical 11 docs) and
+[ROLLUP-UPGRADE.md](docs/ROLLUP-UPGRADE.md). Validation:
+`cargo test --workspace`, `check_aa_complexity.js`,
+`node test_settlement_aa.js` (Linux/CI).
 
 ## Verification status
 
-* **Rust suite (CI-covered):** `.github/workflows/ci.yml` runs
-  `cargo test --workspace` on push/PR (stable toolchain; MSRV pinned at
-  1.85). Covers gossip caps, journal CRC + physical truncation, snapshot
-  versioning/fallback, canonical-number hash rules, batch-commit gov-nonce
-  WAL (H2 regression included).
-* **AA complexity gate (CI `js-checks`):** `node obyte-local/tools/check_aa_complexity.js`
-  — currently **76/100** (ops 976/2000), ≤85 CI gate. The
-  same job also runs `golden_vector_check.js`.
-* **Golden vector (CI `js-checks`):** `node obyte-local/golden_vector_check.js`
-  prints the canonical Obyte JSON source + data_hash for a fixed input
-  (incl. `big` string > 2^53 and `eps: 0.001`); the Rust-side unit test
-  `golden_vector_matches_ocore_get_json_source` pins the identical hash
-  (`4efa7a37…`), so JS/Rust `get_data_hash` parity is verified on every CI run.
-* **AA devnet E2E (CI `e2e` job):** runs on every `main` push **and** every
-  pull request. Local Windows hosts without Visual Studio Build Tools still
-  cannot compile the vendored aa-testkit's `rocksdb`/`sqlite3`; the live
-  lifecycle is proven in CI, not on this host.
-* **Watcher:** the independent watcher crate (`crates/operp-watch`) replays
-  `da_unit_<h>` off-chain and now posts `{challenge:1}` on-chain via
-  `post_challenge.js` when it detects an in-window ROOT/BINDING mismatch (or a
-  missing `temp_data`) and `OPERP_WATCH_MNEMONIC` is set. Without a mnemonic it
-  prints the alert only. Mutual deterrence requires a key separate from the poster.
-
-See the commit history for the full security-audit remediation this repo
-went through (proof-gated withdrawals, deposit whitelisting, overflow
-guards, market whitelist, strict signatures, orphan recovery, bounded logs,
-keeper rewards, bad-debt socialization).
-
+* **CI** runs workspace tests, the four-AA complexity gate, the golden vector,
+  and `test_settlement_aa.js` (win32 skips).
+* **Watcher:** `operp-watch` builds `proof.json` and posts to the dispute AA
+  (`--pred --proof`; requires `OPERP_WATCH_MNEMONIC`, `--vault` and
+  `--rollup`). Without a mnemonic it prints alerts only. Use a key separate
+  from the poster.
 
 ## License
 
 MIT
+

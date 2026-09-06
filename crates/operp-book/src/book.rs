@@ -83,6 +83,10 @@ impl OrderBook {
     pub fn get(&self, id: OrderId) -> Option<&Order> {
         self.orders.get(&id)
     }
+    /// Live orders (remaining > 0) for witness-leaf commitment.
+    pub fn live_orders(&self) -> impl Iterator<Item = &Order> {
+        self.orders.values().filter(|o| o.remaining > 0)
+    }
 
     pub fn best_bid(&self) -> Option<(Price, Qty)> {
         // O(log depth): cached visible qty; zero-qty levels pruned on update.
