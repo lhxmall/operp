@@ -92,7 +92,7 @@ const VAULT_SRC = writeResolved("operp_vault.aa", { ROLLUP_AA_HERE: ROLLUP_ADDR,
 // dispute AA address is also deterministic — compute AFTER substitution.
 const DISPUTE_ADDR = chashOf(fs.readFileSync(DISPUTE_SRC, "utf8"));
 const FILL_ADDR = chashOf(fs.readFileSync(FILL_SRC, "utf8"));
-const POOL_FUND_GROSS = 50000000010000; // 5x POOL_MIN + 10000 fee: survives 7 fraud slashes (7x5e11) in this run
+const POOL_FUND_GROSS = 50000000010000; // 50x POOL_MIN net: survives all fraud slashes in this run
 const SUBMIT_FEE = 10000; // submits pay only the bounce fee; pool gates
 const RACE_REWARD = 20000;
 const SLASH_HALF = 500000000000;
@@ -449,7 +449,8 @@ async function main() {
     throw new Error("slash reward wrong: " + JSON.stringify(st["slash_reward_" + chAddr]));
   // Verdict slashes the standing pool by 5e11 per fraud (2 so far).
   const opAddr = await operator.getAddress();
-  if (Number(st["pool_" + opAddr] || 0) !== Number(5000000000000 - SLASH_HALF * 2))
+  const poolNet = POOL_FUND_GROSS - 10000; // {pool:1} credits net of bounce fee
+  if (Number(st["pool_" + opAddr] || 0) !== Number(poolNet - SLASH_HALF * 2))
     throw new Error("pool not slashed by fraud: " + JSON.stringify(st["pool_" + opAddr]));
 
   // ---- 8. honest deposit → 'no fraud' (height stays live) ------------------
