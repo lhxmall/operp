@@ -439,9 +439,13 @@ JSON（`u,t,o,c,f?,l?,e?`）：`u` 为该单元 JSON（含签名），`t`/`o`/`c
 trace/ops/counts 条目，无成交时省略 `f`，`e` 仅 Deposit/GovDeposit 携带
 （按 `aa_unit` 匹配证据），`l` 为该单元叶集（print-only 可省略）。
 package = base64（`\n` 连接 frames）；`data_root` =
-hex(sha256(拼接 blob 字节))；承载该对象的 Obyte 单元之规范 `data_hash`
+hex(sha256(拼接 blob 字节))；多包时 `packages` 记 package 单元的真实
+Obyte unit hash 列表（poster 先发包、拿到 unit 后填，Rust 打包时只留占位），
+watcher 按条目 `get_joint` 取包；承载该对象的 Obyte 单元之规范 `data_hash`
 仍为 `hex(sha256(getJsonSource(header或package对象)))`。充值证据在 frame
 `e` 内，复原即拼接各 `e` 字段（无 header `deposit_evidences`）。
+超限（去 `l` 重打仍有包超 `PACK_SOURCE_CAP`）整批 print-only：超限包上不了链，
+watcher 在缺失 joints 上 backoff 放弃，绝不误挑战。
 
 意义：
 

@@ -196,26 +196,56 @@ function submitData(height, stateRoot, prev) {
     wit_count: GEN_WIT_COUNT,
   };
 }
-
-async function sendCombinedSubmit(wallet, height, stateRoot, prev) {
-  const batchData = {
-    chain_id: "operp-v2",
-    height,
-    state_root: stateRoot,
-    unit_ids: ["u" + height],
+// Single-package inline DA: full header scalars + frames_blob (JS join+base64,
+// no helper binary). Derived from the submit so header roots match the
+// commitment; the AA only reads the submit, but the blob path is exercised.
+function headerFromSubmit(sd, frameOp) {
+  const frame = JSON.stringify({ u: { op: "x" }, t: sd.trace_root, o: frameOp || "x", c: "1" });
+  const blob = Buffer.from(frame, "utf8").toString("base64");
+  const raw = Buffer.from(blob, "base64");
+  return {
+    chain_id: sd.chain_id || "operp-v2",
+    height: sd.height,
+    prev_state_hash: sd.prev_state_hash,
+    state_root: sd.state_root,
+    aa_root: sha256Hex("aa"),
+    aa_shard_roots: Array(16).fill(sha256Hex("shard")),
+    last_unit: sha256Hex("last"),
+    seq: sd.height,
+    fill_count: 0,
+    fills_hash: sha256Hex("fills"),
+    assertion_version: sd.assertion_version || 1,
+    wit_root: sd.wit_root,
+    trace_root: sd.trace_root,
+    units_root: sd.units_root,
+    units_set_root: sd.units_set_root,
+    unit_count: sd.unit_count,
+    wit_count: sd.wit_count,
+    ops_root: sd.ops_root,
+    fills_root: sd.fills_root,
+    counts_root: sd.counts_root,
+    frames_blob: blob,
+    data_root: crypto.createHash("sha256").update(raw).digest("hex"),
   };
+}
+function tempDataMsg(data) {
+  return {
+    app: "temp_data",
+    payload_location: "inline",
+    payload: {
+      data_length: require("ocore/object_length.js").getLength(data, true),
+      data_hash: require("ocore/object_hash.js").getBase64Hash(data, true),
+      data,
+    },
+  };
+}
+async function sendCombinedSubmit(wallet, height, stateRoot, prev) {
+  const sd = submitData(height, stateRoot, prev);
+  const header = headerFromSubmit(sd);
   const r = await wallet.sendMulti({
     messages: [
-      {
-        app: "temp_data",
-        payload_location: "inline",
-        payload: {
-          data_length: require("ocore/object_length.js").getLength(batchData, true),
-          data_hash: require("ocore/object_hash.js").getBase64Hash(batchData, true),
-          data: batchData,
-        },
-      },
-      { app: "data", payload: submitData(height, stateRoot, prev) },
+      tempDataMsg(header),
+      { app: "data", payload: sd },
     ],
     base_outputs: [{ address: ROLLUP_ADDR, amount: SUBMIT_GROSS }],
   });
@@ -327,18 +357,10 @@ async function main() {
     sd.unit_count = 1;
     sd.wit_root = witRoot || WIT_ROOT;
     sd.wit_count = witCount || GEN_WIT_COUNT;
-    const h2data = { chain_id: "operp-v2", height: 2 };
+    const h2header = headerFromSubmit(sd);
     const r = await operator.sendMulti({
       messages: [
-        {
-          app: "temp_data",
-          payload_location: "inline",
-          payload: {
-            data_length: require("ocore/object_length.js").getLength(h2data, true),
-            data_hash: require("ocore/object_hash.js").getBase64Hash(h2data, true),
-            data: h2data,
-          },
-        },
+        tempDataMsg(h2header),
         { app: "data", payload: sd },
       ],
       base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
@@ -349,21 +371,6 @@ async function main() {
     if (res && res.response && res.response.bounced)
       throw new Error("h2 submit bounced: " + JSON.stringify(res.response).slice(0, 200));
   }
-  // H3 pre-tree (genesis leaves + two live orders) is hoisted here because
-  // scenario 8's honest h2 submit must ALREADY commit it as wit_root_2:
-  // every h3 k=0 predicate anchors pre_wit on wit_root_2.
-  const MAKER_ORD = `ord:${"d".repeat(64)}:1:1:100000000:7:5:${"c".repeat(64)}`;
-  const BETTER_ORD = `ord:${"e".repeat(63)}f:1:1:90000000:6:9:${"c".repeat(64)}`;
-  const H3_PRE = [DEP_PRE, FILL_TAKER_PRE, META1, META2, POS2, MAKER_ORD, BETTER_ORD].sort();
-  const H3_PRE_WIT = merkle.getMerkleRoot(H3_PRE);
-  const H3_PRE_IDX = {};
-  H3_PRE.forEach((l, i) => { H3_PRE_IDX[l] = i; });
-  const forcedOmit = sha256Hex("forced-unit");
-  await trigger(operator, rollup, { force: 1, unit_id: forcedOmit }, 20000);
-  await network.timetravel({ shift: "60s" }); // force ts strictly < inbox_upto_2
-  const otherId = sha256Hex("other-unit");
-  const SET1 = pad2([otherId], "set1");
-  const SET_ROOT1 = merkle.getMerkleRoot(SET1);
   async function triggerVerdict(wallet, to, data, amount, what) {
     const t = await trigger(wallet, to, data, amount);
     const r = await network.getAaResponseToUnit(t.unit).catch(() => null);
@@ -539,13 +546,10 @@ async function main() {
     s.trace_root = traceRoot;
     s.fills_root = fillsRoot;
     s.ops_root = OPS_ROOT1;
-    const h3data = { chain_id: "operp-v2", height: 3 };
+    const h3header = headerFromSubmit(s);
     const r = await operator.sendMulti({
       messages: [
-        { app: "temp_data", payload_location: "inline", payload: {
-          data_length: require("ocore/object_length.js").getLength(h3data, true),
-          data_hash: require("ocore/object_hash.js").getBase64Hash(h3data, true),
-          data: h3data } },
+        tempDataMsg(h3header),
         { app: "data", payload: s },
       ],
       base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
@@ -666,44 +670,45 @@ async function main() {
   const PKG_WIT = merkle.getMerkleRoot(PKG_POST);
   const PKG_TRACE = pad2([PKG_WIT], "pkgtrace");
   const PKG_TRACE_ROOT = merkle.getMerkleRoot(PKG_TRACE);
-  const frameA = JSON.stringify({ u: { op: "a" }, t: "x", o: PKG_OP, c: "1" });
-  const frameB = JSON.stringify({ u: { op: "b" }, t: "y", o: PKG_OP, c: "1" });
+  const frameA = JSON.stringify({ u: { op: "a" }, t: PKG_TRACE_ROOT, o: PKG_OP, c: "1" });
+  const frameB = JSON.stringify({ u: { op: "b" }, t: PKG_TRACE_ROOT, o: PKG_OP, c: "1" });
   const blobA = Buffer.from(frameA, "utf8").toString("base64");
   const blobB = Buffer.from(frameB, "utf8").toString("base64");
   const rawA = Buffer.from(blobA, "base64");
   const rawB = Buffer.from(blobB, "base64");
   const shaHex = (b) => crypto.createHash("sha256").update(b).digest("hex");
-  const h3pkg = { chain_id: "operp-v2", height: 3, packages: [shaHex(rawA), shaHex(rawB)], data_root: shaHex(Buffer.concat([rawA, rawB])) };
   const sd3pkg = submitData(3, STATE_ROOT, STATE_ROOT);
   sd3pkg.ops_root = PKG_OPS_ROOT;
   sd3pkg.trace_root = PKG_TRACE_ROOT;
   sd3pkg.units_root = UNITS_SET_ROOT;
   sd3pkg.units_set_root = SET_ROOT1;
+  // Full header scalars from the submit (same helper as single-package),
+  // then packages = REAL package unit hashes (pr.unit) so watchers can
+  // get_joint each entry; data_root = sha256 of concatenated blob bytes.
+  const h3pkg = headerFromSubmit(sd3pkg, PKG_OP);
+  h3pkg.data_root = shaHex(Buffer.concat([rawA, rawB]));
   {
+    const pkgMsg = (blob) => ({ app: "temp_data", payload_location: "inline", payload: {
+      data_length: require("ocore/object_length.js").getLength({ package_blob: blob }, true),
+      data_hash: require("ocore/object_hash.js").getBase64Hash({ package_blob: blob }, true),
+      data: { package_blob: blob } } });
     const pr1 = await operator.sendMulti({
-      messages: [{ app: "temp_data", payload_location: "inline", payload: {
-        data_length: require("ocore/object_length.js").getLength({ package_blob: blobA }, true),
-        data_hash: require("ocore/object_hash.js").getBase64Hash({ package_blob: blobA }, true),
-        data: { package_blob: blobA } } }],
+      messages: [pkgMsg(blobA)],
       base_outputs: [{ address: await operator.getAddress(), amount: 10000 }],
     });
     if (pr1.error) throw new Error("package 1 post failed: " + pr1.error);
     await network.witnessUntilStable(pr1.unit);
     const pr2 = await operator.sendMulti({
-      messages: [{ app: "temp_data", payload_location: "inline", payload: {
-        data_length: require("ocore/object_length.js").getLength({ package_blob: blobB }, true),
-        data_hash: require("ocore/object_hash.js").getBase64Hash({ package_blob: blobB }, true),
-        data: { package_blob: blobB } } }],
+      messages: [pkgMsg(blobB)],
       base_outputs: [{ address: await operator.getAddress(), amount: 10000 }],
     });
     if (pr2.error) throw new Error("package 2 post failed: " + pr2.error);
     await network.witnessUntilStable(pr2.unit);
+    delete h3pkg.frames_blob;
+    h3pkg.packages = [pr1.unit, pr2.unit];
     const r3p = await operator.sendMulti({
       messages: [
-        { app: "temp_data", payload_location: "inline", payload: {
-          data_length: require("ocore/object_length.js").getLength(h3pkg, true),
-          data_hash: require("ocore/object_hash.js").getBase64Hash(h3pkg, true),
-          data: h3pkg } },
+        tempDataMsg(h3pkg),
         { app: "data", payload: sd3pkg },
       ],
       base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
