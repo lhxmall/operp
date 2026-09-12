@@ -105,7 +105,7 @@ fn main() {
     let _ = tip;
 
     let batch = Batch::from_applied(&prev, &mut eng, &applied).expect("batch");
-    let (mut header, _) = batch.temp_data_packages().expect("pack");
+    let mut header = batch.header_json();
     let frames = batch.frames();
     header["frames"] = serde_json::to_value(&frames).unwrap();
     let out: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

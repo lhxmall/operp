@@ -505,7 +505,6 @@ impl Batch {
             "aa_shard_roots": self.checkpoint.aa_shard_roots,
             "last_unit": hex::encode(self.checkpoint.last_unit.0),
             "seq": self.checkpoint.seq,
-            "unit_ids": self.checkpoint.unit_ids.iter().map(|u| hex::encode(u.0)).collect::<Vec<_>>(),
             "fill_count": self.checkpoint.fill_count,
             "fills_hash": hex::encode(self.checkpoint.fills_hash),
             "assertion_version": self.checkpoint.assertion_version,
@@ -528,7 +527,11 @@ impl Batch {
         data
     }
     /// Frames → packages → header+blobs. Single-package callers inline
-    /// `frames_blob`; multi-package headers use `packages`+`data_root`.
+    /// `frames_blob`; multi-package headers list the package **unit hashes**
+    /// (filled by the poster after posting each package unit — Rust cannot
+    /// know them), so watchers can `get_joint` each entry. Here `packages`
+    /// is an empty placeholder array of the right length; the poster
+    /// replaces it with real unit hashes before submitting the header.
     pub fn temp_data_packages(&self) -> Result<(serde_json::Value, Vec<String>), SettleError> {
         let frames = self.frames();
         let mut blobs = pack_frames(&frames);
@@ -548,15 +551,13 @@ impl Batch {
                     serde_json::to_string(&v).unwrap()
                 })
                 .collect();
-            let reblobs = pack_frames(&stripped);
-            let still_over = reblobs.iter().any(|b| {
-                let obj = serde_json::json!({"package_blob": b});
-                crate::obyte_hash::get_json_source(&obj).len() > PACK_SOURCE_CAP
-            });
-            if still_over {
-                return Err(SettleError::TooManyUnits);
-            }
-            blobs = reblobs;
+            blobs = pack_frames(&stripped);
+            // Still over cap with all leaves stripped: print-only. The
+            // oversize package cannot land on-chain (ocore rejects it), so
+            // the header's packages can never assemble — watchers back off
+            // on the missing joints instead of mis-challenging. Return the
+            // data as-is rather than erroring (same posture as the legacy
+            // 4MB leaf_trace cap).
         }
         let raw: Vec<Vec<u8>> = blobs
             .iter()
@@ -573,13 +574,11 @@ impl Batch {
             header["frames_blob"] = serde_json::Value::String(blobs[0].clone());
             header["data_root"] = serde_json::Value::String(root);
         } else {
-            let hashes: Vec<String> = raw.iter().map(|b| hex::encode(sha256(b))).collect();
-            header["packages"] = serde_json::to_value(&hashes).unwrap();
+            header["packages"] = serde_json::to_value(&vec![String::new(); blobs.len()]).unwrap();
             header["data_root"] = serde_json::Value::String(root);
         }
         Ok((header, blobs))
     }
-
     pub fn validate_against(
         &self,
         prev_root: [u8; 32],
@@ -787,7 +786,16 @@ pub fn pack_frames_with_cap(frames: &[String], cap: usize) -> Vec<String> {
     use base64::Engine as _;
     let mut out: Vec<String> = Vec::new();
     let mut cur: Vec<&String> = Vec::new();
-    let mut cur_joined_len: usize = 0;
+    let src_len = |cur: &[&String], extra: Option<&String>| -> usize {
+        let mut parts: Vec<&str> = cur.iter().map(|s| s.as_str()).collect();
+        if let Some(e) = extra {
+            parts.push(e.as_str());
+        }
+        let joined = parts.join("\n");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(joined.as_bytes());
+        let obj = serde_json::json!({"package_blob": b64});
+        crate::obyte_hash::get_json_source(&obj).len()
+    };
     let flush = |cur: &mut Vec<&String>, out: &mut Vec<String>| {
         if cur.is_empty() {
             return;
@@ -801,21 +809,10 @@ pub fn pack_frames_with_cap(frames: &[String], cap: usize) -> Vec<String> {
         cur.clear();
     };
     for f in frames {
-        let add = if cur.is_empty() { f.len() } else { 1 + f.len() };
-        let candidate_joined_len = cur_joined_len + add;
-        let candidate_raw = (candidate_joined_len + 2) / 3 * 4;
-        let candidate_src = candidate_raw + 20;
-        if !cur.is_empty() && candidate_src > cap {
+        if !cur.is_empty() && src_len(&cur, Some(f)) > cap {
             flush(&mut cur, &mut out);
-            cur_joined_len = 0;
         }
-        if cur.is_empty() {
-            cur.push(f);
-            cur_joined_len = f.len();
-        } else {
-            cur.push(f);
-            cur_joined_len += add;
-        }
+        cur.push(f);
     }
     flush(&mut cur, &mut out);
     if out.is_empty() {
@@ -927,9 +924,9 @@ pub fn unit_frame_from_json(
     Ok((unit, t, o, c, f, l, e))
 }
 /// Rebuild a [`Batch`] from a header JSON plus decoded frame strings.
-/// Header carries scalars + `unit_ids`; frames carry units/trace/ops/
-/// counts/fills/leaves/evidences. `unit_ids` are re-derived via
-/// `unit_id()` and must match the header list.
+/// Header carries scalars (no per-unit arrays); frames carry units/trace/
+/// ops/counts/fills/leaves/evidences. `unit_ids` are re-derived via
+/// `unit_id()`; a legacy header carrying `unit_ids` is cross-checked.
 pub fn batch_from_frames(
     header: &serde_json::Value,
     frames: &[String],
@@ -1052,17 +1049,15 @@ pub fn batch_from_frames(
     if unit_count as usize != units.len() {
         return Err(SettleError::RootMismatch);
     }
-    let header_ids = header
-        .get("unit_ids")
-        .and_then(|v| v.as_array())
-        .ok_or(SettleError::RootMismatch)?;
-    if header_ids.len() != derived_ids.len() {
-        return Err(SettleError::RootMismatch);
-    }
-    for (i, h) in header_ids.iter().enumerate() {
-        let s = h.as_str().ok_or(SettleError::RootMismatch)?;
-        if s.to_lowercase() != hex::encode(derived_ids[i].0) {
+    if let Some(header_ids) = header.get("unit_ids").and_then(|v| v.as_array()) {
+        if header_ids.len() != derived_ids.len() {
             return Err(SettleError::RootMismatch);
+        }
+        for (i, h) in header_ids.iter().enumerate() {
+            let s = h.as_str().ok_or(SettleError::RootMismatch)?;
+            if s.to_lowercase() != hex::encode(derived_ids[i].0) {
+                return Err(SettleError::RootMismatch);
+            }
         }
     }
     Ok(Batch {

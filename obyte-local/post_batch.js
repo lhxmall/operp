@@ -225,22 +225,21 @@ async function main() {
   const dataRoot = crypto.createHash("sha256").update(Buffer.concat(rawBlobs)).digest("hex");
   const header = Object.assign({}, batchData);
   delete header.frames;
+  delete header.frames_blob;
+  delete header.packages;
+  delete header.data_root;
   delete header.units;
+  delete header.unit_ids;
   delete header.trace;
   delete header.ops;
   delete header.counts;
   delete header.fills;
   delete header.leaf_trace;
   delete header.deposit_evidences;
-  const pkgHashes = rawBlobs.map((b) => crypto.createHash("sha256").update(b).digest("hex"));
-  if (packages.length === 1) {
-    header.frames_blob = packages[0];
-    header.data_root = dataRoot;
-  } else {
-    header.packages = pkgHashes;
-    header.data_root = dataRoot;
-  }
-  console.log("canonical data_hash:", obyteDataHash(header), "data_length:", obyteDataLength(header));
+  // Multi-package: post each package unit FIRST, then the header nails the
+  // real Obyte unit hashes (base64 unit ids as the hub returns them) so
+  // watchers can get_joint each entry. Single package inlines frames_blob.
+  const pkgUnits = [];
   for (let i = 0; i < packages.length; i++) {
     if (packages.length > 1) {
       const pr = await poster.sendMulti({
@@ -249,8 +248,16 @@ async function main() {
       });
       if (pr.error) throw new Error("package post failed: " + pr.error);
       await network.witnessUntilStable(pr.unit);
-      console.log("package posted:", pr.unit, pkgHashes[i].slice(0, 12));
+      pkgUnits.push(pr.unit);
+      console.log("package posted:", pr.unit);
     }
+  }
+  if (packages.length === 1) {
+    header.frames_blob = packages[0];
+    header.data_root = dataRoot;
+  } else {
+    header.packages = pkgUnits;
+    header.data_root = dataRoot;
   }
   // 1+2 COMBINED: header DA reveal + submit in ONE unit — block order = this
   // unit's order. The AA records var['da_unit_<h>'] = this unit's hash, so
