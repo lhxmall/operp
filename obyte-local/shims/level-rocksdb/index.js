@@ -26,6 +26,10 @@ class MemoryBatch {
     this._ops.push({ type: "del", key: toStr(key) });
     return this;
   }
+  clear() {
+    this._ops = [];
+    return this;
+  }
   write(opts, cb) {
     if (typeof opts === "function") {
       cb = opts;
