@@ -241,7 +241,7 @@ async function main() {
     .with.agent({ dispute: DISPUTE_SRC })
     .with.agent({ fill: FILL_SRC })
     .with.agent({ vault: VAULT_SRC })
-    .with.wallet({ operator: 1e14 })
+    .with.wallet({ operator: 2e14 })
     .with.wallet({ challenger: 1e13 })
     .run();
   const { operator, challenger } = network.wallet;
