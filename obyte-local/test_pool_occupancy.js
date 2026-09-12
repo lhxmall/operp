@@ -45,17 +45,17 @@ function chashOf(aaSource) {
   return objectHash.getChash160(["autonomous agent", parsed]);
 }
 const ROLLUP_ADDR = chashOf(readDef("operp_rollup.aa"));
-
-const POOL_FUND_GROSS = 10000000010000; // 1x POOL_MIN + fee: no fraud here, no slash
-const SUBMIT_FEE = 10000;
+// AA gates witness roots at 44 chars (base64), state roots at 64 hex.
+// Values need not be real trees here — no predicates run in this file.
+const b64root = (s) => Buffer.from(sha256Hex(s), "hex").toString("base64");
 const FOREST = sha256Hex("f0").repeat(16);
-const WIT_ROOT = sha256Hex("wit");
-const TRACE_ROOT = sha256Hex("trace");
-const UNITS_ROOT = sha256Hex("units");
-const UNITS_SET_ROOT = sha256Hex("set");
-const OPS_ROOT = sha256Hex("ops");
-const FILLS_ROOT = sha256Hex("fills");
-const COUNTS_ROOT = sha256Hex("counts");
+const WIT_ROOT = b64root("wit");
+const TRACE_ROOT = b64root("trace");
+const UNITS_ROOT = b64root("units");
+const UNITS_SET_ROOT = b64root("set");
+const OPS_ROOT = b64root("ops");
+const FILLS_ROOT = b64root("fills");
+const COUNTS_ROOT = b64root("counts");
 const GENESIS = sha256Hex("genesis");
 
 function submitData(h, prev) {
@@ -84,6 +84,11 @@ async function trigger(wallet, to, data, amount) {
   const r = await wallet.triggerAaWithData({ toAddress: to, amount, data });
   if (r.error) throw new Error(`trigger h=${data.height}: ${r.error}`);
   await network.witnessUntilStable(r.unit);
+  const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
+  const log = JSON.stringify(res || {});
+  if (log.includes('"bounced":true')) {
+    throw new Error(`trigger h=${data.height} bounced: ` + log.slice(0, 300));
+  }
   return r;
 }
 async function vars(aa) {
