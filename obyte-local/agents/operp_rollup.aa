@@ -5,15 +5,16 @@
 	// height and finalizes it after CHALLENGE_SECS unless a bound dispute AA
 	// reports fraud via {verdict:'fraud'}. There is NO pay-to-kill challenge
 	// path: {challenge:1} is not a case here and never freezes anything.
-	// Constants mirror Rust (crates/operp-types/src/lib.rs):
-	//   'operp-v2'      -> CHAIN_ID
-	//   1               -> ASSERTION_VERSION
-	//   3600            -> CHALLENGE_SECS (finalize clean window from submit)
-	//   604800          -> ESCAPE_STALL_SECS (escape hatch)
-	//   1000000000000   -> SUBMIT_BOND_NET (per-height submit bond)
-	//   500000000000    -> SUBMIT_BOND_SLASH_HALF (fraud slash to challenger)
-	//   20000           -> RACE_REWARD (first-submitter reward)
-	//   10000           -> BOUNCE_FEE_BASE
+// Constants mirror Rust (crates/operp-types/src/lib.rs):
+//   'operp-v2'      -> CHAIN_ID
+//   1               -> ASSERTION_VERSION
+//   3600            -> CHALLENGE_SECS (finalize clean window from submit)
+//   604800          -> ESCAPE_STALL_SECS (escape hatch)
+//   1000000000000   -> SUBMIT_BOND_NET (standing pool floor, not per-height lock)
+//   1000000000000   -> POOL_MIN (== SUBMIT_BOND_NET)
+//   50              -> POOL_MAX_INFLIGHT (last_submitted-last_finalized < 50)
+//   500000000000    -> SUBMIT_BOND_SLASH_HALF (fraud slash to challenger)
+//   20000           -> RACE_REWARD (first-submitter reward)
 	// DA convention (social, enforced by watchers off-chain): the submit
 	// trigger unit carries a temp_data message with the batch JSON
 	// (trace/ops/fills arrays); da_unit_<h> pins that unit. The AA does NOT
@@ -26,8 +27,8 @@
 	//   unit_count_<h>, wit_count_<h>, da_unit_<h>, active_bond_<h>,
 	//   fee_winner_<h>, frozen_<h> (absent/0 live, 2 failed),
 	//   inbox_upto_<h> (submit timestamp: forces older than this belong here)
+	//   pool_<addr> (standing submit pool; submits need >= 1e12)
 	//   sbond_<addr>, reward_<addr>, slash_reward_<addr>
-	//   inbox_<unit_id_hex> = force timestamp
 	bounce_fees: { base: 10000 },
 	messages: {
 		cases: [
@@ -85,10 +86,28 @@
 				]
 			},
 			{
+				// Standing pool fund: net inbound (minus bounce fee) credits
+				// var['pool_'||trigger.address]. Submits gate on pool >= 1e12.
+				if: "{trigger.data.pool}",
+				init: "{
+					if (trigger.output[[asset=base]] <= 10000)
+						bounce('need pool');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							var['pool_' || trigger.address] = (var['pool_' || trigger.address] otherwise 0) + trigger.output[[asset=base]] - 10000;
+						}"
+					}
+				]
+			},
+			{
 				if: "{trigger.data.submit}",
 				init: "{
 					$h = trigger.data.height;
 					$ls = (var['last_submitted'] otherwise 0);
+					$lf = (var['last_finalized'] otherwise 0);
 					if (trigger.data.chain_id != 'operp-v2'
 						OR !$h OR $h != $ls + 1
 						OR trigger.data.assertion_version != 1
@@ -101,16 +120,20 @@
 						OR !trigger.data.units_set_root OR length(trigger.data.units_set_root) != 44
 						OR !trigger.data.ops_root OR length(trigger.data.ops_root) != 44
 						OR !trigger.data.fills_root OR length(trigger.data.fills_root) != 44
-						OR !is_integer(trigger.data.unit_count) OR trigger.data.unit_count < 1 OR trigger.data.unit_count > 8192
+						OR !is_integer(trigger.data.unit_count) OR trigger.data.unit_count < 1 OR trigger.data.unit_count > 200000
 						OR !is_integer(trigger.data.wit_count) OR trigger.data.wit_count < 1)
 						bounce('bad submit');
 					if ($ls > 0 AND (var['frozen_' || $ls] otherwise 0) != 2
 						AND trigger.data.prev_state_hash != var['state_root_' || $ls])
 						bounce('prev mismatch');
-					if (var['active_bond_' || $h])
+					if (trigger.output[[asset=base]] < 10000)
+						bounce('need fee');
+					if ((var['pool_' || trigger.address] otherwise 0) < 1000000000000)
+						bounce('need pool');
+					if ($ls - $lf >= 50)
+						bounce('pool occupancy');
+					if (var['active_bond_' || $h] AND $h <= $ls AND (var['frozen_' || $h] otherwise 0) != 2)
 						bounce('height taken');
-					if (trigger.output[[asset=base]] - 10000 < 1000000000000)
-						bounce('need submit bond');
 				}",
 				messages: [
 					{
@@ -161,10 +184,6 @@
 						app: "state",
 						state: "{
 							var['last_finalized'] = trigger.data.height;
-							$ab = var['active_bond_' || trigger.data.height];
-							if ($ab){
-								var['sbond_' || $ab] += 1000000000000;
-							}
 							$fw = var['fee_winner_' || trigger.data.height];
 							if ($fw){
 								var['reward_' || $fw] += 20000;
@@ -199,6 +218,11 @@
 							var['frozen_' || trigger.data.height] = 2;
 							var['state_root_' || trigger.data.height] = 0;
 							var['aa_forest_' || trigger.data.height] = 0;
+							$op = var['active_bond_' || trigger.data.height];
+							if ($op){
+								$p = (var['pool_' || $op] otherwise 0);
+								var['pool_' || $op] = ($p > 500000000000 ? $p - 500000000000 : 0);
+							}
 							var['active_bond_' || trigger.data.height] = 0;
 							var['fee_winner_' || trigger.data.height] = 0;
 							var['last_submitted'] = trigger.data.height - 1;
@@ -211,9 +235,11 @@
 				if: "{trigger.data.claim}",
 				init: "{
 					$k = trigger.data.claim;
-					if ($k != 'reward' AND $k != 'sbond' AND $k != 'slash')
+					if ($k != 'reward' AND $k != 'sbond' AND $k != 'slash' AND $k != 'pool')
 						bounce('bad claim kind');
-					$key = ($k == 'reward' ? 'reward_' : ($k == 'sbond' ? 'sbond_' : 'slash_reward_'));
+					if ($k == 'pool' AND (var['last_submitted'] otherwise 0) != (var['last_finalized'] otherwise 0))
+						bounce('pool busy');
+					$key = ($k == 'reward' ? 'reward_' : ($k == 'sbond' ? 'sbond_' : ($k == 'slash' ? 'slash_reward_' : 'pool_')));
 					$owed = (var[$key || trigger.address] otherwise 0);
 					if (!$owed OR trigger.output[[asset=base]] < 10000)
 						bounce('nothing claimable');

@@ -14,20 +14,19 @@
 //
 // Scenarios:
 //  1.  bind dispute + fill → rollup dispute_aa/_fill set; double bind bounces
-//  2.  submit bond gate: 20000 → 'need submit bond'
-//  3.  combined submit height 1 → last_submitted=1; resubmit 'height taken'
+//  2.  pool gate: no pool → 'need pool'; {pool:1} funds standing pool
+//  3.  combined submit height 1 (10000 fee) → last_submitted=1; resubmit 'bad submit'
 //  4.  {lock:1} / {challenge:1} have NO cases → auto-bounce, nothing frozen
-//  5.  finalize before 3600s → 'cannot finalize'; after → last_finalized=1
-//  6.  honest deposit predicate → 'no fraud', height still live
+//  5.  finalize before 3600s → 'cannot finalize'; after → last_finalized=1, no sbond credit
+//  6.  omit fraud (forced id missing) → verdict freezes h2
 //  7.  dishonest post collateral → verdict fires: frozen=2, last_submitted
-//      rolls back, slash_reward_ 500000000000 claimable
-//  8.  omit fraud (forced id missing) → frozen=2
-//  9.  omit honest (id present) → 'no fraud'
-//  10. fill_math dishonest → fill AA verdict, frozen=2
-//  11. fill_math honest → 'no fraud'
-//  12. ghost (absent maker) → frozen=2
-//  13. skip (better order ignored) → frozen=2 (heights 3-4 chain)
-//  14. re-submit + finalize after fraud works
+//      rolls back, slash_reward_ 500000000000 claimable, pool slashed 5e11
+//  8.  honest deposit → 'no fraud', height stays live
+//  9-13. fill_math/ghost/skip/negative-price predicates on h3 chain
+//  14. two-package (gzip) height deposit fraud → frozen=3
+//  15. re-submit + finalize after fraud works
+//  16. pipeline h4+h5 with no inter-finalize, then finalize in order
+//  17. pool claim: 'pool busy' while live, full claim when idle
 
 // Windows: aa-testkit's runChild replaces the child env wholesale and never
 // sets APPDATA, which ocore's desktop_app reads on win32 — the genesis node
@@ -40,6 +39,7 @@ if (process.platform === "win32") {
 
 const fs = require("fs");
 const crypto = require("crypto");
+const zlib = require("zlib");
 const path = require("path");
 const aaRoot = path.join(__dirname, "..", "vendor", "aa-testkit");
 const nm = path.join(aaRoot, "node_modules");
@@ -92,14 +92,13 @@ const VAULT_SRC = writeResolved("operp_vault.aa", { ROLLUP_AA_HERE: ROLLUP_ADDR,
 // dispute AA address is also deterministic — compute AFTER substitution.
 const DISPUTE_ADDR = chashOf(fs.readFileSync(DISPUTE_SRC, "utf8"));
 const FILL_ADDR = chashOf(fs.readFileSync(FILL_SRC, "utf8"));
-
-const SUBMIT_GROSS = 10000000010000; // SUBMIT_BOND_NET + 10000 headroom
+const POOL_FUND_GROSS = 50000000010000; // 50x POOL_MIN net: survives all fraud slashes in this run
+const SUBMIT_FEE = 10000; // submits pay only the bounce fee; pool gates
 const RACE_REWARD = 20000;
 const SLASH_HALF = 500000000000;
 
 let network;
 let failures = 0;
-
 async function trigger(wallet, to, data, amount) {
   const r = await wallet.triggerAaWithData({ toAddress: to, amount, data });
   if (r.error) throw new Error(`trigger ${JSON.stringify(data).slice(0, 60)}: ${r.error}`);
@@ -196,13 +195,13 @@ function submitData(height, stateRoot, prev) {
     wit_count: GEN_WIT_COUNT,
   };
 }
-// Single-package inline DA: full header scalars + frames_blob (JS join+base64,
-// no helper binary). Derived from the submit so header roots match the
-// commitment; the AA only reads the submit, but the blob path is exercised.
+// Single-package inline DA: full header scalars + frames_blob (gzip of the
+// `\n`-joined frames, base64). Derived from the submit so header roots match
+// the commitment; the AA only reads the submit, but the blob path is exercised.
 function headerFromSubmit(sd, frameOp) {
   const frame = JSON.stringify({ u: { op: "x" }, t: sd.trace_root, o: frameOp || "x", c: "1" });
-  const blob = Buffer.from(frame, "utf8").toString("base64");
-  const raw = Buffer.from(blob, "base64");
+  const blob = zlib.gzipSync(Buffer.from(frame, "utf8")).toString("base64");
+  const raw = zlib.gunzipSync(Buffer.from(blob, "base64"));
   return {
     chain_id: sd.chain_id || "operp-v2",
     height: sd.height,
@@ -247,7 +246,7 @@ async function sendCombinedSubmit(wallet, height, stateRoot, prev) {
       tempDataMsg(header),
       { app: "data", payload: sd },
     ],
-    base_outputs: [{ address: ROLLUP_ADDR, amount: SUBMIT_GROSS }],
+    base_outputs: [{ address: ROLLUP_ADDR, amount: SUBMIT_FEE }],
   });
   if (r.error) throw new Error("combined submit failed: " + r.error);
   await network.witnessUntilStable(r.unit);
@@ -296,10 +295,14 @@ async function main() {
   st = await vars(rollup);
   if (String(st.dispute_aa) !== dispute) throw new Error("double bind overwrote dispute_aa!");
 
-  // ---- 2. submit bond gate ----------------------------------------------
+  // ---- 2. pool gate: no pool → 'need pool'; fund {pool:1} → gate passes ----
   const sd = submitData(1, STATE_ROOT, PREV_ROOT);
-  await triggerBounce(operator, rollup, Object.assign({}, sd, { height: 1 }), 20000, "need submit bond");
-  console.log("2. submit bond gate ok");
+  await triggerBounce(operator, rollup, Object.assign({}, sd, { height: 1 }), 20000, "need pool");
+  await trigger(operator, rollup, { pool: 1 }, POOL_FUND_GROSS);
+  st = await vars(rollup);
+  if (Number(st["pool_" + (await operator.getAddress())] || 0) < 1000000000000)
+    throw new Error("pool not funded: " + JSON.stringify(st["pool_" + (await operator.getAddress())]));
+  console.log("2. pool gate ok — funded standing pool");
 
   // ---- 3. combined submit height 1 --------------------------------------
   await sendCombinedSubmit(operator, 1, STATE_ROOT, PREV_ROOT);
@@ -309,7 +312,7 @@ async function main() {
   if (st.da_unit_1 === undefined) throw new Error("da_unit_1 not pinned");
   // resubmit same height → 'bad submit' (h != last_submitted+1; the
   // 'height taken' gate only applies to a fresh h == last_submitted+1)
-  await triggerBounce(operator, rollup, submitData(1, STATE_ROOT, PREV_ROOT), SUBMIT_GROSS, "bad submit");
+  await triggerBounce(operator, rollup, submitData(1, STATE_ROOT, PREV_ROOT), SUBMIT_FEE, "bad submit");
   console.log("3. combined submit ok, resubmit rejected");
 
   // ---- 4. lock/challenge are dead paths ---------------------------------
@@ -327,7 +330,9 @@ async function main() {
   if (Number(st.last_finalized) !== 1) throw new Error("last_finalized != 1");
   if (Number(st["reward_" + (await operator.getAddress())] || 0) !== RACE_REWARD)
     throw new Error("operator race reward not accrued");
-  console.log("5. finalize ok, race reward accrued");
+  console.log("5. finalize ok, race reward accrued, no sbond credit");
+  if (Number(st["sbond_" + (await operator.getAddress())] || 0) !== 0)
+    throw new Error("finalize must not credit sbond under pool model");
 
   // ---- 6. honest deposit predicate bounces 'no fraud' --------------------
   // All proofs are real merkle.getMerkleProof paths. post_wit commits a
@@ -363,7 +368,7 @@ async function main() {
         tempDataMsg(h2header),
         { app: "data", payload: sd },
       ],
-      base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
+      base_outputs: [{ address: rollup, amount: SUBMIT_FEE }],
     });
     if (r.error) throw new Error("h2 submit failed: " + r.error);
     await network.witnessUntilStable(r.unit);
@@ -442,10 +447,11 @@ async function main() {
   // Cumulative: scenario 6's omit verdict already banked one half.
   if (Number(st["slash_reward_" + chAddr] || 0) !== SLASH_HALF * 2)
     throw new Error("slash reward wrong: " + JSON.stringify(st["slash_reward_" + chAddr]));
-  await trigger(challenger, rollup, { claim: "slash" }, 20000);
-  st = await vars(rollup);
-  if (Number(st["slash_reward_" + chAddr] || 0) !== 0) throw new Error("slash not paid out");
-  console.log("7. deposit fraud verdict: height failed, slashed, challenger paid");
+  // Verdict slashes the standing pool by 5e11 per fraud (2 so far).
+  const opAddr = await operator.getAddress();
+  const poolNet = POOL_FUND_GROSS - 10000; // {pool:1} credits net of bounce fee
+  if (Number(st["pool_" + opAddr] || 0) !== Number(poolNet - SLASH_HALF * 2))
+    throw new Error("pool not slashed by fraud: " + JSON.stringify(st["pool_" + opAddr]));
 
   // ---- 8. honest deposit → 'no fraud' (height stays live) ------------------
   // This assertion ALSO commits wit_root_2 = H3_PRE_WIT: every h3 k=0
@@ -502,7 +508,7 @@ async function main() {
           data: h3data } },
         { app: "data", payload: sd3 },
       ],
-      base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
+      base_outputs: [{ address: rollup, amount: SUBMIT_FEE }],
     });
     if (r.error) throw new Error("h3 submit failed: " + r.error);
     await network.witnessUntilStable(r.unit);
@@ -567,7 +573,7 @@ async function main() {
         tempDataMsg(h3header),
         { app: "data", payload: s },
       ],
-      base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
+      base_outputs: [{ address: rollup, amount: SUBMIT_FEE }],
     });
     if (r.error) throw new Error("h3 submit failed: " + r.error);
     await network.witnessUntilStable(r.unit);
@@ -687,10 +693,10 @@ async function main() {
   const PKG_TRACE_ROOT = merkle.getMerkleRoot(PKG_TRACE);
   const frameA = JSON.stringify({ u: { op: "a" }, t: PKG_TRACE_ROOT, o: PKG_OP, c: "1" });
   const frameB = JSON.stringify({ u: { op: "b" }, t: PKG_TRACE_ROOT, o: PKG_OP, c: "1" });
-  const blobA = Buffer.from(frameA, "utf8").toString("base64");
-  const blobB = Buffer.from(frameB, "utf8").toString("base64");
-  const rawA = Buffer.from(blobA, "base64");
-  const rawB = Buffer.from(blobB, "base64");
+  const blobA = zlib.gzipSync(Buffer.from(frameA, "utf8")).toString("base64");
+  const blobB = zlib.gzipSync(Buffer.from(frameB, "utf8")).toString("base64");
+  const rawA = zlib.gunzipSync(Buffer.from(blobA, "base64"));
+  const rawB = zlib.gunzipSync(Buffer.from(blobB, "base64"));
   const shaHex = (b) => crypto.createHash("sha256").update(b).digest("hex");
   const sd3pkg = submitData(3, STATE_ROOT, STATE_ROOT);
   sd3pkg.ops_root = PKG_OPS_ROOT;
@@ -726,7 +732,7 @@ async function main() {
         tempDataMsg(h3pkg),
         { app: "data", payload: sd3pkg },
       ],
-      base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
+      base_outputs: [{ address: rollup, amount: SUBMIT_FEE }],
     });
     if (r3p.error) throw new Error("h3 2-package submit failed: " + r3p.error);
     await network.witnessUntilStable(r3p.unit);
@@ -762,6 +768,34 @@ async function main() {
   st = await vars(rollup);
   if (Number(st.last_finalized) !== 3) throw new Error("re-finalize after fraud failed");
   console.log("15. re-submit + finalize after fraud ok");
+  // ---- 16. pipeline: h4 + h5 with no finalize between ---------------------
+  // Occupancy is last_submitted-last_finalized = 2 < 50, so the second submit
+  // must NOT bounce. Then timetravel once, finalize in order.
+  await sendCombinedSubmit(operator, 4, STATE_ROOT, STATE_ROOT);
+  await sendCombinedSubmit(operator, 5, STATE_ROOT, STATE_ROOT);
+  st = await vars(rollup);
+  if (Number(st.last_submitted) !== 5) throw new Error("pipeline submits failed: " + st.last_submitted);
+  if (Number(st.last_finalized) !== 3) throw new Error("pipeline must not finalize early");
+  console.log("16. pipeline h4+h5 submitted with no inter-finalize");
+  await network.timetravel({ shift: "3600s" });
+  await trigger(operator, rollup, { finalize: 1, height: 4 }, 20000);
+  await trigger(operator, rollup, { finalize: 1, height: 5 }, 20000);
+  st = await vars(rollup);
+  if (Number(st.last_finalized) !== 5) throw new Error("pipelined finalize failed");
+  console.log("16a. pipelined h4+h5 finalized in order");
+  // ---- 17. pool claim when chain idle; pool busy otherwise -----------------
+  // Chain idle (ls==lf==5): operator claims the standing pool back.
+  const poolBefore = Number(st["pool_" + (await operator.getAddress())] || 0);
+  if (!(poolBefore >= 1000000000000)) throw new Error("pool below floor after slashes: " + poolBefore);
+  await sendCombinedSubmit(operator, 6, STATE_ROOT, STATE_ROOT);
+  await triggerBounce(operator, rollup, { claim: "pool" }, 20000, "pool busy");
+  await network.timetravel({ shift: "3600s" });
+  await trigger(operator, rollup, { finalize: 1, height: 6 }, 20000);
+  await trigger(operator, rollup, { claim: "pool" }, 20000);
+  st = await vars(rollup);
+  if (Number(st["pool_" + (await operator.getAddress())] || 0) !== 0)
+    throw new Error("pool not zeroed after claim");
+  console.log("17. pool claim ok when idle, busy otherwise");
   console.log(failures === 0 ? "\nALL SETTLEMENT E2E CHECKS PASSED" : `\n${failures} FAILURES`);
   process.exit(failures === 0 ? 0 : 1);
 }

@@ -17,6 +17,7 @@ sha2 = { workspace = true }
 base64 = "0.23"
 thiserror = { workspace = true }
 hex = { workspace = true }
+flate2 = { workspace = true }
 operp-book = { version = "0.1.0", path = "../operp-book" }
 
 [dev-dependencies]

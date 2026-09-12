@@ -411,12 +411,12 @@ slash_reward_bps 归挑战者、余下烧毁。
 
 ### 8.1 批次切分
 
-operator 从线性化执行流中切出前缀（≤ BATCH_MAX_UNITS=8192 units），
+operator 从线性化执行流中切出前缀（≤ BATCH_MAX_UNITS=200000 units），
 调用 `Batch::from_applied(prev_state, engine, applied)`：
 
 ```
 applied 为空                    → Empty
-applied.len() > 8192             → TooManyUnits
+applied.len() > 200000           → TooManyUnits
 checkpoint.height               = prev.height + 1
 prev_state_hash                 = prev.state_root()
 engine.state.height ← height    （先推进再取根，meta_leaf 绑定高度）
@@ -438,10 +438,15 @@ header 只带标量（`chain_id`、height、各根计数、`aa_shard_roots`、
 JSON（`u,t,o,c,f?,l?,e?`）：`u` 为该单元 JSON（含签名），`t`/`o`/`c` 为
 trace/ops/counts 条目，无成交时省略 `f`，`e` 仅 Deposit/GovDeposit 携带
 （按 `aa_unit` 匹配证据），`l` 为该单元叶集（print-only 可省略）。
-package = base64（`\n` 连接 frames）；`data_root` =
-hex(sha256(拼接 blob 字节))；多包时 `packages` 记 package 单元的真实
-Obyte unit hash 列表（poster 先发包、拿到 unit 后填，Rust 打包时只留占位），
-watcher 按条目 `get_joint` 取包；承载该对象的 Obyte 单元之规范 `data_hash`
+package = base64(gzip（`\n` 连接 frames）)；cap 仍按
+`get_json_source({"package_blob": b64}).len() <= PACK_SOURCE_CAP` 核算；
+`data_root` = hex(sha256(拼接 **gunzip 后** blob 字节))，JS 侧
+`zlib.gunzipSync` + concat + sha256 对得上；非法 gzip → BindingMismatch。
+`l` 保留在线上——`prove.rs` 的 `deposit_proof` 要拿 liar 贴过的叶子对
+committed `trace[k]` 开证明，省 `l` 会让一枪谓词开不了。多包时 `packages`
+记 package 单元的真实 Obyte unit hash 列表（poster 先发包、拿到 unit 后填，
+Rust 打包时只留占位），watcher 按条目 `get_joint` 取包、gunzip 后拼接；
+承载该对象的 Obyte 单元之规范 `data_hash`
 仍为 `hex(sha256(getJsonSource(header或package对象)))`。充值证据在 frame
 `e` 内，复原即拼接各 `e` 字段（无 header `deposit_evidences`）。
 超限（去 `l` 重打仍有包超 `PACK_SOURCE_CAP`）整批 print-only：超限包上不了链，
@@ -578,7 +583,8 @@ ops_root_h, fills_root_h, unit_count_h, wit_count_h
 da_unit_h, active_bond_h, fee_winner_h
 frozen_h ∈ {∅/0=live, 2=failed}
 inbox_<unit_id_hex>, inbox_upto_h
-sbond_<addr>, reward_<addr>, slash_reward_<addr>
+pool_<addr>（常备池；提交门 pool>=1e12）
+sbond_<addr>, reward_<addr>, slash_reward_<addr>（sbond 仅遗留 claim 路径）
 ```
 
 时钟：
@@ -594,9 +600,11 @@ sbond_<addr>, reward_<addr>, slash_reward_<addr>
 ∧ prev == `state_root_{h-1}`（上一高度 frozen=2 时豁免）
 ∧ state_root/prev 64 hex ∧ aa_forest 1024 hex ∧ 六个承诺根 44 b64
 ∧ 组合单元（temp_data 在同一 unit，`da_unit_h=trigger.unit`）
-∧ 输出-10000 ≥ 1e12（SUBMIT_BOND_NET）
+∧ 输出 ≥ 10000（仅 bounce 费）∧ `pool_<sender> >= 1e12`
+∧ `last_submitted-last_finalized < 50`（在途占用）
 → 写全部 <h> 键 + `inbox_upto_h = timestamp` + last_submitted=h；
-  已占位且 frozen≠2 → bounce('height taken')。无 lock。
+  活高度重发（h ≤ last_submitted 且 frozen≠2）→ bounce('height taken')；
+  欺诈重开的后续高度可自由覆盖。无 lock。
 
 ### 10.2 谓词揭发 — dispute / dispute_fill
 
@@ -612,19 +620,18 @@ sbond_<addr>, reward_<addr>, slash_reward_<addr>
 所有成员证明 `.root` 必须等于对应 pre_wit/post_wit/roots。
 验不过 bounce('no fraud')；验过 → 付 10000 bytes + data
 `{verdict:'fraud', height, challenger}` 给 rollup。
-
 ### 10.3 verdict(h) — rollup
 
 `trigger.address ∈ {dispute_aa, dispute_fill_aa}` ∧ verdict=='fraud'
 ∧ 高度 live ∧ 窗内 ∧ challenger 是合法 32 字符地址
 → frozen_h=2、清 state_root/aa_forest/active_bond/fee_winner、
-  last_submitted=h-1、slash_reward_<challenger> += 5e11。
-
+  last_submitted=h-1、`pool_<operator>` 扣 5e11（不足清零）、
+  slash_reward_<challenger> += 5e11。
 ### 10.4 finalize / escape_finalize(h) — rollup
 
 `{finalize}`：!frozen ∧ root 在 ∧ h == last_finalized+1
-∧ now ≥ submitted_at_h + 3600 → last_finalized=h、sbond += 1e12、
-reward_<fee_winner> += 20000。`{escape_finalize}` 窗口阈值 604800，
+∧ now ≥ submitted_at_h + 3600 → last_finalized=h、
+reward_<fee_winner> += 20000（无 sbond 记账）。`{escape_finalize}` 窗口阈值 604800，
 任意账户，不越过未结欺诈（frozen≠0 bounce 'challenged'）。
 
 ### 10.5 withdraw — vault
@@ -634,12 +641,14 @@ reward_<fee_winner> += 20000。`{escape_finalize}` 窗口阈值 604800，
 `amount + wd_ <= min(collateral, withdrawn)`，`perp_amount` 可选部分领取，
 `wp_` 封顶。`{escape_withdraw}` 弹 `no escape withdraw`。
 
-### 10.6 force / claim — rollup
+### 10.6 pool / force / claim — rollup
 
-`{force, unit_id 64hex}` ≥10000 bytes → `inbox_<id>=timestamp`（重复 bounce
-`already forced`）。claim 三态：`reward|sbond|slash`。
-
----
+`{pool:1}` 净流入（减 10000 bounce 费）累加 `pool_<sender>`，不足 10000
+bounce `need pool`。`{force, unit_id 64hex}` ≥10000 bytes →
+`inbox_<id>=timestamp`（重复 bounce `already forced`）。
+claim 四态：`reward|sbond|slash` 按旧键支付；`pool` 仅链空闲
+（`last_submitted==last_finalized`，否则 bounce `pool busy`）可取，
+全额支付并清零。
 
 ## 11. Witness 树与谓词承诺
 

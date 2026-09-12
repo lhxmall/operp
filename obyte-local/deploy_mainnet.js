@@ -11,8 +11,8 @@
 //     node obyte-local/deploy_mainnet.js   # run issue_perp.js FIRST
 //
 // Needs funded GBYTE (definition posts + 2x20000 bind + smoke). Does NOT
-// send the 1000 GBYTE submit bond. Do not deposit user GBYTE until
-// deployment.json addresses match the audited sources.
+// fund the 1000 GBYTE standing pool here — the operator funds {pool:1} after
+// verifying deployment.json addresses against the audited sources.
 
 const path = require("path");
 const fs = require("fs");
@@ -25,7 +25,7 @@ if (!PERP_ASSET_ID || PERP_ASSET_ID === "PERP_ASSET_ID_HERE" || PERP_ASSET_ID.le
   throw new Error("PERP_ASSET_ID env (44-char base64 asset id) required — run issue_perp.js first");
 
 const CHAIN_ID = "operp-v2";
-const SUBMIT_BOND_GROSS = 10000000010000; // SUBMIT_BOND_NET + 10000 headroom
+const POOL_FUND_GROSS = 10000000010000; // POOL_MIN 1e12 + 10000 fee for {pool:1}
 const CHALLENGE_SECS = 3600;
 
 function readAa(file) {
@@ -137,7 +137,7 @@ async function main() {
     vault_aa_address: vault.address,
     perp_asset_id: PERP_ASSET_ID,
     chain_id: CHAIN_ID,
-    submit_bond_gross: SUBMIT_BOND_GROSS,
+    pool_fund_gross: POOL_FUND_GROSS,
     challenge_secs: CHALLENGE_SECS,
     deployed_at: new Date().toISOString(),
   };
@@ -152,7 +152,7 @@ async function main() {
   } catch (e) {
     console.log("vault smoke bounced (AA responded):", String(e).slice(0, 200));
   }
-  console.log("OK: mainnet deploy complete. Do NOT send the 1000 GBYTE submit bond here.");
+  console.log("OK: mainnet deploy complete. Fund the 1000 GBYTE standing pool with {pool:1} before submitting.");
   process.exit(0);
 }
 

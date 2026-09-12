@@ -126,7 +126,7 @@ async function main() {
     perp_asset_id: PERP_ASSET_ID,
     challenge_secs: 3600,
     chain_id: CHAIN_ID,
-    submit_bond_gross: 10000000010000,
+    pool_fund_gross: 10000000010000,
     deployed_at: new Date().toISOString(),
   };
   console.log("NOTE: mainnet deployment requires a formal AA audit.");

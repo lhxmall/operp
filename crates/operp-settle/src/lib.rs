@@ -561,12 +561,7 @@ impl Batch {
         }
         let raw: Vec<Vec<u8>> = blobs
             .iter()
-            .map(|b| {
-                use base64::Engine as _;
-                base64::engine::general_purpose::STANDARD
-                    .decode(b)
-                    .unwrap_or_default()
-            })
+            .map(|b| decode_package_blob(b).unwrap_or_default())
             .collect();
         let root = data_root_hex(&raw);
         let mut header = self.header_json();
@@ -780,8 +775,26 @@ pub fn evidences_from_payload(
         }
     }
 }
-/// Greedy pack: each package = base64 of `\n`-joined frames with
-/// `get_json_source({"package_blob": b64}).len() <= cap`.
+/// Greedy pack: each package = base64(gzip(`\n`-joined frames)) with
+/// `get_json_source({"package_blob": b64}).len() <= cap`. `data_root` hashes
+/// the gunzipped concatenated frame bytes (content, not the gzip wrapper)
+/// so JS `zlib.gunzipSync` + concat + sha256 matches.
+pub fn gzip_bytes(raw: &[u8]) -> Vec<u8> {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(raw).expect("gzip encode");
+    enc.finish().expect("gzip finish")
+}
+pub fn gunzip_bytes(gz: &[u8]) -> Result<Vec<u8>, SettleError> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut dec = GzDecoder::new(gz);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)
+        .map_err(|_| SettleError::RootMismatch)?;
+    Ok(out)
+}
 pub fn pack_frames_with_cap(frames: &[String], cap: usize) -> Vec<String> {
     use base64::Engine as _;
     let mut out: Vec<String> = Vec::new();
@@ -792,7 +805,8 @@ pub fn pack_frames_with_cap(frames: &[String], cap: usize) -> Vec<String> {
             parts.push(e.as_str());
         }
         let joined = parts.join("\n");
-        let b64 = base64::engine::general_purpose::STANDARD.encode(joined.as_bytes());
+        let gz = gzip_bytes(joined.as_bytes());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&gz);
         let obj = serde_json::json!({"package_blob": b64});
         crate::obyte_hash::get_json_source(&obj).len()
     };
@@ -805,7 +819,8 @@ pub fn pack_frames_with_cap(frames: &[String], cap: usize) -> Vec<String> {
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        out.push(base64::engine::general_purpose::STANDARD.encode(joined.as_bytes()));
+        let gz = gzip_bytes(joined.as_bytes());
+        out.push(base64::engine::general_purpose::STANDARD.encode(&gz));
         cur.clear();
     };
     for f in frames {
@@ -816,7 +831,7 @@ pub fn pack_frames_with_cap(frames: &[String], cap: usize) -> Vec<String> {
     }
     flush(&mut cur, &mut out);
     if out.is_empty() {
-        out.push(base64::engine::general_purpose::STANDARD.encode(b""));
+        out.push(base64::engine::general_purpose::STANDARD.encode(gzip_bytes(b"")));
     }
     out
 }
@@ -824,13 +839,22 @@ pub fn pack_frames_with_cap(frames: &[String], cap: usize) -> Vec<String> {
 pub fn pack_frames(frames: &[String]) -> Vec<String> {
     pack_frames_with_cap(frames, PACK_SOURCE_CAP)
 }
-/// `data_root` = hex(sha256 of concatenated raw blob bytes in package order).
+/// `data_root` = hex(sha256 of concatenated gunzipped blob bytes in package order).
 pub fn data_root_hex(blobs: &[Vec<u8>]) -> String {
     let mut all = Vec::new();
     for b in blobs {
         all.extend_from_slice(b);
     }
     hex::encode(sha256(&all))
+}
+/// Decode one package blob: base64 → gunzip → raw frame bytes. Invalid gzip
+/// maps to `BindingMismatch` at the caller (`RootMismatch` here).
+pub fn decode_package_blob(b64: &str) -> Result<Vec<u8>, SettleError> {
+    use base64::Engine as _;
+    let gz = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|_| SettleError::RootMismatch)?;
+    gunzip_bytes(&gz)
 }
 /// Parse one frame `{"u","t","o","c","f"?,"l"?,"e"?}`. Returns
 /// (unit, trace, ops, counts, fills, leaves, evidence).
@@ -1791,10 +1815,7 @@ mod tests {
         batch.deposit_evidences = vec![ev];
         let (header, blobs) = batch.temp_data_packages().unwrap();
         assert_eq!(blobs.len(), 1);
-        use base64::Engine as _;
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(&blobs[0])
-            .unwrap();
+        let raw = decode_package_blob(&blobs[0]).unwrap();
         let text = String::from_utf8(raw).unwrap();
         let frames: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
         let rebuilt = batch_from_frames(&header, &frames).unwrap();
@@ -2014,10 +2035,7 @@ mod tests {
         assert_eq!(frames.len(), batch.units.len());
         let (header, blobs) = batch.temp_data_packages().unwrap();
         assert_eq!(blobs.len(), 1);
-        use base64::Engine as _;
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(&blobs[0])
-            .unwrap();
+        let raw = decode_package_blob(&blobs[0]).unwrap();
         let split: Vec<String> = String::from_utf8(raw)
             .unwrap()
             .split('\n')
@@ -2046,12 +2064,11 @@ mod tests {
         ];
         let packs = pack_frames_with_cap(&frames, 1000);
         assert!(!packs.is_empty());
-        use base64::Engine as _;
         let mut seen: Vec<String> = Vec::new();
         for p in &packs {
             let obj = serde_json::json!({"package_blob": p});
             assert!(crate::obyte_hash::get_json_source(&obj).len() <= 1000);
-            let raw = base64::engine::general_purpose::STANDARD.decode(p).unwrap();
+            let raw = decode_package_blob(p).unwrap();
             for line in String::from_utf8(raw).unwrap().split('\n') {
                 seen.push(line.to_string());
             }

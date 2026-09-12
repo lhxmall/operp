@@ -30,7 +30,12 @@ pub const FUNDING_CAP_BPS: i64 = 50;
 pub const CHALLENGE_SECS: u64 = 3600;
 pub const OBYTE_STABILITY_SECS: u64 = 600;
 pub const BATCH_INTERVAL_MS: u64 = 2000;
-pub const BATCH_MAX_UNITS: u32 = 8192;
+pub const BATCH_MAX_UNITS: u32 = 200_000;
+/// Standing pool floor: an address may submit while `pool_<addr> >= POOL_MIN`
+/// (pool, not per-height lock).
+pub const POOL_MIN: u64 = SUBMIT_BOND_NET;
+/// Max in-flight heights: `last_submitted - last_finalized < POOL_MAX_INFLIGHT`.
+pub const POOL_MAX_INFLIGHT: u64 = 50;
 pub const MAX_PARENTS: usize = 2;
 /// Hard depth cap for the AA-facing hex-domain merkle tree. Mirrors the
 /// vault AA's `reduce(..., 18, ...)` and ocore's fatal behavior on arrays

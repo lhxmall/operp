@@ -124,7 +124,7 @@ opt-in.
 
 ### 4. Settlement: two roots per batch
 
-Every batch (≤ BATCH_MAX_UNITS=8192 units / 2 s) produces a `Checkpoint`:
+Every batch (≤ BATCH_MAX_UNITS=200000 units / 2 s) produces a `Checkpoint`:
 
 ```text
 { height, prev_state_hash, state_root, aa_root, last_unit, seq,
@@ -178,20 +178,26 @@ replica can audit the operator.
 
 Three AAs (`CHAIN_ID=operp-v2`). **No lock, no pay-to-kill.** Collateral is GBYTE.
 
-1. **submit (rollup)** — combined unit: header `temp_data` (`frames_blob` XOR
-   `packages`+`data_root`) + `{submit, height, roots,
-   trace/units/ops/fills roots}` with the 1000 GBYTE submit bond.
+1. **pool + submit (rollup)** — standing pool `pool_<addr> >= 1000 GBYTE`
+   (`{pool:1}` funds net inbound minus 10000 fee); each submit pays only the
+   10000 bounce fee. Occupancy `last_submitted-last_finalized < 50` lets the
+   poster pipeline h+1 before h finalizes. Combined unit: header `temp_data`
+   (`frames_blob` XOR `packages`+`data_root`, gzip-compressed frames) +
+   `{submit, height, roots, trace/units/ops/fills roots}`.
    Multi-package heights post package units first; the da_unit carries the
    header + submit in one unit.
-   `h == last_submitted+1`; an occupied, un-failed height bounces
-   `height taken`. Window: `submitted_at + 3600 s`.
+   `h == last_submitted+1`; a live height re-submit bounces
+   `height taken` (fraud-reopened successors overwrite freely). Window:
+   `submitted_at + 3600 s`.
 2. **Fraud (dispute / dispute_fill)** — inside the window anyone submits a
    one-shot predicate (deposit/withdraw/omit/fill_math/ghost/skip). Failing
    predicates bounce `no fraud` and leave the height alone; a proven one
-   forwards `{verdict:'fraud'}` and the rollup slashes half the submit bond
-   and reopens the height. No response rounds.
+   forwards `{verdict:'fraud'}` and the rollup slashes 5e11 off the
+   operator's standing pool and reopens the height. No response rounds.
 3. **finalize (rollup)** — after `submitted_at+3600` with no verdict:
-   `last_finalized=h`, bond released, 20 000-byte race reward.
+   `last_finalized=h`, 20 000-byte race reward, no sbond credit.
+   Pool is reclaimed via `{claim:'pool'}` when the chain is idle
+   (`last_submitted==last_finalized`).
    `{escape_finalize}` remains the 7-day stall hatch.
 4. **withdraw (vault)** — reads `var[ROLLUP]['aa_forest_'||last_finalized]`;
    the 16-deep Merkle fold and the W anti-replay cap are unchanged.

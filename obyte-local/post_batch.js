@@ -18,6 +18,7 @@
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const zlib = require("zlib");
 // ===== CONFIG: PERP governance asset ================================
 // Set to the real PERP asset id once issued; must match deploy_testnet.js.
 // devnet (default) has no issued asset: fall back to 'base' exactly like
@@ -207,21 +208,22 @@ async function main() {
   });
   const PACK_CAP = 4000000;
   const srcLen = (b64) => Buffer.byteLength(getJsonSourceString({ package_blob: b64 }), "utf8");
+  const gzB64 = (text) => zlib.gzipSync(Buffer.from(text, "utf8")).toString("base64");
   const packages = [];
   let cur = [];
   const flush = () => {
     if (!cur.length) return;
-    packages.push(Buffer.from(cur.join("\n"), "utf8").toString("base64"));
+    packages.push(gzB64(cur.join("\n")));
     cur = [];
   };
   for (const f of stamped) {
     const trial = cur.length ? cur.join("\n") + "\n" + f : f;
-    const b64 = Buffer.from(trial, "utf8").toString("base64");
+    const b64 = gzB64(trial);
     if (cur.length && srcLen(b64) > PACK_CAP) flush();
     cur.push(f);
   }
   flush();
-  const rawBlobs = packages.map((b) => Buffer.from(b, "base64"));
+  const rawBlobs = packages.map((b) => zlib.gunzipSync(Buffer.from(b, "base64")));
   const dataRoot = crypto.createHash("sha256").update(Buffer.concat(rawBlobs)).digest("hex");
   const header = Object.assign({}, batchData);
   delete header.frames;
@@ -286,12 +288,18 @@ async function main() {
     unit_count: header.unit_count,
     wit_count: header.wit_count,
   };
-  if (header.validity_proof_hash) submitData.validity_proof_hash = header.validity_proof_hash;
-  if (header.perp_burned !== undefined) submitData.perp_burned = String(header.perp_burned);
-  // 10000000010000 = 1000000000000 SUBMIT_BOND_NET + 10000 bounce fee headroom.
+  // Standing pool: fund {pool:1} once (POOL_MIN 1e12 + 10000 fee); submits
+  // pay only the 10000 bounce fee. Pipelining allowed while ls-lf < 50.
+  const poolFund = await poster.sendMulti({
+    messages: [{ app: "data", payload: { pool: 1 } }],
+    base_outputs: [{ address: rollup, amount: 10000000010000 }],
+  });
+  if (poolFund.error) throw new Error("pool fund failed: " + poolFund.error);
+  await network.witnessUntilStable(poolFund.unit);
+  console.log("pool funded:", poolFund.unit);
   const r = await poster.sendMulti({
     messages: [tempDataMessage(header), { app: "data", payload: submitData }],
-    base_outputs: [{ address: rollup, amount: 10000000010000 }],
+    base_outputs: [{ address: rollup, amount: 10000 }],
   });
   if (r.error) throw new Error("combined da_unit failed: " + r.error);
   const daUnit = r.unit;

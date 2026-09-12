@@ -146,10 +146,12 @@ pub fn verify_da_binding(da: &DaUnit) -> Result<(), WatchError> {
     Ok(())
 }
 /// Assemble a multi-package header's blob: fetch each `packages` hash via
-/// `get_joint`, require its `package_blob` string, concat raw bytes, and
-/// check hex(sha256(concat)) against `data_root`. Transport errors map to
-/// `HubUnavailable` (caller backs off); bad content maps to
-/// `BindingMismatch`. No retries here — the poll loop owns backoff.
+/// `get_joint`, require its `package_blob` string (base64(gzip(frames))),
+/// gunzip, concat raw frame bytes, and check hex(sha256(concat)) against
+/// `data_root`. Returns base64(gzip(concat)) so it splices as `frames_blob`.
+/// Transport errors map to `HubUnavailable` (caller backs off); bad content
+/// (bad base64, invalid gzip, root mismatch) maps to `BindingMismatch`.
+/// No retries here — the poll loop owns backoff.
 pub fn assemble_frames<H: HubClient>(
     hub: &H,
     data: &serde_json::Value,
@@ -179,9 +181,10 @@ pub fn assemble_frames<H: HubClient>(
             .ok_or_else(|| {
                 WatchError::BindingMismatch("package joint missing package_blob".into())
             })?;
-        let raw = base64::engine::general_purpose::STANDARD
+        let gz = base64::engine::general_purpose::STANDARD
             .decode(b64)
             .map_err(|_| WatchError::BindingMismatch("package_blob not base64".into()))?;
+        let raw = gunzip_blob(&gz)?;
         concat.extend_from_slice(&raw);
     }
     use sha2::{Digest, Sha256};
@@ -191,7 +194,7 @@ pub fn assemble_frames<H: HubClient>(
             "data_root mismatch: want {want} got {got}"
         )));
     }
-    Ok(base64::engine::general_purpose::STANDARD.encode(&concat))
+    Ok(base64::engine::general_purpose::STANDARD.encode(&operp_settle::gzip_bytes(&concat)))
 }
 
 /// Replay a posted batch against the running engine and assert it reproduces
@@ -208,18 +211,25 @@ pub fn replay_and_check(
 }
 
 /// Rebuild a [`Batch`] from the temp_data header JSON. The new wire stores
-/// scalars plus `frames_blob` (single package). Multi-package
-/// (`packages`+`data_root`) arrives via `assemble_frames` before this call —
-/// legacy `units`-array headers are rejected.
+/// scalars plus `frames_blob` (single package, base64(gzip(frames))).
+/// Multi-package (`packages`+`data_root`) arrives via `assemble_frames`
+/// before this call — legacy `units`-array headers are rejected. `data_root`
+/// covers gunzipped frame bytes, not the gzip wrapper.
+pub fn gunzip_blob(gz: &[u8]) -> Result<Vec<u8>, WatchError> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut dec = GzDecoder::new(gz);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)
+        .map_err(|_| WatchError::BindingMismatch("package_blob not gzip".into()))?;
+    Ok(out)
+}
 pub fn batch_from_data(data: &serde_json::Value) -> Result<Batch, SettleError> {
     if data.get("units").is_some() {
         return Err(SettleError::RootMismatch);
     }
     let blob = get_str(data, "frames_blob")?;
-    use base64::Engine as _;
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(blob)
-        .map_err(|_| SettleError::RootMismatch)?;
+    let raw = operp_settle::decode_package_blob(blob)?;
     let text = String::from_utf8(raw).map_err(|_| SettleError::RootMismatch)?;
     let frames: Vec<String> = if text.is_empty() {
         Vec::new()
@@ -490,20 +500,16 @@ mod tests {
         use sha2::{Digest, Sha256};
         let f1 = "{\"u\":1}".to_string();
         let f2 = "{\"u\":2}".to_string();
-        let b1 = base64::engine::general_purpose::STANDARD.encode(f1.as_bytes());
-        let b2 = base64::engine::general_purpose::STANDARD.encode(f2.as_bytes());
-        let r1 = base64::engine::general_purpose::STANDARD
-            .decode(&b1)
-            .unwrap();
-        let r2 = base64::engine::general_purpose::STANDARD
-            .decode(&b2)
-            .unwrap();
+        let b1 = base64::engine::general_purpose::STANDARD
+            .encode(&operp_settle::gzip_bytes(f1.as_bytes()));
+        let b2 = base64::engine::general_purpose::STANDARD
+            .encode(&operp_settle::gzip_bytes(f2.as_bytes()));
         let mut concat = Vec::new();
-        concat.extend_from_slice(&r1);
-        concat.extend_from_slice(&r2);
+        concat.extend_from_slice(f1.as_bytes());
+        concat.extend_from_slice(f2.as_bytes());
         let root = hex::encode(Sha256::digest(&concat));
-        let h1 = hex::encode(Sha256::digest(&r1));
-        let h2 = hex::encode(Sha256::digest(&r2));
+        let h1 = hex::encode(Sha256::digest(f1.as_bytes()));
+        let h2 = hex::encode(Sha256::digest(f2.as_bytes()));
         let header = serde_json::json!({"packages": [h1, h2], "data_root": root});
         let pkg = |b: &str| {
             serde_json::json!({
@@ -519,11 +525,23 @@ mod tests {
             ]),
         };
         let got = assemble_frames(&hub, &header).unwrap();
-        let raw = base64::engine::general_purpose::STANDARD
+        let gz = base64::engine::general_purpose::STANDARD
             .decode(&got)
             .unwrap();
+        let raw = gunzip_blob(&gz).unwrap();
         assert_eq!(String::from_utf8(raw).unwrap(), format!("{f1}{f2}"));
         let bad = serde_json::json!({"packages": [h1], "data_root": "00".repeat(32)});
         assert!(assemble_frames(&hub, &bad).is_err());
+        // Invalid gzip maps to BindingMismatch, not HubUnavailable.
+        let not_gz = base64::engine::general_purpose::STANDARD.encode(b"not-gzip");
+        let hub2 = MockHub {
+            vars: Default::default(),
+            joints: std::collections::HashMap::from([(h1.clone(), pkg(&not_gz))]),
+        };
+        let hdr2 = serde_json::json!({"packages": [h1], "data_root": root});
+        assert!(matches!(
+            assemble_frames(&hub2, &hdr2),
+            Err(WatchError::BindingMismatch(_))
+        ));
     }
 }

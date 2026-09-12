@@ -110,7 +110,7 @@ TWAP 环与连续偏移罚没已上线（激活门控），外部锚为可选启
 
 ### 4. 结算：每批双根
 
-每批（≤ BATCH_MAX_UNITS=8192 units / 2 s）产出 `Checkpoint`：
+每批（≤ BATCH_MAX_UNITS=200000 units / 2 s）产出 `Checkpoint`：
 
 ```text
 { height, prev_state_hash, state_root, aa_root, last_unit, seq,
@@ -152,9 +152,9 @@ operator。
 
 三个 AA（`CHAIN_ID=operp-v2`）。**没有 lock，没有付钱否决。** 保证金是 GBYTE。
 
-1. **submit（rollup）** — 组合单元：header `temp_data`（`frames_blob` 或 `packages`+`data_root`）+ `{submit, height, 双根, trace/units/ops/fills 根}`，附 1000 GBYTE 提交债。多包时 package 单元先发，da_unit 以一单元承载 header + submit。`h == last_submitted+1`；已占位且未 `frozen=2` → `height taken`。窗从 `submitted_at` 起算 3600 s。
-2. **揭发（dispute / dispute_fill）** — 窗内任何人提交一枪谓词（deposit/withdraw/omit/fill_math/ghost/skip）。验不过 bounce `no fraud`，高度不动；验过则 `{verdict:'fraud'}`，rollup 罚没一半提交债、高度重开。无应诉回合。
-3. **finalize（rollup）** — `submitted_at+3600` 且未冻结 → `last_finalized=h`，退提交债，竞速奖 20000 bytes。`{escape_finalize}` 为 7 天停滞门。
+1. **资金池 + submit（rollup）** — 常备池 `pool_<addr> >= 1000 GBYTE`（`{pool:1}` 按净流入减 10000 fee 累加）；每次提交只付 10000 bounce 费。在途 `last_submitted-last_finalized < 50` 允许 h 未终结就发 h+1。组合单元：header `temp_data`（`frames_blob` 或 `packages`+`data_root`，gzip 帧）+ `{submit, height, 双根, trace/units/ops/fills 根}`。多包时 package 单元先发，da_unit 以一单元承载 header + submit。`h == last_submitted+1`；活高度重发 → `height taken`（欺诈重开的后续高度可自由覆盖）。窗从 `submitted_at` 起算 3600 s。
+2. **揭发（dispute / dispute_fill）** — 窗内任何人提交一枪谓词（deposit/withdraw/omit/fill_math/ghost/skip）。验不过 bounce `no fraud`，高度不动；验过则 `{verdict:'fraud'}`，rollup 从 operator 常备池扣 5e11、高度重开。无应诉回合。
+3. **finalize（rollup）** — `submitted_at+3600` 且未冻结 → `last_finalized=h`，竞速奖 20000 bytes，不再记 sbond。链空闲（`last_submitted==last_finalized`）时 `{claim:'pool'}` 取回池子。`{escape_finalize}` 为 7 天停滞门。
 4. **withdraw（vault）** — 只读 `var[ROLLUP]['aa_forest_'||last_finalized]`，原 16 深 Merkle 折叠与 W 防重放不变。`{escape_withdraw}` 仍弹 `no escape withdraw`。
 5. **force（rollup inbox）** — `{force, unit_id}` 抗审查；漏收可 P-omit。
 

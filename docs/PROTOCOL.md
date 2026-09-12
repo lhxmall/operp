@@ -125,7 +125,7 @@ reduce_only      : equity·10000 ≤ mm·12000
 
 ## 3. 结算层：双根承诺
 
-每 ≤8192 units（BATCH_MAX_UNITS）/ 2 秒切一个批次，产出 Checkpoint：
+每 ≤200000 units（BATCH_MAX_UNITS）/ 2 秒切一个批次，产出 Checkpoint：
 
 ```text
 { height, prev_state_hash, state_root, aa_root,
@@ -190,7 +190,7 @@ set replay.height = checkpoint.height
 assert last_unit 一致 ∧ replay.state_root == root   # RootMismatch
 ```
 
-TooManyUnits 上限（8192）在 from_applied 就挡住超大批次。
+TooManyUnits 上限（200000）在 from_applied 就挡住超大批次。
 
 ## 4. 结算层：三个 AA（CHAIN_ID=operp-v2）
 
@@ -204,7 +204,8 @@ submitted_at_h, state_root_h, aa_forest_h (1024 hex), prev_h,
 da_unit_h                     # DA 绑定 = 组合单元 hash
 active_bond_h, fee_winner_h, frozen_h ∈ {∅=live, 2=failed}
 inbox_<unit_id_hex>, inbox_upto_h
-sbond_<addr>, reward_<addr>, slash_reward_<addr>
+pool_<addr>                    # 常备池：提交门 pool>=1e12
+sbond_<addr>, reward_<addr>, slash_reward_<addr>   # sbond 仅遗留路径
 ```
 
 侧链 ChainState（PERP 治理，§7）不变：markets、perp_balances/supply/burned、
@@ -214,13 +215,17 @@ proposals、oracle 账本。金库 vault AA 只有 `deposit` / `withdraw`，提�
 ### 生命周期（高度 h）
 
 ```
+pool       {pool:1} → pool_<trigger.address> += 输出-10000（bounce 费之外净额）
+
 submit(h)    h == last_submitted+1 ∧ chain_id='operp-v2' ∧ 双根 + 六个 44-char
              承诺根 ∧ 组合单元 = header temp_data（`frames_blob` 或
-             `packages`+`data_root`）+ submit；多包时 package 单元先发，
+             `packages`+`data_root`，gzip 帧）+ submit；多包时 package 单元先发，
              da_unit 只钉哈希列表
-             ∧ 输出-10000 ≥ 1000000000000（SUBMIT_BOND_NET）
+             ∧ 输出 ≥ 10000（仅 bounce 费）∧ pool_<sender> ≥ 1000000000000
+             ∧ last_submitted-last_finalized < 50（在途占用）
              → 写全部 <h> 键、da_unit_h=trigger.unit、last_submitted=h；
-               已占位且 frozen≠2 → bounce('height taken')；
+               活高度重发（h ≤ last_submitted 且 frozen≠2）→ bounce('height taken')；
+               欺诈重开的后续高度可自由覆盖；
                prev 必须等于上一高度 state_root（除非上一高度已 frozen=2）
 
 fraud(h)     窗内（submitted_at+3600）任何人打 dispute / dispute_fill：
@@ -228,11 +233,15 @@ fraud(h)     窗内（submitted_at+3600）任何人打 dispute / dispute_fill：
              验不过 → bounce('no fraud')，高度不动；
              验过 → dispute 付 10000 bytes + {verdict:'fraud',height,challenger}
                → rollup frozen_h=2、清根、last_submitted=h-1、
+                 pool_<operator> 扣 500000000000（不足则清零）、
                  slash_reward_<challenger> += 500000000000
 
 finalize(h)  !frozen ∧ h == last_finalized+1 ∧ now ≥ submitted_at_h+3600
              （escape_finalize 用 604800）
-             → last_finalized=h；sbond_<active_bond> += 1e12；reward += 20000
+             → last_finalized=h；reward += 20000（无 sbond 记账）
+
+claim        'reward'|'sbond'|'slash' 按旧键支付；'pool' 仅链空闲
+             （last_submitted==last_finalized）可取，全额支付并清零
 
 withdraw     vault：leaf_account==trigger.address；
              amount + wd_<addr> ≤ min(collateral, withdrawn)；
@@ -246,15 +255,15 @@ force(id)    rollup：{force, unit_id 64hex} → inbox_<id>=timestamp；
 ```
 
 **没有 lock，没有 `{challenge:1}`，没有应诉。** 揭发必须算对那一笔；
-诚实根杀不掉。债券是资本门槛，不是许可名单。
+诚实根杀不掉。常备池是资本门槛，不是许可名单。
 
 关键安全性质：
 
 - **余额权威是 proof 叶子**——operator 腐化也改不了提款上限。
 - **leaf_account == trigger.address**：只能为自己证明。
 - **无 owner key**：升级 = 部署新 AA + 同一 finalized 提款路径迁资金。
-- 常量注释映射 Rust 权威定义（CHAIN_ID / SUBMIT_BOND_NET / CHALLENGE_SECS /
-  ESCAPE_STALL_SECS），避免双源漂移。
+- 常量注释映射 Rust 权威定义（CHAIN_ID / POOL_MIN / POOL_MAX_INFLIGHT /
+  SUBMIT_BOND_NET / CHALLENGE_SECS / ESCAPE_STALL_SECS），避免双源漂移。
 
 Oscript 实现细节（踩过的坑）：
 
