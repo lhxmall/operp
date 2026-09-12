@@ -45,6 +45,9 @@ function chashOf(aaSource) {
   return objectHash.getChash160(["autonomous agent", parsed]);
 }
 const ROLLUP_ADDR = chashOf(readDef("operp_rollup.aa"));
+
+const POOL_FUND_GROSS = 10000000010000; // 1x POOL_MIN + fee: no fraud here, no slash
+const SUBMIT_FEE = 10000;
 // AA gates witness roots at 44 chars (base64), state roots at 64 hex.
 // Values need not be real trees here — no predicates run in this file.
 const b64root = (s) => Buffer.from(sha256Hex(s), "hex").toString("base64");
