@@ -673,6 +673,7 @@ async function main() {
   const rawA = Buffer.from(blobA, "base64");
   const rawB = Buffer.from(blobB, "base64");
   const shaHex = (b) => crypto.createHash("sha256").update(b).digest("hex");
+  const h3pkg = { chain_id: "operp-v2", height: 3, packages: [shaHex(rawA), shaHex(rawB)], data_root: shaHex(Buffer.concat([rawA, rawB])) };
   const sd3pkg = submitData(3, STATE_ROOT, STATE_ROOT);
   sd3pkg.ops_root = PKG_OPS_ROOT;
   sd3pkg.trace_root = PKG_TRACE_ROOT;
