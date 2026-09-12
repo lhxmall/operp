@@ -30,7 +30,7 @@ pub const FUNDING_CAP_BPS: i64 = 50;
 pub const CHALLENGE_SECS: u64 = 3600;
 pub const OBYTE_STABILITY_SECS: u64 = 600;
 pub const BATCH_INTERVAL_MS: u64 = 2000;
-pub const BATCH_MAX_UNITS: u32 = 512;
+pub const BATCH_MAX_UNITS: u32 = 8192;
 pub const MAX_PARENTS: usize = 2;
 /// Hard depth cap for the AA-facing hex-domain merkle tree. Mirrors the
 /// vault AA's `reduce(..., 18, ...)` and ocore's fatal behavior on arrays

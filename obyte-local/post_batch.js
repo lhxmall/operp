@@ -100,7 +100,10 @@ const { hub } = require(path.join(aaRoot, "node_modules", "ocore", "network.js")
 async function buildDepositEvidences(batchData, vaultAddress) {
   const evidences = [];
   const seen = new Set();
-  const units = batchData.units || [];
+  const frameUnits = Array.isArray(batchData.frames)
+    ? batchData.frames.map((f) => { try { return JSON.parse(f).u; } catch (_) { return null; } }).filter(Boolean)
+    : [];
+  const units = (batchData.units && batchData.units.length ? batchData.units : frameUnits) || [];
   for (const u of units) {
     const op = u.op || {};
     const isPerp = op.GovDeposit !== undefined;
@@ -183,48 +186,104 @@ async function main() {
   const vault = network.agent.vault;
   process.env.OPERP_VAULT_AA = vault;
   console.log("rollup", rollup, "vault", vault);
-  // Step4: build deposit_evidences BEFORE posting so the temp_data reveal
-  // carries them (watchers verify unit_hash(joint) == aa_unit independently).
-  const evidences = await buildDepositEvidences(batchData, vault);
-  if (evidences.length) {
-    batchData.deposit_evidences = evidences;
-    console.log("deposit_evidences:", batchData.deposit_evidences.length);
-  } else {
-    delete batchData.deposit_evidences;
+  // Frames come from export_batch (`frames` array). Embed evidences into
+  // their Deposit/GovDeposit frames, pack so each package source <= 4MB,
+  // post each package unit first, then the header da_unit nails the hash list.
+  const frames = Array.isArray(batchData.frames) ? batchData.frames.slice() : [];
+  if (!frames.length) throw new Error("batch.json is missing the frames array (re-run export_batch)");
+  const evByAnchor = new Map();
+  for (const e of await buildDepositEvidences(batchData, vault)) evByAnchor.set(String(e.aa_unit).toLowerCase(), e);
+  const stamped = frames.map((f) => {
+    let o;
+    try { o = JSON.parse(f); } catch (_) { return f; }
+    const dep = (o.u && o.u.op && (o.u.op.Deposit || o.u.op.GovDeposit)) || null;
+    if (dep) {
+      const raw = dep.aa_unit;
+      const hex = Array.isArray(raw) ? Buffer.from(raw).toString("hex") : raw;
+      const ev = evByAnchor.get(String(hex || "").toLowerCase());
+      if (ev) o.e = ev;
+    }
+    return JSON.stringify(o);
+  });
+  const PACK_CAP = 4000000;
+  const srcLen = (b64) => Buffer.byteLength(getJsonSourceString({ package_blob: b64 }), "utf8");
+  const packages = [];
+  let cur = [];
+  const flush = () => {
+    if (!cur.length) return;
+    packages.push(Buffer.from(cur.join("\n"), "utf8").toString("base64"));
+    cur = [];
+  };
+  for (const f of stamped) {
+    const trial = cur.length ? cur.join("\n") + "\n" + f : f;
+    const b64 = Buffer.from(trial, "utf8").toString("base64");
+    if (cur.length && srcLen(b64) > PACK_CAP) flush();
+    cur.push(f);
   }
-
-  // 1+2 COMBINED: DA reveal + submit in ONE unit — block order = this
+  flush();
+  const rawBlobs = packages.map((b) => Buffer.from(b, "base64"));
+  const dataRoot = crypto.createHash("sha256").update(Buffer.concat(rawBlobs)).digest("hex");
+  const header = Object.assign({}, batchData);
+  delete header.frames;
+  delete header.units;
+  delete header.trace;
+  delete header.ops;
+  delete header.counts;
+  delete header.fills;
+  delete header.leaf_trace;
+  delete header.deposit_evidences;
+  const pkgHashes = rawBlobs.map((b) => crypto.createHash("sha256").update(b).digest("hex"));
+  if (packages.length === 1) {
+    header.frames_blob = packages[0];
+    header.data_root = dataRoot;
+  } else {
+    header.packages = pkgHashes;
+    header.data_root = dataRoot;
+  }
+  console.log("canonical data_hash:", obyteDataHash(header), "data_length:", obyteDataLength(header));
+  for (let i = 0; i < packages.length; i++) {
+    if (packages.length > 1) {
+      const pr = await poster.sendMulti({
+        messages: [tempDataMessage({ package_blob: packages[i] })],
+        base_outputs: [{ address: await poster.getAddress(), amount: 10000 }],
+      });
+      if (pr.error) throw new Error("package post failed: " + pr.error);
+      await network.witnessUntilStable(pr.unit);
+      console.log("package posted:", pr.unit, pkgHashes[i].slice(0, 12));
+    }
+  }
+  // 1+2 COMBINED: header DA reveal + submit in ONE unit — block order = this
   // unit's order. The AA records var['da_unit_<h>'] = this unit's hash, so
   // the root provably points at exactly this temp_data package. First
   // stable combined unit wins the height ('height taken' otherwise).
-  const shardRoots = batchData.aa_shard_roots;
+  const shardRoots = header.aa_shard_roots;
   if (!Array.isArray(shardRoots) || shardRoots.length !== 16 ||
       !shardRoots.every((r) => typeof r === "string" && /^[0-9a-f]{64}$/.test(r)))
     throw new Error("batch.json is missing a valid 16-entry aa_shard_roots array");
   const aaForest = shardRoots.join("");
   const submitData = {
     submit: 1,
-    chain_id: batchData.chain_id || "operp-v2",
-    height: batchData.height,
-    prev_state_hash: batchData.prev_state_hash,
-    state_root: batchData.state_root,
+    chain_id: header.chain_id || "operp-v2",
+    height: header.height,
+    prev_state_hash: header.prev_state_hash,
+    state_root: header.state_root,
     aa_forest: aaForest,
-    assertion_version: batchData.assertion_version || 1,
-    wit_root: batchData.wit_root,
-    trace_root: batchData.trace_root,
-    units_root: batchData.units_root,
-    units_set_root: batchData.units_set_root,
-    ops_root: batchData.ops_root,
-    fills_root: batchData.fills_root,
-    counts_root: batchData.counts_root,
-    unit_count: batchData.unit_count,
-    wit_count: batchData.wit_count,
+    assertion_version: header.assertion_version || 1,
+    wit_root: header.wit_root,
+    trace_root: header.trace_root,
+    units_root: header.units_root,
+    units_set_root: header.units_set_root,
+    ops_root: header.ops_root,
+    fills_root: header.fills_root,
+    counts_root: header.counts_root,
+    unit_count: header.unit_count,
+    wit_count: header.wit_count,
   };
-  if (batchData.validity_proof_hash) submitData.validity_proof_hash = batchData.validity_proof_hash;
-  if (batchData.perp_burned !== undefined) submitData.perp_burned = String(batchData.perp_burned);
+  if (header.validity_proof_hash) submitData.validity_proof_hash = header.validity_proof_hash;
+  if (header.perp_burned !== undefined) submitData.perp_burned = String(header.perp_burned);
   // 10000000010000 = 1000000000000 SUBMIT_BOND_NET + 10000 bounce fee headroom.
   const r = await poster.sendMulti({
-    messages: [tempDataMessage(batchData), { app: "data", payload: submitData }],
+    messages: [tempDataMessage(header), { app: "data", payload: submitData }],
     base_outputs: [{ address: rollup, amount: 10000000010000 }],
   });
   if (r.error) throw new Error("combined da_unit failed: " + r.error);
@@ -234,7 +293,7 @@ async function main() {
   console.log("da_unit:", daUnit);
   // 2. challenge window then finalize (no lock in operp-v2)
   await network.timetravel({ shift: "3600s" });
-  await trigger(poster, { finalize: 1, height: batchData.height }, undefined, rollup);
+  await trigger(poster, { finalize: 1, height: header.height }, undefined, rollup);
 
   // 3. claim the operator race reward
   const claim = await poster.triggerAaWithData({

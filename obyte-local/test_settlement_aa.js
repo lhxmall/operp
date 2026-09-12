@@ -241,7 +241,7 @@ async function main() {
     .with.agent({ dispute: DISPUTE_SRC })
     .with.agent({ fill: FILL_SRC })
     .with.agent({ vault: VAULT_SRC })
-    .with.wallet({ operator: 1e14 })
+    .with.wallet({ operator: 2e14 })
     .with.wallet({ challenger: 1e13 })
     .run();
   const { operator, challenger } = network.wallet;
@@ -653,13 +653,95 @@ async function main() {
   if (Number(st.frozen_3) !== 2) throw new Error("negative-price fill_math fraud did not freeze height");
   console.log("13a. fill_math negative-price dishonest → frozen=3 via fill AA");
 
-  // ---- 14. re-submit + finalize after fraud works -------------------------
+  // ---- 14. two-package height: deposit-fraud predicate fires, height fails --
+  // h3 was frozen by 13a, so last_submitted=2 and a fresh h3 submit is legal.
+  // Two 1-unit packages post first (JS join+base64, no helper binary), then
+  // the da_unit header nails the real package hashes + data_root. The fraud
+  // verdict proves the multi-package DA reveal feeds the same predicate path
+  // as single-package inline.
+  const PKG_OP = "d:" + DEP_ACCT + ":100000";
+  const PKG_OPS = pad2([PKG_OP], "pkgops");
+  const PKG_OPS_ROOT = merkle.getMerkleRoot(PKG_OPS);
+  const PKG_POST = pad2([`acct:${DEP_ACCT}:1000000:0:0`], "pkgpost");
+  const PKG_WIT = merkle.getMerkleRoot(PKG_POST);
+  const PKG_TRACE = pad2([PKG_WIT], "pkgtrace");
+  const PKG_TRACE_ROOT = merkle.getMerkleRoot(PKG_TRACE);
+  const frameA = JSON.stringify({ u: { op: "a" }, t: "x", o: PKG_OP, c: "1" });
+  const frameB = JSON.stringify({ u: { op: "b" }, t: "y", o: PKG_OP, c: "1" });
+  const blobA = Buffer.from(frameA, "utf8").toString("base64");
+  const blobB = Buffer.from(frameB, "utf8").toString("base64");
+  const rawA = Buffer.from(blobA, "base64");
+  const rawB = Buffer.from(blobB, "base64");
+  const shaHex = (b) => crypto.createHash("sha256").update(b).digest("hex");
+  const h3pkg = { chain_id: "operp-v2", height: 3, packages: [shaHex(rawA), shaHex(rawB)], data_root: shaHex(Buffer.concat([rawA, rawB])) };
+  const sd3pkg = submitData(3, STATE_ROOT, STATE_ROOT);
+  sd3pkg.ops_root = PKG_OPS_ROOT;
+  sd3pkg.trace_root = PKG_TRACE_ROOT;
+  sd3pkg.units_root = UNITS_SET_ROOT;
+  sd3pkg.units_set_root = SET_ROOT1;
+  {
+    const pr1 = await operator.sendMulti({
+      messages: [{ app: "temp_data", payload_location: "inline", payload: {
+        data_length: require("ocore/object_length.js").getLength({ package_blob: blobA }, true),
+        data_hash: require("ocore/object_hash.js").getBase64Hash({ package_blob: blobA }, true),
+        data: { package_blob: blobA } } }],
+      base_outputs: [{ address: await operator.getAddress(), amount: 10000 }],
+    });
+    if (pr1.error) throw new Error("package 1 post failed: " + pr1.error);
+    await network.witnessUntilStable(pr1.unit);
+    const pr2 = await operator.sendMulti({
+      messages: [{ app: "temp_data", payload_location: "inline", payload: {
+        data_length: require("ocore/object_length.js").getLength({ package_blob: blobB }, true),
+        data_hash: require("ocore/object_hash.js").getBase64Hash({ package_blob: blobB }, true),
+        data: { package_blob: blobB } } }],
+      base_outputs: [{ address: await operator.getAddress(), amount: 10000 }],
+    });
+    if (pr2.error) throw new Error("package 2 post failed: " + pr2.error);
+    await network.witnessUntilStable(pr2.unit);
+    const r3p = await operator.sendMulti({
+      messages: [
+        { app: "temp_data", payload_location: "inline", payload: {
+          data_length: require("ocore/object_length.js").getLength(h3pkg, true),
+          data_hash: require("ocore/object_hash.js").getBase64Hash(h3pkg, true),
+          data: h3pkg } },
+        { app: "data", payload: sd3pkg },
+      ],
+      base_outputs: [{ address: rollup, amount: SUBMIT_GROSS }],
+    });
+    if (r3p.error) throw new Error("h3 2-package submit failed: " + r3p.error);
+    await network.witnessUntilStable(r3p.unit);
+    const res3p = await network.getAaResponseToUnit(r3p.unit).catch(() => null);
+    if (res3p && res3p.response && res3p.response.bounced)
+      throw new Error("h3 2-package submit bounced: " + JSON.stringify(res3p.response).slice(0, 200));
+  }
+  const pkgFraud = {
+    k: 0,
+    op: PKG_OP,
+    ops_proof: merkle.getMerkleProof(PKG_OPS, 0),
+    trace_root: PKG_TRACE_ROOT,
+    ops_root: PKG_OPS_ROOT,
+    units_root: UNITS_SET_ROOT,
+    units_set_root: SET_ROOT1,
+    fills_root: FILLS_ROOT,
+    pre_wit: H3_PRE_WIT,
+    post_wit: PKG_WIT,
+    post_proof: merkle.getMerkleProof(PKG_TRACE, 0),
+    pre_leaf: DEP_PRE,
+    post_leaf: PKG_POST[0],
+    pre_leaf_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[DEP_PRE]),
+    post_leaf_proof: merkle.getMerkleProof(PKG_POST, 0),
+  };
+  await triggerVerdict(challenger, dispute, Object.assign({ pred: "deposit", height: 3 }, pkgFraud), 20000, "2-package deposit fraud predicate");
+  st = await vars(rollup);
+  if (Number(st.frozen_3) !== 2) throw new Error("2-package fraud did not freeze height");
+  console.log("14. 2-package height deposit fraud → frozen=3");
+  // ---- 15. re-submit + finalize after fraud works -------------------------
   await sendCombinedSubmit(operator, 3, STATE_ROOT, STATE_ROOT);
   await network.timetravel({ shift: "3600s" });
   await trigger(operator, rollup, { finalize: 1, height: 3 }, 20000);
   st = await vars(rollup);
   if (Number(st.last_finalized) !== 3) throw new Error("re-finalize after fraud failed");
-  console.log("14. re-submit + finalize after fraud ok");
+  console.log("15. re-submit + finalize after fraud ok");
   console.log(failures === 0 ? "\nALL SETTLEMENT E2E CHECKS PASSED" : `\n${failures} FAILURES`);
   process.exit(failures === 0 ? 0 : 1);
 }

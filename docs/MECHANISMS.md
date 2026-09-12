@@ -411,12 +411,12 @@ slash_reward_bps 归挑战者、余下烧毁。
 
 ### 8.1 批次切分
 
-operator 从线性化执行流中切出前缀（≤ BATCH_MAX_UNITS=512 units），
+operator 从线性化执行流中切出前缀（≤ BATCH_MAX_UNITS=8192 units），
 调用 `Batch::from_applied(prev_state, engine, applied)`：
 
 ```
 applied 为空                    → Empty
-applied.len() > 512             → TooManyUnits
+applied.len() > 8192             → TooManyUnits
 checkpoint.height               = prev.height + 1
 prev_state_hash                 = prev.state_root()
 engine.state.height ← height    （先推进再取根，meta_leaf 绑定高度）
@@ -430,10 +430,20 @@ unit_count / wit_count          = applied.len() / wit_leaves.len()
 高度进入 meta_leaf ⇒ state_root 跨批次成链：`prev_state_hash` 断链
 即重组可见。
 
-### 8.2 temp_data 全量披露
+### 8.2 temp_data 帧披露
 
-`temp_data_payload()` 把**全部 unit（含签名）+ 所有根/哈希**序列化为
-OIP-0007 `temp_data` 消息发上 Obyte。意义：
+header 只带标量（`chain_id`、height、各根计数、`aa_shard_roots`、
+`perp_burned`、`validity_proof_hash`）外加 `frames_blob` XOR
+（`packages`+`data_root`）；逐单元数组不再进 header。每个 frame 是一单元
+JSON（`u,t,o,c,f?,l?,e?`）：`u` 为该单元 JSON（含签名），`t`/`o`/`c` 为
+trace/ops/counts 条目，无成交时省略 `f`，`e` 仅 Deposit/GovDeposit 携带
+（按 `aa_unit` 匹配证据），`l` 为该单元叶集（print-only 可省略）。
+package = base64（`\n` 连接 frames）；`data_root` =
+hex(sha256(拼接 blob 字节))；承载该对象的 Obyte 单元之规范 `data_hash`
+仍为 `hex(sha256(getJsonSource(header或package对象)))`。充值证据在 frame
+`e` 内，复原即拼接各 `e` 字段（无 header `deposit_evidences`）。
+
+意义：
 
 - 数据可用性：任何观察者可在 1 天保留窗口内下载并本地重放
 - 重放结果与 checkpoint 逐字段比对 → 欺诈必然可被检测
@@ -644,8 +654,8 @@ ord:{order_hex}:{market}:{side}:{price}:{seq}:{remaining}:{acct_hex}
 meta:{market}:{tick}:{im}:{mm}:{taker_fee_bps}:{keeper}:{delisted}:{mark}
 ```
 
-`temp_data` 另带 `trace`/`ops`/`fills`/`counts`/`leaf_trace` 数组（DA 给
-watcher；`leaf_trace` 超 4MB 省略）。`validate_against` 重放复算全部根。
+这些数组在 frames 内按单元拆开（`t`/`o`/`f`/`c`/`l`），header 不再带它们；
+`leaf_trace` 单帧可省略（print-only）。`validate_against` 重放复算全部根。
 `is_valid_merkle_proof` 是 ocore 内建（复杂度 1），格式 `{root, siblings, index}`。
 
 ## 12. Multi-operator 手续费竞速
