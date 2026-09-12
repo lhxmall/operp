@@ -58,3 +58,5 @@ jobs:
         run: cargo run -p operp-settle --example gen_withdraw_proof -- I6X2KSUJJJC5D5T6ARVT7OH5Z7XMSMYG 2000000 0 1000000
       - name: Run AA devnet E2E
         run: node obyte-local/test_settlement_aa.js
+      - name: Run pool occupancy gate E2E
+        run: node obyte-local/test_pool_occupancy.js
