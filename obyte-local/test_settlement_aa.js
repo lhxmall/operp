@@ -452,6 +452,11 @@ async function main() {
   const poolNet = POOL_FUND_GROSS - 10000; // {pool:1} credits net of bounce fee
   if (Number(st["pool_" + opAddr] || 0) !== Number(poolNet - SLASH_HALF * 2))
     throw new Error("pool not slashed by fraud: " + JSON.stringify(st["pool_" + opAddr]));
+  // Challenger withdraws the banked slash: payout + zeroed key (no double-claim).
+  await trigger(challenger, rollup, { claim: "slash" }, 20000);
+  st = await vars(rollup);
+  if (Number(st["slash_reward_" + chAddr] || 0) !== 0) throw new Error("slash not paid out");
+  console.log("7. deposit fraud verdict: height failed, slashed, challenger paid");
 
   // ---- 8. honest deposit → 'no fraud' (height stays live) ------------------
   // This assertion ALSO commits wit_root_2 = H3_PRE_WIT: every h3 k=0
@@ -796,7 +801,16 @@ async function main() {
   if (Number(st["pool_" + (await operator.getAddress())] || 0) !== 0)
     throw new Error("pool not zeroed after claim");
   console.log("17. pool claim ok when idle, busy otherwise");
-  console.log(failures === 0 ? "\nALL SETTLEMENT E2E CHECKS PASSED" : `\n${failures} FAILURES`);
+  // ---- 18. depleted pool: drained operator bounces 'need pool' --------------
+  // Scenario 17 claimed the operator pool to zero — the same state a
+  // slash-depleted operator lands in. Its next submit must bounce
+  // 'need pool' until a fresh {pool:1} top-up; then the gate reopens.
+  await triggerBounce(operator, rollup, submitData(7, STATE_ROOT, STATE_ROOT), 20000, "need pool");
+  await trigger(operator, rollup, { pool: 1 }, POOL_FUND_GROSS);
+  await sendCombinedSubmit(operator, 7, STATE_ROOT, STATE_ROOT);
+  st = await vars(rollup);
+  if (Number(st.last_submitted) !== 7) throw new Error("re-submit after pool top-up failed");
+  console.log("18. depleted pool bounces 'need pool'; top-up reopens submit");
   process.exit(failures === 0 ? 0 : 1);
 }
 

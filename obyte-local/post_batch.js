@@ -288,6 +288,11 @@ async function main() {
     unit_count: header.unit_count,
     wit_count: header.wit_count,
   };
+  // Optional audit anchors: the rollup AA does not gate on these, but they
+  // ride the submit data for indexers/self-checks (header temp_data carries
+  // the same values for watchers).
+  if (header.validity_proof_hash) submitData.validity_proof_hash = header.validity_proof_hash;
+  if (header.perp_burned !== undefined) submitData.perp_burned = String(header.perp_burned);
   // Standing pool: fund {pool:1} once (POOL_MIN 1e12 + 10000 fee); submits
   // pay only the 10000 bounce fee. Pipelining allowed while ls-lf < 50.
   const poolFund = await poster.sendMulti({
