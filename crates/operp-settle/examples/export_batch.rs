@@ -105,7 +105,9 @@ fn main() {
     let _ = tip;
 
     let batch = Batch::from_applied(&prev, &mut eng, &applied).expect("batch");
-    let payload = batch.temp_data_payload();
+    let (mut header, _) = batch.temp_data_packages().expect("pack");
+    let frames = batch.frames();
+    header["frames"] = serde_json::to_value(&frames).unwrap();
     let out: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../obyte-local/batch.json")
         .canonicalize()
@@ -115,7 +117,7 @@ fn main() {
     if let Some(dir) = out.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let text = serde_json::to_string_pretty(&payload.data).unwrap();
+    let text = serde_json::to_string_pretty(&header).unwrap();
     std::fs::write(&out, &text).expect("write batch.json");
     println!("wrote {}", out.display());
     println!("height {}", batch.checkpoint.height);

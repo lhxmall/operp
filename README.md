@@ -35,7 +35,7 @@ cd obyte-local && node deploy_mainnet.js      # deploy the four AAs (needs OPERP
                     │   checkpoint = {height, prev_state_hash,    │
                     │                 state_root, aa_root, ...}   │
                     └────────────────┬────────────────────────────┘
-                                     │ temp_data unit (batch data on-chain)
+                                     │ temp_data: frames_blob or package units + data_root
                                      ▼
                     ┌─────────────────────────────────────────────┐
                     │  OBYTE SETTLEMENT (Oscript, CHAIN_ID=operp-v2)│
@@ -124,7 +124,7 @@ opt-in.
 
 ### 4. Settlement: two roots per batch
 
-Every batch (~512 units / 2 s) produces a `Checkpoint`:
+Every batch (≤ BATCH_MAX_UNITS=8192 units / 2 s) produces a `Checkpoint`:
 
 ```text
 { height, prev_state_hash, state_root, aa_root, last_unit, seq,
@@ -178,8 +178,11 @@ replica can audit the operator.
 
 Three AAs (`CHAIN_ID=operp-v2`). **No lock, no pay-to-kill.** Collateral is GBYTE.
 
-1. **submit (rollup)** — combined unit `temp_data` + `{submit, height, roots,
+1. **submit (rollup)** — combined unit: header `temp_data` (`frames_blob` XOR
+   `packages`+`data_root`) + `{submit, height, roots,
    trace/units/ops/fills roots}` with the 1000 GBYTE submit bond.
+   Multi-package heights post package units first; the da_unit carries the
+   header + submit in one unit.
    `h == last_submitted+1`; an occupied, un-failed height bounces
    `height taken`. Window: `submitted_at + 3600 s`.
 2. **Fraud (dispute / dispute_fill)** — inside the window anyone submits a
@@ -253,7 +256,7 @@ cd obyte-local && node test_vault_aa.js
 # deploy the vault AA to Obyte testnet
 cd obyte-local && node deploy_testnet.js
 
-# operator flow: post ONE combined temp_data+submit unit + lock +
+# operator flow: package posts then combined da_unit (header + submit) +
 # finalize + claim race reward (the complete mainnet sequence)
 cd obyte-local && node post_batch.js
 Measured on this machine: `bench_raw` ≈ 5 500 ops/s; `hft_onedag` (8 markets,
@@ -270,7 +273,8 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    not on-chain verifiable; fill_math carries a ±1 tolerance; `temp_data`
    bodies vanish after 24 h; deposit joints are mainly checked off-chain in
    `validate_against` (an empty `OPERP_VAULT_AA` with evidences present is
-   rejected).
+   rejected). The 10k-node wall is closed by frames-in-base64; remaining DA
+   bound is 5MB/`PACK_SOURCE_CAP` and the 24h purge.
 2. **Funding quality is bounded by its price anchor.** Funding stays
    mark-premium based (capped ±50 bps/tick). The default
    `BondedMedianTwap` index derives from bonded reporters' prices; the
@@ -373,7 +377,7 @@ sole withdrawal authority) and lifted raw engine throughput from 5199 to
 
 All eleven designs in [`docs/mainnet/`](docs/mainnet/) are now implemented
 (staged as v1 boring + v2 extensions; deviations and deferred backlogs are
-noted below):
+- [x] **02 Deposit independent verification** — per-frame `e` inside the blob carries FULL Obyte joint units; `unit_hash(joint)` recomputed inside `validate_against` via `operp_settle::obyte_hash::get_unit_hash`; payee/asset checked against caller-supplied `expected_vault`/`perp_asset`, failures map to `SettleError::DepositEvidence`; watchers rehydrate by concatenating `e` fields (full joint still verified in `validate_against`)
 
 - [x] **01 Fraud slashing** — `01-fraud-slashing.md`: 50%/50% burn/reward split + `validity_proof_hash` plug, no matcher re-execution in Oscript *(AA failed-finalize splits the submit bond into `slash_reward_` + burned half)*
 - [x] **02 Deposit independent verification** — `temp_data.deposit_evidences` carries FULL Obyte joint units; `unit_hash(joint)` recomputed inside `validate_against` via `operp_settle::obyte_hash::get_unit_hash`; payee/asset checked against caller-supplied `expected_vault`/`perp_asset`, failures map to `SettleError::DepositEvidence`; watchers rehydrate via `evidences_from_payload`

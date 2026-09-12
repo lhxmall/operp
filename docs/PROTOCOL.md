@@ -125,7 +125,7 @@ reduce_only      : equity·10000 ≤ mm·12000
 
 ## 3. 结算层：双根承诺
 
-每 ~512 units / 2 秒切一个批次，产出 Checkpoint：
+每 ≤8192 units（BATCH_MAX_UNITS）/ 2 秒切一个批次，产出 Checkpoint：
 
 ```text
 { height, prev_state_hash, state_root, aa_root,
@@ -190,7 +190,7 @@ set replay.height = checkpoint.height
 assert last_unit 一致 ∧ replay.state_root == root   # RootMismatch
 ```
 
-TooManyUnits 上限（512）在 from_applied 就挡住超大批次。
+TooManyUnits 上限（8192）在 from_applied 就挡住超大批次。
 
 ## 4. 结算层：三个 AA（CHAIN_ID=operp-v2）
 
@@ -215,7 +215,9 @@ proposals、oracle 账本。金库 vault AA 只有 `deposit` / `withdraw`，提�
 
 ```
 submit(h)    h == last_submitted+1 ∧ chain_id='operp-v2' ∧ 双根 + 六个 44-char
-             承诺根 ∧ 组合单元（temp_data 在同一 unit）
+             承诺根 ∧ 组合单元 = header temp_data（`frames_blob` 或
+             `packages`+`data_root`）+ submit；多包时 package 单元先发，
+             da_unit 只钉哈希列表
              ∧ 输出-10000 ≥ 1000000000000（SUBMIT_BOND_NET）
              → 写全部 <h> 键、da_unit_h=trigger.unit、last_submitted=h；
                已占位且 frozen≠2 → bounce('height taken')；

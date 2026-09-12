@@ -267,6 +267,7 @@ name = "operp-watch"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "ed25519-dalek",
  "hex",
  "operp-dag",
@@ -276,6 +277,7 @@ dependencies = [
  "operp-types",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

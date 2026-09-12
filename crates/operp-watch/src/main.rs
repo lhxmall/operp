@@ -237,7 +237,7 @@ fn check_height(
     let frozen_val = frozen.and_then(|v| v.as_u64()).unwrap_or(0);
     let in_window = sa_val != 0 && now < sa_val + 3600 && frozen_val == 0;
 
-    let da = match fetch_da_unit(hub, &config.rollup_address, h) {
+    let mut da = match fetch_da_unit(hub, &config.rollup_address, h) {
         Ok(None) => return Ok(None),
         Ok(Some(da)) => da,
         Err(WatchError::HubUnavailable(_)) => return Ok(None), // backoff, never mis-challenge
@@ -250,13 +250,40 @@ fn check_height(
         }
         Err(e) => return Ok(Some(format!("h={} WATCH ERROR: {}", h, e))),
     };
-
-    if let Err(e) = verify_da_binding(&da) {
-        let alert = format!("h={} BINDING MISMATCH: {}", h, e);
-        if in_window {
-            maybe_post_challenge(config, h, &alert, None);
+    // Multi-package headers splice the assembled blob as `frames_blob`
+    // before `batch_from_data`. 3 tries + backoff, then give up — never
+    // mis-challenge on flaky package fetches.
+    if da.data.get("frames_blob").is_none() && da.data.get("packages").is_some() {
+        let mut assembled: Option<String> = None;
+        let mut last_err: Option<WatchError> = None;
+        for attempt in 0..3 {
+            match operp_watch::assemble_frames(hub, &da.data) {
+                Ok(b) => {
+                    assembled = Some(b);
+                    break;
+                }
+                Err(WatchError::HubUnavailable(e)) => {
+                    last_err = Some(WatchError::HubUnavailable(e));
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        500 * (attempt + 1) as u64,
+                    ));
+                }
+                Err(e) => {
+                    let alert = format!("h={} BINDING MISMATCH: {}", h, e);
+                    if in_window {
+                        maybe_post_challenge(config, h, &alert, None);
+                    }
+                    return Ok(Some(alert));
+                }
+            }
         }
-        return Ok(Some(alert));
+        match assembled {
+            Some(b) => {
+                da.data["frames_blob"] = serde_json::Value::String(b);
+            }
+            None => return Ok(None),
+        }
+        let _ = last_err;
     }
 
     let prev_root = engine.state.state_root();

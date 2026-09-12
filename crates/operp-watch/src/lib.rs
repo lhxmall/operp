@@ -14,11 +14,8 @@
 //! unit-testable without a live hub; the binary supplies an HTTP client.
 
 pub mod prove;
-use operp_dag::{Op, Unit};
 use operp_exec::Engine;
-use operp_settle::{Batch, Checkpoint, DepositEvidence, SettleError};
-use operp_state::AA_SHARD_COUNT;
-use operp_types::UnitId;
+use operp_settle::{Batch, SettleError};
 
 /// Challenge bond gross attached to a `challenge` trigger.
 /// mirrors operp_types::CHALLENGE_BOND_NET + BOUNCE_FEE_BASE
@@ -148,6 +145,54 @@ pub fn verify_da_binding(da: &DaUnit) -> Result<(), WatchError> {
     }
     Ok(())
 }
+/// Assemble a multi-package header's blob: fetch each `packages` hash via
+/// `get_joint`, require its `package_blob` string, concat raw bytes, and
+/// check hex(sha256(concat)) against `data_root`. Transport errors map to
+/// `HubUnavailable` (caller backs off); bad content maps to
+/// `BindingMismatch`. No retries here — the poll loop owns backoff.
+pub fn assemble_frames<H: HubClient>(
+    hub: &H,
+    data: &serde_json::Value,
+) -> Result<String, WatchError> {
+    let hashes = data
+        .get("packages")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            WatchError::BindingMismatch("header has neither frames_blob nor packages".into())
+        })?;
+    let want = data
+        .get("data_root")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| WatchError::BindingMismatch("packages header missing data_root".into()))?;
+    use base64::Engine as _;
+    let mut concat: Vec<u8> = Vec::new();
+    for h in hashes {
+        let s = h
+            .as_str()
+            .ok_or_else(|| WatchError::BindingMismatch("package hash not a string".into()))?;
+        let joint = hub.get_joint(s).map_err(WatchError::HubUnavailable)?;
+        let payload = extract_temp_data(&joint)
+            .ok_or_else(|| WatchError::BindingMismatch("package joint has no temp_data".into()))?;
+        let b64 = payload
+            .get("package_blob")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                WatchError::BindingMismatch("package joint missing package_blob".into())
+            })?;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|_| WatchError::BindingMismatch("package_blob not base64".into()))?;
+        concat.extend_from_slice(&raw);
+    }
+    use sha2::{Digest, Sha256};
+    let got = hex::encode(Sha256::digest(&concat));
+    if got != want {
+        return Err(WatchError::BindingMismatch(format!(
+            "data_root mismatch: want {want} got {got}"
+        )));
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(&concat))
+}
 
 /// Replay a posted batch against the running engine and assert it reproduces
 /// the committed roots. On success the engine is advanced to the batch's
@@ -162,154 +207,26 @@ pub fn replay_and_check(
     batch.validate_against(prev_root, engine)
 }
 
-/// Rebuild a [`Batch`] from the temp_data payload's `data` value. The wire
-/// format stores hashes as hex strings and `perp_burned` as a decimal string,
-/// so `Checkpoint`'s serde representation does not match — reconstruct it.
+/// Rebuild a [`Batch`] from the temp_data header JSON. The new wire stores
+/// scalars plus `frames_blob` (single package). Multi-package
+/// (`packages`+`data_root`) arrives via `assemble_frames` before this call —
+/// legacy `units`-array headers are rejected.
 pub fn batch_from_data(data: &serde_json::Value) -> Result<Batch, SettleError> {
-    let chain_id = data
-        .get("chain_id")
-        .and_then(|v| v.as_str())
-        .ok_or(SettleError::ChainMismatch)?
-        .to_string();
-    let checkpoint = checkpoint_from_data(data)?;
-    let units = units_from_data(data)?;
-    let deposit_evidences: Vec<DepositEvidence> = operp_settle::evidences_from_payload(data)?;
-    let trace = get_str_array(data, "trace")?;
-    let ops = get_str_array(data, "ops")?;
-    let counts = get_str_array_opt(data, "counts")?;
-    let fills = get_str_array_opt(data, "fills")?;
-    Ok(Batch {
-        chain_id,
-        checkpoint,
-        units,
-        deposit_evidences,
-        trace,
-        ops,
-        fills,
-        counts,
-        leaf_trace: get_leaf_trace_opt(data)?,
-    })
-}
-
-fn checkpoint_from_data(data: &serde_json::Value) -> Result<Checkpoint, SettleError> {
-    let height = get_u64(data, "height")?;
-    let prev_state_hash = get_hex32(data, "prev_state_hash")?;
-    let state_root = get_hex32(data, "state_root")?;
-    let aa_root = get_str(data, "aa_root")?.to_string();
-    let last_unit = UnitId(get_hex32(data, "last_unit")?);
-    let seq = get_u64(data, "seq")?;
-    let fill_count = get_u64(data, "fill_count")? as u32;
-    let fills_hash = get_hex32(data, "fills_hash")?;
-    let assertion_version = get_u64(data, "assertion_version")? as u32;
-    let wit_root = get_str(data, "wit_root")?.to_string();
-    let trace_root = get_str(data, "trace_root")?.to_string();
-    let units_root = get_str(data, "units_root")?.to_string();
-    let units_set_root = get_str(data, "units_set_root")?.to_string();
-    let ops_root = get_str(data, "ops_root")?.to_string();
-    let fills_root = get_str(data, "fills_root")?.to_string();
-    let unit_count = get_u64(data, "unit_count")? as u32;
-    let counts_root = get_str(data, "counts_root")?.to_string();
-
-    let wit_count = get_u64(data, "wit_count")? as u32;
-    let validity_proof_hash = data
-        .get("validity_proof_hash")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let perp_burned = data
-        .get("perp_burned")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<u128>().ok());
-
-    let shards_json = data
-        .get("aa_shard_roots")
-        .and_then(|v| v.as_array())
-        .ok_or(SettleError::RootMismatch)?;
-    if shards_json.len() != AA_SHARD_COUNT {
+    if data.get("units").is_some() {
         return Err(SettleError::RootMismatch);
     }
-    let mut aa_shard_roots: [String; AA_SHARD_COUNT] = Default::default();
-    for (i, s) in shards_json.iter().enumerate() {
-        aa_shard_roots[i] = s.as_str().ok_or(SettleError::RootMismatch)?.to_string();
-    }
-
-    let unit_ids_json = data
-        .get("unit_ids")
-        .and_then(|v| v.as_array())
-        .ok_or(SettleError::RootMismatch)?;
-    let mut unit_ids = Vec::with_capacity(unit_ids_json.len());
-    for u in unit_ids_json {
-        unit_ids.push(UnitId(
-            hex_to_32(&u.as_str().ok_or(SettleError::RootMismatch)?)
-                .map_err(|_| SettleError::RootMismatch)?,
-        ));
-    }
-
-    Ok(Checkpoint {
-        height,
-        prev_state_hash,
-        state_root,
-        aa_shard_roots,
-        aa_root,
-        last_unit,
-        seq,
-        unit_ids,
-        fills_hash,
-        fill_count,
-        assertion_version,
-        wit_root,
-        trace_root,
-        units_root,
-        units_set_root,
-        ops_root,
-        fills_root,
-        counts_root,
-        unit_count,
-        wit_count,
-        validity_proof_hash,
-        perp_burned,
-    })
-}
-
-fn units_from_data(data: &serde_json::Value) -> Result<Vec<Unit>, SettleError> {
-    let units_json = data
-        .get("units")
-        .and_then(|v| v.as_array())
-        .ok_or(SettleError::Replay)?;
-    let mut units = Vec::with_capacity(units_json.len());
-    for u in units_json {
-        let parents_json = u
-            .get("parents")
-            .and_then(|v| v.as_array())
-            .ok_or(SettleError::Replay)?;
-        let mut parents = Vec::with_capacity(parents_json.len());
-        for p in parents_json {
-            parents.push(UnitId(
-                hex_to_32(&p.as_str().ok_or(SettleError::Replay)?)
-                    .map_err(|_| SettleError::Replay)?,
-            ));
-        }
-        let op: Op = serde_json::from_value(u.get("op").cloned().ok_or(SettleError::Replay)?)
-            .map_err(|_| SettleError::Replay)?;
-        let pubkey = hex_to_32(
-            &u.get("pubkey")
-                .and_then(|v| v.as_str())
-                .ok_or(SettleError::Replay)?,
-        )
-        .map_err(|_| SettleError::Replay)?;
-        let sig = hex_to_64(
-            &u.get("sig")
-                .and_then(|v| v.as_str())
-                .ok_or(SettleError::Replay)?,
-        )
-        .map_err(|_| SettleError::Replay)?;
-        units.push(Unit {
-            parents,
-            op,
-            pubkey,
-            sig,
-        });
-    }
-    Ok(units)
+    let blob = get_str(data, "frames_blob")?;
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(blob)
+        .map_err(|_| SettleError::RootMismatch)?;
+    let text = String::from_utf8(raw).map_err(|_| SettleError::RootMismatch)?;
+    let frames: Vec<String> = if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split('\n').map(|s| s.to_string()).collect()
+    };
+    operp_settle::batch_from_frames(data, &frames)
 }
 
 /// Locate the inline `temp_data` payload inside a hub-returned joint. The
@@ -334,77 +251,6 @@ fn get_str<'a>(data: &'a serde_json::Value, key: &str) -> Result<&'a str, Settle
     data.get(key)
         .and_then(|v| v.as_str())
         .ok_or(SettleError::RootMismatch)
-}
-
-fn get_u64(data: &serde_json::Value, key: &str) -> Result<u64, SettleError> {
-    data.get(key)
-        .and_then(|v| v.as_u64())
-        .ok_or(SettleError::RootMismatch)
-}
-fn get_str_array(data: &serde_json::Value, key: &str) -> Result<Vec<String>, SettleError> {
-    let arr = data
-        .get(key)
-        .and_then(|v| v.as_array())
-        .ok_or(SettleError::RootMismatch)?;
-    arr.iter()
-        .map(|v| {
-            v.as_str()
-                .map(|s| s.to_string())
-                .ok_or(SettleError::RootMismatch)
-        })
-        .collect()
-}
-
-fn get_hex32(data: &serde_json::Value, key: &str) -> Result<[u8; 32], SettleError> {
-    hex_to_32(get_str(data, key)?).map_err(|_| SettleError::RootMismatch)
-}
-fn get_str_array_opt(data: &serde_json::Value, key: &str) -> Result<Vec<String>, SettleError> {
-    match data.get(key) {
-        None => Ok(Vec::new()),
-        Some(_) => get_str_array(data, key),
-    }
-}
-fn get_leaf_trace_opt(data: &serde_json::Value) -> Result<Vec<Vec<String>>, SettleError> {
-    match data.get("leaf_trace") {
-        None => Ok(Vec::new()),
-        Some(v) => {
-            let arr = v.as_array().ok_or(SettleError::RootMismatch)?;
-            arr.iter()
-                .map(|inner| {
-                    inner
-                        .as_array()
-                        .ok_or(SettleError::RootMismatch)?
-                        .iter()
-                        .map(|s| {
-                            s.as_str()
-                                .map(|x| x.to_string())
-                                .ok_or(SettleError::RootMismatch)
-                        })
-                        .collect()
-                })
-                .collect()
-        }
-    }
-}
-
-fn hex_to_32(s: &str) -> Result<[u8; 32], hex::FromHexError> {
-    let v = hex::decode(s)?;
-    let mut out = [0u8; 32];
-    if v.len() != 32 {
-        return Err(hex::FromHexError::InvalidStringLength);
-    }
-    out.copy_from_slice(&v);
-    Ok(out)
-}
-
-fn hex_to_64(s: &str) -> Result<[u8; 64], hex::FromHexError> {
-    let v = hex::decode(s)?;
-    let mut out = [0u8; 64];
-    if v.len() != 64 {
-        return Err(hex::FromHexError::InvalidStringLength);
-    }
-    out.copy_from_slice(&v);
-    Ok(out)
 }
 
 pub use operp_settle::obyte_hash;
@@ -637,5 +483,47 @@ mod tests {
             replay_and_check(&da, prev_root, &mut replay).is_err(),
             "tampered batch must not replay"
         );
+    }
+    #[test]
+    fn assemble_frames_multi_package_roundtrip() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let f1 = "{\"u\":1}".to_string();
+        let f2 = "{\"u\":2}".to_string();
+        let b1 = base64::engine::general_purpose::STANDARD.encode(f1.as_bytes());
+        let b2 = base64::engine::general_purpose::STANDARD.encode(f2.as_bytes());
+        let r1 = base64::engine::general_purpose::STANDARD
+            .decode(&b1)
+            .unwrap();
+        let r2 = base64::engine::general_purpose::STANDARD
+            .decode(&b2)
+            .unwrap();
+        let mut concat = Vec::new();
+        concat.extend_from_slice(&r1);
+        concat.extend_from_slice(&r2);
+        let root = hex::encode(Sha256::digest(&concat));
+        let h1 = hex::encode(Sha256::digest(&r1));
+        let h2 = hex::encode(Sha256::digest(&r2));
+        let header = serde_json::json!({"packages": [h1, h2], "data_root": root});
+        let pkg = |b: &str| {
+            serde_json::json!({
+                "unit": {"messages": [{"app": "temp_data", "payload": {"data": {"package_blob": b}}}], "unit": "x"},
+                "messages": [{"app": "temp_data", "payload": {"data": {"package_blob": b}}}],
+            })
+        };
+        let hub = MockHub {
+            vars: Default::default(),
+            joints: std::collections::HashMap::from([
+                (h1.clone(), pkg(&b1)),
+                (h2.clone(), pkg(&b2)),
+            ]),
+        };
+        let got = assemble_frames(&hub, &header).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&got)
+            .unwrap();
+        assert_eq!(String::from_utf8(raw).unwrap(), format!("{f1}{f2}"));
+        let bad = serde_json::json!({"packages": [h1], "data_root": "00".repeat(32)});
+        assert!(assemble_frames(&hub, &bad).is_err());
     }
 }

@@ -101,7 +101,7 @@
 						OR !trigger.data.units_set_root OR length(trigger.data.units_set_root) != 44
 						OR !trigger.data.ops_root OR length(trigger.data.ops_root) != 44
 						OR !trigger.data.fills_root OR length(trigger.data.fills_root) != 44
-						OR !is_integer(trigger.data.unit_count) OR trigger.data.unit_count < 1 OR trigger.data.unit_count > 512
+						OR !is_integer(trigger.data.unit_count) OR trigger.data.unit_count < 1 OR trigger.data.unit_count > 8192
 						OR !is_integer(trigger.data.wit_count) OR trigger.data.wit_count < 1)
 						bounce('bad submit');
 					if ($ls > 0 AND (var['frozen_' || $ls] otherwise 0) != 2

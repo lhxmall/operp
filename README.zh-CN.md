@@ -33,7 +33,7 @@ cd obyte-local && node deploy_mainnet.js      # 主网发四个 AA（需 OPERP_D
                     │   checkpoint = {height, prev_state_hash,    │
                     │                 state_root, aa_root, ...}   │
                     └────────────────┬────────────────────────────┘
-                                     │ temp_data 单元（批次数据上链）
+                                     │ temp_data：frames_blob 或 package 单元 + data_root
                                      ▼
                     ┌─────────────────────────────────────────────┐
                     │  OBYTE 结算（Oscript，CHAIN_ID=operp-v2）     │
@@ -110,7 +110,7 @@ TWAP 环与连续偏移罚没已上线（激活门控），外部锚为可选启
 
 ### 4. 结算：每批双根
 
-每批（约 512 units / 2 s）产出 `Checkpoint`：
+每批（≤ BATCH_MAX_UNITS=8192 units / 2 s）产出 `Checkpoint`：
 
 ```text
 { height, prev_state_hash, state_root, aa_root, last_unit, seq,
@@ -152,7 +152,7 @@ operator。
 
 三个 AA（`CHAIN_ID=operp-v2`）。**没有 lock，没有付钱否决。** 保证金是 GBYTE。
 
-1. **submit（rollup）** — 组合单元 `temp_data` + `{submit, height, 双根, trace/units/ops/fills 根}`，附 1000 GBYTE 提交债。`h == last_submitted+1`；已占位且未 `frozen=2` → `height taken`。窗从 `submitted_at` 起算 3600 s。
+1. **submit（rollup）** — 组合单元：header `temp_data`（`frames_blob` 或 `packages`+`data_root`）+ `{submit, height, 双根, trace/units/ops/fills 根}`，附 1000 GBYTE 提交债。多包时 package 单元先发，da_unit 以一单元承载 header + submit。`h == last_submitted+1`；已占位且未 `frozen=2` → `height taken`。窗从 `submitted_at` 起算 3600 s。
 2. **揭发（dispute / dispute_fill）** — 窗内任何人提交一枪谓词（deposit/withdraw/omit/fill_math/ghost/skip）。验不过 bounce `no fraud`，高度不动；验过则 `{verdict:'fraud'}`，rollup 罚没一半提交债、高度重开。无应诉回合。
 3. **finalize（rollup）** — `submitted_at+3600` 且未冻结 → `last_finalized=h`，退提交债，竞速奖 20000 bytes。`{escape_finalize}` 为 7 天停滞门。
 4. **withdraw（vault）** — 只读 `var[ROLLUP]['aa_forest_'||last_finalized]`，原 16 深 Merkle 折叠与 W 防重放不变。`{escape_withdraw}` 仍弹 `no escape withdraw`。
@@ -215,7 +215,7 @@ cd obyte-local && node test_vault_aa.js
 # 部署 vault AA 到 Obyte 测试网
 cd obyte-local && node deploy_testnet.js
 
-# operator 完整流程：temp_data 全量披露 + submit + lock + finalize + 领奖
+# operator 完整流程：package 先发，组合 da_unit（header + submit）+ finalize + 领奖
 cd obyte-local && node post_batch.js
 ```
 
@@ -230,7 +230,7 @@ cd obyte-local && node post_batch.js
 1. ~~**付钱即可杀掉诚实根。**~~ **已关闭（结算 v2）。** 揭发必须过 dispute
    谓词；`{challenge:1}` 在 rollup/vault 上没有 case。假证明 bounce `no fraud`。
    仍未关闭：保险钳制链上不验；fill_math ±1 容差；`temp_data` 24h 删正文；
-   充值 joint 仍主要在链下 `validate_against`（`OPERP_VAULT_AA` 空且带 evidence 会拒）。
+   充值 joint 仍主要在链下 `validate_against`（`OPERP_VAULT_AA` 空且带 evidence 会拒）。10k 节点墙已由 frames-in-base64 关闭；剩余 DA 上限为 5MB/`PACK_SOURCE_CAP` 与 24h 清理。
 2. **资金费质量受价格锚限制。** 资金费保持 mark-premium 模型（±50 bps/tick
    封顶）。默认 `BondedMedianTwap` index 来自债券报价者价格；外部锚接线已经
    落地（`Op::UpdateExternalPrice`，tag 17，白名单门控，
@@ -311,11 +311,11 @@ v2 扩展分期；偏差与延期积压见下）：
 - [x] **01 欺诈罚没** — `01-fraud-slashing.md`：50%/50% 烧毁/奖励劈分 +
   `validity_proof_hash` 插槽，Oscript 不做撮合重执行 *（AA 失败 finalize 把
   提交债券劈成 `slash_reward_` + 烧毁半）*
-- [x] **02 充值独立验证** — `temp_data.deposit_evidences` 携带完整 Obyte
+- [x] **02 充值独立验证** — blob 内 per-frame `e` 携带完整 Obyte
   joint 单元；`unit_hash(joint)` 在 `validate_against` 内经
   `operp_settle::obyte_hash::get_unit_hash` 复算；收款人/资产以调用方提供的
   `expected_vault`/`perp_asset` 绑定核对，失败映射
-  `SettleError::DepositEvidence`；watcher 经 `evidences_from_payload` 取回
+  `SettleError::DepositEvidence`；watcher 拼接 `e` 字段取回（完整 joint 仍在 `validate_against` 内验证）
 - [x] **03 commit-reveal 排序** — v1 盐化排序早前已发、**本轮去盐**（执行序
   为确定性字典序，盐仅用于孤儿驱逐——局限 #13）；**v2 叠加落地**：
   `Op::Commit`（tag 18）/ `Op::Reveal`（tag 19），TTL
