@@ -742,6 +742,8 @@ async function main() {
   st = await vars(rollup);
   if (Number(st.last_finalized) !== 3) throw new Error("re-finalize after fraud failed");
   console.log("15. re-submit + finalize after fraud ok");
+  console.log(failures === 0 ? "\nALL SETTLEMENT E2E CHECKS PASSED" : `\n${failures} FAILURES`);
+  process.exit(failures === 0 ? 0 : 1);
 }
 
 // Oscript is_valid_merkle_proof accepts object proofs {root, siblings, index}.
