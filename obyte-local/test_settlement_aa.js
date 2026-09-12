@@ -371,6 +371,15 @@ async function main() {
     if (res && res.response && res.response.bounced)
       throw new Error("h2 submit bounced: " + JSON.stringify(res.response).slice(0, 200));
   }
+  // H3 pre-tree (genesis leaves + two live orders) is hoisted here because
+  // scenario 8's honest h2 submit must ALREADY commit it as wit_root_2:
+  // every h3 k=0 predicate anchors pre_wit on wit_root_2.
+  const MAKER_ORD = `ord:${"d".repeat(64)}:1:1:100000000:7:5:${"c".repeat(64)}`;
+  const BETTER_ORD = `ord:${"e".repeat(63)}f:1:1:90000000:6:9:${"c".repeat(64)}`;
+  const H3_PRE = [DEP_PRE, FILL_TAKER_PRE, META1, META2, POS2, MAKER_ORD, BETTER_ORD].sort();
+  const H3_PRE_WIT = merkle.getMerkleRoot(H3_PRE);
+  const H3_PRE_IDX = {};
+  H3_PRE.forEach((l, i) => { H3_PRE_IDX[l] = i; });
   async function triggerVerdict(wallet, to, data, amount, what) {
     const t = await trigger(wallet, to, data, amount);
     const r = await network.getAaResponseToUnit(t.unit).catch(() => null);
@@ -379,6 +388,12 @@ async function main() {
       throw new Error(what + " bounced: " + JSON.stringify(inner).slice(0, 500));
     await network.witnessUntilStable(r.response.response_unit);
   }
+  const forcedOmit = sha256Hex("forced-unit");
+  await trigger(operator, rollup, { force: 1, unit_id: forcedOmit }, 20000);
+  await network.timetravel({ shift: "60s" }); // force ts strictly < inbox_upto_2
+  const otherId = sha256Hex("other-unit");
+  const SET1 = pad2([otherId], "set1");
+  const SET_ROOT1 = merkle.getMerkleRoot(SET1);
   // ---- 6. omit fraud on a REAL committed tree → verdict freezes h2 --------
   await submitH2(OPS_ROOT1, TRACE_ROOT1, SET_ROOT1, FILLS_ROOT);
   const omitProof = {
