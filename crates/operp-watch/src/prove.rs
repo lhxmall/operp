@@ -85,11 +85,27 @@ pub fn build_proof(
         let post_leaves = operp_state::wit_leaves(&replay.state);
         let op = batch.ops.get(k)?.clone();
         if op.starts_with("d:") || op.starts_with("D:") {
-            if let Some(p) = deposit_proof(batch, k, &op, &pre_leaves, &post_leaves, true, vault_receipt) {
+            if let Some(p) = deposit_proof(
+                batch,
+                k,
+                &op,
+                &pre_leaves,
+                &post_leaves,
+                true,
+                vault_receipt,
+            ) {
                 return Some(p);
             }
         } else if op.starts_with("w:") || op.starts_with("W:") {
-            if let Some(p) = deposit_proof(batch, k, &op, &pre_leaves, &post_leaves, false, vault_receipt) {
+            if let Some(p) = deposit_proof(
+                batch,
+                k,
+                &op,
+                &pre_leaves,
+                &post_leaves,
+                false,
+                vault_receipt,
+            ) {
                 return Some(p);
             }
         } else {
@@ -1049,11 +1065,11 @@ fn clamp_proof(
                 .as_ref()
                 .and_then(|p| p.split(':').nth(4)?.parse::<i64>().ok())
                 .unwrap_or(exp_entry);
-            upnl += signed_notional_usd(exp_qty, fill_mark)
-                - signed_notional_usd(exp_qty, entry_used);
+            upnl +=
+                signed_notional_usd(exp_qty, fill_mark) - signed_notional_usd(exp_qty, entry_used);
         } else if !exp_pos_absent {
-            upnl += signed_notional_usd(exp_qty, fill_mark)
-                - signed_notional_usd(exp_qty, exp_entry);
+            upnl +=
+                signed_notional_usd(exp_qty, fill_mark) - signed_notional_usd(exp_qty, exp_entry);
         }
         // Extra post positions (posted) × pre marks, cap 3 (AA pos ≤ 4).
         let mut extras: Vec<(String, String)> = posted_post
@@ -1423,7 +1439,10 @@ mod tests {
         assert_eq!(p.pred, "dep_evidence");
         assert!(!p.fill_aa);
         assert!(!p.clamp_aa);
-        assert_eq!(p.data.get("op").and_then(|v| v.as_str()), Some(b.ops[0].as_str()));
+        assert_eq!(
+            p.data.get("op").and_then(|v| v.as_str()),
+            Some(b.ops[0].as_str())
+        );
         // 2. Amount mismatch → dep_evidence.
         let b = build();
         let wrong = |_: &str, _: bool| -> Result<Option<i128>, String> { Ok(Some(99)) };
@@ -1465,7 +1484,8 @@ mod tests {
         let batch = Batch::from_applied(&prev, &mut eng2, &[id]).expect("batch");
         let forced = hex::encode([0xabu8; 32]);
         let mut replay = Engine::new();
-        let proof = build_proof(&batch, &mut replay, &[(forced.clone(), 0)], 999, None).expect("proof");
+        let proof =
+            build_proof(&batch, &mut replay, &[(forced.clone(), 0)], 999, None).expect("proof");
         assert_eq!(proof.pred, "omit");
         assert!(!proof.fill_aa);
         assert_eq!(
@@ -1670,13 +1690,11 @@ mod tests {
             Some(40_005 * USD_SCALE as i128)
         );
         let mut eng2 = eng.clone();
-        let batch =
-            Batch::from_applied(&prev, &mut eng2, &[id1, id2, id3, id4]).expect("batch");
+        let batch = Batch::from_applied(&prev, &mut eng2, &[id1, id2, id3, id4]).expect("batch");
         // Sanity: the posted batch carries the clamp receipt leaf.
-        assert!(batch.leaf_trace[3].iter().any(|l| l.starts_with(&format!(
-            "clamp:{}:",
-            maker_hex
-        ))));
+        assert!(batch.leaf_trace[3]
+            .iter()
+            .any(|l| l.starts_with(&format!("clamp:{}:", maker_hex))));
         let mut replay = Engine::new();
         replay
             .state

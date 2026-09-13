@@ -480,7 +480,14 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or(0);
 
         for h in args.from_height..=ll {
-            match check_height(&hub, &config, &mut engine, h, now, args.archive_dir.as_deref()) {
+            match check_height(
+                &hub,
+                &config,
+                &mut engine,
+                h,
+                now,
+                args.archive_dir.as_deref(),
+            ) {
                 Ok(None) => {}
                 Ok(Some(msg)) => println!("WATCH ALERT: {}", msg),
                 Err(e) => println!("WATCH ERROR at h={}: {}", h, e),
