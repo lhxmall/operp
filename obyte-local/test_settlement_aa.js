@@ -246,6 +246,21 @@ function tempDataMsg(data) {
     },
   };
 }
+// AA responses may not be indexed the instant the trigger stabilizes — poll
+// until the response appears (fail fast on bounce, fail loudly on timeout
+// instead of cascading a misleading 'stale roots'/'no height' later).
+async function expectAaSuccess(unit, what) {
+  for (let i = 0; i < 30; i++) {
+    const res = await network.getAaResponseToUnit(unit).catch(() => null);
+    if (res && res.response) {
+      if (res.response.bounced)
+        throw new Error(what + " bounced: " + JSON.stringify(res.response).slice(0, 500));
+      return res;
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw new Error(what + " no AA response after 30s for unit " + unit);
+}
 async function sendCombinedSubmit(wallet, height, stateRoot, prev) {
   const sd = submitData(height, stateRoot, prev);
   const header = headerFromSubmit(sd);
@@ -260,11 +275,7 @@ async function sendCombinedSubmit(wallet, height, stateRoot, prev) {
   await network.witnessUntilStable(r.unit);
   // sendMulti reports composer errors only; the AA bounce surfaces on the
   // response unit — fail fast here instead of cascading 'no height' later.
-  const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
-  const log = JSON.stringify(res || {});
-  if (log.includes('"bounced":true')) {
-    throw new Error("combined submit bounced: " + log.slice(0, 500));
-  }
+  await expectAaSuccess(r.unit, "combined submit");
   return r;
 }
 
@@ -387,9 +398,7 @@ async function main() {
     });
     if (r.error) throw new Error("h2 submit failed: " + r.error);
     await network.witnessUntilStable(r.unit);
-    const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
-    if (res && res.response && res.response.bounced)
-      throw new Error("h2 submit bounced: " + JSON.stringify(res.response).slice(0, 200));
+    await expectAaSuccess(r.unit, "h2 submit");
   }
   const MAKER_ORD = `ord:${"d".repeat(64)}:1:1:100000000:7:5:${"c".repeat(64)}`;
   const BETTER_ORD = `ord:${"e".repeat(63)}f:1:1:90000000:6:9:${"c".repeat(64)}`;
@@ -532,9 +541,7 @@ async function main() {
     });
     if (r.error) throw new Error("h3 submit failed: " + r.error);
     await network.witnessUntilStable(r.unit);
-    const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
-    if (res && res.response && res.response.bounced)
-      throw new Error("h3 submit bounced: " + JSON.stringify(res.response).slice(0, 200));
+    await expectAaSuccess(r.unit, "h3 submit");
   }
 
   // ---- 11. fill_math dishonest (taker col 0 instead of -500) → fraud -------
@@ -596,9 +603,7 @@ async function main() {
     });
     if (r.error) throw new Error("h3 submit failed: " + r.error);
     await network.witnessUntilStable(r.unit);
-    const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
-    if (res && res.response && res.response.bounced)
-      throw new Error("h3 submit bounced: " + JSON.stringify(res.response).slice(0, 200));
+    await expectAaSuccess(r.unit, "h3 submit");
   }
   await submitH3(TRACE_H_ROOT, FILLS_ROOT1);
   const fillHonest2 = Object.assign({}, fillBase, {
