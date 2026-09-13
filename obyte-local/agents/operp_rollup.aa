@@ -63,6 +63,21 @@
 				]
 			},
 			{
+				if: "{trigger.data.set_dispute_clamp}",
+				init: "{
+					if (!is_aa(trigger.address) OR var['dispute_clamp_aa'])
+						bounce('not authorized');
+				}",
+				messages: [
+					{
+						app: "state",
+						state: "{
+							var['dispute_clamp_aa'] = trigger.address;
+						}"
+					}
+				]
+			},
+			{
 				// Force-include: pin a sidechain unit id (64 hex) with its
 				// timestamp. Batches submitted later must include every id
 				// forced before their submit (a missing one is P-omit fraud).
@@ -120,8 +135,10 @@
 						OR !trigger.data.units_set_root OR length(trigger.data.units_set_root) != 44
 						OR !trigger.data.ops_root OR length(trigger.data.ops_root) != 44
 						OR !trigger.data.fills_root OR length(trigger.data.fills_root) != 44
-						OR !is_integer(trigger.data.unit_count) OR trigger.data.unit_count < 1 OR trigger.data.unit_count > 200000
-						OR !is_integer(trigger.data.wit_count) OR trigger.data.wit_count < 1)
+						OR !trigger.data.data_root OR length(trigger.data.data_root) != 64
+						OR !is_integer(trigger.data.pkg_count) OR trigger.data.pkg_count < 1 OR trigger.data.pkg_count > 1024
+						OR !is_integer(trigger.data.data_len) OR trigger.data.data_len < 1
+						OR trigger.data.data_len > trigger.data.pkg_count * 4000000)
 						bounce('bad submit');
 					if ($ls > 0 AND (var['frozen_' || $ls] otherwise 0) != 2
 						AND trigger.data.prev_state_hash != var['state_root_' || $ls])
@@ -147,10 +164,11 @@
 							var['trace_root_' || trigger.data.height] = trigger.data.trace_root;
 							var['units_root_' || trigger.data.height] = trigger.data.units_root;
 							var['units_set_root_' || trigger.data.height] = trigger.data.units_set_root;
-							var['ops_root_' || trigger.data.height] = trigger.data.ops_root;
-							var['fills_root_' || trigger.data.height] = trigger.data.fills_root;
 							var['unit_count_' || trigger.data.height] = trigger.data.unit_count;
 							var['wit_count_' || trigger.data.height] = trigger.data.wit_count;
+							var['data_root_' || trigger.data.height] = trigger.data.data_root;
+							var['data_len_' || trigger.data.height] = trigger.data.data_len;
+							var['pkg_count_' || trigger.data.height] = trigger.data.pkg_count;
 							var['da_unit_' || trigger.data.height] = trigger.unit || '';
 							var['inbox_upto_' || trigger.data.height] = timestamp;
 							var['active_bond_' || trigger.data.height] = trigger.address;
@@ -193,13 +211,12 @@
 				]
 			},
 			{
-				// Fraud verdict from a bound dispute AA: fail the height,
-				// slash half the submit bond to the challenger, reopen h.
 				if: "{trigger.data.verdict}",
 				init: "{
 					$da = (var['dispute_aa'] otherwise 0);
 					$df = (var['dispute_fill_aa'] otherwise 0);
-					if (trigger.address != $da AND trigger.address != $df)
+					$dc = (var['dispute_clamp_aa'] otherwise 0);
+					if (trigger.address != $da AND trigger.address != $df AND trigger.address != $dc)
 						bounce('not dispute');
 					if (trigger.data.verdict != 'fraud')
 						bounce('bad verdict');

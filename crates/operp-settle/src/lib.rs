@@ -188,6 +188,8 @@ pub enum SettleError {
     DepositDuplicateAnchor,
     #[error("deposit evidence too large")]
     DepositEvidenceTooLarge,
+    #[error("package over cap: a single frame exceeds PACK_SOURCE_CAP even stripped")]
+    PackageOverCap,
     #[error("gov wal flush failed")]
     WalFlush,
 }
@@ -206,19 +208,32 @@ pub fn fills_bytes(fills: &[Fill]) -> Vec<u8> {
     buf
 }
 /// Op-descriptor string committed by `ops_root` (dispute predicates parse
-/// these; `unit_hex` covers non-financial ops verbatim).
+/// these; `unit_hex` covers non-financial ops verbatim). Deposit descriptors
+/// carry the vault AA unit anchor as standard-base64 (44 chars, the Obyte
+/// unit-id alphabet — no `:` so the descriptor stays colon-split): the
+/// `dep_evidence` predicate matches it against the vault receipt
+/// `dep_<unit>`/`pdep_<unit>` on-chain (doc 12 §2.3).
 pub fn ops_element(unit_hex: &str, op: &operp_dag::Op) -> String {
+    use base64::Engine as _;
     use operp_dag::Op::*;
     match op {
         Deposit {
-            account, amount, ..
+            account,
+            amount,
+            aa_unit,
+            ..
         } => {
-            format!("d:{}:{}", hex::encode(account.0), amount)
+            let anchor = base64::engine::general_purpose::STANDARD.encode(aa_unit);
+            format!("d:{}:{}:{}", hex::encode(account.0), amount, anchor)
         }
         GovDeposit {
-            account, amount, ..
+            account,
+            amount,
+            aa_unit,
+            ..
         } => {
-            format!("D:{}:{}", hex::encode(account.0), amount)
+            let anchor = base64::engine::general_purpose::STANDARD.encode(aa_unit);
+            format!("D:{}:{}:{}", hex::encode(account.0), amount, anchor)
         }
         Withdraw {
             account,
@@ -552,19 +567,26 @@ impl Batch {
                 })
                 .collect();
             blobs = pack_frames(&stripped);
-            // Still over cap with all leaves stripped: print-only. The
-            // oversize package cannot land on-chain (ocore rejects it), so
-            // the header's packages can never assemble — watchers back off
-            // on the missing joints instead of mis-challenging. Return the
-            // data as-is rather than erroring (same posture as the legacy
-            // 4MB leaf_trace cap).
+            // Hard cap (doc 12 §2.4): still over cap with all leaves
+            // stripped → error. A height that cannot assemble is never
+            // submitted; the poster splits heights via from_applied caps
+            // instead of finalizing silently-unverifiable batches.
+            let still_over = blobs.iter().any(|b| {
+                let obj = serde_json::json!({"package_blob": b});
+                crate::obyte_hash::get_json_source(&obj).len() > PACK_SOURCE_CAP
+            });
+            if still_over {
+                return Err(SettleError::PackageOverCap);
+            }
         }
         let raw: Vec<Vec<u8>> = blobs
             .iter()
             .map(|b| decode_package_blob(b).unwrap_or_default())
             .collect();
         let root = data_root_hex(&raw);
+        let data_len: usize = raw.iter().map(|b| b.len()).sum();
         let mut header = self.header_json();
+        header["data_len"] = serde_json::Value::from(data_len as u64);
         if blobs.len() == 1 {
             header["frames_blob"] = serde_json::Value::String(blobs[0].clone());
             header["data_root"] = serde_json::Value::String(root);
@@ -2083,5 +2105,23 @@ mod tests {
         let got = data_root_hex(&blobs);
         let expected = hex::encode(sha256(b"abcd"));
         assert_eq!(got, expected);
+    }
+    #[test]
+    fn header_carries_data_len_and_root() {
+        // Doc 12 §2.4: temp_data_packages commits data_root + data_len
+        // (gunzipped bytes) on the header the rollup submit lands on-chain.
+        let (mut eng, pre, applied, _prev_root, evidences) = seed_trade();
+        let mut batch = Batch::from_applied(&pre.state, &mut eng, &applied).unwrap();
+        batch.deposit_evidences = evidences;
+        let (header, blobs) = batch.temp_data_packages().unwrap();
+        assert_eq!(blobs.len(), 1);
+        let raw = decode_package_blob(&blobs[0]).unwrap();
+        assert_eq!(
+            header["data_len"].as_u64().unwrap(),
+            raw.len() as u64,
+            "data_len must equal the gunzipped package bytes"
+        );
+        assert_eq!(header["data_root"].as_str().unwrap().len(), 64);
+        assert_eq!(header["data_root"].as_str().unwrap(), data_root_hex(&[raw]));
     }
 }

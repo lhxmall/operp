@@ -38,14 +38,21 @@ function resolveAa(agentFile, subs, outName) {
 function resolveRollupAa() {
   return resolveAa("operp_rollup.aa", {}, ".operp_rollup.resolved.aa");
 }
-function resolveDisputeAa(rollupAddress) {
-  return resolveAa("operp_dispute.aa", { ROLLUP_AA_HERE: rollupAddress }, ".operp_dispute.resolved.aa");
+function resolveDisputeAa(rollupAddress, vaultAddress) {
+  return resolveAa(
+    "operp_dispute.aa",
+    { ROLLUP_AA_HERE: rollupAddress, VAULT_AA_HERE: vaultAddress },
+    ".operp_dispute.resolved.aa"
+  );
 }
 function resolveVaultAa(rollupAddress, perpAssetId) {
   return resolveAa("operp_vault.aa", { ROLLUP_AA_HERE: rollupAddress, PERP_ASSET_ID_HERE: perpAssetId }, ".operp_vault.resolved.aa");
 }
 function resolveFillAa(rollupAddress) {
   return resolveAa("operp_dispute_fill.aa", { ROLLUP_AA_HERE: rollupAddress }, ".operp_dispute_fill.resolved.aa");
+}
+function resolveClampAa(rollupAddress) {
+  return resolveAa("operp_dispute_clamp.aa", { ROLLUP_AA_HERE: rollupAddress }, ".operp_dispute_clamp.resolved.aa");
 }
 const aaRoot = path.join(__dirname, "..", "vendor", "aa-testkit");
 const nm = path.join(aaRoot, "node_modules");
@@ -73,10 +80,22 @@ async function main() {
   const operator = network.wallet.operator;
   console.log("rollup AA address:", rollup);
 
+  // vault address, substituted into dispute for dep_evidence — no deployment
+  // needed before computing it.
+  const vaultPath = resolveVaultAa(rollup, PERP_ASSET_ID);
+  const objectHash = require("ocore/object_hash.js");
+  const parseOjson = require("ocore/formula/parse_ojson").parse;
+  let vaultParsed = null;
+  parseOjson(fs.readFileSync(vaultPath, "utf8"), (err, res) => {
+    if (err) throw err;
+    vaultParsed = res[1];
+  });
+  const vaultAddr = objectHash.getChash160(["autonomous agent", vaultParsed]);
   const network2 = await Network.create()
-    .with.agent({ dispute: resolveDisputeAa(rollup) })
+    .with.agent({ dispute: resolveDisputeAa(rollup, vaultAddr) })
     .with.agent({ fill: resolveFillAa(rollup) })
-    .with.agent({ vault: resolveVaultAa(rollup, PERP_ASSET_ID) })
+    .with.agent({ clamp: resolveClampAa(rollup) })
+    .with.agent({ vault: vaultPath })
     .with.wallet({ operator: 1e14 })
     .run();
   const dispute = network2.agent.dispute;
@@ -104,6 +123,16 @@ async function main() {
   if (fb.error || !fb.unit) throw new Error("fill bind failed: " + fb.error);
   await network2.witnessUntilStable(fb.unit);
   console.log("fill bound; unit =", fb.unit);
+  const clamp = network2.agent.clamp;
+  console.log("clamp AA address   :", clamp);
+  const cb = await op2.triggerAaWithData({
+    toAddress: clamp,
+    amount: 20000,
+    data: { bind_clamp: 1 },
+  });
+  if (cb.error || !cb.unit) throw new Error("clamp bind failed: " + cb.error);
+  await network2.witnessUntilStable(cb.unit);
+  console.log("clamp bound; unit =", cb.unit);
 
   const v = await operator.readAAStateVars(rollup);
   const vars_ = v.vars || v;
@@ -111,17 +140,19 @@ async function main() {
     throw new Error("dispute_aa not bound: " + JSON.stringify(vars_.dispute_aa));
   if (String(vars_.dispute_fill_aa) !== String(fill))
     throw new Error("dispute_fill_aa not bound: " + JSON.stringify(vars_.dispute_fill_aa));
+  if (String(vars_.dispute_clamp_aa) !== String(clamp))
+    throw new Error("dispute_clamp_aa not bound: " + JSON.stringify(vars_.dispute_clamp_aa));
   if (Number(vars_.last_submitted || 0) !== 0)
     throw new Error("boot last_submitted wrong");
   if (Number(vars_.last_finalized || 0) !== 0)
     throw new Error("boot last_finalized wrong");
-
   // persist deployment info for the operator tooling
   const info = {
     network: "testnet",
     rollup_aa_address: rollup,
     dispute_aa_address: dispute,
     dispute_fill_aa_address: fill,
+    dispute_clamp_aa_address: clamp,
     vault_aa_address: vault,
     perp_asset_id: PERP_ASSET_ID,
     challenge_secs: 3600,

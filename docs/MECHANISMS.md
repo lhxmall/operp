@@ -398,12 +398,17 @@ slash_reward_bps 归挑战者、余下烧毁。
 双币种 Merkle 证明出金路径（§10.5）。`(market, oracle)` 一旦无债券，
 其后续报价自动失效。
 
-### 7.3 残余操纵风险
+### 7.3 多数合谋硬化（doc 12 §2.2）
 
-±10% 帽允许攻击者以每 tick 10% 步进逐渐走偏 mark；中位数要求腐化按
-债券计的多数报价者配合。TWAP 平滑（oracle/funding 双环）与连续偏移罚没
-已落地，但合谋多数仍可在两次罚没之间施压；外部多源锚（§6.2 末）需
-治理启用后才提供第二意见。
+* mark 话语权计数化：有效报告数（有债券 + 当期有报价）< 3 时中位数只喂
+  TWAP/资金费状态，不动 spot mark；fills 在此期间继续推动 mark，单个或
+  一对报告者无法劫持定价。
+* 限速：中位数偏离长 TWAP 超过 `REPORT_MAX_STEP_BPS=2000` 时不同步
+  mark/index（该报告仍记入罚没 streak 输入）；无 TWAP 的冷启动期豁免。
+* 罚没基线钉死长 TWAP（不同期中位数），抱团跳价连走 3 高度即三家一起可罚。
+* `AggregatedExternal` 下外部馈线过期（`FUNDING_EXTERNAL_MAX_STALENESS=32`）
+  时 mark 冻结（不再回落到可操纵的 bonded 中位数）；资金费仍按 doc 06
+  §2.6 回落（资金永不冻结）。
 
 ---
 
@@ -444,13 +449,15 @@ package = base64(gzip（`\n` 连接 frames）)；cap 仍按
 `zlib.gunzipSync` + concat + sha256 对得上；非法 gzip → BindingMismatch。
 `l` 保留在线上——`prove.rs` 的 `deposit_proof` 要拿 liar 贴过的叶子对
 committed `trace[k]` 开证明，省 `l` 会让一枪谓词开不了。多包时 `packages`
-记 package 单元的真实 Obyte unit hash 列表（poster 先发包、拿到 unit 后填，
-Rust 打包时只留占位），watcher 按条目 `get_joint` 取包、gunzip 后拼接；
+超限（去 `l` 重打仍有包超 `PACK_SOURCE_CAP`）整批直接 `PackageOverCap`
+报错：组装不起来的高度永不提交（poster 按高度切分），杜绝静默 finalize。
+header 另带 `data_len`（gunzip 字节总数）→ rollup `submit` 落 `data_root_h/
+data_len_h/pkg_count_h` 三键并设门（`data_len ≤ pkg_count × 4M`，包数 ≤1024）。
+缺包重试 3 次后是 LOUD alert（`PACKAGE WITHHELD`），不再静默 backoff；
+`--archive-dir` 持久化每高度 temp_data 全量供 24h 后重放。
 承载该对象的 Obyte 单元之规范 `data_hash`
 仍为 `hex(sha256(getJsonSource(header或package对象)))`。充值证据在 frame
 `e` 内，复原即拼接各 `e` 字段（无 header `deposit_evidences`）。
-超限（去 `l` 重打仍有包超 `PACK_SOURCE_CAP`）整批 print-only：超限包上不了链，
-watcher 在缺失 joints 上 backoff 放弃，绝不误挑战。
 
 意义：
 
@@ -569,17 +576,17 @@ AA 只能做字符串拼接与 sha256——它无法解析 i128 LE、无法遍�
 
 ## 10. 结算 AA 状态机（CHAIN_ID=operp-v2）
 
-三个 AA：`operp_rollup.aa`（主张链）、`operp_dispute.aa`（充提/漏单谓词）、
-`operp_dispute_fill.aa`（成交谓词）、`operp_vault.aa`（托管）。金库无
-owner key，claim 在 rollup。
+五个 AA：`operp_rollup.aa`（主张链）、`operp_dispute.aa`（充提/漏单/存款证据谓词）、
+`operp_dispute_fill.aa`（成交谓词）、`operp_dispute_clamp.aa`（保险钳制谓词）、`operp_vault.aa`（托管）。金库无
 
 rollup 状态变量（`<h>` 为高度后缀）：
 
 ```
-last_submitted, last_finalized, dispute_aa, dispute_fill_aa
+last_submitted, last_finalized, dispute_aa, dispute_fill_aa, dispute_clamp_aa
 submitted_at_h, state_root_h, aa_forest_h(1024 hex), prev_h
 wit_root_h, trace_root_h, units_root_h, units_set_root_h
 ops_root_h, fills_root_h, unit_count_h, wit_count_h
+data_root_h(64 hex), data_len_h, pkg_count_h
 da_unit_h, active_bond_h, fee_winner_h
 frozen_h ∈ {∅/0=live, 2=failed}
 inbox_<unit_id_hex>, inbox_upto_h
@@ -599,10 +606,11 @@ sbond_<addr>, reward_<addr>, slash_reward_<addr>（sbond 仅遗留 claim 路径�
 前置：`chain_id=='operp-v2'` ∧ `assertion_version==1` ∧ h == last_submitted+1
 ∧ prev == `state_root_{h-1}`（上一高度 frozen=2 时豁免）
 ∧ state_root/prev 64 hex ∧ aa_forest 1024 hex ∧ 六个承诺根 44 b64
+∧ `data_root` 64 hex ∧ `pkg_count` 1..1024 ∧ `data_len` ≥ 1 ∧ `data_len ≤ pkg_count × 4M`
 ∧ 组合单元（temp_data 在同一 unit，`da_unit_h=trigger.unit`）
 ∧ 输出 ≥ 10000（仅 bounce 费）∧ `pool_<sender> >= 1e12`
 ∧ `last_submitted-last_finalized < 50`（在途占用）
-→ 写全部 <h> 键 + `inbox_upto_h = timestamp` + last_submitted=h；
+→ 写全部 <h> 键（含 `data_root_h/data_len_h/pkg_count_h`）+ `inbox_upto_h = timestamp` + last_submitted=h；
   活高度重发（h ≤ last_submitted 且 frozen≠2）→ bounce('height taken')；
   欺诈重开的后续高度可自由覆盖。无 lock。
 
@@ -610,21 +618,19 @@ sbond_<addr>, reward_<addr>, slash_reward_<addr>（sbond 仅遗留 claim 路径�
 
 | 谓词 | AA | 证明什么 |
 |---|---|---|
-| deposit / withdraw（含 D/W gov） | dispute | op 前后余额算术（含 pre_absent 非成员） |
+| deposit / withdraw（含 D/W gov） | dispute | op 前后余额算术（含 pre_absent 非成员）；deposit op 必须带 44 字符 base64 vault 锚（无锚 bounce 'bad op'） |
+| dep_evidence | dispute | op 锚 `dep_<unit>`/`pdep_<unit>` 在 vault AA 缺收据、金额不等或 base↔PERP 混淆；跨 AA `var[VAULT][key]` 直读 |
 | omit | dispute | inbox 强收 id 不在 units_set_root（三段几何非成员） |
 | fill_math | dispute_fill | apply_fill 全分支（同向 VWAP / 减仓 / 反手 / 平完）± taker fee；±1 Decimal 容差；claimed-absent 仓位带前缀区间非成员 |
 | ghost | dispute_fill | 成交的 maker 订单 id 前缀区间不在 pre_wit |
 | skip | dispute_fill | pre_wit 中存在更优活单未成交 |
+| clamp | dispute_clamp | 单边 fill 重放 + 全仓 upnl（post 仓位 × pre marks，pos≤4）→ shortfall；post 抵押 / 收据增量 / 保险增量（fill taker fee 减双方收据增量）三腿；pos 腿偏离直接定罪 |
 
 公共门：`frozen`/`submitted_at+3600`、stale-root 对比 rollup 变量、
 所有成员证明 `.root` 必须等于对应 pre_wit/post_wit/roots。
 验不过 bounce('no fraud')；验过 → 付 10000 bytes + data
 `{verdict:'fraud', height, challenger}` 给 rollup。
-### 10.3 verdict(h) — rollup
-
-`trigger.address ∈ {dispute_aa, dispute_fill_aa}` ∧ verdict=='fraud'
-∧ 高度 live ∧ 窗内 ∧ challenger 是合法 32 字符地址
-→ frozen_h=2、清 state_root/aa_forest/active_bond/fee_winner、
+`trigger.address ∈ {dispute_aa, dispute_fill_aa, dispute_clamp_aa}` ∧ verdict=='fraud'
   last_submitted=h-1、`pool_<operator>` 扣 5e11（不足清零）、
   slash_reward_<challenger> += 5e11。
 ### 10.4 finalize / escape_finalize(h) — rollup
@@ -665,6 +671,16 @@ acct:{acct_hex}:{collateral}:{perp}:{W}
 pos:{acct_hex}:{market}:{qty}:{entry}
 ord:{order_hex}:{market}:{side}:{price}:{seq}:{remaining}:{acct_hex}
 meta:{market}:{tick}:{im}:{mm}:{taker_fee_bps}:{keeper}:{delisted}:{mark}
+clamp:{acct_hex}:{total}（累计保险钳制吸收量，>0 才有叶；doc 12 §2.1）
+```
+
+op 描述串（`operp_settle::ops_element`，`ops_root` 叶子）：
+
+```
+d:{acct_hex}:{amount}:{anchor_b64}（充值，anchor = vault 触发 unit id，标准 base64 44 字符）
+D:{acct_hex}:{amount}:{anchor_b64}（PERP 充值，同上）
+w:{acct_hex}:{amount}:{nonce}（提款）
+W:{acct_hex}:{amount}:{nonce}（PERP 提款）
 ```
 
 这些数组在 frames 内按单元拆开（`t`/`o`/`f`/`c`/`l`），header 不再带它们；

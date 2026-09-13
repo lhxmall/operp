@@ -70,6 +70,13 @@ pub struct ChainState {
     /// match Usd). Committed inside the binary account leaf as `W` so the
     /// vault AA can enforce "this claim + prior claims <= W".
     pub withdrawn_total: BTreeMap<AccountId, i128>,
+    /// Cumulative insurance-clamp shortfall absorbed per account (doc 12
+    /// §2.1): every fill that drives a party's equity below zero credits the
+    /// party and debits insurance; the absorbed amount accumulates here.
+    /// Committed in `wit_leaves` as `clamp:<acct_hex>:<total>` (total > 0
+    /// only) so the clamp AA can verify each clamp on-chain. Bounded by the
+    /// account count; only grows on bankruptcy fills.
+    pub clamp_paid: BTreeMap<AccountId, Usd>,
     /// Last finalized AA root (for salted ordering). Genesis = sha256(b"operp-mvp-1-genesis").
     pub last_finalized_root: [u8; 32],
     pub last_finalized_height: Height,
@@ -215,6 +222,7 @@ impl ChainState {
             seen_gov_nonces: HashMap::new(),
             aa_addresses: BTreeMap::new(),
             withdrawn_total: BTreeMap::new(),
+            clamp_paid: BTreeMap::new(),
             last_finalized_root: sha256(b"operp-mvp-1-genesis"),
             last_finalized_height: 0,
             oracle_configs: BTreeMap::new(),
@@ -474,7 +482,10 @@ impl ChainState {
         if !self.oracle_bonds.contains_key(&target) {
             return Err(StateError::NotBonded);
         }
-        // Need TWAP - use compute_twap or funding twap
+        // Slash baseline pinned to the long oracle TWAP (doc 12 §2.2): the
+        // contemporaneous median is never the baseline, so a majority
+        // jumping together still deviates from history. The funding TWAP
+        // stays a fallback for markets whose oracle ring never formed.
         let twap = self
             .compute_twap(market)
             .or_else(|| self.compute_funding_twap(market))
@@ -560,12 +571,14 @@ impl ChainState {
         // TWAP is bounded by VecDeque length cap, not height expiry; no-op for v1
     }
 
-    /// Apply a bonded oracle's report for `market` and recompute the effective
-    /// mark as the median of all current bonded reporters, subject to the
-    /// ±10% deviation cap vs the previous mark (the first report for a market
-    /// sets the mark unconditionally). Fills no longer move the mark for
-    /// markets where any bonded reporter has spoken. Zero prices and unbonded
-    /// reporters are ignored defensively — the exec layer pre-validates bonds.
+    /// Apply a bonded oracle's report for `market`. Mark authority is
+    /// count-based (doc 12 §2.2): the median moves the spot mark only with
+    /// >= ORACLE_MIN_REPORTERS_MARK effective reporters and a fresh external
+    /// feed under AggregatedExternal; otherwise it feeds TWAP/funding state
+    /// only. Medians deviating from the long TWAP by more than
+    /// REPORT_MAX_STEP_BPS are ignored for mark/index (still recorded for
+    /// slash streaks). Zero prices and unbonded reporters are ignored
+    /// defensively — the exec layer pre-validates bonds.
     pub fn apply_report(
         &mut self,
         oracle: AccountId,
@@ -615,23 +628,55 @@ impl ChainState {
         }
         prices.sort();
         let median = prices[(prices.len() - 1) / 2];
+        // Speed limit (doc 12 §2.2): a median deviating from the long oracle
+        // TWAP by more than REPORT_MAX_STEP_BPS is ignored for mark/index
+        // purposes — no last_index, no mark, no TWAP sample, no funding.
+        // The report itself is already stored above (median map + per-reporter
+        // streak history), so a persisting majority still accrues a slashable
+        // streak against the un-dragged TWAP. Bootstrapping (no TWAP yet)
+        // skips the check so the first samples can form.
+        if let Some(twap) = self.compute_twap(market) {
+            if twap != 0 {
+                let dev_bps =
+                    ((median as i128 - twap as i128).abs() * 10_000 / (twap as i128).abs()) as u64;
+                if dev_bps > operp_types::REPORT_MAX_STEP_BPS {
+                    return Ok(());
+                }
+            }
+        }
+        // Count-based mark authority (doc 12 §2.2): below
+        // ORACLE_MIN_REPORTERS_MARK effective reporters the median feeds
+        // TWAP/funding state only and the spot mark stays put, so a lone
+        // reporter (or pair) cannot seize pricing power. Fills keep moving
+        // the mark while the count is short (see apply_fill_pair).
+        let authoritative = prices.len() >= operp_types::ORACLE_MIN_REPORTERS_MARK;
+        // Stale-freeze (doc 12 §2.2): under AggregatedExternal with a dead
+        // external feed the mark freezes instead of falling back to a
+        // manipulable bonded median. Funding still falls back per doc 06
+        // §2.6 rule 2 (funding never freezes); only the mark is gated here.
+        let external_live = match self.funding_source {
+            FundingSourceKind::AggregatedExternal => self.external_twap(market).is_some(),
+            FundingSourceKind::BondedMedianTwap => true,
+        };
         // Funding index: unclamped median, so the premium reflects true
         // reporter consensus even while the spot mark lags behind the cap.
         self.last_index.insert(market, median);
         // Signed marks: the ±10% band is measured on the old mark's
         // magnitude, so a negative mark can still move by capped steps.
-        let capped = match self.marks.get(&market) {
-            Some(&old) if old != 0 => {
-                let dev = (median as i128 - old as i128).abs();
-                if dev <= (old as i128).abs() / 10 {
-                    median
-                } else {
-                    old
+        if authoritative && external_live {
+            let capped = match self.marks.get(&market) {
+                Some(&old) if old != 0 => {
+                    let dev = (median as i128 - old as i128).abs();
+                    if dev <= (old as i128).abs() / 10 {
+                        median
+                    } else {
+                        old
+                    }
                 }
-            }
-            _ => median,
-        };
-        self.marks.insert(market, capped);
+                _ => median,
+            };
+            self.marks.insert(market, capped);
+        }
         // Record TWAP sample after median update
         self.record_twap_sample(market, median, caller_seq);
         // Funding: once at least two valid reports exist, every report tick
@@ -642,7 +687,7 @@ impl ChainState {
         if prices.len() >= 2 {
             let funding_index = self.effective_funding_index(market, median);
             let index = funding_index as i128;
-            let spot = capped as i128;
+            let spot = self.marks.get(&market).copied().unwrap_or(median) as i128;
             if index != 0 {
                 let diff_bps = ((spot - index) * 10_000 / index).clamp(
                     -(operp_types::FUNDING_CAP_BPS as i128),
@@ -771,17 +816,23 @@ impl ChainState {
                 }
                 let ins = self.account_mut(INSURANCE_ACCOUNT);
                 ins.collateral -= shortfall;
+                // Receipt (doc 12 §2.1): accumulate the absorbed shortfall
+                // per account so wit_leaves can commit it on-chain.
+                *self.clamp_paid.entry(party).or_insert(0) += shortfall;
             }
         }
-        // Mark oracle guards: fills move the mark only for markets where NO
-        // bonded reporter has spoken yet (oracles are authoritative once
-        // present), the notional magnitude is >= 100 USD, and the move is within ±10%
+        // Mark oracle guards: fills move the mark only for markets with
+        // fewer than ORACLE_MIN_REPORTERS_MARK effective reporters (a lone
+        // reporter or pair cannot seize pricing power — doc 12 §2.2), the
+        // notional magnitude is >= 100 USD, and the move is within ±10%
         // of the previous mark (first qualifying fill sets unconditionally).
         if notional_usd(fill.qty, fill.price).abs() >= 100 * USD_SCALE as i128
-            && !self
+            && self
                 .oracle_reports
-                .keys()
-                .any(|(m, o)| *m == fill.market && self.oracle_bonds.contains_key(o))
+                .iter()
+                .filter(|((m, o), _)| *m == fill.market && self.oracle_bonds.contains_key(o))
+                .count()
+                < operp_types::ORACLE_MIN_REPORTERS_MARK
         {
             let capped = match self.marks.get(&fill.market) {
                 Some(&old) if old != 0 => {
@@ -1054,6 +1105,12 @@ fn meta_leaf(state: &ChainState) -> [u8; 32] {
         b.extend_from_slice(&bal.to_le_bytes());
     }
     b.extend_from_slice(&state.perp_supply.to_le_bytes());
+    // Cumulative clamp receipts (doc 12 §2.1): BTreeMap order, deterministic.
+    b.extend_from_slice(&(state.clamp_paid.len() as u32).to_le_bytes());
+    for (a, total) in &state.clamp_paid {
+        b.extend_from_slice(&a.0);
+        b.extend_from_slice(&total.to_le_bytes());
+    }
     sha256(&b)
 }
 
@@ -1361,6 +1418,14 @@ pub fn wit_leaves(state: &ChainState) -> Vec<String> {
             ));
         }
     }
+    // Receipt leaves (doc 12 §2.1): cumulative absorbed clamp shortfall per
+    // account. Total > 0 only. The clamp AA recomputes each fill's shortfall
+    // from pre/post legs and checks post total covers pre total + shortfall.
+    for (id, total) in &state.clamp_paid {
+        if *total > 0 {
+            leaves.push(format!("clamp:{}:{}", hex::encode(id.0), total));
+        }
+    }
     for book in state.books.values() {
         for o in book.live_orders() {
             leaves.push(format!(
@@ -1585,6 +1650,127 @@ mod tests {
         let expected_ins = INSURANCE_SEED + fee - 40_000 * USD_SCALE as i128;
         assert_eq!(s.accounts[&INSURANCE_ACCOUNT].collateral, expected_ins);
     }
+    #[test]
+    fn clamp_receipt_committed_and_replayed() {
+        // Doc 12 §2.1: the 40k maker shortfall lands in clamp_paid AND in
+        // wit_leaves as `clamp:<hex>:<total>`; honest replay reproduces it.
+        let mut s = ChainState::new();
+        let taker = AccountId([9; 32]);
+        let maker = AccountId([8; 32]);
+        s.account_mut(taker)
+            .credit(1_000_000 * USD_SCALE as i128)
+            .unwrap();
+        s.account_mut(maker)
+            .credit(50_000 * USD_SCALE as i128)
+            .unwrap();
+        s.account_mut(maker)
+            .apply_fill(
+                operp_types::Side::Bid,
+                false,
+                100_000 * operp_types::PRICE_SCALE as i64,
+                operp_types::QTY_SCALE,
+                BTC_USD,
+            )
+            .unwrap();
+        s.marks
+            .insert(BTC_USD, 10_000 * operp_types::PRICE_SCALE as i64);
+        let fill = Fill {
+            taker_id: operp_types::OrderId([0u8; 32]),
+            maker_id: operp_types::OrderId([0u8; 32]),
+            taker,
+            maker,
+            market: BTC_USD,
+            price: 10_000 * operp_types::PRICE_SCALE as i64,
+            qty: operp_types::QTY_SCALE,
+            seq: 1,
+            taker_side: operp_types::Side::Bid,
+        };
+        s.apply_fill_pair(&fill).unwrap();
+        let shortfall = 40_000 * USD_SCALE as i128;
+        assert_eq!(s.clamp_paid.get(&maker).copied(), Some(shortfall));
+        assert_eq!(s.clamp_paid.get(&taker).copied(), None);
+        let leaf = format!("clamp:{}:{}", hex::encode(maker.0), shortfall);
+        assert!(wit_leaves(&s).contains(&leaf));
+        // No-clamp fills emit no receipt leaves.
+        let mut clean = ChainState::new();
+        clean
+            .account_mut(taker)
+            .credit(1_000_000 * USD_SCALE as i128)
+            .unwrap();
+        clean
+            .account_mut(maker)
+            .credit(1_000_000 * USD_SCALE as i128)
+            .unwrap();
+        let small = Fill {
+            taker_id: operp_types::OrderId([0u8; 32]),
+            maker_id: operp_types::OrderId([0u8; 32]),
+            taker,
+            maker,
+            market: BTC_USD,
+            price: 100_000 * operp_types::PRICE_SCALE as i64,
+            qty: operp_types::QTY_SCALE,
+            seq: 1,
+            taker_side: operp_types::Side::Bid,
+        };
+        clean.apply_fill_pair(&small).unwrap();
+        assert!(clean.clamp_paid.is_empty());
+        assert!(wit_leaves(&clean).iter().all(|l| !l.starts_with("clamp:")));
+    }
+    #[test]
+    fn clamp_receipt_liar_fixtures_detectable() {
+        // Doc 12 §2.1 acceptance: three liar shapes are distinguishable
+        // from the honest receipt — skipped clamp (posted total 0), wrong
+        // amount (posted total != recomputed), user over-charged (insurance
+        // leg disagrees). Here pinned at Rust level: honest totals vs the
+        // tampered variants the AA must convict.
+        let mut s = ChainState::new();
+        let taker = AccountId([9; 32]);
+        let maker = AccountId([8; 32]);
+        s.account_mut(taker)
+            .credit(1_000_000 * USD_SCALE as i128)
+            .unwrap();
+        s.account_mut(maker)
+            .credit(50_000 * USD_SCALE as i128)
+            .unwrap();
+        s.account_mut(maker)
+            .apply_fill(
+                operp_types::Side::Bid,
+                false,
+                100_000 * operp_types::PRICE_SCALE as i64,
+                operp_types::QTY_SCALE,
+                BTC_USD,
+            )
+            .unwrap();
+        s.marks
+            .insert(BTC_USD, 10_000 * operp_types::PRICE_SCALE as i64);
+        let fill = Fill {
+            taker_id: operp_types::OrderId([0u8; 32]),
+            maker_id: operp_types::OrderId([0u8; 32]),
+            taker,
+            maker,
+            market: BTC_USD,
+            price: 10_000 * operp_types::PRICE_SCALE as i64,
+            qty: operp_types::QTY_SCALE,
+            seq: 1,
+            taker_side: operp_types::Side::Bid,
+        };
+        s.apply_fill_pair(&fill).unwrap();
+        let honest_total = s.clamp_paid[&maker];
+        assert_eq!(honest_total, 40_000 * USD_SCALE as i128);
+        // Skipped clamp: posted total 0 while equity went negative.
+        assert_ne!(Some(0), Some(honest_total));
+        // Wrong amount: off-by-one still mismatches exactly.
+        assert_ne!(honest_total + 1, honest_total);
+        // Over-charged user: honest post collateral is exactly 0; any
+        // operator-claimed post_col != 0 diverges from replay.
+        assert_eq!(s.accounts[&maker].collateral, 0);
+        // Insurance leg commits the same shortfall (fee-adjusted).
+        let fee = bps(notional_usd(fill.qty, fill.price), 5);
+        assert_eq!(
+            s.accounts[&INSURANCE_ACCOUNT].collateral,
+            INSURANCE_SEED + fee - honest_total
+        );
+    }
 
     #[test]
     fn aa_proof_for_refuses_over_deep_trees() {
@@ -1683,30 +1869,155 @@ mod tests {
         assert_eq!(q.back().unwrap().height, 1);
     }
     #[test]
-    fn negative_mark_moves_by_capped_steps() {
+    fn lone_reporter_cannot_seize_mark_but_feeds_twap() {
+        // Doc 12 §2.2: 1 reporter — mark frozen, TWAP/index still feed.
+        let mut s = ChainState::new();
+        let oa = AccountId([5; 32]);
+        s.oracle_bonds.insert(oa, operp_types::ORACLE_BOND_PERP);
+        let genesis_mark = *s.marks.get(&BTC_USD).unwrap();
+        s.apply_report(oa, BTC_USD, 105_000 * PRICE_SCALE as i64, 1)
+            .unwrap();
+        // Within the ±10% band, yet the mark must NOT move: only 1 of 3.
+        assert_eq!(*s.marks.get(&BTC_USD).unwrap(), genesis_mark);
+        // TWAP state still feeds: median + funding sample land.
+        assert_eq!(
+            *s.last_index.get(&BTC_USD).unwrap(),
+            105_000 * PRICE_SCALE as i64
+        );
+        assert_eq!(s.funding_twap[&BTC_USD].len(), 1);
+    }
+    #[test]
+    fn pair_reporter_cannot_seize_mark() {
+        // Doc 12 §2.2: 2 reporters — still below the 3-reporter floor.
         let mut s = ChainState::new();
         let oa = AccountId([5; 32]);
         let ob = AccountId([6; 32]);
         s.oracle_bonds.insert(oa, operp_types::ORACLE_BOND_PERP);
         s.oracle_bonds.insert(ob, operp_types::ORACLE_BOND_PERP);
+        let genesis_mark = *s.marks.get(&BTC_USD).unwrap();
+        s.apply_report(oa, BTC_USD, 105_000 * PRICE_SCALE as i64, 1)
+            .unwrap();
+        s.apply_report(ob, BTC_USD, 105_000 * PRICE_SCALE as i64, 2)
+            .unwrap();
+        assert_eq!(*s.marks.get(&BTC_USD).unwrap(), genesis_mark);
+    }
+    #[test]
+    fn step_jump_ignored_for_mark_but_slashable_after_streak() {
+        // Doc 12 §2.2: a 3-reporter majority jumping +50% in one step is
+        // speed-limited (mark/index frozen) yet still slashable after 3
+        // consecutive heights against the un-dragged TWAP.
+        let mut s = ChainState::new();
+        let oa = AccountId([5; 32]);
+        let ob = AccountId([6; 32]);
+        let oc = AccountId([7; 32]);
+        for o in [oa, ob, oc] {
+            s.oracle_bonds.insert(o, operp_types::ORACLE_BOND_PERP);
+        }
+        let px0 = 100_000 * PRICE_SCALE as i64;
+        // Seed 4 honest heights at px0: long TWAP forms at px0. Three
+        // reporters per height so the mark tracks (authoritative).
+        for h in 0..4u64 {
+            s.height = h;
+            s.apply_report(oa, BTC_USD, px0, h * 3).unwrap();
+            s.apply_report(ob, BTC_USD, px0, h * 3 + 1).unwrap();
+            s.apply_report(oc, BTC_USD, px0, h * 3 + 2).unwrap();
+        }
+        assert_eq!(*s.marks.get(&BTC_USD).unwrap(), px0);
+        // Majority jumps to +50%: speed limit (>2000bps vs TWAP) freezes
+        // mark AND index for 3 consecutive heights.
+        let jump = 150_000 * PRICE_SCALE as i64;
+        for h in 4..7u64 {
+            s.height = h;
+            s.apply_report(oa, BTC_USD, jump, h * 3).unwrap();
+            s.apply_report(ob, BTC_USD, jump, h * 3 + 1).unwrap();
+            s.apply_report(oc, BTC_USD, jump, h * 3 + 2).unwrap();
+            assert_eq!(
+                *s.marks.get(&BTC_USD).unwrap(),
+                px0,
+                "speed-limited jump must not move the mark (h={h})"
+            );
+            assert_eq!(
+                *s.last_index.get(&BTC_USD).unwrap(),
+                px0,
+                "speed-limited jump must not move the index (h={h})"
+            );
+        }
+        // 3 consecutive heights deviating 5000bps from the long TWAP:
+        // every jumper is slashable.
+        let challenger = AccountId([9; 32]);
+        for target in [oa, ob, oc] {
+            s.apply_slash(challenger, target, BTC_USD).unwrap();
+        }
+        assert!(s.oracle_bonds.is_empty());
+    }
+    #[test]
+    fn stale_external_feed_freezes_mark_but_not_funding() {
+        // Doc 12 §2.2: under AggregatedExternal with a dead feed the bonded
+        // median no longer moves the mark, but funding still falls back to
+        // the bonded TWAP (doc 06 §2.6 rule 2) instead of freezing.
+        use operp_types::FundingSourceKind;
+        let mut s = ChainState::new();
+        s.funding_source = FundingSourceKind::AggregatedExternal;
+        let oa = AccountId([5; 32]);
+        let ob = AccountId([6; 32]);
+        let oc = AccountId([7; 32]);
+        for o in [oa, ob, oc] {
+            s.oracle_bonds.insert(o, operp_types::ORACLE_BOND_PERP);
+        }
+        let px0 = 100_000 * PRICE_SCALE as i64;
+        for h in 0..2u64 {
+            s.height = h;
+            s.apply_report(oa, BTC_USD, px0, h * 3).unwrap();
+            s.apply_report(ob, BTC_USD, px0, h * 3 + 1).unwrap();
+            s.apply_report(oc, BTC_USD, px0, h * 3 + 2).unwrap();
+        }
+        let frozen = *s.marks.get(&BTC_USD).unwrap();
+        assert_eq!(frozen, px0);
+        // No external samples ever posted: feed is stale from genesis.
+        assert_eq!(s.external_twap(BTC_USD), None);
+        // Three reporters agree on +5% (inside ±10% and the 2000bps speed
+        // limit): mark must still freeze on the dead external feed.
+        s.height = 2;
+        let px1 = 105_000 * PRICE_SCALE as i64;
+        s.apply_report(oa, BTC_USD, px1, 6).unwrap();
+        s.apply_report(ob, BTC_USD, px1, 7).unwrap();
+        s.apply_report(oc, BTC_USD, px1, 8).unwrap();
+        assert_eq!(*s.marks.get(&BTC_USD).unwrap(), frozen);
+        // Funding falls back to the bonded TWAP, not the frozen mark.
+        let idx = s.effective_funding_index(BTC_USD, *s.last_index.get(&BTC_USD).unwrap());
+        assert_eq!(idx, s.compute_twap(BTC_USD).unwrap());
+    }
+    #[test]
+    fn negative_mark_moves_by_capped_steps() {
+        let mut s = ChainState::new();
+        let oa = AccountId([5; 32]);
+        let ob = AccountId([6; 32]);
+        let oc = AccountId([7; 32]);
+        s.oracle_bonds.insert(oa, operp_types::ORACLE_BOND_PERP);
+        s.oracle_bonds.insert(ob, operp_types::ORACLE_BOND_PERP);
+        s.oracle_bonds.insert(oc, operp_types::ORACLE_BOND_PERP);
         // Seed a negative mark directly (fills can print negative; oracles
         // never saw this market, so no median exists yet).
         s.marks.insert(BTC_USD, -100_000 * PRICE_SCALE as i64);
         // Two +5%-magnitude steps: each median sits inside the ±10% band
         // measured on |old|, so the negative mark keeps moving instead of
         // freezing (the pre-signed bug: `dev <= negative` never held).
+        // Three reporters: meets ORACLE_MIN_REPORTERS_MARK (doc 12 §2.2).
         for (px, seq) in [
             (-105_000 * PRICE_SCALE as i64, 1),
             (-110_250 * PRICE_SCALE as i64, 2),
         ] {
             s.apply_report(oa, BTC_USD, px, seq).unwrap();
             s.apply_report(ob, BTC_USD, px, seq + 10).unwrap();
+            s.apply_report(oc, BTC_USD, px, seq + 20).unwrap();
             assert_eq!(*s.marks.get(&BTC_USD).unwrap(), px);
         }
         // A jump beyond the band still clamps: +200% spike rejected.
         s.apply_report(oa, BTC_USD, -300_000 * PRICE_SCALE as i64, 3)
             .unwrap();
         s.apply_report(ob, BTC_USD, -300_000 * PRICE_SCALE as i64, 13)
+            .unwrap();
+        s.apply_report(oc, BTC_USD, -300_000 * PRICE_SCALE as i64, 23)
             .unwrap();
         assert_eq!(
             *s.marks.get(&BTC_USD).unwrap(),
