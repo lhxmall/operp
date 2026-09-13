@@ -645,13 +645,13 @@ async function main() {
     right_proof: merkle.getMerkleProof(gSorted, gBetter),
   };
   st = await vars(rollup);
+  console.log("ghost roots:", JSON.stringify({ want_trace: TRACE_H_ROOT, got_trace: st.trace_root_3, want_fills: FILLS_ROOT1, got_fills: st.fills_root_3, want_ops: OPS_ROOT1, got_ops: st.ops_root_3 }));
   await triggerVerdict(challenger, fill, Object.assign({ pred: "ghost", height: 3 }, ghostProof), 20000, "ghost predicate");
   st = await vars(rollup);
   if (Number(st.frozen_3) !== 2) throw new Error("ghost fraud did not freeze height");
   console.log("12. ghost (absent maker) → frozen=3");
   // ---- 13. skip: better live order ignored → fraud -------------------------
   const SKIP_TRACE4 = pad2([`skip-post-wit`], "skiptrace4");
-  const SKIP_TRACE4_ROOT = merkle.getMerkleRoot(SKIP_TRACE4);
   const SKIP_FILLS = pad2([`f:${"u".repeat(64)}:0:${FILL_TAKER}:${"c".repeat(64)}:${"d".repeat(64)}:${"d".repeat(64)}:1:100000000:50000000:7:0`], "skipfills");
   const SKIP_FILLS_ROOT = merkle.getMerkleRoot(SKIP_FILLS);
   // h3 was frozen by ghost: re-submit carrying the skip assertion's roots.
