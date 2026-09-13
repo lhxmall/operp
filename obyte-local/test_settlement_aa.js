@@ -649,11 +649,12 @@ async function main() {
     right: gSorted[gBetter],
     right_proof: merkle.getMerkleProof(gSorted, gBetter),
   };
+  st = await vars(rollup);
+  console.log("ghost preflight:", JSON.stringify({ frozen_3: st.frozen_3, submitted_at_3: st.submitted_at_3, now_s: Math.floor(Date.now() / 1000) }));
   await triggerVerdict(challenger, fill, Object.assign({ pred: "ghost", height: 3 }, ghostProof), 20000, "ghost predicate");
   st = await vars(rollup);
   if (Number(st.frozen_3) !== 2) throw new Error("ghost fraud did not freeze height");
   console.log("12. ghost (absent maker) → frozen=3");
-
   // ---- 13. skip: better live order ignored → fraud -------------------------
   const SKIP_TRACE4 = pad2([`skip-post-wit`], "skiptrace4");
   const SKIP_TRACE4_ROOT = merkle.getMerkleRoot(SKIP_TRACE4);
