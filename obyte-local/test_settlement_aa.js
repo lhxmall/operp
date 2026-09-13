@@ -604,8 +604,13 @@ async function main() {
     if (r.error) throw new Error("h3 submit failed: " + r.error);
     await network.witnessUntilStable(r.unit);
     await expectAaSuccess(r.unit, "h3 submit");
+    // Paranoia: confirm the committed roots are exactly what we submitted
+    // (a mismatch here means the submit landed elsewhere, and every later
+    // predicate would misleadingly report 'stale roots').
+    const check = await vars(rollup);
+    if (check.trace_root_3 !== traceRoot || check.fills_root_3 !== fillsRoot)
+      throw new Error(`h3 roots not stored: want ${traceRoot}/${fillsRoot} got ${check.trace_root_3}/${check.fills_root_3}`);
   }
-  await submitH3(TRACE_H_ROOT, FILLS_ROOT1);
   const fillHonest2 = Object.assign({}, fillBase, {
     trace_root: TRACE_H_ROOT,
     post_wit: POST_H_WIT,
