@@ -267,7 +267,9 @@
 					$u0 = ($post_pos_missing) ? 0 : ($n0 - $e0);
 					$xp_count = trigger.data.xp_count otherwise 0;
 					if (!is_integer($xp_count) OR $xp_count < 0 OR $xp_count > 3) bounce('bad xp_count');
-					$u1 = 0;
+					// Oscript locals are single-assignment on every path:
+					// branch results land in distinct $uNa names, summed with
+					// `otherwise 0` for the untaken branches.
 					if ($xp_count >= 1){
 						$xp0 = trigger.data.xp0;
 						$xm0 = trigger.data.xm0;
@@ -286,9 +288,8 @@
 						$xmk0 = $XM0[8] + 0;
 						$xn0 = floor($xq0 * $xmk0 / 100000000 * 1000000 / 100000000);
 						$xe0n = floor($xq0 * $xe0 / 100000000 * 1000000 / 100000000);
-						$u1 = $xn0 - $xe0n;
+						$u1a = $xn0 - $xe0n;
 					}
-					$u2 = 0;
 					if ($xp_count >= 2){
 						$xp1 = trigger.data.xp1;
 						$xm1 = trigger.data.xm1;
@@ -307,9 +308,8 @@
 						$xmk1 = $XM1[8] + 0;
 						$xn1 = floor($xq1 * $xmk1 / 100000000 * 1000000 / 100000000);
 						$xe1n = floor($xq1 * $xe1 / 100000000 * 1000000 / 100000000);
-						$u2 = $xn1 - $xe1n;
+						$u2a = $xn1 - $xe1n;
 					}
-					$u3 = 0;
 					if ($xp_count >= 3){
 						$xp2 = trigger.data.xp2;
 						$xm2 = trigger.data.xm2;
@@ -328,13 +328,13 @@
 						$xmk2 = $XM2[8] + 0;
 						$xn2 = floor($xq2 * $xmk2 / 100000000 * 1000000 / 100000000);
 						$xe2n = floor($xq2 * $xe2 / 100000000 * 1000000 / 100000000);
-						$u3 = $xn2 - $xe2n;
+						$u3a = $xn2 - $xe2n;
 					}
-					$upnl = $u0 + $u1 + $u2 + $u3;
+					$upnl = $u0 + ($u1a otherwise 0) + ($u2a otherwise 0) + ($u3a otherwise 0);
 					$equity_noclamp = $exp_col + $upnl;
 					$shortfall = ($equity_noclamp < 0) ? (0 - $equity_noclamp) : 0;
 					// Receipt legs: clamp:<acct>:<total>, absent leaf means 0.
-					$pre_cl = 0;
+					// Oscript single-assignment: each branch assigns once.
 					if (!trigger.data.pre_clamp_absent){
 						$pre_cl_leaf = trigger.data.pre_clamp;
 						if (typeof($pre_cl_leaf) == 'boolean'
@@ -344,8 +344,9 @@
 						$C0 = split($pre_cl_leaf, ':');
 						if (array_length($C0) != 3 OR $C0[1] != $acct_hex) bounce('bad pre clamp');
 						$pre_cl = $C0[2] + 0;
+					} else {
+						$pre_cl = 0;
 					}
-					$post_cl = 0;
 					if (!trigger.data.post_clamp_absent){
 						$post_cl_leaf = trigger.data.post_clamp;
 						if (typeof($post_cl_leaf) == 'boolean'
@@ -355,6 +356,8 @@
 						$C1 = split($post_cl_leaf, ':');
 						if (array_length($C1) != 3 OR $C1[1] != $acct_hex) bounce('bad post clamp');
 						$post_cl = $C1[2] + 0;
+					} else {
+						$post_cl = 0;
 					}
 					// Insurance legs: acct leaf of the zero account.
 					$zero = '0000000000000000000000000000000000000000000000000000000000000000';
@@ -373,10 +376,8 @@
 						bounce('bad insurance post proof');
 					$I1 = split($ins_post, ':');
 					if (array_length($I1) != 5 OR $I1[1] != $zero) bounce('bad insurance post');
-					$ins_post_col = $I1[2] + 0;
 					// Other side posted receipt delta (its own clamp proof
 					// covers lies there; here it only feeds the insurance leg).
-					$other_pre_cl = 0;
 					if (!trigger.data.other_pre_absent){
 						$other_pre_leaf = trigger.data.other_pre;
 						if (typeof($other_pre_leaf) == 'boolean'
@@ -386,8 +387,9 @@
 						$OC0 = split($other_pre_leaf, ':');
 						if (array_length($OC0) != 3 OR $OC0[1] != $other_hex) bounce('bad other pre');
 						$other_pre_cl = $OC0[2] + 0;
+					} else {
+						$other_pre_cl = 0;
 					}
-					$other_post_cl = 0;
 					if (!trigger.data.other_post_absent){
 						$other_post_leaf = trigger.data.other_post;
 						if (typeof($other_post_leaf) == 'boolean'
@@ -397,6 +399,8 @@
 						$OC1 = split($other_post_leaf, ':');
 						if (array_length($OC1) != 3 OR $OC1[1] != $other_hex) bounce('bad other post');
 						$other_post_cl = $OC1[2] + 0;
+					} else {
+						$other_post_cl = 0;
 					}
 					// Three posted legs vs the honest replay: collateral
 					// (over-charge), receipt delta (skip/wrong amount),
