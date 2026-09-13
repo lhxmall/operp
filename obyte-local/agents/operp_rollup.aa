@@ -164,8 +164,9 @@
 							var['trace_root_' || trigger.data.height] = trigger.data.trace_root;
 							var['units_root_' || trigger.data.height] = trigger.data.units_root;
 							var['units_set_root_' || trigger.data.height] = trigger.data.units_set_root;
+							var['ops_root_' || trigger.data.height] = trigger.data.ops_root;
+							var['fills_root_' || trigger.data.height] = trigger.data.fills_root;
 							var['unit_count_' || trigger.data.height] = trigger.data.unit_count;
-							var['wit_count_' || trigger.data.height] = trigger.data.wit_count;
 							var['data_root_' || trigger.data.height] = trigger.data.data_root;
 							var['data_len_' || trigger.data.height] = trigger.data.data_len;
 							var['pkg_count_' || trigger.data.height] = trigger.data.pkg_count;
