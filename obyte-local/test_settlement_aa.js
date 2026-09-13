@@ -766,12 +766,12 @@ async function main() {
     units_root: UNITS_SET_ROOT,
     units_set_root: SET_ROOT1,
     fills_root: FILLS_ROOT,
-    pre_wit: WIT_ROOT,
+    pre_wit: H3_PRE_WIT,
     post_wit: REAL_LIAR_WIT,
     post_proof: merkle.getMerkleProof(REAL_LIAR_TRACE, 0),
-    pre_leaf: preLeaf,
+    pre_leaf: DEP_PRE,
     post_leaf: REAL_LIAR_POST[0],
-    pre_leaf_proof: merkle.getMerkleProof(GENESIS_LEAVES, depPreIdx),
+    pre_leaf_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[DEP_PRE]),
     post_leaf_proof: merkle.getMerkleProof(REAL_LIAR_POST, 0),
   };
   await triggerVerdict(challenger, dispute, Object.assign({ pred: "deposit", height: 3 }, realLiar), 20000, "deposit bookkeeping predicate");
@@ -784,17 +784,17 @@ async function main() {
   // H3_PRE (wit_root_2): taker flat col 0, META1 mark=100 fee 5bps, taker
   // holds POS2 (market 2). Fill taker-bid 1e8 x 1e8: notional 1e6, fee 500,
   // exp col -500. upnl = fill leg (1-1e6) + market-2 leg (0-450000) =
-  // -1449999 equity → shortfall 1449999, honest post col 1449499.
+  // -1450499 equity → shortfall 1450499, honest post col 1449999.
   const CLAMP_FILL = `f:${"u".repeat(64)}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"e".repeat(64)}:1:100000000:100000000:9:0`;
   const CLAMP_FILLS = pad2([CLAMP_FILL], "clampfills");
   const CLAMP_FILLS_ROOT = merkle.getMerkleRoot(CLAMP_FILLS);
   const CLAMP_POST = [
-    `acct:${takerH}:1448499:0:0`,
+    `acct:${takerH}:1448999:0:0`,
     META1,
     `pos:${takerH}:1:100000000:100000000`,
     `pos:${takerH}:2:50000000:90000000`,
-    `clamp:${takerH}:1449999`,
-    `acct:${ZERO_ACCT}:-1449499:0:0`,
+    `clamp:${takerH}:1450499`,
+    `acct:${ZERO_ACCT}:-1450499:0:0`,
   ].sort();
   const CLAMP_POST_WIT = merkle.getMerkleRoot(CLAMP_POST);
   const CLAMP_TRACE = pad2([CLAMP_POST_WIT], "clamptrace");
@@ -812,8 +812,8 @@ async function main() {
     post_proof: merkle.getMerkleProof(CLAMP_TRACE, 0),
     pre_acct: FILL_TAKER_PRE,
     pre_acct_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[FILL_TAKER_PRE]),
-    post_acct: `acct:${takerH}:1448499:0:0`,
-    post_acct_proof: merkle.getMerkleProof(CLAMP_POST, CLAMP_POST.indexOf(`acct:${takerH}:1448499:0:0`)),
+    post_acct: `acct:${takerH}:1448999:0:0`,
+    post_acct_proof: merkle.getMerkleProof(CLAMP_POST, CLAMP_POST.indexOf(`acct:${takerH}:1448999:0:0`)),
     post_pos: `pos:${takerH}:1:100000000:100000000`,
     post_pos_proof: merkle.getMerkleProof(CLAMP_POST, CLAMP_POST.indexOf(`pos:${takerH}:1:100000000:100000000`)),
     pre_meta: META1,
@@ -830,11 +830,11 @@ async function main() {
     xm0_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[META2]),
     insurance_pre: `acct:${ZERO_ACCT}:0:0:0`,
     insurance_pre_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[`acct:${ZERO_ACCT}:0:0:0`]),
-    insurance_post: `acct:${ZERO_ACCT}:-1449499:0:0`,
-    insurance_post_proof: merkle.getMerkleProof(CLAMP_POST, CLAMP_POST.indexOf(`acct:${ZERO_ACCT}:-1449499:0:0`)),
+    insurance_post: `acct:${ZERO_ACCT}:-1450499:0:0`,
+    insurance_post_proof: merkle.getMerkleProof(CLAMP_POST, CLAMP_POST.indexOf(`acct:${ZERO_ACCT}:-1450499:0:0`)),
     pre_clamp_absent: true,
-    post_clamp: `clamp:${takerH}:1449999`,
-    post_clamp_proof: merkle.getMerkleProof(CLAMP_POST, CLAMP_POST.indexOf(`clamp:${takerH}:1449999`)),
+    post_clamp: `clamp:${takerH}:1450499`,
+    post_clamp_proof: merkle.getMerkleProof(CLAMP_POST, CLAMP_POST.indexOf(`clamp:${takerH}:1450499`)),
     other_pre_absent: true,
     other_post_absent: true,
   };
@@ -845,14 +845,14 @@ async function main() {
   console.log("13b. clamp over-charge dishonest → frozen=3 via clamp AA");
 
   // ---- 13c. clamp honest → 'no fraud' -------------------------------------
-  // h3 reopened by 13b: re-submit with the honest post tree (col 1449499).
+  // h3 reopened by 13b: re-submit with the honest post tree (col 1449999).
   const CLAMP_POST_H = [
-    `acct:${takerH}:1449499:0:0`,
+    `acct:${takerH}:1449999:0:0`,
     META1,
     `pos:${takerH}:1:100000000:100000000`,
     `pos:${takerH}:2:50000000:90000000`,
-    `clamp:${takerH}:1449999`,
-    `acct:${ZERO_ACCT}:-1449499:0:0`,
+    `clamp:${takerH}:1450499`,
+    `acct:${ZERO_ACCT}:-1450499:0:0`,
   ].sort();
   const CLAMP_POST_H_WIT = merkle.getMerkleRoot(CLAMP_POST_H);
   const CLAMP_TRACE_H = pad2([CLAMP_POST_H_WIT], "clamptraceh");
@@ -862,12 +862,12 @@ async function main() {
     trace_root: CLAMP_TRACE_H_ROOT,
     post_wit: CLAMP_POST_H_WIT,
     post_proof: merkle.getMerkleProof(CLAMP_TRACE_H, 0),
-    post_acct: `acct:${takerH}:1449499:0:0`,
-    post_acct_proof: merkle.getMerkleProof(CLAMP_POST_H, CLAMP_POST_H.indexOf(`acct:${takerH}:1449499:0:0`)),
+    post_acct: `acct:${takerH}:1449999:0:0`,
+    post_acct_proof: merkle.getMerkleProof(CLAMP_POST_H, CLAMP_POST_H.indexOf(`acct:${takerH}:1449999:0:0`)),
     post_pos_proof: merkle.getMerkleProof(CLAMP_POST_H, CLAMP_POST_H.indexOf(`pos:${takerH}:1:100000000:100000000`)),
     xp0_proof: merkle.getMerkleProof(CLAMP_POST_H, CLAMP_POST_H.indexOf(`pos:${takerH}:2:50000000:90000000`)),
-    insurance_post_proof: merkle.getMerkleProof(CLAMP_POST_H, CLAMP_POST_H.indexOf(`acct:${ZERO_ACCT}:-1449499:0:0`)),
-    post_clamp_proof: merkle.getMerkleProof(CLAMP_POST_H, CLAMP_POST_H.indexOf(`clamp:${takerH}:1449999`)),
+    insurance_post_proof: merkle.getMerkleProof(CLAMP_POST_H, CLAMP_POST_H.indexOf(`acct:${ZERO_ACCT}:-1450499:0:0`)),
+    post_clamp_proof: merkle.getMerkleProof(CLAMP_POST_H, CLAMP_POST_H.indexOf(`clamp:${takerH}:1450499`)),
   });
   await triggerBounce(challenger, clamp, Object.assign({ pred: "clamp", height: 3 }, clampHonest), 20000, "no fraud");
   st = await vars(rollup);
