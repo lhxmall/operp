@@ -610,6 +610,8 @@ async function main() {
     const check = await vars(rollup);
     if (check.trace_root_3 !== traceRoot || check.fills_root_3 !== fillsRoot)
       throw new Error(`h3 roots not stored: want ${traceRoot}/${fillsRoot} got ${check.trace_root_3}/${check.fills_root_3}`);
+    if (Number(check.frozen_3 || 0) !== 0)
+      throw new Error(`h3 not reopened by submit: frozen_3=${check.frozen_3}`);
   }
   const fillHonest2 = Object.assign({}, fillBase, {
     trace_root: TRACE_H_ROOT,
