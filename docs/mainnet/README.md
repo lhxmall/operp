@@ -15,6 +15,7 @@
 | 9 | No audit, budget exhausted | [09-complexity-audit.md](09-complexity-audit.md) | Per-branch op-count (~95/100, withdraw 36), 6 merges, R1 single-sha256 fold saves 16, total −27 → 68/100 (+32 headroom) + 9-section audit checklist |
 | 10 | aa-tree 2¹⁶ cap | [10-aa-tree-sharding.md](10-aa-tree-sharding.md) | v1 bump 16→18 (262 k accounts, 0 new vars), v2 sharded forest S=16×D16=1 M, activation-height migration |
 | 11 | Replay window 256h | [11-replay-persistence.md](11-replay-persistence.md) | Choice A persistent BTree/RocksDB vs B `256→2048` in-RAM + journal (v1 ship), `REPLAY_WINDOW=2048` (~68 min) |
+| 12 | Clamp unverifiable / oracle majority / deposit self-mint / DA social | [12-clamp-evidence-da.md](12-clamp-evidence-da.md) | clamp receipt leaf + `dispute_clamp.aa` (33/100); oracle 3-reporter floor + 2000bps speed limit + stale-freeze; op anchor + vault `dep_/pdep_` + `dep_evidence`; DA hard cap + `data_root/len/pkg` on-chain + `--archive-dir` (da_frame deferred: Oscript cannot gunzip — documented) |
 
 **Staging (as shipped):** salted ordering + salted eviction + `perp_burned` + 2048-window constants + deposit evidences + slashing/TWAP landed in Gate1–3; depth-18, escape hatch, commit-reveal, sharding, RocksDB and validity-ZK remain v2.
 

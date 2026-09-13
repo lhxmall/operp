@@ -39,6 +39,13 @@
 					{
 						app: "state",
 						state: "{
+							// Receipt (doc 12 §2.3): net base paid, keyed by the
+							// trigger unit id (base64). The dep_evidence
+							// predicate matches the sidechain op anchor
+							// against this key; amount must equal the op
+							// amount string-parsed (same convention as
+							// deposit_verify.rs:176-188).
+							var['dep_' || trigger.unit] = trigger.output[[asset=base]] - 10000;
 						}"
 					}
 				]
@@ -59,6 +66,10 @@
 						app: "state",
 						state: "{
 							var['pperp_' || trigger.address] = (var['pperp_' || trigger.address] otherwise 0) + trigger.output[[asset='PERP_ASSET_ID_HERE']];
+							// Receipt (doc 12 §2.3): PERP amount keyed by the
+							// trigger unit id, mirrored against GovDeposit
+							// anchors by dep_evidence.
+							var['pdep_' || trigger.unit] = trigger.output[[asset='PERP_ASSET_ID_HERE']];
 						}"
 					}
 				]

@@ -64,6 +64,15 @@ pub const ORACLE_TWAP_MAX: Height = 1800;
 pub const SLASH_DEVIATION_BPS: u64 = 500;
 pub const SLASH_TWAP_STREAK: u64 = 3;
 pub const SLASH_REWARD_BPS: u64 = 5000;
+/// Minimum effective (bonded + currently reporting) reporters for oracle
+/// reports to move the spot mark (doc 12 §2.2). Below this, reports feed
+/// TWAP/funding state only and fills keep moving the mark, so a lone
+/// reporter cannot seize pricing power.
+pub const ORACLE_MIN_REPORTERS_MARK: usize = 3;
+/// Speed limit on the bonded median vs the oracle TWAP (bps, doc 12 §2.2).
+/// A median deviating more than this from history is ignored for
+/// mark/index purposes (still recorded as slash-streak input).
+pub const REPORT_MAX_STEP_BPS: u64 = 2000;
 pub const FUNDING_TWAP_WINDOW: Height = 256;
 pub const FUNDING_TWAP_MIN_SAMPLES: usize = 2;
 pub const FUNDING_TWAP_WINDOW_MAX: u64 = 1800;

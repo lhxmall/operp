@@ -1,0 +1,449 @@
+{
+	// OPERP clamp dispute AA (operp-v2) — one-shot insurance-clamp fraud predicate.
+	//
+	// The ONLY party (besides operp_dispute.aa / operp_dispute_fill.aa) allowed
+	// to fail a rollup height on clamp grounds. Bound via {bind_clamp:1} ->
+	// rollup {set_dispute_clamp:1}; the rollup verdict case accepts the clamp
+	// AA alongside the other two. Success forwards {verdict:'fraud', height,
+	// challenger} with 10000 bytes to the rollup AA. Failed predicates bounce
+	// ('no fraud') and coins return; no challenge bond exists.
+	//
+	// ROLLUP_AA_HERE is substituted at deploy/test time.
+	// Empty-sentinel wit root (obyte_merkle::root(["empty"]), pinned by the
+	// Rust unit test): Lhz6grA1wmy7va5jLOoHBRTri3c/YWqur2aOLwvo8Q0=
+	//
+	// Fill string (crates/operp-settle/src/lib.rs fills_element):
+	//   f:{unit_hex}:{idx}:{taker_hex}:{maker_hex}:{taker_order_hex}:
+	//   {maker_order_hex}:{market}:{price}:{qty}:{seq}:{side}
+	// side 0=Bid 1=Ask. Witness leaves (wit_leaves):
+	//   acct:{acct_hex_64}:{collateral}:{perp}:{W}
+	//   pos:{acct_hex_64}:{market}:{qty_signed}:{entry}
+	//   ord:{order_hex}:{market}:{side}:{price}:{seq}:{remaining}:{acct_hex}
+	//   meta:{market}:{tick}:{im}:{mm}:{taker_fee_bps}:{keeper}:{delisted}:{mark}
+	//   clamp:{acct_hex_64}:{total} (total > 0 only; absent leaf means 0)
+	bounce_fees: { base: 10000 },
+	messages: {
+		cases: [
+			{
+				if: "{trigger.data.bind_clamp}",
+				init: "{
+					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
+				}",
+				messages: [
+					{
+						app: "payment",
+						payload: {
+							asset: "base",
+							outputs: [
+								{
+									address: "ROLLUP_AA_HERE",
+									amount: 10000
+								}
+							]
+						}
+					},
+					{
+						app: "data",
+						payload: {
+							set_dispute_clamp: 1
+						}
+					},
+					{
+						app: "state",
+						state: "{
+							var['bound_clamp'] = 1;
+						}"
+					}
+				]
+			},
+			{
+				// P-clamp (taker or maker side): the operator's posted clamp
+				// legs disagree with the honest replay. The challenger picks
+				// one side; the AA replays that side's fill (same math as
+				// P-fill_math), recomputes shortfall = max(0, -(exp_col +
+				// upnl over post positions at pre marks)) and checks three
+				// posted legs: post collateral, the clamp receipt delta, and
+				// the insurance pre/post delta (fee minus both sides' posted
+				// receipt deltas). Skipped clamp, wrong receipt amount, and
+				// user over-charge all break at least one leg. An honest
+				// clamped height matches on every leg ('no fraud').
+				// Extra post positions beyond the fill market: xp0..xp2 with
+				// xp proofs (post_wit) and xm metas (pre_wit marks), xp_count
+				// 0..3. Protocol constraint: accounts with more than 4
+				// markets of post positions must reduce first.
+				if: "{trigger.data.pred == 'clamp'}",
+				init: "{
+					$h = trigger.data.height;
+					$rollup = 'ROLLUP_AA_HERE';
+					$n = var[$rollup]['unit_count_' || $h];
+					if (!$h OR !$n) bounce('no height');
+					if (var[$rollup]['frozen_' || $h] OR timestamp >= (var[$rollup]['submitted_at_' || $h] otherwise 0) + 3600)
+						bounce('challenge not possible');
+					if (trigger.data.trace_root != var[$rollup]['trace_root_' || $h]
+						OR trigger.data.fills_root != var[$rollup]['fills_root_' || $h]
+						OR trigger.data.ops_root != var[$rollup]['ops_root_' || $h])
+						bounce('stale roots');
+					$k = trigger.data.k;
+					if (!is_integer($k) OR $k < 0 OR $k >= $n)
+						bounce('bad k');
+					$fill = trigger.data.fill;
+					if (typeof($fill) == 'boolean'
+						OR !is_valid_merkle_proof($fill, trigger.data.fill_proof)
+						OR trigger.data.fill_proof.root != trigger.data.fills_root)
+						bounce('bad fill proof');
+					$F = split($fill, ':');
+					if (array_length($F) != 12) bounce('bad fill');
+					if ($F[11] != '0' AND $F[11] != '1') bounce('bad fill');
+					$price = $F[8] + 0;
+					$qty = $F[9] + 0;
+					$market = $F[7];
+					if (length($F[3]) != 64 OR length($F[4]) != 64) bounce('bad fill');
+					// Challenger side is implicit: pre_acct leaf owner must be
+					// one of the two fill parties.
+					$pre_wit = trigger.data.pre_wit;
+					if ($k == 0){
+						if ($h == 1){
+							if ($pre_wit != 'Lhz6grA1wmy7va5jLOoHBRTri3c/YWqur2aOLwvo8Q0=') bounce('bad pre wit');
+						} else {
+							if ($pre_wit != var[$rollup]['wit_root_' || ($h - 1)]) bounce('bad pre wit');
+						}
+					} else {
+						if (!trigger.data.pre_proof OR trigger.data.pre_proof.index != $k - 1 OR trigger.data.pre_proof.root != trigger.data.trace_root
+							OR !is_valid_merkle_proof($pre_wit, trigger.data.pre_proof))
+							bounce('bad pre proof');
+					}
+					if (!trigger.data.post_proof OR trigger.data.post_proof.index != $k OR trigger.data.post_proof.root != trigger.data.trace_root
+						OR !is_valid_merkle_proof(trigger.data.post_wit, trigger.data.post_proof))
+						bounce('bad post proof');
+					$post_wit = trigger.data.post_wit;
+					$pre_acct = trigger.data.pre_acct;
+					if (typeof($pre_acct) == 'boolean'
+						OR !is_valid_merkle_proof($pre_acct, trigger.data.pre_acct_proof)
+						OR trigger.data.pre_acct_proof.root != $pre_wit)
+						bounce('bad pre acct proof');
+					$A0 = split($pre_acct, ':');
+					if (array_length($A0) != 5) bounce('bad pre acct');
+					$acct_hex = $A0[1];
+					$who = ($acct_hex == $F[3]) ? 'taker' : (($acct_hex == $F[4]) ? 'maker' : 'none');
+					if ($who == 'none') bounce('bad side');
+					$other_hex = ($who == 'taker') ? $F[4] : $F[3];
+					$side_acct = ($who == 'taker') ? $F[11] : (($F[11] == '0') ? '1' : '0');
+					$delta = ($side_acct == '0') ? $qty : 0 - $qty;
+					$old_col = $A0[2] + 0;
+					if (trigger.data.pos_absent){
+						$plo = 'pos:' || $acct_hex || ':' || $market || ':';
+						$phi = 'pos:' || $acct_hex || ':' || $market || ';';
+						$phit1 = trigger.data.pleft AND is_valid_merkle_proof(trigger.data.pleft, trigger.data.pleft_proof)
+							AND trigger.data.pleft_proof.root == $pre_wit
+							AND trigger.data.pright AND is_valid_merkle_proof(trigger.data.pright, trigger.data.pright_proof)
+							AND trigger.data.pright_proof.root == $pre_wit
+							AND trigger.data.pleft_proof.index + 1 == trigger.data.pright_proof.index
+							AND trigger.data.pleft < $plo AND $phi <= trigger.data.pright;
+						$phit2 = trigger.data.pleft AND is_valid_merkle_proof(trigger.data.pleft, trigger.data.pleft_proof)
+							AND trigger.data.pleft_proof.root == $pre_wit
+							AND trigger.data.pleft_proof.index == 0
+							AND $phi <= trigger.data.pleft;
+						$phit3 = ($k == 0 AND $h > 1) AND trigger.data.pleft AND is_valid_merkle_proof(trigger.data.pleft, trigger.data.pleft_proof)
+							AND trigger.data.pleft_proof.root == $pre_wit
+							AND trigger.data.pleft_proof.index == (var[$rollup]['wit_count_' || ($h - 1)] otherwise 0) - 1
+							AND trigger.data.pleft < $plo;
+						if (!$phit1 AND !$phit2 AND !$phit3) bounce('no fraud');
+						$old_qty = 0;
+						$old_entry = 0;
+					} else {
+						$pre_pos = trigger.data.pre_pos;
+						if (typeof($pre_pos) == 'boolean'
+							OR !is_valid_merkle_proof($pre_pos, trigger.data.pre_pos_proof)
+							OR trigger.data.pre_pos_proof.root != $pre_wit)
+							bounce('bad pre pos proof');
+						$PP = split($pre_pos, ':');
+						if (array_length($PP) != 5 OR $PP[1] != $acct_hex OR $PP[2] != $market) bounce('bad pre pos');
+						$old_qty = $PP[3] + 0;
+						$old_entry = $PP[4] + 0;
+					}
+					// fee from the pre meta leaf (same formula as fill_math).
+					$pre_meta = trigger.data.pre_meta;
+					if (typeof($pre_meta) == 'boolean'
+						OR !is_valid_merkle_proof($pre_meta, trigger.data.pre_meta_proof)
+						OR trigger.data.pre_meta_proof.root != $pre_wit)
+						bounce('bad pre meta proof');
+					$M = split($pre_meta, ':');
+					if (array_length($M) != 9 OR $M[1] != $market) bounce('bad pre meta');
+					$fee_bps = $M[5] + 0;
+					$fill_mark = $M[8] + 0;
+					$notional = floor($qty * $price / 100000000 * 1000000 / 100000000);
+					$fee = floor($notional * $fee_bps / 10000);
+					$post_acct = trigger.data.post_acct;
+					if (typeof($post_acct) == 'boolean'
+						OR !is_valid_merkle_proof($post_acct, trigger.data.post_acct_proof)
+						OR trigger.data.post_acct_proof.root != $post_wit)
+						bounce('bad post acct proof');
+					$A1 = split($post_acct, ':');
+					if (array_length($A1) != 5 OR $A1[1] != $acct_hex) bounce('bad post acct');
+					$post_col = $A1[2] + 0;
+					$abs_old = ($old_qty < 0) ? (0 - $old_qty) : $old_qty;
+					$abs_delta = ($delta < 0) ? (0 - $delta) : $delta;
+					$same = ($old_qty == 0 OR (($old_qty > 0 AND $delta > 0) OR ($old_qty < 0 AND $delta < 0)));
+					if ($same){
+						$exp_qty_s = $old_qty + $delta;
+						$exp_entry_s = ($old_qty == 0) ? $price : floor(($abs_old * $old_entry + $qty * $price) / ($abs_old + $qty));
+						$exp_col_s = ($who == 'taker') ? ($old_col - $fee) : $old_col;
+						if (trigger.data.post_pos_absent) bounce('bad post pos');
+						$post_pos_s = trigger.data.post_pos;
+						if (typeof($post_pos_s) == 'boolean'
+							OR !is_valid_merkle_proof($post_pos_s, trigger.data.post_pos_proof)
+							OR trigger.data.post_pos_proof.root != $post_wit)
+							bounce('bad post pos proof');
+						$PS = split($post_pos_s, ':');
+						if (array_length($PS) != 5 OR $PS[1] != $acct_hex OR $PS[2] != $market) bounce('bad post pos');
+						// Pos-leg mismatch is fraud, not 'no fraud': an honest
+						// height replays deterministically, so a divergent
+						// posted pos leg can only be operator fraud. Flag it
+						// and let the collateral leg below convict (entry ±1
+						// keeps the VWAP truncation tolerance of fill_math).
+						$pos_bad_s = ($PS[3] + 0 != $exp_qty_s OR abs($PS[4] + 0 - $exp_entry_s) > 1);
+						$exp_col = $exp_col_s;
+						$post_qty = $exp_qty_s;
+						$post_entry = $PS[4] + 0;
+						$post_pos_missing = false;
+						$pos_bad = $pos_bad_s;
+					} else {
+						$close = ($abs_old < $abs_delta) ? $abs_old : $abs_delta;
+						$signed = ($old_qty > 0) ? ($price - $old_entry) : ($old_entry - $price);
+						$pnl_raw = $signed * $close * 1000000 / 100000000 / 100000000;
+						$pnl = ($pnl_raw < 0) ? ceil($pnl_raw) : floor($pnl_raw);
+						$exp_col_c = ($who == 'taker') ? ($old_col + $pnl - $fee) : ($old_col + $pnl);
+						$leftover = $abs_old - $close;
+						$open = $abs_delta - $close;
+						if ($leftover == 0 AND $open == 0){
+							if (trigger.data.post_pos_absent){
+								$exp_col = $exp_col_c;
+								$post_qty = 0;
+								$post_entry = 0;
+								$post_pos_missing = true;
+								$pos_bad = false;
+							} else {
+								$exp_col = $exp_col_c;
+								$post_qty = 0;
+								$post_entry = 0;
+								$post_pos_missing = true;
+								$pos_bad = true;
+							}
+						} else {
+							$exp_qty_flip = ($delta > 0) ? $open : (0 - $open);
+							$exp_qty_red = ($old_qty > 0) ? $leftover : (0 - $leftover);
+							$exp_qty_c = ($leftover == 0) ? $exp_qty_flip : $exp_qty_red;
+							$exp_entry_c = ($leftover == 0) ? $price : $old_entry;
+							if (trigger.data.post_pos_absent){
+								$exp_col = $exp_col_c;
+								$post_qty = $exp_qty_c;
+								$post_entry = $exp_entry_c;
+								$post_pos_missing = false;
+								$pos_bad = true;
+							} else {
+								$post_pos_c = trigger.data.post_pos;
+								if (typeof($post_pos_c) == 'boolean'
+									OR !is_valid_merkle_proof($post_pos_c, trigger.data.post_pos_proof)
+									OR trigger.data.post_pos_proof.root != $post_wit)
+									bounce('bad post pos proof');
+								$PC = split($post_pos_c, ':');
+								if (array_length($PC) != 5 OR $PC[1] != $acct_hex OR $PC[2] != $market) bounce('bad post pos');
+								$pos_bad_c = ($PC[3] + 0 != $exp_qty_c OR $PC[4] + 0 != $exp_entry_c);
+								$exp_col = $exp_col_c;
+								$post_qty = $exp_qty_c;
+								$post_entry = $PC[4] + 0;
+								$post_pos_missing = false;
+								$pos_bad = $pos_bad_c;
+							}
+						}
+					}
+					// upnl over POST positions at PRE marks: fill-market leg
+					// from the verified post pos, extra legs xp0..xp2 (post
+					// leaves, post_wit proofs) times xm metas (pre leaves,
+					// pre_wit proofs). notional legs truncate like Rust
+					// (signed division truncates toward zero).
+					$n0 = floor($post_qty * $fill_mark / 100000000 * 1000000 / 100000000);
+					$e0 = floor($post_qty * $post_entry / 100000000 * 1000000 / 100000000);
+					$u0 = ($post_pos_missing) ? 0 : ($n0 - $e0);
+					$xp_count = trigger.data.xp_count otherwise 0;
+					if (!is_integer($xp_count) OR $xp_count < 0 OR $xp_count > 3) bounce('bad xp_count');
+					// Oscript locals are single-assignment on every path:
+					// branch results land in distinct $uNa names, summed with
+					// `otherwise 0` for the untaken branches.
+					if ($xp_count >= 1){
+						$xp0 = trigger.data.xp0;
+						$xm0 = trigger.data.xm0;
+						if (typeof($xp0) == 'boolean' OR typeof($xm0) == 'boolean'
+							OR !is_valid_merkle_proof($xp0, trigger.data.xp0_proof)
+							OR trigger.data.xp0_proof.root != $post_wit
+							OR !is_valid_merkle_proof($xm0, trigger.data.xm0_proof)
+							OR trigger.data.xm0_proof.root != $pre_wit)
+							bounce('bad extra leg 0');
+						$X0 = split($xp0, ':');
+						$XM0 = split($xm0, ':');
+						if (array_length($X0) != 5 OR $X0[1] != $acct_hex OR array_length($XM0) != 9
+							OR $X0[2] != $XM0[1]) bounce('bad extra leg 0');
+						$xq0 = $X0[3] + 0;
+						$xe0 = $X0[4] + 0;
+						$xmk0 = $XM0[8] + 0;
+						$xn0 = floor($xq0 * $xmk0 / 100000000 * 1000000 / 100000000);
+						$xe0n = floor($xq0 * $xe0 / 100000000 * 1000000 / 100000000);
+						$u1a = $xn0 - $xe0n;
+					}
+					if ($xp_count >= 2){
+						$xp1 = trigger.data.xp1;
+						$xm1 = trigger.data.xm1;
+						if (typeof($xp1) == 'boolean' OR typeof($xm1) == 'boolean'
+							OR !is_valid_merkle_proof($xp1, trigger.data.xp1_proof)
+							OR trigger.data.xp1_proof.root != $post_wit
+							OR !is_valid_merkle_proof($xm1, trigger.data.xm1_proof)
+							OR trigger.data.xm1_proof.root != $pre_wit)
+							bounce('bad extra leg 1');
+						$X1 = split($xp1, ':');
+						$XM1 = split($xm1, ':');
+						if (array_length($X1) != 5 OR $X1[1] != $acct_hex OR array_length($XM1) != 9
+							OR $X1[2] != $XM1[1]) bounce('bad extra leg 1');
+						$xq1 = $X1[3] + 0;
+						$xe1 = $X1[4] + 0;
+						$xmk1 = $XM1[8] + 0;
+						$xn1 = floor($xq1 * $xmk1 / 100000000 * 1000000 / 100000000);
+						$xe1n = floor($xq1 * $xe1 / 100000000 * 1000000 / 100000000);
+						$u2a = $xn1 - $xe1n;
+					}
+					if ($xp_count >= 3){
+						$xp2 = trigger.data.xp2;
+						$xm2 = trigger.data.xm2;
+						if (typeof($xp2) == 'boolean' OR typeof($xm2) == 'boolean'
+							OR !is_valid_merkle_proof($xp2, trigger.data.xp2_proof)
+							OR trigger.data.xp2_proof.root != $post_wit
+							OR !is_valid_merkle_proof($xm2, trigger.data.xm2_proof)
+							OR trigger.data.xm2_proof.root != $pre_wit)
+							bounce('bad extra leg 2');
+						$X2 = split($xp2, ':');
+						$XM2 = split($xm2, ':');
+						if (array_length($X2) != 5 OR $X2[1] != $acct_hex OR array_length($XM2) != 9
+							OR $X2[2] != $XM2[1]) bounce('bad extra leg 2');
+						$xq2 = $X2[3] + 0;
+						$xe2 = $X2[4] + 0;
+						$xmk2 = $XM2[8] + 0;
+						$xn2 = floor($xq2 * $xmk2 / 100000000 * 1000000 / 100000000);
+						$xe2n = floor($xq2 * $xe2 / 100000000 * 1000000 / 100000000);
+						$u3a = $xn2 - $xe2n;
+					}
+					$upnl = $u0 + ($u1a otherwise 0) + ($u2a otherwise 0) + ($u3a otherwise 0);
+					$equity_noclamp = $exp_col + $upnl;
+					$shortfall = ($equity_noclamp < 0) ? (0 - $equity_noclamp) : 0;
+					// Receipt legs: clamp:<acct>:<total>, absent leaf means 0.
+					// Oscript single-assignment: each branch assigns once.
+					if (!trigger.data.pre_clamp_absent){
+						$pre_cl_leaf = trigger.data.pre_clamp;
+						if (typeof($pre_cl_leaf) == 'boolean'
+							OR !is_valid_merkle_proof($pre_cl_leaf, trigger.data.pre_clamp_proof)
+							OR trigger.data.pre_clamp_proof.root != $pre_wit)
+							bounce('bad pre clamp proof');
+						$C0 = split($pre_cl_leaf, ':');
+						if (array_length($C0) != 3 OR $C0[1] != $acct_hex) bounce('bad pre clamp');
+						$pre_cl = $C0[2] + 0;
+					} else {
+						$pre_cl = 0;
+					}
+					if (!trigger.data.post_clamp_absent){
+						$post_cl_leaf = trigger.data.post_clamp;
+						if (typeof($post_cl_leaf) == 'boolean'
+							OR !is_valid_merkle_proof($post_cl_leaf, trigger.data.post_clamp_proof)
+							OR trigger.data.post_clamp_proof.root != $post_wit)
+							bounce('bad post clamp proof');
+						$C1 = split($post_cl_leaf, ':');
+						if (array_length($C1) != 3 OR $C1[1] != $acct_hex) bounce('bad post clamp');
+						$post_cl = $C1[2] + 0;
+					} else {
+						$post_cl = 0;
+					}
+					// Insurance legs: acct leaf of the zero account.
+					$zero = '0000000000000000000000000000000000000000000000000000000000000000';
+					$ins_pre = trigger.data.insurance_pre;
+					if (typeof($ins_pre) == 'boolean'
+						OR !is_valid_merkle_proof($ins_pre, trigger.data.insurance_pre_proof)
+						OR trigger.data.insurance_pre_proof.root != $pre_wit)
+						bounce('bad insurance pre proof');
+					$I0 = split($ins_pre, ':');
+					if (array_length($I0) != 5 OR $I0[1] != $zero) bounce('bad insurance pre');
+					$ins_pre_col = $I0[2] + 0;
+					$ins_post = trigger.data.insurance_post;
+					if (typeof($ins_post) == 'boolean'
+						OR !is_valid_merkle_proof($ins_post, trigger.data.insurance_post_proof)
+						OR trigger.data.insurance_post_proof.root != $post_wit)
+						bounce('bad insurance post proof');
+					$I1 = split($ins_post, ':');
+					if (array_length($I1) != 5 OR $I1[1] != $zero) bounce('bad insurance post');
+					$ins_post_col = $I1[2] + 0;
+					// Other side posted receipt delta (its own clamp proof
+					// covers lies there; here it only feeds the insurance leg).
+					if (!trigger.data.other_pre_absent){
+						$other_pre_leaf = trigger.data.other_pre;
+						if (typeof($other_pre_leaf) == 'boolean'
+							OR !is_valid_merkle_proof($other_pre_leaf, trigger.data.other_pre_proof)
+							OR trigger.data.other_pre_proof.root != $pre_wit)
+							bounce('bad other pre proof');
+						$OC0 = split($other_pre_leaf, ':');
+						if (array_length($OC0) != 3 OR $OC0[1] != $other_hex) bounce('bad other pre');
+						$other_pre_cl = $OC0[2] + 0;
+					} else {
+						$other_pre_cl = 0;
+					}
+					if (!trigger.data.other_post_absent){
+						$other_post_leaf = trigger.data.other_post;
+						if (typeof($other_post_leaf) == 'boolean'
+							OR !is_valid_merkle_proof($other_post_leaf, trigger.data.other_post_proof)
+							OR trigger.data.other_post_proof.root != $post_wit)
+							bounce('bad other post proof');
+						$OC1 = split($other_post_leaf, ':');
+						if (array_length($OC1) != 3 OR $OC1[1] != $other_hex) bounce('bad other post');
+						$other_post_cl = $OC1[2] + 0;
+					} else {
+						$other_post_cl = 0;
+					}
+					// Three posted legs vs the honest replay: collateral
+					// (over-charge), receipt delta (skip/wrong amount),
+					// insurance delta (fill taker fee minus both receipt
+					// deltas). The fee leg is side-independent: exactly one
+					// fill party pays it, but insurance always receives it.
+					if (!$pos_bad
+						AND $post_col == $exp_col + $shortfall
+						AND $post_cl - $pre_cl == $shortfall
+						AND $ins_post_col - $ins_pre_col == $fee - $shortfall - ($other_post_cl - $other_pre_cl))
+						bounce('no fraud');
+					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
+				}",
+				messages: [
+					{
+						app: "payment",
+						payload: {
+							asset: "base",
+							outputs: [
+								{
+									address: "ROLLUP_AA_HERE",
+									amount: 10000
+								}
+							]
+						}
+					},
+					{
+						app: "data",
+						payload: {
+							verdict: "fraud",
+							height: "{trigger.data.height}",
+							challenger: "{trigger.address}"
+						}
+					},
+					{
+						app: "state",
+						state: "{
+							var['fraud_' || trigger.data.height] = trigger.address;
+						}"
+					}
+				]
+			}
+		]
+	}
+}

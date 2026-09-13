@@ -28,6 +28,7 @@ function walk(def, path, acc) {
 const SUBSTITUTIONS = {
 	PERP_ASSET_ID_HERE: 'n9y3VghJdrwhU4nWem6P78yNc2NVFywqMdFcaXGBTeE=',
 	ROLLUP_AA_HERE: 'MXMEKGN37H5QO2AWHT7XRG6LHJVVTAWU',
+	VAULT_AA_HERE: 'MXMEKGN37H5QO2AWHT7XRG6LHJVVTAWU',
 };
 async function check(f) {
 	let src = fs.readFileSync(f, 'utf8');

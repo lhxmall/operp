@@ -117,6 +117,13 @@
 					$amt = substring($tail, 1, length($tail));
 					$next = index_of($amt, ':');
 					$amount = substring($amt, 0, $next < 0 ? length($amt) : $next);
+					// Deposit descriptors carry the vault AA unit anchor as a
+					// third segment (doc 12 §2.3); withdrawals have none.
+					// Anchors are standard-base64 unit ids, always 44 chars.
+					if ($deposit){
+						$anchor = ($next < 0) ? false : substring($amt, $next + 1, length($amt));
+						if (typeof($anchor) == 'boolean' OR length($anchor) != 44) bounce('bad op');
+					}
 					$tail1 = substring($post_leaf, 70, length($post_leaf));
 					$col1 = substring($tail1, 0, index_of($tail1, ':'));
 					if (typeof($post_leaf) == 'boolean' OR typeof($post_wit) == 'boolean'
@@ -224,6 +231,91 @@
 						AND trigger.data.left_proof.index == $n - 1
 						AND $id > trigger.data.left;
 					if (!$hit1 AND !$hit2 AND !$hit3) bounce('no fraud');
+					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
+				}",
+				messages: [
+					{
+						app: "payment",
+						payload: {
+							asset: "base",
+							outputs: [
+								{
+									address: "ROLLUP_AA_HERE",
+									amount: 10000
+								}
+							]
+						}
+					},
+					{
+						app: "data",
+						payload: {
+							verdict: "fraud",
+							height: "{trigger.data.height}",
+							challenger: "{trigger.address}"
+						}
+					},
+					{
+						app: "state",
+						state: "{
+							var['fraud_' || trigger.data.height] = trigger.address;
+						}"
+					}
+				]
+			},
+			{
+				// P-dep_evidence: the deposit op's vault-unit anchor has no
+				// (or a mismatched) receipt in the vault AA. The op anchor is
+				// the trigger unit id (base64) of the vault {deposit:1} /
+				// {deposit_perp:1}; the vault persists dep_<unit>/pdep_<unit>
+				// with the net amount. Missing receipt, wrong amount, or
+				// base<->PERP confusion convicts; an exact match bounces
+				// ('no fraud'). VAULT_AA_HERE is substituted at deploy/test.
+				if: "{trigger.data.pred == 'dep_evidence'}",
+				init: "{
+					$h = trigger.data.height;
+					$rollup = 'ROLLUP_AA_HERE';
+					$vault = 'VAULT_AA_HERE';
+					$n = var[$rollup]['unit_count_' || $h];
+					if (!$h OR !$n) bounce('no height');
+					if (var[$rollup]['frozen_' || $h] OR timestamp >= (var[$rollup]['submitted_at_' || $h] otherwise 0) + 3600)
+						bounce('challenge not possible');
+					if (trigger.data.trace_root != var[$rollup]['trace_root_' || $h]
+						OR trigger.data.ops_root != var[$rollup]['ops_root_' || $h]
+						OR trigger.data.units_root != var[$rollup]['units_root_' || $h]
+						OR trigger.data.units_set_root != var[$rollup]['units_set_root_' || $h]
+						OR trigger.data.fills_root != var[$rollup]['fills_root_' || $h])
+						bounce('stale roots');
+					$k = trigger.data.k;
+					if (!is_integer($k) OR $k < 0 OR $k >= $n)
+						bounce('bad k');
+					$op = trigger.data.op;
+					if (!trigger.data.ops_proof OR trigger.data.ops_proof.index != $k OR trigger.data.ops_proof.root != trigger.data.ops_root
+						OR !is_valid_merkle_proof($op, trigger.data.ops_proof))
+						bounce('bad ops proof');
+					$deposit = starts_with($op, 'd:');
+					$gov = starts_with($op, 'D:');
+					if (!$deposit AND !$gov) bounce('no fraud');
+					// op = 'd:'/'D:' || 64-hex || ':' || amount || ':' ||
+					// 44-char base64 anchor. Reuse the deposit-case split:
+					// tail after index 66, amount = first segment, anchor =
+					// the remainder (must be exactly 44 chars).
+					$tail = substring($op, 66, length($op));
+					$amt = substring($tail, 1, length($tail));
+					$next = index_of($amt, ':');
+					if ($next < 0) bounce('bad op');
+					$amount = substring($amt, 0, $next);
+					$anchor = substring($amt, $next + 1, length($amt));
+					if (length($anchor) != 44) bounce('bad op');
+					$key = ($deposit ? 'dep_' : 'pdep_') || $anchor;
+					$receipt = var[$vault][$key] otherwise false;
+					// Missing receipt: fictitious aa_unit. Present but
+					// unequal: amount mismatch or base<->PERP confusion
+					// (receipts live under disjoint dep_/pdep_ keys).
+					// typeof-guard first: a missing var reads boolean false,
+					// and Oscript cross-type != is not a reliable absence
+					// test on its own.
+					if (typeof($receipt) != 'boolean' AND $receipt == ($amount + 0))
+						bounce('no fraud');
 					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
 				}",
 				messages: [

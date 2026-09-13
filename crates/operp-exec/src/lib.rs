@@ -1877,12 +1877,16 @@ mod tests {
         allow_all(&mut eng);
         let oa = acct_of(&sk(5));
         let ob = acct_of(&sk(6));
+        let oc = acct_of(&sk(7));
         eng.state
             .oracle_bonds
             .insert(oa, operp_types::ORACLE_BOND_PERP);
         eng.state
             .oracle_bonds
             .insert(ob, operp_types::ORACLE_BOND_PERP);
+        eng.state
+            .oracle_bonds
+            .insert(oc, operp_types::ORACLE_BOND_PERP);
         let g = genesis_id();
         let mk = |secret: &[u8; 32], px: Price| {
             sign_unit(
@@ -1899,14 +1903,16 @@ mod tests {
             .unwrap();
         eng.ingest(mk(&sk(6), 110_000 * PRICE_SCALE as i64))
             .unwrap();
-        // Effective mark = median across reporters; median of two is the
-        // lower middle, i.e. 100_000 (which equals the genesis mark, so the
-        // clamp keeps it).
+        eng.ingest(mk(&sk(7), 100_000 * PRICE_SCALE as i64))
+            .unwrap();
+        // Effective mark = median across 3 reporters = 100_000 (which equals
+        // the genesis mark, so the clamp keeps it). Three reporters meet
+        // ORACLE_MIN_REPORTERS_MARK (doc 12 §2.2).
         assert_eq!(
             eng.state.marks.get(&BTC_USD).copied().unwrap(),
             100_000 * PRICE_SCALE as i64
         );
-        // Once an oracle has spoken, fills must NOT move the mark.
+        // With 3 authoritative reporters, fills must NOT move the mark.
         let alice = sk(1);
         eng.state
             .accounts
@@ -1929,6 +1935,86 @@ mod tests {
             eng.state.marks.get(&BTC_USD).copied().unwrap(),
             100_000 * PRICE_SCALE as i64,
             "oracle-authoritative mark must ignore fills"
+        );
+    }
+
+    #[test]
+    fn pair_reporter_leaves_mark_to_fills() {
+        // Doc 12 §2.2: with only 2 effective reporters (below
+        // ORACLE_MIN_REPORTERS_MARK) a band-internal fill still moves the
+        // mark — pricing power stays with the book until 3 reporters agree.
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let oa = acct_of(&sk(5));
+        let ob = acct_of(&sk(6));
+        eng.state
+            .oracle_bonds
+            .insert(oa, operp_types::ORACLE_BOND_PERP);
+        eng.state
+            .oracle_bonds
+            .insert(ob, operp_types::ORACLE_BOND_PERP);
+        let g = genesis_id();
+        let mk = |secret: &[u8; 32], px: Price| {
+            sign_unit(
+                vec![g],
+                Op::ReportPrice {
+                    oracle: acct_of(secret),
+                    market: BTC_USD,
+                    price: px,
+                },
+                secret,
+            )
+        };
+        eng.ingest(mk(&sk(5), 100_000 * PRICE_SCALE as i64))
+            .unwrap();
+        eng.ingest(mk(&sk(6), 100_000 * PRICE_SCALE as i64))
+            .unwrap();
+        // 2 reporters: mark stays at genesis despite in-band agreement.
+        assert_eq!(
+            eng.state.marks.get(&BTC_USD).copied().unwrap(),
+            100_000 * PRICE_SCALE as i64
+        );
+        // A band-internal fill (+5%) moves the mark: fills are authoritative
+        // while the reporter count is short. Fund via deposits (same path
+        // as two_crossing_orders_fill) so book + risk see funded accounts.
+        let alice = sk(1);
+        let bob = sk(2);
+        let d1 = deposit(vec![g], &alice, 1_000_000 * USD_SCALE as i128, 11);
+        let tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![tip], &bob, 1_000_000 * USD_SCALE as i128, 12);
+        let tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+        let px = 105_000 * PRICE_SCALE as i64;
+        let ask = place_on(
+            vec![tip],
+            &bob,
+            BTC_USD,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
+        let tip = unit_id(&ask);
+        eng.ingest(ask).unwrap();
+        let bid = place_on(
+            vec![tip],
+            &alice,
+            BTC_USD,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
+        eng.ingest(bid).unwrap();
+        assert_eq!(
+            eng.state.marks.get(&BTC_USD).copied().unwrap(),
+            px,
+            "with only 2 reporters a band-internal fill must move the mark"
         );
     }
 

@@ -193,7 +193,34 @@ async function main() {
   const frames = Array.isArray(batchData.frames) ? batchData.frames.slice() : [];
   if (!frames.length) throw new Error("batch.json is missing the frames array (re-run export_batch)");
   const evByAnchor = new Map();
-  for (const e of await buildDepositEvidences(batchData, vault)) evByAnchor.set(String(e.aa_unit).toLowerCase(), e);
+  const evidences = await buildDepositEvidences(batchData, vault);
+  for (const e of evidences) evByAnchor.set(String(e.aa_unit).toLowerCase(), e);
+  // Wait-for-receipt (doc 12 §2.3): every deposit anchor must have a
+  // persisted vault receipt (dep_<unit>/pdep_<unit>) before packing — the
+  // dep_evidence predicate kills heights whose anchors are fictitious, so
+  // packing without receipts is self-sabotage. Poll the vault AA state;
+  // devnet (no live vault deposits) skips like the joint fixture path.
+  if (evidences.length && !(process.env.devnet && !process.env.testnet && !process.env.mainnet)) {
+    for (const e of evidences) {
+      const b64 = Buffer.from(String(e.aa_unit), "hex").toString("base64");
+      const key = (e.is_perp ? "pdep_" : "dep_") + b64;
+      let got = false;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        const v = await poster.readAAStateVars(vault).catch(() => null);
+        const vars_ = (v && (v.vars || v)) || {};
+        if (vars_[key] !== undefined && vars_[key] !== false) {
+          const want = String(e.amount);
+          if (String(vars_[key]) !== want)
+            throw new Error(`vault receipt ${key} = ${vars_[key]} != op amount ${want}`);
+          got = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+      if (!got) throw new Error(`vault receipt missing for deposit anchor ${key} (waited 60s)`);
+      console.log("vault receipt ok:", key);
+    }
+  }
   const stamped = frames.map((f) => {
     let o;
     try { o = JSON.parse(f); } catch (_) { return f; }
@@ -287,6 +314,11 @@ async function main() {
     counts_root: header.counts_root,
     unit_count: header.unit_count,
     wit_count: header.wit_count,
+    // DA commitments (doc 12 §2.4): landed on-chain by the rollup submit
+    // case so da_frame can challenge frames against data_root_<h>.
+    data_root: header.data_root,
+    data_len: header.data_len !== undefined ? header.data_len : Buffer.byteLength(JSON.stringify(header.frames_blob || header.packages || []), "utf8"),
+    pkg_count: Array.isArray(header.packages) ? header.packages.length : 1,
   };
   // Optional audit anchors: the rollup AA does not gate on these, but they
   // ride the submit data for indexers/self-checks (header temp_data carries

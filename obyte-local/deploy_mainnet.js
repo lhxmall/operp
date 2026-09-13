@@ -102,39 +102,49 @@ async function main() {
   const rollup = await postDefinition(rollupDef, "rollup");
   await waitBeat(rollup.unit, "rollup");
 
-  // 2. Dispute, fill, vault with substituted addresses.
-  const disputeSrc = substitute(readAa("operp_dispute.aa"), { ROLLUP_AA_HERE: rollup.address });
-  const fillSrc = substitute(readAa("operp_dispute_fill.aa"), { ROLLUP_AA_HERE: rollup.address });
+  // 2. Vault first: its address is substituted into dispute for dep_evidence.
+  // The vault def depends only on rollup + PERP, so it deploys standalone.
   const vaultSrc = substitute(readAa("operp_vault.aa"), {
     ROLLUP_AA_HERE: rollup.address,
     PERP_ASSET_ID_HERE: PERP_ASSET_ID,
   });
-  const disputeDef = ["autonomous agent", await parseAa(disputeSrc, "operp_dispute.aa")];
-  const fillDef = ["autonomous agent", await parseAa(fillSrc, "operp_dispute_fill.aa")];
   const vaultDef = ["autonomous agent", await parseAa(vaultSrc, "operp_vault.aa")];
-  const dispute = await postDefinition(disputeDef, "dispute");
-  const fill = await postDefinition(fillDef, "fill");
   const vault = await postDefinition(vaultDef, "vault");
   await waitBeat(vault.unit, "vault");
 
-  // 3. Bind both dispute AAs (20000 each); assert via AA state.
+  // 3. Dispute, fill, clamp with rollup + vault addresses substituted.
+  const disputeSrc = substitute(readAa("operp_dispute.aa"), {
+    ROLLUP_AA_HERE: rollup.address,
+    VAULT_AA_HERE: vault.address,
+  });
+  const fillSrc = substitute(readAa("operp_dispute_fill.aa"), { ROLLUP_AA_HERE: rollup.address });
+  const clampSrc = substitute(readAa("operp_dispute_clamp.aa"), { ROLLUP_AA_HERE: rollup.address });
+  const disputeDef = ["autonomous agent", await parseAa(disputeSrc, "operp_dispute.aa")];
+  const fillDef = ["autonomous agent", await parseAa(fillSrc, "operp_dispute_fill.aa")];
+  const clampDef = ["autonomous agent", await parseAa(clampSrc, "operp_dispute_clamp.aa")];
+  const dispute = await postDefinition(disputeDef, "dispute");
+  const fill = await postDefinition(fillDef, "fill");
+  const clamp = await postDefinition(clampDef, "clamp");
+
+  // 4. Bind all three dispute AAs (20000 each); assert via AA state.
   await triggerAa({ to: dispute.address, amount: 20000, data: { bind: 1 } }, "dispute bind");
   await triggerAa({ to: fill.address, amount: 20000, data: { bind_fill: 1 } }, "fill bind");
+  await triggerAa({ to: clamp.address, amount: 20000, data: { bind_clamp: 1 } }, "clamp bind");
   await waitBeat("binds", "bind");
   const state = await readAaState(rollup.address);
   if (String(state.dispute_aa) !== String(dispute.address))
     throw new Error("dispute_aa not bound: " + JSON.stringify(state.dispute_aa));
   if (String(state.dispute_fill_aa) !== String(fill.address))
     throw new Error("dispute_fill_aa not bound: " + JSON.stringify(state.dispute_fill_aa));
-  console.log("both dispute AAs bound");
+  if (String(state.dispute_clamp_aa) !== String(clamp.address))
+    throw new Error("dispute_clamp_aa not bound: " + JSON.stringify(state.dispute_clamp_aa));
+  console.log("all three dispute AAs bound");
 
   // 4. Write deployment.json.
   const info = {
-    network: "mainnet",
-    rollup_aa_address: rollup.address,
     dispute_aa_address: dispute.address,
     dispute_fill_aa_address: fill.address,
-    vault_aa_address: vault.address,
+    dispute_clamp_aa_address: clamp.address,
     perp_asset_id: PERP_ASSET_ID,
     chain_id: CHAIN_ID,
     pool_fund_gross: POOL_FUND_GROSS,

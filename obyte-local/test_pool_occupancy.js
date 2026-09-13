@@ -79,6 +79,9 @@ function submitData(h, prev) {
     counts_root: COUNTS_ROOT,
     unit_count: 1,
     wit_count: 1,
+    data_root: sha256Hex("data-" + h),
+    data_len: 100,
+    pkg_count: 1,
   };
 }
 

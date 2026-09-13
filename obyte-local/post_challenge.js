@@ -40,15 +40,18 @@ let network;
 async function main() {
   const deploy = JSON.parse(fs.readFileSync(path.join(__dirname, "deployment.json"), "utf8"));
   const useFill = flag("fill");
-  const dispute = useFill
-    ? deploy.dispute_fill_aa_address || process.env.OPERP_DISPUTE_FILL_AA
-    : deploy.dispute_aa_address || process.env.OPERP_DISPUTE_AA;
+  const useClamp = flag("clamp");
+  const dispute = useClamp
+    ? deploy.dispute_clamp_aa_address || process.env.OPERP_DISPUTE_CLAMP_AA
+    : useFill
+      ? deploy.dispute_fill_aa_address || process.env.OPERP_DISPUTE_FILL_AA
+      : deploy.dispute_aa_address || process.env.OPERP_DISPUTE_AA;
   const rollup = deploy.rollup_aa_address || process.env.OPERP_ROLLUP_AA;
   if (!dispute || !rollup) throw new Error("deployment.json dispute_aa_address/rollup_aa_address missing");
   const height = Number(arg("height"));
   const pred = arg("pred", "deposit");
   const proofFile = arg("proof");
-  if (!height || !proofFile) throw new Error("usage: node post_challenge.js --height N --pred deposit --proof proof.json [--fill]");
+  if (!height || !proofFile) throw new Error("usage: node post_challenge.js --height N --pred deposit --proof proof.json [--fill] [--clamp]");
 
   network = await Network.create()
     .with.wallet({ challenger: 1e7 })
@@ -58,14 +61,13 @@ async function main() {
 
   // Bind only when the rollup has no dispute AA registered yet (double
   // bind bounces 'not authorized' — the rollup keeps the first binder).
-  const rv = await challenger.readAAStateVars(rollup);
-  const rvars = rv.vars || rv;
-  const boundKey = useFill ? "dispute_fill_aa" : "dispute_aa";
+  const boundKey = useClamp ? "dispute_clamp_aa" : useFill ? "dispute_fill_aa" : "dispute_aa";
+  const bindData = useClamp ? { bind_clamp: 1 } : useFill ? { bind_fill: 1 } : { bind: 1 };
   if (!rvars[boundKey]) {
     const bind = await challenger.triggerAaWithData({
       toAddress: dispute,
       amount: 20000,
-      data: useFill ? { bind_fill: 1 } : { bind: 1 },
+      data: bindData,
     });
     if (bind.error) throw new Error("bind failed: " + bind.error);
     await network.witnessUntilStable(bind.unit);

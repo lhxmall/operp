@@ -140,6 +140,7 @@ struct Args {
     from_height: u64,
     poll_interval_secs: u64,
     bond: u64,
+    archive_dir: Option<String>,
 }
 fn parse_args() -> Result<Args, String> {
     let mut rollup = None;
@@ -149,7 +150,7 @@ fn parse_args() -> Result<Args, String> {
     let mut from_height = 1u64;
     let mut poll_interval_secs = DEFAULT_POLL_INTERVAL_SECS;
     let mut bond = CHALLENGE_BOND_GROSS;
-
+    let mut archive_dir: Option<String> = None;
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -178,6 +179,9 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--bond must be u64")?
             }
+            "--archive-dir" => {
+                archive_dir = Some(it.next().ok_or("--archive-dir needs a value")?);
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -194,17 +198,19 @@ fn parse_args() -> Result<Args, String> {
         from_height,
         poll_interval_secs,
         bond,
+        archive_dir,
     })
 }
-
 fn print_usage() {
     eprintln!(
         "operp-watch --rollup <rollup-aa-addr> --vault <vault-aa-addr> --hub <hub-url> [--dispute <dispute-aa-addr>] \
- [--from-height <u64>] [--poll-interval <secs>] [--bond <gross-bytes>]\n\
+ [--from-height <u64>] [--poll-interval <secs>] [--bond <gross-bytes>] [--archive-dir <path>]\n\
  \n\
 Polls the rollup's da_unit_<h> assertions, replays each submitted height, and flags any\n\
 root mismatch inside the submitted_at+3600 dispute window for a watcher-owned\n\
-wallet to challenge via post_challenge.js (one-shot fraud predicates, no bond)."
+wallet to challenge via post_challenge.js (one-shot fraud predicates, no bond).\n\
+--archive-dir persists every height's full temp_data JSON for post-24h replay\n\
+(doc 12 §2.4); without it history lives only in hub temp_data (24h purge)."
     );
 }
 
@@ -224,6 +230,7 @@ fn check_height(
     engine: &mut Engine,
     h: u64,
     now: u64,
+    archive_dir: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     let sa_key = format!("submitted_at_{}", h);
     let frozen_key = format!("frozen_{}", h);
@@ -281,14 +288,40 @@ fn check_height(
             Some(b) => {
                 da.data["frames_blob"] = serde_json::Value::String(b);
             }
-            None => return Ok(None),
+            // Missing package after retries: LOUD alert, not silent backoff
+            // (doc 12 §2.4). No expressible on-chain predicate covers a
+            // withheld package — the operator, dual watchers, and the
+            // archive below are the defense; the alert names the height.
+            None => {
+                let alert = format!(
+                    "h={} PACKAGE WITHHELD ({}): cannot assemble frames — operator DA failure, investigate now",
+                    h,
+                    last_err.map(|e| e.to_string()).unwrap_or_else(|| "hub unavailable".into())
+                );
+                return Ok(Some(alert));
+            }
         }
-        let _ = last_err;
+    }
+    // Archive every height's full temp_data JSON when --archive-dir is set
+    // (doc 12 §2.4): post-24h replay source after the hub purges temp_data.
+    // Best-effort: a failed write warns but never blocks the replay check.
+    if let Some(dir) = archive_dir {
+        let path = std::path::Path::new(dir).join(format!("height-{}.json", h));
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&path, serde_json::to_string(&da.data).unwrap_or_default()) {
+            eprintln!("archive write failed for h={}: {}", h, e);
+        }
     }
 
     let prev_root = engine.state.state_root();
     // Build the fraud proof BEFORE replay_and_check advances the engine:
     // build_proof replays unit-by-unit on a scratch engine fork.
+    // The vault-receipt closure answers dep_evidence checks against the
+    // live vault AA (dep_<unit>/pdep_<unit>): missing var = fictitious
+    // anchor, transport failure = skip receipt checks (never mis-challenge
+    // on a flaky read).
     let proof_hint: Option<prove::BuiltProof> = (|| {
         let batch = batch_from_data(&da.data).ok()?;
         let mut scratch = engine.clone();
@@ -304,7 +337,20 @@ fn check_height(
                     .collect()
             })
             .unwrap_or_default();
-        prove::build_proof(&batch, &mut scratch, &inbox, sa_val)
+        let vault_addr = config.vault_address.clone();
+        let receipt = |anchor: &str, is_perp: bool| -> Result<Option<i128>, String> {
+            let key = if is_perp {
+                format!("pdep_{}", anchor)
+            } else {
+                format!("dep_{}", anchor)
+            };
+            match hub.get_aa_state_var(&vault_addr, &key) {
+                Ok(None) => Ok(None),
+                Ok(Some(v)) => Ok(v.as_i64().map(|x| x as i128)),
+                Err(e) => Err(e),
+            }
+        };
+        prove::build_proof(&batch, &mut scratch, &inbox, sa_val, Some(&receipt))
     })();
     match replay_and_check(&da, prev_root, engine) {
         Ok(()) => Ok(None),
@@ -329,8 +375,9 @@ fn check_height(
 /// If `OPERP_WATCH_MNEMONIC` is set, spawn `obyte-local/post_challenge.js`.
 /// Unset mnemonic → print-only (caller already prints the alert).
 /// A built proof is written to a temp `proof.json` and passed as
-/// `--pred/--proof` (plus `--fill` for the fill AA); without a proof the
-/// spawn is skipped — never post without `--pred` and `--proof`.
+/// `--pred/--proof` (plus `--fill` for the fill AA, `--clamp` for the clamp
+/// AA); without a proof the spawn is skipped — never post without `--pred`
+/// and `--proof`.
 fn maybe_post_challenge(
     config: &WatchConfig,
     h: u64,
@@ -367,7 +414,13 @@ fn maybe_post_challenge(
         h,
         p.pred,
         path.display(),
-        if p.fill_aa { "--fill" } else { "" },
+        if p.clamp_aa {
+            "--clamp"
+        } else if p.fill_aa {
+            "--fill"
+        } else {
+            ""
+        },
     );
     let mut args: Vec<std::ffi::OsString> = vec![
         script.as_os_str().to_owned(),
@@ -380,7 +433,9 @@ fn maybe_post_challenge(
         std::ffi::OsStr::new("--hub").to_owned(),
         std::ffi::OsStr::new(&hub).to_owned(),
     ];
-    if p.fill_aa {
+    if p.clamp_aa {
+        args.push(std::ffi::OsStr::new("--clamp").to_owned());
+    } else if p.fill_aa {
         args.push(std::ffi::OsStr::new("--fill").to_owned());
     }
     // Hub flag is accepted for log parity; the poster resolves addresses
@@ -425,7 +480,14 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or(0);
 
         for h in args.from_height..=ll {
-            match check_height(&hub, &config, &mut engine, h, now) {
+            match check_height(
+                &hub,
+                &config,
+                &mut engine,
+                h,
+                now,
+                args.archive_dir.as_deref(),
+            ) {
                 Ok(None) => {}
                 Ok(Some(msg)) => println!("WATCH ALERT: {}", msg),
                 Err(e) => println!("WATCH ERROR at h={}: {}", h, e),
