@@ -622,7 +622,8 @@ async function main() {
     post_pos_proof: merkle.getMerkleProof(POST_H, POST_H.indexOf(`pos:${takerH}:1:100000000:100000000`)),
   });
   await triggerBounce(challenger, fill, Object.assign({ pred: "fill_math", height: 3 }, fillHonest2), 20000, "no fraud");
-  console.log("11a. fill_math honest bounced 'no fraud'");
+  st = await vars(rollup);
+  console.log("11a post-bounce:", JSON.stringify({ frozen_3: st.frozen_3 }));
 
   // ---- 12. ghost: maker order absent → fraud -------------------------------
   // maker id "e"*64 has no ord leaf in H3_PRE. Sorted H3_PRE runs
