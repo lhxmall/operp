@@ -376,6 +376,7 @@
 						bounce('bad insurance post proof');
 					$I1 = split($ins_post, ':');
 					if (array_length($I1) != 5 OR $I1[1] != $zero) bounce('bad insurance post');
+					$ins_post_col = $I1[2] + 0;
 					// Other side posted receipt delta (its own clamp proof
 					// covers lies there; here it only feeds the insurance leg).
 					if (!trigger.data.other_pre_absent){
