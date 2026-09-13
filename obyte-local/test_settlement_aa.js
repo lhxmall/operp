@@ -575,13 +575,17 @@ async function main() {
 
   // ---- 11a. fill_math honest → 'no fraud' ---------------------------------
   // h3 reopened by scenario 11's verdict: re-submit with the HONEST post
+  // tree (col -500) and prove honest math bounces.
+  const POST_H = [`acct:${takerH}:-500:0:0`, META1, `pos:${takerH}:1:100000000:100000000`].sort();
+  const POST_H_WIT = merkle.getMerkleRoot(POST_H);
+  const TRACE_H = pad2([POST_H_WIT], "traceh");
+  const TRACE_H_ROOT = merkle.getMerkleRoot(TRACE_H);
   async function submitH3(traceRoot, fillsRoot, witRoot, witCount) {
     const s = submitData(3, STATE_ROOT, STATE_ROOT);
     s.wit_root = witRoot || H3_PRE_WIT;
     s.wit_count = witCount || H3_PRE.length;
     s.trace_root = traceRoot;
     s.fills_root = fillsRoot;
-    s.ops_root = OPS_ROOT1;
     const h3header = headerFromSubmit(s);
     const r = await operator.sendMulti({
       messages: [
