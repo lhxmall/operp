@@ -731,40 +731,15 @@ async function main() {
   if (Number(st.frozen_3) !== 2) throw new Error("dep_evidence fraud did not freeze height");
   console.log("13d. dep_evidence fictitious anchor → frozen=3 via dispute AA");
 
-  // ---- 13e. dep_evidence honest → 'no fraud' ------------------------------
-  // Fund the vault for real: {deposit:1} with 110000 gross (net 100000).
-  // The trigger unit id becomes the op anchor; the vault persists
-  // dep_<unit> = 100000, so dep_evidence matches and bounces.
+  // ---- 13e2. deposit bookkeeping liar → fraud (freezes the height) -------
+  // 13d froze h3. Re-submit the REAL op with a liar post tree (col unchanged
+  // despite the +100000 deposit) and kill it with the bookkeeping predicate.
   const depTrigger = await trigger(challenger, vault, { deposit: 1 }, 110000);
   const depUnitB64 = depTrigger.unit;
   if (typeof(depUnitB64) != "string" || depUnitB64.length != 44) throw new Error("bad deposit unit id: " + depUnitB64);
   const REAL_OP = "d:" + DEP_ACCT + ":100000:" + depUnitB64;
   const REAL_OPS = pad2([REAL_OP], "realops");
   const REAL_OPS_ROOT = merkle.getMerkleRoot(REAL_OPS);
-  const REAL_POST = pad2([`acct:${DEP_ACCT}:1100000:0:0`], "realpost");
-  const REAL_WIT = merkle.getMerkleRoot(REAL_POST);
-  const REAL_TRACE = pad2([REAL_WIT], "realtrace");
-  const REAL_TRACE_ROOT = merkle.getMerkleRoot(REAL_TRACE);
-  await submitH3(REAL_TRACE_ROOT, REAL_OPS_ROOT, REAL_OPS_ROOT);
-  const realEvidence = {
-    k: 0,
-    op: REAL_OP,
-    ops_proof: merkle.getMerkleProof(REAL_OPS, 0),
-    trace_root: REAL_TRACE_ROOT,
-    ops_root: REAL_OPS_ROOT,
-    units_root: UNITS_ROOT,
-    units_set_root: UNITS_SET_ROOT,
-    fills_root: REAL_OPS_ROOT,
-  };
-  await triggerBounce(challenger, dispute, Object.assign({ pred: "dep_evidence", height: 3 }, realEvidence), 20000, "no fraud");
-  st = await vars(rollup);
-  if (Number(st.frozen_3 || 0) !== 0) throw new Error("honest dep_evidence froze the height!");
-  console.log("13e. dep_evidence honest receipt bounced 'no fraud' — height live");
-
-  // ---- 13e2. deposit bookkeeping liar → fraud (freezes the live h3) -------
-  // 13e left h3 live; the clamp scenarios need a frozen height to submit new
-  // roots. Re-submit the REAL op with a liar post tree (col unchanged despite
-  // the +100000 deposit) and kill it with the bookkeeping predicate.
   const REAL_LIAR_POST = pad2([`acct:${DEP_ACCT}:1000000:0:0`], "realliarpost");
   const REAL_LIAR_WIT = merkle.getMerkleRoot(REAL_LIAR_POST);
   const REAL_LIAR_TRACE = pad2([REAL_LIAR_WIT], "realliartrace");
@@ -792,8 +767,41 @@ async function main() {
   if (Number(st.frozen_3) !== 2) throw new Error("deposit bookkeeping fraud did not freeze height");
   console.log("13e2. deposit bookkeeping liar → frozen=3");
 
+  // ---- 13e. dep_evidence honest → 'no fraud' ------------------------------
+  // 13e2 froze h3; re-submit the HONEST post tree (col reflects the
+  // +100000 deposit). The vault persists dep_<unit> = 100000 keyed by the
+  // trigger unit id, so dep_evidence matches and bounces. Live h3 remains.
+  const REAL_POST = pad2([`acct:${DEP_ACCT}:1100000:0:0`], "realpost");
+  const REAL_WIT = merkle.getMerkleRoot(REAL_POST);
+  const REAL_TRACE = pad2([REAL_WIT], "realtrace");
+  const REAL_TRACE_ROOT = merkle.getMerkleRoot(REAL_TRACE);
+  await submitH3(REAL_TRACE_ROOT, REAL_OPS_ROOT, REAL_OPS_ROOT);
+  const realEvidence = {
+    k: 0,
+    op: REAL_OP,
+    ops_proof: merkle.getMerkleProof(REAL_OPS, 0),
+    trace_root: REAL_TRACE_ROOT,
+    ops_root: REAL_OPS_ROOT,
+    units_root: UNITS_ROOT,
+    units_set_root: UNITS_SET_ROOT,
+    fills_root: REAL_OPS_ROOT,
+  };
+  await triggerBounce(challenger, dispute, Object.assign({ pred: "dep_evidence", height: 3 }, realEvidence), 20000, "no fraud");
+  st = await vars(rollup);
+  if (Number(st.frozen_3 || 0) !== 0) throw new Error("honest dep_evidence froze the height!");
+  console.log("13e. dep_evidence honest receipt bounced 'no fraud' — height live");
+
+  // ---- 13e3. dep_evidence fictitious re-submit → fraud (refreezes) --------
+  // 13e left h3 live; the clamp scenarios need a frozen height. Re-submit
+  // the 13d FAKE roots (its verdict re-fires identically).
+  await submitH3(FAKE_TRACE_ROOT, FAKE_OPS_ROOT, FAKE_OPS_ROOT);
+  await triggerVerdict(challenger, dispute, Object.assign({ pred: "dep_evidence", height: 3 }, fakeEvidence), 20000, "dep_evidence refreeze predicate");
+  st = await vars(rollup);
+  if (Number(st.frozen_3) !== 2) throw new Error("dep_evidence refreeze did not freeze height");
+  console.log("13e3. dep_evidence fictitious re-submit → frozen=3");
+
   // ---- 13b. clamp dishonest (over-charged user) → fraud via clamp AA ------
-  // h3 was frozen by 13e2: re-submit carrying a clamp assertion. Pre tree is
+  // h3 was frozen by 13e3: re-submit carrying a clamp assertion. Pre tree is
   // H3_PRE (wit_root_2): taker flat col 0, META1 mark=100 fee 5bps, taker
   // holds POS2 (market 2). Fill taker-bid 1e8 x 1e8: notional 1e6, fee 500,
   // exp col -500. upnl = fill leg (1-1e6) + market-2 leg (0-450000) =
