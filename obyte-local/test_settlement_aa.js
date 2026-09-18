@@ -584,13 +584,13 @@ async function main() {
   const POST_H_WIT = merkle.getMerkleRoot(POST_H);
   const TRACE_H = pad2([POST_H_WIT], "traceh");
   const TRACE_H_ROOT = merkle.getMerkleRoot(TRACE_H);
-  async function submitH3(traceRoot, fillsRoot) {
+  async function submitH3(traceRoot, fillsRoot, opsRoot) {
     const s = submitData(3, STATE_ROOT, STATE_ROOT);
     s.wit_root = H3_PRE_WIT;
     s.wit_count = H3_PRE.length;
     s.trace_root = traceRoot;
     s.fills_root = fillsRoot;
-    s.ops_root = OPS_ROOT1;
+    s.ops_root = opsRoot || OPS_ROOT1;
     const h3header = headerFromSubmit(s);
     const r = await operator.sendMulti({
       messages: [
@@ -715,7 +715,7 @@ async function main() {
   const FAKE_WIT = merkle.getMerkleRoot(FAKE_POST);
   const FAKE_TRACE = pad2([FAKE_WIT], "faketrace");
   const FAKE_TRACE_ROOT = merkle.getMerkleRoot(FAKE_TRACE);
-  await submitH3(FAKE_TRACE_ROOT, FAKE_OPS_ROOT);
+  await submitH3(FAKE_TRACE_ROOT, FAKE_OPS_ROOT, FAKE_OPS_ROOT);
   const fakeEvidence = {
     k: 0,
     op: FAKE_OP,
@@ -745,7 +745,7 @@ async function main() {
   const REAL_WIT = merkle.getMerkleRoot(REAL_POST);
   const REAL_TRACE = pad2([REAL_WIT], "realtrace");
   const REAL_TRACE_ROOT = merkle.getMerkleRoot(REAL_TRACE);
-  await submitH3(REAL_TRACE_ROOT, REAL_OPS_ROOT);
+  await submitH3(REAL_TRACE_ROOT, REAL_OPS_ROOT, REAL_OPS_ROOT);
   const realEvidence = {
     k: 0,
     op: REAL_OP,
@@ -769,7 +769,7 @@ async function main() {
   const REAL_LIAR_WIT = merkle.getMerkleRoot(REAL_LIAR_POST);
   const REAL_LIAR_TRACE = pad2([REAL_LIAR_WIT], "realliartrace");
   const REAL_LIAR_TRACE_ROOT = merkle.getMerkleRoot(REAL_LIAR_TRACE);
-  await submitH3(REAL_LIAR_TRACE_ROOT, REAL_OPS_ROOT);
+  await submitH3(REAL_LIAR_TRACE_ROOT, REAL_OPS_ROOT, REAL_OPS_ROOT);
   const realLiar = {
     k: 0,
     op: REAL_OP,
