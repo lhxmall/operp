@@ -449,6 +449,8 @@ package = base64(gzip（`\n` 连接 frames）)；cap 仍按
 `zlib.gunzipSync` + concat + sha256 对得上；非法 gzip → BindingMismatch。
 `l` 保留在线上——`prove.rs` 的 `deposit_proof` 要拿 liar 贴过的叶子对
 committed `trace[k]` 开证明，省 `l` 会让一枪谓词开不了。多包时 `packages`
+记 package 单元的真实 Obyte unit hash 列表（poster 先发包、拿到 unit 后填，
+ Rust 打包时只留占位），watcher 按条目 `get_joint` 取包、gunzip 后拼接；
 超限（去 `l` 重打仍有包超 `PACK_SOURCE_CAP`）整批直接 `PackageOverCap`
 报错：组装不起来的高度永不提交（poster 按高度切分），杜绝静默 finalize。
 header 另带 `data_len`（gunzip 字节总数）→ rollup `submit` 落 `data_root_h/
@@ -467,8 +469,6 @@ data_len_h/pkg_count_h` 三键并设门（`data_len ≤ pkg_count × 4M`，包�
 
 `data_hash`/`data_length` 采用与 ocore 一致的**单一规范形**：
 `source = getJsonSource(data)`（递归字典序排序对象键的 minified JSON；
-Rust 侧移植于 `operp_settle::obyte_hash::get_json_source`），
-`data_hash = hex(sha256(source))`，`data_length = source 的 UTF-8 字节长`。
 Rust `temp_data_payload` 与 JS 工具链（post_batch.js 的
 `obyteDataHash`/`obyteDataLength`）使用同一定义，黄金向量测试对拍同一
 嵌套对象得到相同 hash/length。注意区分：**链上 OIP-0007 信封**仍须满足
@@ -630,7 +630,11 @@ sbond_<addr>, reward_<addr>, slash_reward_<addr>（sbond 仅遗留 claim 路径�
 所有成员证明 `.root` 必须等于对应 pre_wit/post_wit/roots。
 验不过 bounce('no fraud')；验过 → 付 10000 bytes + data
 `{verdict:'fraud', height, challenger}` 给 rollup。
+### 10.3 verdict(h) — rollup
+
 `trigger.address ∈ {dispute_aa, dispute_fill_aa, dispute_clamp_aa}` ∧ verdict=='fraud'
+∧ 高度 live ∧ 窗内 ∧ challenger 是合法 32 字符地址
+→ frozen_h=2、清 state_root/aa_forest/active_bond/fee_winner、
   last_submitted=h-1、`pool_<operator>` 扣 5e11（不足清零）、
   slash_reward_<challenger> += 5e11。
 ### 10.4 finalize / escape_finalize(h) — rollup
@@ -658,7 +662,7 @@ claim 四态：`reward|sbond|slash` 按旧键支付；`pool` 仅链空闲
 
 ## 11. Witness 树与谓词承诺
 
-每批 checkpoint 额外携带（`operp_settle`）：`wit_root`（执行完最后单元的
+每批 checkpoint 额外携带（`operp-settle`）：`wit_root`（执行完最后单元的
 witness 叶根）、`trace_root`（每单元 post wit_root 的 Obyte 原生 Merkle，
 按批序）、`units_root` / `units_set_root`（unit_id hex 批序/排序）、
 `ops_root`（op 描述串）、`fills_root`（成交描述串）、`counts_root`
@@ -670,7 +674,6 @@ witness 叶（`operp_state::wit_leaves`，排序后 Obyte 原生 Merkle）：
 acct:{acct_hex}:{collateral}:{perp}:{W}
 pos:{acct_hex}:{market}:{qty}:{entry}
 ord:{order_hex}:{market}:{side}:{price}:{seq}:{remaining}:{acct_hex}
-meta:{market}:{tick}:{im}:{mm}:{taker_fee_bps}:{keeper}:{delisted}:{mark}
 clamp:{acct_hex}:{total}（累计保险钳制吸收量，>0 才有叶；doc 12 §2.1）
 ```
 

@@ -142,9 +142,12 @@ async function main() {
 
   // 4. Write deployment.json.
   const info = {
+    network: "mainnet",
+    rollup_aa_address: rollup.address,
     dispute_aa_address: dispute.address,
     dispute_fill_aa_address: fill.address,
     dispute_clamp_aa_address: clamp.address,
+    vault_aa_address: vault.address,
     perp_asset_id: PERP_ASSET_ID,
     chain_id: CHAIN_ID,
     pool_fund_gross: POOL_FUND_GROSS,

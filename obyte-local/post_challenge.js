@@ -61,6 +61,8 @@ async function main() {
 
   // Bind only when the rollup has no dispute AA registered yet (double
   // bind bounces 'not authorized' — the rollup keeps the first binder).
+  const rv = await challenger.readAAStateVars(rollup);
+  const rvars = rv.vars || rv;
   const boundKey = useClamp ? "dispute_clamp_aa" : useFill ? "dispute_fill_aa" : "dispute_aa";
   const bindData = useClamp ? { bind_clamp: 1 } : useFill ? { bind_fill: 1 } : { bind: 1 };
   if (!rvars[boundKey]) {
