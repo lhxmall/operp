@@ -86,10 +86,12 @@ function writeResolved(file, subs, out) {
 
 // Precompute the rollup address from its definition (no placeholders).
 const ROLLUP_ADDR = chashOf(readDef("operp_rollup.aa"));
-const DISPUTE_SRC = writeResolved("operp_dispute.aa", { ROLLUP_AA_HERE: ROLLUP_ADDR, VAULT_AA_HERE: VAULT_ADDR }, ".e2e_dispute.aa");
-const FILL_SRC = writeResolved("operp_dispute_fill.aa", { ROLLUP_AA_HERE: ROLLUP_ADDR }, ".e2e_fill.aa");
+// Vault resolves first (rollup + PERP only); its definition hash is the
+// vault address, substituted into dispute for dep_evidence (doc 12 §2.3).
 const VAULT_SRC = writeResolved("operp_vault.aa", { ROLLUP_AA_HERE: ROLLUP_ADDR, PERP_ASSET_ID_HERE: PERP_ASSET }, ".e2e_vault.aa");
 const VAULT_ADDR = chashOf(fs.readFileSync(VAULT_SRC, "utf8"));
+const DISPUTE_SRC = writeResolved("operp_dispute.aa", { ROLLUP_AA_HERE: ROLLUP_ADDR, VAULT_AA_HERE: VAULT_ADDR }, ".e2e_dispute.aa");
+const FILL_SRC = writeResolved("operp_dispute_fill.aa", { ROLLUP_AA_HERE: ROLLUP_ADDR }, ".e2e_fill.aa");
 const CLAMP_SRC = writeResolved("operp_dispute_clamp.aa", { ROLLUP_AA_HERE: ROLLUP_ADDR }, ".e2e_clamp.aa");
 // dispute AA address is also deterministic — compute AFTER substitution.
 const DISPUTE_ADDR = chashOf(fs.readFileSync(DISPUTE_SRC, "utf8"));
