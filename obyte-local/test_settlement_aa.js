@@ -723,7 +723,7 @@ async function main() {
     ops_root: FAKE_OPS_ROOT,
     units_root: UNITS_SET_ROOT,
     units_set_root: SET_ROOT1,
-    fills_root: FILLS_ROOT,
+    fills_root: FILLS_ROOT1,
   };
   await triggerVerdict(challenger, dispute, Object.assign({ pred: "dep_evidence", height: 3 }, fakeEvidence), 20000, "dep_evidence fictitious predicate");
   st = await vars(rollup);
@@ -753,7 +753,7 @@ async function main() {
     ops_root: REAL_OPS_ROOT,
     units_root: UNITS_SET_ROOT,
     units_set_root: SET_ROOT1,
-    fills_root: FILLS_ROOT,
+    fills_root: FILLS_ROOT1,
   };
   await triggerBounce(challenger, dispute, Object.assign({ pred: "dep_evidence", height: 3 }, realEvidence), 20000, "no fraud");
   st = await vars(rollup);
@@ -776,7 +776,7 @@ async function main() {
     ops_root: REAL_OPS_ROOT,
     units_root: UNITS_SET_ROOT,
     units_set_root: SET_ROOT1,
-    fills_root: FILLS_ROOT,
+    fills_root: FILLS_ROOT1,
     pre_wit: H3_PRE_WIT,
     post_wit: REAL_LIAR_WIT,
     post_proof: merkle.getMerkleProof(REAL_LIAR_TRACE, 0),
