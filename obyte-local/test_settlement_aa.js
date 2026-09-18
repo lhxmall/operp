@@ -28,14 +28,9 @@
 //  16. pipeline h4+h5 with no inter-finalize, then finalize in order
 //  17. pool claim: 'pool busy' while live, full claim when idle
 
-// Windows: aa-testkit's runChild replaces the child env wholesale and never
-// sets APPDATA, which ocore's desktop_app reads on win32 — the genesis node
-// crashes before the network starts. The plan gates e2e on CI (ubuntu);
-// skip gracefully on win32 rather than fail.
-if (process.platform === "win32") {
-  console.log("SKIP: e2e requires a POSIX env (aa-testkit child env omits APPDATA on win32); see CI e2e job.");
-  process.exit(0);
-}
+// NOTE: the historical win32 skip is gone — aa-testkit's runChild now
+// propagates APPDATA to child processes (AbstractNode.js), so the devnet
+// runs natively on Windows and CI (ubuntu) alike.
 
 const fs = require("fs");
 const crypto = require("crypto");
