@@ -600,6 +600,7 @@ async function main() {
         tempDataMsg(h3header),
         { app: "data", payload: s },
       ],
+      base_outputs: [{ address: rollup, amount: SUBMIT_FEE }],
     });
     if (r.error) throw new Error("h3 submit failed: " + r.error);
     await network.witnessUntilStable(r.unit);
@@ -652,8 +653,8 @@ async function main() {
   console.log("12. ghost (absent maker) → frozen=3");
   // ---- 13. skip: better live order ignored → fraud -------------------------
   const SKIP_TRACE4 = pad2([`skip-post-wit`], "skiptrace4");
+  const SKIP_TRACE4_ROOT = merkle.getMerkleRoot(SKIP_TRACE4);
   const SKIP_FILLS = pad2([`f:${"u".repeat(64)}:0:${FILL_TAKER}:${"c".repeat(64)}:${"d".repeat(64)}:${"d".repeat(64)}:1:100000000:50000000:7:0`], "skipfills");
-  const SKIP_FILLS_ROOT = merkle.getMerkleRoot(SKIP_FILLS);
   // h3 was frozen by ghost: re-submit carrying the skip assertion's roots.
   await submitH3(SKIP_TRACE4_ROOT, SKIP_FILLS_ROOT);
   const skipProof = {

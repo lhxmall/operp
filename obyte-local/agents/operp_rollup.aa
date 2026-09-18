@@ -20,11 +20,13 @@
 	// (trace/ops/fills arrays); da_unit_<h> pins that unit. The AA does NOT
 	// inspect unit[trigger.unit].messages (fragile at eval time).
 	// State vars:
-	//   last_submitted, last_finalized, dispute_aa, dispute_fill_aa
+	//   last_submitted, last_finalized, dispute_aa, dispute_fill_aa,
+	//   dispute_clamp_aa
 	//   submitted_at_<h>, state_root_<h>, aa_forest_<h> (1024 hex),
 	//   prev_<h>, wit_root_<h>, trace_root_<h>, units_root_<h>,
 	//   units_set_root_<h>, ops_root_<h>, fills_root_<h>,
-	//   unit_count_<h>, wit_count_<h>, da_unit_<h>, active_bond_<h>,
+	//   unit_count_<h>, wit_count_<h>, data_root_<h>, data_len_<h>,
+	//   pkg_count_<h>, da_unit_<h>, active_bond_<h>,
 	//   fee_winner_<h>, frozen_<h> (absent/0 live, 2 failed),
 	//   inbox_upto_<h> (submit timestamp: forces older than this belong here)
 	//   pool_<addr> (standing submit pool; submits need >= 1e12)
@@ -167,6 +169,7 @@
 							var['ops_root_' || trigger.data.height] = trigger.data.ops_root;
 							var['fills_root_' || trigger.data.height] = trigger.data.fills_root;
 							var['unit_count_' || trigger.data.height] = trigger.data.unit_count;
+							var['wit_count_' || trigger.data.height] = trigger.data.wit_count;
 							var['data_root_' || trigger.data.height] = trigger.data.data_root;
 							var['data_len_' || trigger.data.height] = trigger.data.data_len;
 							var['pkg_count_' || trigger.data.height] = trigger.data.pkg_count;
