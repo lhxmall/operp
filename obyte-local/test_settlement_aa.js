@@ -593,13 +593,13 @@ async function main() {
     s.wit_count = witCount || H3_PRE.length;
     s.trace_root = traceRoot;
     s.fills_root = fillsRoot;
+    s.ops_root = OPS_ROOT1;
     const h3header = headerFromSubmit(s);
     const r = await operator.sendMulti({
       messages: [
         tempDataMsg(h3header),
         { app: "data", payload: s },
       ],
-      base_outputs: [{ address: rollup, amount: SUBMIT_FEE }],
     });
     if (r.error) throw new Error("h3 submit failed: " + r.error);
     await network.witnessUntilStable(r.unit);
