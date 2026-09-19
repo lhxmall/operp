@@ -786,14 +786,14 @@ async function main() {
   if (Number(st.frozen_3 || 0) !== 0) throw new Error("honest dep_evidence froze the height!");
   console.log("13e. dep_evidence honest receipt bounced 'no fraud' — height live");
 
-  // ---- 13e3. dep_evidence fictitious re-submit → fraud (refreezes) --------
+  // ---- 13e3. negative-price fill_math re-submit → fraud (refreezes) -------
   // 13e left h3 live; the clamp scenarios need a frozen height. Re-submit
-  // the 13d FAKE roots (its verdict re-fires identically).
-  await submitH3(FAKE_TRACE_ROOT, FAKE_OPS_ROOT, FAKE_OPS_ROOT);
-  await triggerVerdict(challenger, dispute, Object.assign({ pred: "dep_evidence", height: 3 }, fakeEvidence), 20000, "dep_evidence refreeze predicate");
+  // the 13a NEG roots and re-fire its verdict (deterministic fraud).
+  await submitH3(NEG_TRACE_ROOT, NEG_FILLS_ROOT);
+  await triggerVerdict(challenger, fill, Object.assign({ pred: "fill_math", height: 3 }, negBase), 20000, "negative-price refreeze predicate");
   st = await vars(rollup);
-  if (Number(st.frozen_3) !== 2) throw new Error("dep_evidence refreeze did not freeze height");
-  console.log("13e3. dep_evidence fictitious re-submit → frozen=3");
+  if (Number(st.frozen_3) !== 2) throw new Error("negative-price refreeze did not freeze height");
+  console.log("13e3. negative-price fill_math re-submit → frozen=3");
 
   // ---- 13b. clamp dishonest (over-charged user) → fraud via clamp AA ------
   // h3 was frozen by 13e3: re-submit carrying a clamp assertion. Pre tree is
