@@ -1,4 +1,5 @@
 # Gap 2 — Funding Rate Mark-Premium Based, Not External — Design
+> **HISTORICAL DESIGN RECORD (pre-v2).** Written 2026-08 against the original single-vault-AA settlement (`operp-mvp-1`, submit/lock/challenge in `operp_vault.aa`, 50 000-byte submit bond, 64-hex `aa_root`). The code is now settlement v2: `chain_id = operp-v2`, four AAs, standing pool, no lock / no pay-to-kill, 1024-hex sharded `aa_forest`. File:line refs and AA symbols below describe the OLD architecture — design rationale only. Current state machine: [`../MECHANISMS.md`](../MECHANISMS.md) §10 and `README.md` "Mainnet Roadmap".
 
 > Owner: `DesignFundingAnchor` · Status: DESIGN-ONLY · Batch: Mainnet-1..5
 > Depends: `operp-state` `apply_report` funding tick (`last_index`, `marks`, `oracle_reports`, `oracle_bonds`), `operp-types` `FUNDING_CAP_BPS`, `operp-exec` `Op::ReportPrice`, `operp-dag` `Op`, `ChainState::meta_leaf`
@@ -580,4 +581,6 @@ fn e2e_report_price_funding_pays_via_twap() {
 8. **Staging path if gap proves infeasible in one shot** — if TWAP ring + funding formula change is too large for one review, split: Phase 1 ships only the storage + `record_funding_sample` + `meta_leaf` commit (no funding switch) so watchers can audit TWAP without fee impact; Phase 2 flips `effective_funding_index` to TWAP on next activation height. Draft above ships both phases together for minimal diff; split is additive and safe to stage behind same activation flag if needed.
 
 9. **Interaction with `MAX_AA_TREE_DEPTH` / 256h windows** — no interaction expected, but confirm `funding_twap` prune does not use height-expiry that would conflict with 256h replay assumptions. Draft uses length cap, not height expiry, so compatible.
+
+
 

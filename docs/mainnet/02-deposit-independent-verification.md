@@ -1,4 +1,5 @@
 # Gap 4 — Deposit Endorsements Self-Attested  •  DesignDoc (DesignDepositIndep)
+> **HISTORICAL DESIGN RECORD (pre-v2).** Written 2026-08 against the original single-vault-AA settlement (`operp-mvp-1`, submit/lock/challenge in `operp_vault.aa`, 50 000-byte submit bond, 64-hex `aa_root`). The code is now settlement v2: `chain_id = operp-v2`, four AAs, standing pool, no lock / no pay-to-kill, 1024-hex sharded `aa_forest`. File:line refs and AA symbols below describe the OLD architecture — design rationale only. Current state machine: [`../MECHANISMS.md`](../MECHANISMS.md) §10 and `README.md` "Mainnet Roadmap".
 
 ## 1. Target
 
@@ -333,3 +334,5 @@ impl Batch {
 **What this batch ships as v1:** §2.2 + §2.3 fully (evidence type, hash port, `verify_all`, `validate_against` hook, size/kind/hash/content checks, tests). No AA edit. Operator tooling updated to include evidences. E2E `fake aa_unit → validate_against fails` green.
 
 **Staged v2 follow-up:** add `mci/ball/witness` light proof, optional AA `d_/pd_` per-unit vars, and `DEPOSIT_VERIFY_HEIGHT` activation governance — tracked as separate ticket.
+
+

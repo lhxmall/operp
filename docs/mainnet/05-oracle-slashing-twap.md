@@ -1,4 +1,5 @@
 # Gap 3 — Oracle Bonded Reporters: No Slashing + Median without TWAP — Design
+> **HISTORICAL DESIGN RECORD (pre-v2).** Written 2026-08 against the original single-vault-AA settlement (`operp-mvp-1`, submit/lock/challenge in `operp_vault.aa`, 50 000-byte submit bond, 64-hex `aa_root`). The code is now settlement v2: `chain_id = operp-v2`, four AAs, standing pool, no lock / no pay-to-kill, 1024-hex sharded `aa_forest`. File:line refs and AA symbols below describe the OLD architecture — design rationale only. Current state machine: [`../MECHANISMS.md`](../MECHANISMS.md) §10 and `README.md` "Mainnet Roadmap".
 
 > Owner: `DesignOracleSlash` · Status: DESIGN-ONLY · Batch: Mainnet-1..5
 > Depends: `operp-state` oracle median path, `operp-dag` `Op::ReportPrice`, `operp-exec` intake gate, `operp-types` `ORACLE_BOND_PERP`
@@ -588,4 +589,6 @@ Acceptance for minimal v1: median attacker flagged in logs, test asserts `ExecEv
 * **Gap 6 (orphan eviction)** — orphan handling is DAG-level; oracle reports are regular units subject to same `ORPHAN_CAP`. No shared mutable state.
 * **Gap 4 (deposit endorsement)** — `StakeOracle` reuses `perp_balances` funded by `GovDeposit` which is already endorsement-gated. Oracle stake correctly inherits deposit authenticity guarantees.
 * **Gap 1 (fraud response)** — slashing is orthogonal to batch fraud; a malicious operator cannot slash via state root lie because slash execution is deterministic in batch replay; a bogus slash root would be challenged via the same challenge → freeze → rollback path.
+
+
 

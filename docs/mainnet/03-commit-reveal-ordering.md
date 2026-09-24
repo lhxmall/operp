@@ -1,4 +1,5 @@
 # Gap 5 — UnitId-Lexicographic Grindable Ordering — Design
+> **HISTORICAL DESIGN RECORD (pre-v2).** Written 2026-08 against the original single-vault-AA settlement (`operp-mvp-1`, submit/lock/challenge in `operp_vault.aa`, 50 000-byte submit bond, 64-hex `aa_root`). The code is now settlement v2: `chain_id = operp-v2`, four AAs, standing pool, no lock / no pay-to-kill, 1024-hex sharded `aa_forest`. File:line refs and AA symbols below describe the OLD architecture — design rationale only. Current state machine: [`../MECHANISMS.md`](../MECHANISMS.md) §10 and `README.md` "Mainnet Roadmap".
 
 > Owner: `DesignCommitReveal` · Status: DESIGN-ONLY · Batch: Mainnet-1..5
 
@@ -418,4 +419,6 @@ Stage 2 (future, if needed): commit = H(op || salt32), reveal = (commit_ref, op,
 * `crates/operp-settle/src/lib.rs:97-153` — `Batch::from_applied` height commitment & fills hash
 * `crates/operp-types/src/lib.rs` — `BATCH_MAX_UNITS = 512`, `MAX_AA_TREE_DEPTH = 16`, `CHAIN_ID`
 * `README.md:250-305` — L5 (this gap) + L6 orphan note
+
+
 

@@ -379,8 +379,14 @@ Op::ReportPrice { oracle, market, price }        # canonical tag 6
 报价者；债券记入 `oracle_bonds`，无白名单、无审批。退出走
 `UnstakeOracle`(tag 15) 的 `ORACLE_UNBOND_HEIGHTS = 256` 高度解锁排队，
 期间报价即失效；`SlashOracle`(tag 16) 对 TWAP 连续偏移达标者罚没
-（500 bps 偏移 ×3 连续采样双条件，激活门控），罚没 = 债券 ×
-slash_reward_bps 归挑战者、余下烧毁。
+（500 bps 偏移 ×3 连续采样双条件，激活门控）。另有两条可罚性门槛
+（`apply_slash` 前置）：报告历史不足 `SLASH_TWAP_STREAK` 条、或最近一次
+报告距当前高度 > 256（新鲜度），任一成立 → `SlashNotEligible`。
+罚没 = 债券 ×
+slash_reward_bps **烧毁**、余下归挑战者（`apply_slash`：
+`burn = bond × SLASH_REWARD_BPS / 10_000`，`reward = bond − burn`；
+默认 5000 bps 下恰好各半，但每市场 `OracleConfig.slash_reward_bps`
+一旦被治理改写即分叉）。
 
 规则：
 
@@ -618,7 +624,8 @@ sbond_<addr>, reward_<addr>, slash_reward_<addr>（sbond 仅遗留 claim 路径�
 
 公共门：`frozen`/`submitted_at+3600`、stale-root 对比 rollup 变量、
 所有成员证明 `.root` 必须等于对应 pre_wit/post_wit/roots。
-验不过 bounce('no fraud')；验过 → 付 10000 bytes + data
+揭发者实付 `>= 20000` bytes（dispute AA 门槛，含自身 bounce 余量）；
+验不过 bounce('no fraud')；验过 → 转发 10000 bytes + data
 `{verdict:'fraud', height, challenger}` 给 rollup。
 ### 10.3 verdict(h) — rollup
 
@@ -639,7 +646,8 @@ reward_<fee_winner> += 20000（无 sbond 记账）。`{escape_finalize}` 窗口�
 `$lf = var[ROLLUP]['last_finalized']`；`$src = var[ROLLUP]['aa_forest_'||$lf]`。
 叶子 `acct:addr:col:perp:W`（hex 域），16 深折叠，
 `amount + wd_ <= min(collateral, withdrawn)`，`perp_amount` 可选部分领取，
-`wp_` 封顶。`{escape_withdraw}` 弹 `no escape withdraw`。
+`wp_` 封顶。`{escape_withdraw}` 无对应 case（vault 仅 `deposit` /
+`deposit_perp` / `withdraw`），按未匹配触发 bounce。
 
 ### 10.6 pool / force / claim — rollup
 
@@ -764,8 +772,10 @@ asset id。发币时只需改一个常量并重新部署 AA。
   `deposits_allowed` 白名单（同一集合，replay 时由批次内 GovDeposit ops
   注入交叉校验），入账 `perp_balances[account] += amount`，
   `perp_supply += amount`
-- **GovWithdraw**（tag 9）：共享 withdrawals 表与 65 536 条目上限；
-  无 reduce-only 检查；AA 侧走扩展后的双币种 Merkle 证明提款
+- **GovWithdraw**（tag 9）：**独立**的每账户严格递增 nonce 水位线
+  `seen_gov_nonces`（`nonce <= watermark` → `DuplicateNonce`，允许跳号），
+  不共享 `withdrawals` 表、也不受其 65 536 条目上限约束——水位线按账户数
+  有界；无 reduce-only 检查；AA 侧走扩展后的双币种 Merkle 证明提款
   （§10.5，叶子含 perp 字段）
 
 `perp_supply` 定义为可赎回流通量：Σ 充值 − 提款 − 烧毁。
@@ -775,8 +785,11 @@ asset id。发币时只需改一个常量并重新部署 AA。
 （symbol、tick_size、im_bps、mm_bps、taker_fee_bps、keeper_reward_bps、
 `spot_only`），
 存入 `markets[market_id]`——IM/MM/taker fee/keeper 奖励从全局常量变为
-**每市场参数**（§4.2/§5.2/§6.1 相应改为读参数）。tick_size 或任一 bps
-为 0 → Risk 拒绝。簿不预建，沿用 `book_mut` 惰性创建。
+**每市场参数**（§4.2/§5.2/§6.1 相应改为读参数）。除 tick_size 或任一 bps
+为 0 → Risk 拒绝外，还有一层硬上限（exec `create_market`）：任一 bps
+> 10 000、`im_bps <= mm_bps`、`mm_bps < 500`、`im_bps > 5000`、
+`taker_fee_bps > 200`、`keeper_reward_bps > 500` 均 Risk 拒绝。
+簿不预建，沿用 `book_mut` 惰性创建。
 
 `spot_only` 建时定死：无 `ParamKey` 可翻转。`true` 的市场为纯合约/meme
 市场——拒收一切报价（双通道 `NotFound`，见 §6.2）、永无资金费；
@@ -789,15 +802,19 @@ delisted 市场（见 16.3 Delist 提案）拒绝新挂单；撤单与清算平�
 
 **CreateProposal**（tag 11）：创建者对指定市场提交参数修改提案，`key` 取
 `ParamKey`（ImBps/MmBps/TakerFeeBps/KeeperRewardBps/Delist）；bps 键的
-value ≤ 10 000、Delist 键的 value 必须为 0，否则 Risk 拒绝。创建门槛：
+value ≤ 10 000、Delist 键的 value 必须为 0，否则 Risk 拒绝。并发上限：
+`proposals.len() >= 64` 时新提案 Risk 拒绝（状态膨胀防护，exec
+`create_proposal`）。创建门槛：
 创建者 PERP 余额 ≥ `PROPOSAL_MIN_STAKE_PERP = 1_000`（仅门槛检查，
 质押不锁定）。提案登记即固定两个快照：`created_seq` 与 quorum 分母
 `supply_at_create = perp_supply`——期限与法定人数在创建时刻确定，任何副本
 重放得出相同的通过判定。
 
-**Vote**（tag 12）：权重 = **投票 unit 执行时刻**的 PERP 余额。MVP 不存
-创建时的余额快照映射——余额随充值/提款/烧毁实时变化，文档如实表述；
-拆分账户不放大总权重（§13）。每账户一票（`voted` 集合去重）；期限
+**Vote**（tag 12）：权重取自**创建时刻的余额快照**
+`Proposal.weight_snapshot`（`CreateProposal` 时对全部非零
+`perp_balances` 冻结；余额为 0 的账户不入表，计票 `unwrap_or(0)`）。
+此后充值/提款/烧毁都不改变该票权重——烧毁 PERP 既不能放大也不能规避
+投票。每账户一票（`voted` 集合去重）；期限
 `seq < deadline_seq = created_seq + PROPOSAL_DURATION_SEQS
 = created_seq + 20_000 seqs`。
 

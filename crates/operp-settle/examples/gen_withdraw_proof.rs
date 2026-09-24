@@ -1,6 +1,6 @@
 //! Generates a vault-AA withdrawal claim (JSON) for a target account.
 //!
-//! Output JSON shape consumed by obyte-local/test_vault_aa.js (Phase 5.2
+//! Output JSON shape consumed by obyte-local/test_settlement_aa.js (Phase 5.2
 //! sharded forest wire format):
 //! {
 //!   "height": <finalized height>,

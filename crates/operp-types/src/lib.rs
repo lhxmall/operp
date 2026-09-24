@@ -14,7 +14,6 @@ pub const USD_SCALE: u64 = 1_000_000;
 pub const CHAIN_ID: &str = "operp-v2";
 pub const ASSERTION_VERSION: u32 = 1;
 pub const OBYTE_MERKLE_ROOT_LEN: usize = 44;
-pub const INBOX_LAG_SECS: u64 = 600;
 pub const WIT_EMPTY_ELEMENT: &str = "empty";
 pub const IM_RATE_BPS: u64 = 1000;
 pub const MM_RATE_BPS: u64 = 500;

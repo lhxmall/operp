@@ -128,9 +128,15 @@ reduce_only      : equity·10000 ≤ mm·12000
 每 ≤200000 units（BATCH_MAX_UNITS）/ 2 秒切一个批次，产出 Checkpoint：
 
 ```text
-{ height, prev_state_hash, state_root, aa_root,
-  last_unit, seq, unit_ids, fills_hash, fill_count }
+{ height, prev_state_hash, state_root, aa_shard_roots[16], aa_root,
+  last_unit, seq, unit_ids, fills_hash, fill_count, assertion_version,
+  wit_root, trace_root, units_root, units_set_root, ops_root, fills_root,
+  counts_root, unit_count, wit_count,
+  validity_proof_hash?, perp_burned? }   # 可选字段：旧批次缺省
 ```
+
+`aa_root` 是 16 个 shard 根拼接的 1024-hex `aa_forest` 的森林哈希
+（`aa_forest_hash`）；`validity_proof_hash` 为可选透传字段（AA 不作门）。
 
 ### 3.1 state_root（字节域 Merkle 树）
 
@@ -141,9 +147,9 @@ account_leaf = sha256("acct" ‖ id32 ‖ collateral_i128le16 ‖ realized_i128l
                       ‖ pos_count_u32 ‖ [market_le4 qty_le8 entry_le8]*
                       ‖ perp_u128le16)
                # perp = PERP 治理余额（§7），与抵押并列进入承诺
-book_leaf    = sha256(params_57B ‖ 簿承诺)
-               # params_57B = symbol16‖tick_le8‖im_le8‖mm_le8‖taker_le8
-               #   ‖keeper_le8‖delisted1B——市场参数本身成为被承诺状态
+book_leaf    = sha256(params_58B ‖ 簿承诺)
+               # params_58B = symbol16‖tick_le8‖im_le8‖mm_le8‖taker_le8
+               #   ‖keeper_le8‖delisted1B‖spot_only1B——市场参数本身成为被承诺状态
 meta_leaf    = sha256("meta" ‖ height_le ‖ seq_le ‖ last_unit
                       ‖ perp_burned_le16 ‖ next_market_id_le4
                       ‖ next_proposal_id_le8)
@@ -202,15 +208,15 @@ submitted_at_h, state_root_h, aa_forest_h (1024 hex), prev_h,
   wit_root_h, trace_root_h, units_root_h, units_set_root_h,
   ops_root_h, fills_root_h, unit_count_h, wit_count_h
 da_unit_h                     # DA 绑定 = 组合单元 hash
-active_bond_h, fee_winner_h, frozen_h ∈ {∅=live, 2=failed}
-inbox_<unit_id_hex>, inbox_upto_h
+active_bond_<h>, fee_winner_<h>, frozen_<h> ∈ {∅/0=live, 2=failed}
+inbox_<unit_id_hex>, inbox_upto_<h>   # inbox_upto = submit 时间戳
 pool_<addr>                    # 常备池：提交门 pool>=1e12
 sbond_<addr>, reward_<addr>, slash_reward_<addr>   # sbond 仅遗留路径
 ```
 
 侧链 ChainState（PERP 治理，§7）不变：markets、perp_balances/supply/burned、
-proposals、oracle 账本。金库 vault AA 只有 `deposit` / `withdraw`，提款读
-`var[ROLLUP]['aa_forest_'||last_finalized]`。
+proposals、oracle 账本。金库 vault AA 只有 `deposit` / `deposit_perp` /
+`withdraw`，提款读 `var[ROLLUP]['aa_forest_'||last_finalized]`。
 
 ### 生命周期（高度 h）
 

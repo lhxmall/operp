@@ -1,4 +1,5 @@
 # Gap 6 — Salted Orphan Eviction (DESIGN-ONLY)
+> **HISTORICAL DESIGN RECORD (pre-v2).** Written 2026-08 against the original single-vault-AA settlement (`operp-mvp-1`, submit/lock/challenge in `operp_vault.aa`, 50 000-byte submit bond, 64-hex `aa_root`). The code is now settlement v2: `chain_id = operp-v2`, four AAs, standing pool, no lock / no pay-to-kill, 1024-hex sharded `aa_forest`. File:line refs and AA symbols below describe the OLD architecture — design rationale only. Current state machine: [`../MECHANISMS.md`](../MECHANISMS.md) §10 and `README.md` "Mainnet Roadmap".
 
 > Status: **design v1** · no code edits · read authoritative files only.
 > Authoritative basis: `README.md` L6, `crates/operp-dag/src/lib.rs` (Dag::insert_verified, waiting index, ORPHAN_CAP=4096), `crates/operp-state/src/lib.rs` (ChainState, merkle_root, state_root, aa_root), `crates/operp-exec/src/lib.rs` (Engine), `crates/operp-types/src/amount.rs` (sha256), `obyte-local/agents/operp_vault.aa` (last_finalized).
@@ -443,3 +444,5 @@ Recommended: ship Stage 0+1 together (single PR) since `ChainState` field is tri
 * Prior security plan claim: orphan buffering fixed (4096, deterministic eviction, reverse index) — this proposal hardens that fix from deterministic-lex to deterministic-salted.
 * Commit-reveal design doc `local/mainnet-commit-reveal-design.md` — same `last_finalized_root` anchor; eviction deliberately omits epoch for stability.
 * Obyte vault `last_finalized` stride: `var['last_finalized']` increments strictly by 1 per `finalize` (§5 in vault AA), so `note_finalized` height monotonicity can be asserted: `height == self.state.last_finalized_height + 1`.
+
+

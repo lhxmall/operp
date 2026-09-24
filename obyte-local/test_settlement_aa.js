@@ -2,7 +2,7 @@
 
 // OPERP settlement E2E — three-agent lifecycle (rollup + dispute + vault).
 //
-// Replaces test_vault_aa.js: the vault is now pure custody (no submit /
+// This is the settlement-v2 harness. The vault is pure custody (no submit /
 // lock / challenge / finalize), the rollup AA stores bonded assertions,
 // and the dispute AA is the only party that can fail a height — via
 // one-shot Oscript-verified fraud predicates, never a pay-to-kill bond.
