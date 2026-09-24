@@ -14,7 +14,7 @@
 > current state machine see [`docs/MECHANISMS.md`](../MECHANISMS.md)
 > (§10 结算 AA 状态机) and `README.md` §"Settlement AAs".
 
-| # | Gap (README) | Design doc | One-line |
+| # | Gap (README) | Design doc | One-line (as proposed in 2026-08 — not current behaviour) |
 |---|---|---|---|
 | 1 | Fraud is freeze-and-rollback | [01-fraud-slashing.md](01-fraud-slashing.md) | Slashing split (50% burn / 50% challenger) + `validity_proof_hash` plug, no matcher re-execution in Oscript |
 | 2 | Deposit self-attested | [02-deposit-independent-verification.md](02-deposit-independent-verification.md) | `temp_data.deposit_evidences` carries Obyte joint JSON, `object_hash.js` recomputed in `validate_against` (0 AA ops v1) |
