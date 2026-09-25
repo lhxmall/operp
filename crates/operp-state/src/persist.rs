@@ -26,7 +26,7 @@ const KEEP_SNAPSHOTS: usize = 2;
 /// Version header prefixing every snapshot body. Old formats are not
 /// migrated (mainnet is not live); unknown versions are skipped by
 /// [`load_latest`].
-const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 /// Durability of directory entries (rename) needs a directory fsync on unix;
 /// Windows has no equivalent API, so this is a no-op there.

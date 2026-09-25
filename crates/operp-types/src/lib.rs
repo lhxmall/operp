@@ -14,7 +14,6 @@ pub const USD_SCALE: u64 = 1_000_000;
 pub const CHAIN_ID: &str = "operp-v2";
 pub const ASSERTION_VERSION: u32 = 1;
 pub const OBYTE_MERKLE_ROOT_LEN: usize = 44;
-pub const INBOX_LAG_SECS: u64 = 600;
 pub const WIT_EMPTY_ELEMENT: &str = "empty";
 pub const IM_RATE_BPS: u64 = 1000;
 pub const MM_RATE_BPS: u64 = 500;
@@ -27,6 +26,29 @@ pub const TAKER_FEE_BPS: u64 = 5;
 /// shorts pay longs when mark < oracle. Payment per position =
 /// signed_notional(qty, oracle) * clamp(diff_bps, ±FUNDING_CAP_BPS)/10000.
 pub const FUNDING_CAP_BPS: i64 = 50;
+// ---------------------------------------------------------------------------
+// Funding-rate market (traded book price = external venue funding rate).
+// Stored price is never the raw rate: rates in bps ride on a large offset so
+// `price == 0` keeps its "invalid/market-order" meaning for every market kind
+// and a rate of exactly 0 bps stays representable.
+/// `encode_funding_price(0)` — the stored price of a 0 bps funding rate.
+pub const FUNDING_PRICE_OFFSET: Price = 10_000 * PRICE_SCALE as Price;
+/// Stored-price units per bps of funding rate.
+pub const FUNDING_BPS_UNIT: Price = (PRICE_SCALE / 10_000) as Price;
+/// Funding-rate markets settle the peg at most once per this many heights
+/// (deterministic height counter, never a wall clock).
+pub const FUNDING_PEG_INTERVAL_HEIGHTS: Height = 14_400;
+
+/// Encode a funding rate in bps into the stored (offset) price domain.
+pub fn encode_funding_price(rate_bps: i64) -> Price {
+    FUNDING_PRICE_OFFSET + rate_bps.saturating_mul(FUNDING_BPS_UNIT)
+}
+
+/// Inverse of [`encode_funding_price`]: recover the funding rate in bps.
+pub fn funding_rate_bps(price: Price) -> i64 {
+    (price - FUNDING_PRICE_OFFSET) / FUNDING_BPS_UNIT
+}
+
 pub const CHALLENGE_SECS: u64 = 3600;
 pub const OBYTE_STABILITY_SECS: u64 = 600;
 pub const BATCH_INTERVAL_MS: u64 = 2000;
@@ -252,6 +274,12 @@ pub struct MarketParams {
     /// Meme/contract-only market: fixed at creation, no ParamKey flips it.
     /// Spot-only markets reject every price report and never accrue funding.
     pub spot_only: bool,
+    /// Funding-rate market: book price is an external venue funding rate
+    /// (encoded via `encode_funding_price`), reports write the index only,
+    /// fills write the mark, and funding settles as the peg. Fixed at
+    /// creation; old JSON without this field parses as `false`.
+    #[serde(default)]
+    pub funding_rate: bool,
 }
 
 /// Genesis market BTC_USD: same values as the pre-governance globals.
@@ -267,6 +295,7 @@ pub fn genesis_params() -> MarketParams {
         keeper_reward_bps: KEEPER_REWARD_BPS,
         delisted: false,
         spot_only: false,
+        funding_rate: false,
     }
 }
 
@@ -297,4 +326,27 @@ pub fn parse_hex64(s: &str) -> Result<[u8; 64], TypesError> {
     let v = hex::decode(s).map_err(|_| TypesError::InvalidHex)?;
     let a: [u8; 64] = v.try_into().map_err(|_| TypesError::InvalidHex)?;
     Ok(a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn funding_price_encoding_round_trips_and_stays_positive() {
+        // A 0 bps rate stays representable and positive: `price == 0`
+        // must keep its "invalid / market-order" meaning.
+        assert!(encode_funding_price(0) > 0);
+        assert_eq!(encode_funding_price(0), FUNDING_PRICE_OFFSET);
+        // Negative rates stay positive in the stored domain.
+        let neg = encode_funding_price(-3);
+        assert!(neg > 0);
+        assert_eq!(funding_rate_bps(neg), -3);
+        // Round-trip across the representable bps range (the offset keeps
+        // every rate positive; the mul saturates before the add).
+        let max_bps = (i64::MAX - FUNDING_PRICE_OFFSET) / FUNDING_BPS_UNIT;
+        for bps in [0i64, 1, 12, 20, 500, -50, -100_000, max_bps] {
+            assert_eq!(funding_rate_bps(encode_funding_price(bps)), bps);
+        }
+    }
 }

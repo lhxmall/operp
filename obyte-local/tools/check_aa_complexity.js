@@ -1,5 +1,6 @@
 // Parses each .aa via ocore's own ojson parser, validates every oscript
-// formula, and reports per-case complexity (exit 2 if > MAX_COMPLEXITY).
+// formula, and reports per-case complexity + op-count totals (exit 2 if a
+// formula exceeds MAX_COMPLEXITY, or the AA's op total exceeds MAX_OPS).
 // Usage: node tools/check_aa_complexity.js agents/*.aa
 const fs = require('fs');
 const path = require('path');
@@ -37,10 +38,19 @@ async function check(f) {
 	);
 	const items = walk(def, path.basename(f), []);
 	let max = 0;
+	let sumCx = 0;
+	let sumOps = 0;
 	let i = 0;
 	function next() {
 		if (i >= items.length) {
-			console.log(`${f}: ${items.length} formulas, max complexity ${max}`);
+			console.log(
+				`${f}: ${items.length} formulas, max complexity ${max}/${constants.MAX_COMPLEXITY}, ` +
+					`sum complexity ${sumCx}, ops ${sumOps}/${constants.MAX_OPS}`
+			);
+			if (sumOps > constants.MAX_OPS) {
+				console.error(`${f}: ops ${sumOps} > ${constants.MAX_OPS}`);
+				process.exit(2);
+			}
 			return runNext();
 		}
 		const [p, v] = items[i++];
@@ -61,11 +71,14 @@ async function check(f) {
 			(res) => {
 				const err = res && typeof res === 'object' ? res.error : res;
 				const cx = res && typeof res === 'object' ? res.complexity : 0;
+				const ops = res && typeof res === 'object' ? res.count_ops : 0;
 				if (err) {
 					console.error(`${f}${p}: ${err}`);
 					process.exit(1);
 				}
 				if (cx > max) max = cx;
+				sumCx += cx;
+				sumOps += ops;
 				if (cx > constants.MAX_COMPLEXITY) {
 					console.error(`${f}${p}: complexity ${cx} > ${constants.MAX_COMPLEXITY}`);
 					process.exit(2);

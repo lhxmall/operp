@@ -21,9 +21,9 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 // ===== CONFIG: PERP governance asset ================================
 // Set to the real PERP asset id once issued; must match deploy_testnet.js.
-// devnet (default) has no issued asset: fall back to 'base' exactly like
-// test_vault_aa.js's bootstrap substitution — the perp-deposit branch is
-// keyed on trigger.data.deposit_perp, so base can never reach it here.
+// devnet (default) has no issued asset: fall back to 'base' — the
+// perp-deposit branch is keyed on trigger.data.deposit_perp, so base can
+// never reach it here.
 let PERP_ASSET_ID = "PERP_ASSET_ID_HERE";
 // ====================================================================
 
@@ -50,9 +50,9 @@ if (process.env.testnet) {
   process.env.mainnet = "1";
 } else {
   process.env.devnet = "1";
-  // devnet has no issued asset: fall back to 'base' exactly like
-  // test_vault_aa.js's bootstrap substitution — the perp-deposit branch is
-  // keyed on trigger.data.deposit_perp, so base can never reach it here.
+  // devnet has no issued asset: fall back to 'base' — the perp-deposit
+  // branch is keyed on trigger.data.deposit_perp, so base can never reach
+  // it here.
   PERP_ASSET_ID = "base";
 }
 

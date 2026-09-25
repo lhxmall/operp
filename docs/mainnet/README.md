@@ -1,8 +1,20 @@
 # Mainnet Roadmap — 11 Gap Designs (2026-08-25)
 
-> Status: **Gate1–Gate3 implemented and pushed (2026-08-25, `107c14e`+)** — per-gap status in the table. Each gap from `README.md#Limitations` has a concrete, file-accurate design doc; the 37-item security-fix batch shipped earlier (`53106c2`).
+> **HISTORICAL DESIGN RECORD (pre-v2).** These 11 docs were written against
+> the original `operp-mvp-1` single-vault-AA settlement (submit/lock/
+> challenge/respond/finalize/withdraw all inside `operp_vault.aa`,
+> `SUBMIT_BOND_NET = 50 000` bytes, 64-hex `aa_root`). The code has since
+> been restructured to **settlement v2**: `chain_id = 'operp-v2'`, four AAs
+> (`operp_rollup` assertion log + `operp_dispute`/`operp_dispute_fill`
+> one-shot predicates + pure-custody `operp_vault`), standing pool
+> (`pool >= 1e12`), no lock / no pay-to-kill, and a 1024-hex sharded
+> `aa_forest`. File:line references, AA variable names, bond amounts and
+> E2E file names in the docs below describe the OLD architecture — treat
+> them as design rationale, not as current-code documentation. For the
+> current state machine see [`docs/MECHANISMS.md`](../MECHANISMS.md)
+> (§10 结算 AA 状态机) and `README.md` §"Settlement AAs".
 
-| # | Gap (README) | Design doc | One-line |
+| # | Gap (README) | Design doc | One-line (as proposed in 2026-08 — not current behaviour) |
 |---|---|---|---|
 | 1 | Fraud is freeze-and-rollback | [01-fraud-slashing.md](01-fraud-slashing.md) | Slashing split (50% burn / 50% challenger) + `validity_proof_hash` plug, no matcher re-execution in Oscript |
 | 2 | Deposit self-attested | [02-deposit-independent-verification.md](02-deposit-independent-verification.md) | `temp_data.deposit_evidences` carries Obyte joint JSON, `object_hash.js` recomputed in `validate_against` (0 AA ops v1) |
@@ -16,24 +28,27 @@
 | 10 | aa-tree 2¹⁶ cap | [10-aa-tree-sharding.md](10-aa-tree-sharding.md) | v1 bump 16→18 (262 k accounts, 0 new vars), v2 sharded forest S=16×D16=1 M, activation-height migration |
 | 11 | Replay window 256h | [11-replay-persistence.md](11-replay-persistence.md) | Choice A persistent BTree/RocksDB vs B `256→2048` in-RAM + journal (v1 ship), `REPLAY_WINDOW=2048` (~68 min) |
 
-**Staging (as shipped):** salted ordering + salted eviction + `perp_burned` + 2048-window constants + deposit evidences + slashing/TWAP landed in Gate1–3; depth-18, escape hatch, commit-reveal, sharding, RocksDB and validity-ZK remain v2.
+**How to read:** each doc has Target / Change (step-by-step, file:line) /
+Acceptance (E2E assertion) / Complexity & Risk / Open Questions.
 
-**How to read:** each doc has Target / Change (step-by-step, file:line) / Acceptance (E2E assertion) / Complexity & Risk / Open Questions. All respect existing patterns (`otherwise` guards, `BTreeMap` ordering, `MAX_AA_TREE_DEPTH`, 256h→2048h gating).
+**Current implementation status (as of 2026-09, post-v2 refactor; the
+authoritative narrative lives in `README.md` "Mainnet Roadmap"):**
 
-**Implementation status (Gate1–Gate3):**
-
-| # | Status |
+| # | Status in today's code |
 |---|---|
-| 01 Fraud slashing | ✅ shipped — `Checkpoint.validity_proof_hash`, AA failed-finalize 50/50 split (`slash_reward_` / burned) |
-| 02 Deposit verification | ✅ shipped — `operp-settle::obyte_hash` + `deposit_verify`, `temp_data.deposit_evidences`, `post_batch.js` builds joints |
-| 03 Ordering | ✅ shipped, **desalted** — deterministic lex `Dag::ready_linearized` (salt kept for orphan eviction only, README Limitations #13); commit-reveal v2 open |
-| 04 Salted eviction + gossip | ✅ shipped — `Dag::set_eviction_salt` via `Engine::note_finalized` (epoch-rotated); WantUnits gossip landed (`crates/operp-gossip`) |
-| 05 Oracle slashing/TWAP | ✅ shipped — tags 14–16, height-gated; external multi-source pricing open |
-| 06 Funding anchor | ✅ mechanism shipped — `FUNDING_TWAP_ACTIVATION_HEIGHT` gate; external feed wiring operator-side, open |
-| 07 Escape hatch | ✅ shipped — folded into existing finalize/withdraw cases (`{escape_finalize}`, `{escape_withdraw}`, ESCAPE_STALL_SECS 604800/3600) |
-| 08 Burn accounting | ✅ Rust/checkpoint shipped; AA mirror vars dropped for budget |
-| 09 Complexity audit | ✅ applied — probe `tools/check_aa_complexity.js`, now **85/100** (ops 1086/2000) |
-| 10 Tree depth/sharding | ⏸ depth stays 16; 18-bump reverted for budget — pair with sharding v2 |
-| 11 Replay window | ✅ v1 shipped — constants + generalized pruning + `GovNonceJournal` WAL (flushed at batch commit, `Batch::from_applied`) + versioned bincode snapshots (`Engine::load_or_genesis`/`flush_snapshot`); RocksDB v1.1 open |
+| 01 Fraud slashing | ✅ shipped — dispute verdict path: proven predicate → rollup slashes `5e11` off the operator's standing pool into `slash_reward_<challenger>`, height reopens. `Checkpoint.validity_proof_hash` exists but is carried as an optional header field (not AA-gated). Doc's failed-finalize 50/50 bond split / `claim_slash` handler is the old model |
+| 02 Deposit verification | ✅ shipped — per-frame `e` carries FULL Obyte joint units; `unit_hash(joint)` recomputed in `validate_against` via `operp_settle::obyte_hash::get_unit_hash`; post_batch.js builds the joints. Doc's AA-side deposit gates superseded (vault AA is pure custody) |
+| 03 Ordering | ✅ shipped, **desalted** — deterministic lex execution; **commit-reveal v2 landed** (`Op::Commit` tag 18 / `Op::Reveal` tag 19, `COMMIT_TTL_HEIGHTS = 16`, ≤ 8 live commits/account, live at height 0) |
+| 04 Salted eviction + gossip | ✅ shipped — `argmin sha256(salt‖unit_id)` eviction, epoch-rotated salt via `Engine::note_finalized`; WantUnits gossip in `crates/operp-gossip` |
+| 05 Oracle slashing/TWAP | ✅ shipped — stake/unstake (256-height unbond)/slash, TWAP rings, 500 bps ×3-streak + 256-height freshness, `SlashOracle` tag 16; per-market `OracleConfig` |
+| 06 Funding anchor | ✅ shipped — funding-index abstraction live at height 0; operator wiring landed (`Op::UpdateExternalPrice` tag 17, allowlist, staleness fallback) |
+| 07 Escape hatch | ✅ partially shipped — `{escape_finalize: 1}` rides the rollup finalize case (`submitted_at + 604800`, frozen≠0 bounces 'challenged'); **`{escape_withdraw}` was dropped** (vault AA is pure custody; no such case) |
+| 08 Burn accounting | ✅ Rust/checkpoint shipped (`perp_burned` in meta_leaf/Checkpoint); AA-side mirror vars dropped for budget (doc's AA handler is the old model) |
+| 09 Complexity audit | ✅ probe `check_aa_complexity.js` shipped; today's numbers: per-formula max complexity 18–21 (≤100 ocore gate enforced in CI), Σops 524–1513 per AA (≤2000) |
+| 10 Tree depth/sharding | ✅ shipped — v2 sharded forest: one 1024-hex `aa_forest` = 16 shard roots, depth stays 16, ~1M accounts/batch; v1 depth-18 path superseded |
+| 11 Replay window | ✅ v1 shipped — `REPLAY_WINDOW = 2048` from genesis + generalized pruning + `GovNonceJournal` WAL + versioned bincode snapshots; RocksDB (`persist-rocksdb`) remains v1.1 backlog |
 
-**Verification of the implementation batch:** `cargo test --workspace` 124 passed; `node tools/check_aa_complexity.js` 85/100 (ops 1086/2000). Devnet E2E (`test_vault_aa.js`) updated for the new trigger API and W-gate negatives but requires a live aa-testkit network run (native rocksdb/sqlite3 build; not run on Windows dev hosts lacking VS Build Tools).
+**Verification of the current tree:** `cargo test --workspace` **147
+passed**; complexity probe reports per-formula max 18–21 (CI gate:
+`> 100` fails) with Σops 524–1513 (≤ 2000); golden vector check; devnet
+E2E is `node test_settlement_aa.js` (Linux/CI; win32 skips).

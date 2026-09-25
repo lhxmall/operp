@@ -1,5 +1,7 @@
 # Mainnet Gap 7 — Burned PERP Stranded / Auditable Burn Accounting
 
+> **HISTORICAL DESIGN RECORD (pre-v2).** Written 2026-08 against the original single-vault-AA settlement (`operp-mvp-1`, submit/lock/challenge in `operp_vault.aa`, 50 000-byte submit bond, 64-hex `aa_root`). The code is now settlement v2: `chain_id = operp-v2`, four AAs, standing pool, no lock / no pay-to-kill, 1024-hex sharded `aa_forest`. File:line refs and AA symbols below describe the OLD architecture — design rationale only. Current state machine: [`../MECHANISMS.md`](../MECHANISMS.md) §10 and `README.md` "Mainnet Roadmap".
+
 > **Design-only**. No code edits in this batch. Parent merges after all 11 designs land.
 > Owner: `DesignBurnView` — Gap 7: *Burned PERP stays stranded in the vault AA* (README L7).
 
@@ -365,3 +367,5 @@ If even v1 AA var is deemed too expensive, the **minimal v0 fallback** is:
 - [ ] Tests: Rust `cumulative_burn_view_after_market_creation` + extended `create_market_burns_exact_fee…` + AA E2E `holdings − supply == burned`.
 - [ ] Docs: README/PROTOCOL/MECHANISMS burn-audit subsection with the exact invariant and API names.
 - [ ] Count AA ops before/after; drop `{get_burn}` sugar if over budget.
+
+

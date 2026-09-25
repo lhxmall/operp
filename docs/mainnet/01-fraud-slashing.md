@@ -1,5 +1,7 @@
 # Gap 1 — Fraud Response: Freeze-and-Rollback → Slashing + Validity-Proof Stub — Design
 
+> **HISTORICAL DESIGN RECORD (pre-v2).** Written 2026-08 against the original single-vault-AA settlement (`operp-mvp-1`, submit/lock/challenge in `operp_vault.aa`, 50 000-byte submit bond, 64-hex `aa_root`). The code is now settlement v2: `chain_id = operp-v2`, four AAs, standing pool, no lock / no pay-to-kill, 1024-hex sharded `aa_forest`. File:line refs and AA symbols below describe the OLD architecture — design rationale only. Current state machine: [`../MECHANISMS.md`](../MECHANISMS.md) §10 and `README.md` "Mainnet Roadmap".
+
 > Owner: `DesignFraudSlash` · Status: DESIGN-ONLY · Batch: Mainnet-1..5
 > Depends: `operp_vault.aa` challenge/respond/finalize, `crates/operp-settle` Batch/Checkpoint, `crates/operp-state` aa_root/state_root
 
@@ -514,3 +516,5 @@ fn bad_aa_root_is_fraud_even_when_state_root_ok() {
 * Wire real verification into `finalize` or `respond`: `valid_proof_h` ZK verifier call or validator BLS threshold check; success unfreezes without timeout, failure triggers same slash path but automatically (watcher need not wait 3600s if proof is provided).
 * Per-height challenge bonds, challenge window shortening, and AA-side `valid_proof` mandatory after activation height.
 * IPFS/p2p archiving for `temp_data` with `data_hash` pinning and `operp-exec` fallback fetcher.
+
+

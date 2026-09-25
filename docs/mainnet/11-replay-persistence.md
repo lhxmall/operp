@@ -1,5 +1,7 @@
 # Gap 11 — Replay-Dedup Windows Bounded at 256 Heights — Design
 
+> **HISTORICAL DESIGN RECORD (pre-v2).** Written 2026-08 against the original single-vault-AA settlement (`operp-mvp-1`, submit/lock/challenge in `operp_vault.aa`, 50 000-byte submit bond, 64-hex `aa_root`). The code is now settlement v2: `chain_id = operp-v2`, four AAs, standing pool, no lock / no pay-to-kill, 1024-hex sharded `aa_forest`. File:line refs and AA symbols below describe the OLD architecture — design rationale only. Current state machine: [`../MECHANISMS.md`](../MECHANISMS.md) §10 and `README.md` "Mainnet Roadmap".
+
 > Owner: `DesignReplayPersist` · Status: DESIGN-ONLY · Batch: Mainnet-1..5
 > Depends on: `crates/operp-state`, `crates/operp-exec`, `crates/operp-settle`, `crates/operp-types`
 > No AA change. No wire-format change in v1.
@@ -449,4 +451,6 @@ cargo test --workspace --features persist-rocksdb
 5. **Activation height coordination:** how is `REPLAY_WINDOW_ACTIVATION` agreed across operators without a hard fork? **Proposed:** set it to `current_tip + 1024` at deploy time, announce in `docs/PROTOCOL.md`, and have `Batch::validate_against` accept either window for a 1024-height grace period (`height < ACTIVATION` uses legacy, `>= ACTIVATION` uses new, but both are accepted during grace). After grace, legacy path can be removed.
 
 6. **RocksDB native dependency in CI:** adding `rocksdb` increases CI build time by ~2-3 min and requires `libclang`. Should the default CI run without `persist-rocksdb` and have a separate `ci-persist` job? **Proposed:** yes — default `cargo test --workspace` stays RocksDB-free; `cargo test --features persist-rocksdb` runs in `ci-persist`.
+
+
 

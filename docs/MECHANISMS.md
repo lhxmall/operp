@@ -100,7 +100,7 @@ Unit {
 | Liquidate | 7 | caller, target, market_le4 |
 | GovDeposit | 8 | account, amount_le16, aa_unit_32 |
 | GovWithdraw | 9 | account, amount_le16, nonce_le8 |
-| CreateMarket | 10 | creator, symbol16, tick_size_le8, im_bps_le8, mm_bps_le8, taker_fee_bps_le8, keeper_reward_bps_le8, spot_only_u8（0/1） |
+| CreateMarket | 10 | creator, symbol16, tick_size_le8, im_bps_le8, mm_bps_le8, taker_fee_bps_le8, keeper_reward_bps_le8, spot_only_u8（0/1）, funding_rate_u8（0/1） |
 | CreateProposal | 11 | creator, market_le4, key_u8（ParamKey）, value_le8 |
 | Vote | 12 | voter, proposal_id_le8, approve_u8（0/1） |
 | FinalizeProposal | 13 | caller, proposal_id_le8 |
@@ -352,6 +352,26 @@ TWAP；环空或最新样本超过 `FUNDING_EXTERNAL_MAX_STALENESS = 32` 个高�
 `UpdateExternalPrice` 均以 `NotFound` 驳回），有效报告数恒为 0，
 资金费永不触发。
 
+`funding_rate` 市场（§16.2，建时定死）走**外部费率 peg**，与上面的
+溢价模式正交（普通 perp 不变）：
+
+- **编码**：簿价从不是裸费率。stored price =
+  `FUNDING_PRICE_OFFSET(10^12) + rate_bps × FUNDING_BPS_UNIT(10^4)`，
+  恒正、0 bps 可表示，`price == 0` 仍保留"无效/市价单"语义。
+- **预言机只写 index**：报告仍过 zero/bond 过滤、写 `oracle_reports`/
+  history/`last_index`，但**不写 mark**（无 ±10% 钳位）、不跑溢价块、
+  不记 TWAP，随后走 `settle_funding_peg`。`UpdateExternalPrice` 不喂此 peg。
+- **fill 写 mark**：跳过 100 USD 下限、oracle 锁与 ±10% 带；`qty ≥
+  QTY_SCALE/100` 才无钳位写 `marks`，并顺带重评 peg。
+- **结算**（`settle_funding_peg`）：缺 index 或 mark → 不推进；新鲜报告
+  （`back().height + FUNDING_EXTERNAL_MAX_STALENESS > height` 的已质押者）
+  < 2 → 不付不推进；首窗只 arm `last_funding_height`；此后 `height ≥
+  last + FUNDING_PEG_INTERVAL_HEIGHTS(14_400)` 才结算（付款公式同上，
+  diff 改为**费率域** `clamp((mark−index)/FUNDING_BPS_UNIT, ±50)`——
+  两价均带 offset，除 index 会把现实费率差截断成 0），付完置位；`diff == 0`
+  仍推进时钟，`index == 0` 跳过不推进。`UpdateExternalPrice` 不参与。
+- meta 叶承诺 `last_funding_height` 时钟；时钟以高度计，不读墙钟。
+
 ### 6.3 dust 说明
 
 整数除法截断产生亚微美元残差，随交易数线性累积，经济上可忽略。
@@ -379,8 +399,14 @@ Op::ReportPrice { oracle, market, price }        # canonical tag 6
 报价者；债券记入 `oracle_bonds`，无白名单、无审批。退出走
 `UnstakeOracle`(tag 15) 的 `ORACLE_UNBOND_HEIGHTS = 256` 高度解锁排队，
 期间报价即失效；`SlashOracle`(tag 16) 对 TWAP 连续偏移达标者罚没
-（500 bps 偏移 ×3 连续采样双条件，激活门控），罚没 = 债券 ×
-slash_reward_bps 归挑战者、余下烧毁。
+（500 bps 偏移 ×3 连续采样双条件，激活门控）。另有两条可罚性门槛
+（`apply_slash` 前置）：报告历史不足 `SLASH_TWAP_STREAK` 条、或最近一次
+报告距当前高度 > 256（新鲜度），任一成立 → `SlashNotEligible`。
+罚没 = 债券 ×
+slash_reward_bps **烧毁**、余下归挑战者（`apply_slash`：
+`burn = bond × SLASH_REWARD_BPS / 10_000`，`reward = bond − burn`；
+默认 5000 bps 下恰好各半，但每市场 `OracleConfig.slash_reward_bps`
+一旦被治理改写即分叉）。
 
 规则：
 
@@ -504,11 +530,12 @@ account_leaf = sha256("acct" ‖ id32 ‖ collateral_i128le16
                       ‖ perp_u128le16)
                # perp 取自 perp_balances（PERP 治理余额，§16），
                # 与 collateral 并列进入承诺
-book_leaf    = sha256(params_58B ‖ b"book" ‖ market_le4 ‖ [price_le8 ‖
+book_leaf    = sha256(params_59B ‖ b"book" ‖ market_le4 ‖ [price_le8 ‖
                (order_id32 ‖ remaining_le8)*]*)
-               # params_58B = symbol16 ‖ tick_size_le8 ‖ im_bps_le8
+               # params_59B = symbol16 ‖ tick_size_le8 ‖ im_bps_le8
                #   ‖ mm_bps_le8 ‖ taker_fee_bps_le8 ‖ keeper_reward_bps_le8
-               #   ‖ delisted_u8 ‖ spot_only_u8（定宽 58 字节）——市场参数本身成为被承诺
+               #   ‖ delisted_u8 ‖ spot_only_u8 ‖ funding_rate_u8（定宽 59 字节）
+               #   ——市场参数本身成为被承诺
                #   的共识状态；同时提交每一个价格档与每个活单，
                #   簿深度与参数都逃不过审计
 meta_leaf    = sha256(b"meta" ‖ height ‖ seq ‖ last_unit
@@ -517,6 +544,7 @@ meta_leaf    = sha256(b"meta" ‖ height ‖ seq ‖ last_unit
                       ‖ oracle_bonds ‖ oracle_unbonding ‖ oracle_slash_nonce
                       ‖ oracle_twap ‖ funding_twap ‖ funding_index_twap
                       ‖ external_price_ring ‖ external_sources
+                      ‖ last_funding_height(资金费 peg 时钟)
                       ‖ commits(commit-reveal) ‖ funding_source
                       ‖ oracle_configs ‖ oracle_reports
                       ‖ oracle_report_history
@@ -530,6 +558,9 @@ meta_leaf    = sha256(b"meta" ‖ height ‖ seq ‖ last_unit
 共识破坏记录（主网未发，无迁移）：`CreateMarket` canonical 尾部追加
 `spot_only_u8`；book 叶市场参数承诺 57B→58B；`Price` 由 u64 改为 i64
 （`tick_size` 同为 i64 但恒为正；`price == 0` 仍拒绝/忽略）。
+其后又追加 `funding_rate_u8`（tag 10 尾部）：book 叶参数 58B→59B、
+`meta_leaf` 在 `external_sources` 后提交 `last_funding_height`、
+snapshot 格式版本 1→2（v1 快照不再加载）。
 正数 canonical 字节逐字节不变。
 
 meta_leaf 绑定 height（from_applied 先把 engine.state.height 推到
@@ -618,7 +649,8 @@ sbond_<addr>, reward_<addr>, slash_reward_<addr>（sbond 仅遗留 claim 路径�
 
 公共门：`frozen`/`submitted_at+3600`、stale-root 对比 rollup 变量、
 所有成员证明 `.root` 必须等于对应 pre_wit/post_wit/roots。
-验不过 bounce('no fraud')；验过 → 付 10000 bytes + data
+揭发者实付 `>= 20000` bytes（dispute AA 门槛，含自身 bounce 余量）；
+验不过 bounce('no fraud')；验过 → 转发 10000 bytes + data
 `{verdict:'fraud', height, challenger}` 给 rollup。
 ### 10.3 verdict(h) — rollup
 
@@ -639,7 +671,8 @@ reward_<fee_winner> += 20000（无 sbond 记账）。`{escape_finalize}` 窗口�
 `$lf = var[ROLLUP]['last_finalized']`；`$src = var[ROLLUP]['aa_forest_'||$lf]`。
 叶子 `acct:addr:col:perp:W`（hex 域），16 深折叠，
 `amount + wd_ <= min(collateral, withdrawn)`，`perp_amount` 可选部分领取，
-`wp_` 封顶。`{escape_withdraw}` 弹 `no escape withdraw`。
+`wp_` 封顶。`{escape_withdraw}` 无对应 case（vault 仅 `deposit` /
+`deposit_perp` / `withdraw`），按未匹配触发 bounce。
 
 ### 10.6 pool / force / claim — rollup
 
@@ -764,8 +797,10 @@ asset id。发币时只需改一个常量并重新部署 AA。
   `deposits_allowed` 白名单（同一集合，replay 时由批次内 GovDeposit ops
   注入交叉校验），入账 `perp_balances[account] += amount`，
   `perp_supply += amount`
-- **GovWithdraw**（tag 9）：共享 withdrawals 表与 65 536 条目上限；
-  无 reduce-only 检查；AA 侧走扩展后的双币种 Merkle 证明提款
+- **GovWithdraw**（tag 9）：**独立**的每账户严格递增 nonce 水位线
+  `seen_gov_nonces`（`nonce <= watermark` → `DuplicateNonce`，允许跳号），
+  不共享 `withdrawals` 表、也不受其 65 536 条目上限约束——水位线按账户数
+  有界；无 reduce-only 检查；AA 侧走扩展后的双币种 Merkle 证明提款
   （§10.5，叶子含 perp 字段）
 
 `perp_supply` 定义为可赎回流通量：Σ 充值 − 提款 − 烧毁。
@@ -773,14 +808,25 @@ asset id。发币时只需改一个常量并重新部署 AA。
 **CreateMarket**（tag 10）：任何人可上架，代价是烧毁
 `CREATE_MARKET_FEE_PERP = 10_000` PERP 上架费。市场参数随 op 提交
 （symbol、tick_size、im_bps、mm_bps、taker_fee_bps、keeper_reward_bps、
-`spot_only`），
+`spot_only`、`funding_rate`），
 存入 `markets[market_id]`——IM/MM/taker fee/keeper 奖励从全局常量变为
-**每市场参数**（§4.2/§5.2/§6.1 相应改为读参数）。tick_size 或任一 bps
-为 0 → Risk 拒绝。簿不预建，沿用 `book_mut` 惰性创建。
+**每市场参数**（§4.2/§5.2/§6.1 相应改为读参数）。除 tick_size 或任一 bps
+为 0 → Risk 拒绝外，还有一层硬上限（exec `create_market`）：任一 bps
+> 10 000、`im_bps <= mm_bps`、`mm_bps < 500`、`im_bps > 5000`、
+`taker_fee_bps > 200`、`keeper_reward_bps > 500` 均 Risk 拒绝。
+簿不预建，沿用 `book_mut` 惰性创建。
 
 `spot_only` 建时定死：无 `ParamKey` 可翻转。`true` 的市场为纯合约/meme
 市场——拒收一切报价（双通道 `NotFound`，见 §6.2）、永无资金费；
 成交仍可定 mark（首笔合格 fill 写 `marks`）。可 delist 照旧（与 spot 正交）。
+
+`funding_rate` 同样建时定死、无 `ParamKey` 翻转：资金费率市场，簿价是
+外部交易所资金费率的编码价（`encode_funding_price`，offset 域内恒正，
+0 bps 可表示）。报价只写 `last_index`（不写 mark、不进 ±10% 钳位、不记
+TWAP）；fill 写 mark（≥ 1% 数量，无钳位）；资金费按 peg 结算——需
+index+mark+2 份新鲜报告才启动 `last_funding_height` 时钟，此后每
+14_400 高度至多结算一次（`settle_funding_peg`）。与 `spot_only` 互斥：
+两者同时为 true → `Risk` 拒绝（烧费之前）。
 
 delisted 市场（见 16.3 Delist 提案）拒绝新挂单；撤单与清算平仓仍允许
 (清算路径不经 place 校验)。MVP 不做强制拍卖：存量仓位只能平仓或被清算。
@@ -789,15 +835,19 @@ delisted 市场（见 16.3 Delist 提案）拒绝新挂单；撤单与清算平�
 
 **CreateProposal**（tag 11）：创建者对指定市场提交参数修改提案，`key` 取
 `ParamKey`（ImBps/MmBps/TakerFeeBps/KeeperRewardBps/Delist）；bps 键的
-value ≤ 10 000、Delist 键的 value 必须为 0，否则 Risk 拒绝。创建门槛：
+value ≤ 10 000、Delist 键的 value 必须为 0，否则 Risk 拒绝。并发上限：
+`proposals.len() >= 64` 时新提案 Risk 拒绝（状态膨胀防护，exec
+`create_proposal`）。创建门槛：
 创建者 PERP 余额 ≥ `PROPOSAL_MIN_STAKE_PERP = 1_000`（仅门槛检查，
 质押不锁定）。提案登记即固定两个快照：`created_seq` 与 quorum 分母
 `supply_at_create = perp_supply`——期限与法定人数在创建时刻确定，任何副本
 重放得出相同的通过判定。
 
-**Vote**（tag 12）：权重 = **投票 unit 执行时刻**的 PERP 余额。MVP 不存
-创建时的余额快照映射——余额随充值/提款/烧毁实时变化，文档如实表述；
-拆分账户不放大总权重（§13）。每账户一票（`voted` 集合去重）；期限
+**Vote**（tag 12）：权重取自**创建时刻的余额快照**
+`Proposal.weight_snapshot`（`CreateProposal` 时对全部非零
+`perp_balances` 冻结；余额为 0 的账户不入表，计票 `unwrap_or(0)`）。
+此后充值/提款/烧毁都不改变该票权重——烧毁 PERP 既不能放大也不能规避
+投票。每账户一票（`voted` 集合去重）；期限
 `seq < deadline_seq = created_seq + PROPOSAL_DURATION_SEQS
 = created_seq + 20_000 seqs`。
 

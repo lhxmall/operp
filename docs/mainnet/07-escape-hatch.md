@@ -1,5 +1,7 @@
 # Gap 8 — No Trustless Escape Hatch if All Operators Disappear — Design
 
+> **HISTORICAL DESIGN RECORD (pre-v2).** Written 2026-08 against the original single-vault-AA settlement (`operp-mvp-1`, submit/lock/challenge in `operp_vault.aa`, 50 000-byte submit bond, 64-hex `aa_root`). The code is now settlement v2: `chain_id = operp-v2`, four AAs, standing pool, no lock / no pay-to-kill, 1024-hex sharded `aa_forest`. File:line refs and AA symbols below describe the OLD architecture — design rationale only. Current state machine: [`../MECHANISMS.md`](../MECHANISMS.md) §10 and `README.md` "Mainnet Roadmap".
+
 > Owner: `DesignEscapeHatch` · Status: DESIGN-ONLY · Batch: Mainnet-1..5
 
 ---
@@ -407,4 +409,6 @@ Assertions:
 6. **Reduced submit bond after stall:** keep at `50000` in v1 to avoid spam. If real stall proves that no altruistic submitter can front `50000`, follow-up can lower to `10000` after `ESCAPE` (single `if` on `progress_ts`). Needs decision on Hawthorne effect vs spam.
 
 7. **AA complexity exact measurement:** final Oscript must be compiled with `ocore`'s AA complexity meter. Which comments to trim to stay under `MAX_AA_TREE_DEPTH`-adjacent limits is an implementation detail — file a `TODO(escape-budget)` with the two candidate lines to delete if the meter trips.
+
+
 

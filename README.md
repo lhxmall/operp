@@ -201,7 +201,9 @@ Three AAs (`CHAIN_ID=operp-v2`). **No lock, no pay-to-kill.** Collateral is GBYT
    `{escape_finalize}` remains the 7-day stall hatch.
 4. **withdraw (vault)** — reads `var[ROLLUP]['aa_forest_'||last_finalized]`;
    the 16-deep Merkle fold and the W anti-replay cap are unchanged.
-   `{escape_withdraw}` still bounces `no escape withdraw`.
+   `{escape_withdraw}` has no case in the vault AA (it exposes only
+   `deposit` / `deposit_perp` / `withdraw`), so it bounces as an unmatched
+   trigger.
 5. **force (rollup inbox)** — `{force, unit_id}` censorship escape; omission
    is provable via P-omit.
 
@@ -257,7 +259,7 @@ cargo run -p operp-settle --example export_batch
 
 # AA lifecycle on local devnet (needs node + a C++ toolchain for the
 # vendored aa-testkit's native rocksdb/sqlite3; see Verification status)
-cd obyte-local && node test_vault_aa.js
+cd obyte-local && node test_settlement_aa.js
 
 # deploy the vault AA to Obyte testnet
 cd obyte-local && node deploy_testnet.js
@@ -315,8 +317,9 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
 7. ~~**The sitting operator resets the stability timer for free.**~~
    **RESOLVED**: single-candidate combined units; further submits bounce
    `height taken`; only a proven fraud reopens the height.
-8. No formal AA audit. Every AA must stay ≤100 complexity (fill AA ≈ 21).
-   Probe: `node obyte-local/tools/check_aa_complexity.js agents/*.aa`.
+8. No formal AA audit. Every AA must stay ≤100 per-formula complexity and
+   ≤2000 ops (fill AA: max 21, ops 1513).
+   Probe: `cd obyte-local && node tools/check_aa_complexity.js agents/*.aa`.
 9. **Replay-dedup window is 2048** (`REPLAY_ACTIVATION_HEIGHT = 0`).
    Duplicates outside the window escape sidechain dedup; AA-side `wd_`/`wp_`
    caps still hold.
@@ -370,8 +373,8 @@ commitment expansion over all consensus maps (a breaking `state_root`
 format change), canonical `data_hash`/`data_length` unified across Rust and
 JS via ocore `getJsonSource`, deposit evidences carrying the full joint
 unit, fail-fast on unset `PERP_ASSET_ID`, the lock bond gate
-(`active_bond_` presence), the sharded aa-forest, `escape_finalize`/
-`escape_withdraw`, commit-reveal v2, WantUnits gossip, and the funding
+(`active_bond_` presence), the sharded aa-forest, `escape_finalize`,
+commit-reveal v2, WantUnits gossip, and the funding
 external-anchor wiring.
 
 Post-audit follow-ups restored `{deposit_perp}` crediting (the vault
@@ -383,17 +386,17 @@ sole withdrawal authority) and lifted raw engine throughput from 5199 to
 
 All eleven designs in [`docs/mainnet/`](docs/mainnet/) are now implemented
 (staged as v1 boring + v2 extensions; deviations and deferred backlogs are
-- [x] **02 Deposit independent verification** — per-frame `e` inside the blob carries FULL Obyte joint units; `unit_hash(joint)` recomputed inside `validate_against` via `operp_settle::obyte_hash::get_unit_hash`; payee/asset checked against caller-supplied `expected_vault`/`perp_asset`, failures map to `SettleError::DepositEvidence`; watchers rehydrate by concatenating `e` fields (full joint still verified in `validate_against`)
+listed at the end):
 
-- [x] **01 Fraud slashing** — `01-fraud-slashing.md`: 50%/50% burn/reward split + `validity_proof_hash` plug, no matcher re-execution in Oscript *(AA failed-finalize splits the submit bond into `slash_reward_` + burned half)*
+- [x] **01 Fraud slashing** — `01-fraud-slashing.md`: `validity_proof_hash` plug + dispute-verdict slashing (5e11 off the operator's standing pool to `slash_reward_<challenger>`, height reopens), no matcher re-execution in Oscript
 - [x] **02 Deposit independent verification** — `temp_data.deposit_evidences` carries FULL Obyte joint units; `unit_hash(joint)` recomputed inside `validate_against` via `operp_settle::obyte_hash::get_unit_hash`; payee/asset checked against caller-supplied `expected_vault`/`perp_asset`, failures map to `SettleError::DepositEvidence`; watchers rehydrate via `evidences_from_payload`
 - [x] **03 Commit-reveal ordering** — v1 salted sort shipped earlier and **desalted this round** (execution order is deterministic lex; the salt remains for orphan eviction only — Limitations #13); **v2 additive landed this round**: `Op::Commit` (tag 18) / `Op::Reveal` (tag 19), TTL `COMMIT_TTL_HEIGHTS = 16`, ≤ 8 live commits/account, `reveal_commit_hash = sha256(inner_op_bytes ‖ salt)`, live at height 0
 - [x] **04 Salted orphan eviction + WantUnits gossip** — `argmin sha256(salt‖unit_id)` with `Engine::note_finalized` rotating the salt per epoch (`sha256(ORDERING_SALT_DOMAIN ‖ root ‖ epoch_le)`); **gossip landed this round**: new `crates/operp-gossip` (WantUnits/HaveUnits, debounced fanout, bounded requests/responses) as a pure operator/P2P layer — wire transport per doc OQ5
 - [x] **05 Oracle slashing + TWAP** — 50k PERP stake/unstake (256-height unbond)/slash, TWAP rings, 500 bps ×3-streak double condition, `SlashOracle` tag 16, live at height 0
 - [x] **06 Funding external anchor** — funding-index abstraction + activation height 0 (live at genesis); **operator wiring landed this round**: `Op::UpdateExternalPrice` (tag 17), source allowlist, `AggregatedExternal` mode, staleness fallback external TWAP → bonded-median TWAP → instant median (`FUNDING_EXTERNAL_MAX_STALENESS = 32`)
-- [x] **07 Escape hatch** — **landed this round**, folded into existing cases for budget: `{escape_finalize: 1}` rides the finalize handler (any caller, `ESCAPE_STALL_SECS = 604800` mainnet / 3600 testnet), `{escape_withdraw}` removed (bounces `no escape withdraw`); deviation per doc07 §4 waiver: escape_finalize enforces only the LOCAL stall gate
+- [x] **07 Escape hatch** — **landed this round**, folded into existing cases for budget: `{escape_finalize: 1}` rides the finalize handler (any caller, `ESCAPE_STALL_SECS = 604800` mainnet / 3600 testnet), `{escape_withdraw}` removed (no such case; unmatched triggers bounce); deviation per doc07 §4 waiver: escape_finalize enforces only the LOCAL stall gate
 - [x] **08 Burn accounting (Rust + checkpoint)** — `perp_burned` in `meta_leaf`, emitted via `Checkpoint.perp_burned` / `temp_data`; AA-side mirror vars dropped for budget, `holdings−supply==burned` stays watcher-verifiable
-- [x] **09 Complexity audit** — single-sha256 fold, unified claim dispatcher (`claim:'kind'`), lock-merge refactor; probe: `node tools/check_aa_complexity.js`. Current **76/100** (ops 976/2000) — ≤85 gate
+- [x] **09 Complexity audit** — single-sha256 fold, unified claim dispatcher (`claim:'kind'`), lock-merge refactor; probe: `node obyte-local/tools/check_aa_complexity.js obyte-local/agents/*.aa`. Today: per-formula max complexity 18–21 (CI gate: any formula > 100 fails), Σops 524–1513 per AA (probe now also gates Σops > 2000)
 - [x] **10 AA-tree sharding (v2)** — clean cutover this round: ONE 1024-hex `aa_forest` var = 16 concatenated shard roots (fits `MAX_STATE_VAR_VALUE_LENGTH` exactly), empty-shard sentinel roots, depth stays 16 → ~1M accounts/batch; the doc's v1 depth-18 path is superseded per its own OpenQ3
 - [x] **11 Replay persistence (v1)** — `256→2048` constants + generalized pruning; `GovNonceJournal` WAL — flushed at batch commit (`Batch::from_applied`), max-merge on restart — plus versioned bincode snapshots `chainstate.<height>.snap` via `Engine::load_or_genesis` / `flush_snapshot` / `maybe_flush_snapshot` (every 64 heights). RocksDB (`persist-rocksdb`) stays doc-declared v1.1 backlog
 
@@ -404,15 +407,16 @@ All eleven designs in [`docs/mainnet/`](docs/mainnet/) are now implemented
   the rollup AA (`reward|sbond|slash`).
 - **Per-shard depth stays 16**; the proposal table is capped at 64 concurrent.
 
-See [`docs/mainnet/`](docs/mainnet/) (historical 11 docs) and
-[ROLLUP-UPGRADE.md](docs/ROLLUP-UPGRADE.md). Validation:
-`cargo test --workspace`, `check_aa_complexity.js`,
+See [`docs/mainnet/`](docs/mainnet/) (historical 11 docs — pre-v2 design
+records) and [ROLLUP-UPGRADE.md](docs/ROLLUP-UPGRADE.md). Validation:
+`cargo test --workspace`, `check_aa_complexity.js` (complexity + ops gate),
 `node test_settlement_aa.js` (Linux/CI).
 
 ## Verification status
 
-* **CI** runs workspace tests, the four-AA complexity gate, the golden vector,
-  and `test_settlement_aa.js` (win32 skips).
+* **CI** runs workspace tests, the four-AA complexity gate (per-formula
+  ≤ 100 and Σops ≤ 2000), the golden vector, and `test_settlement_aa.js`
+  (win32 skips).
 * **Watcher:** `operp-watch` builds `proof.json` and posts to the dispute AA
   (`--pred --proof`; requires `OPERP_WATCH_MNEMONIC`, `--vault` and
   `--rollup`). Without a mnemonic it prints alerts only. Use a key separate

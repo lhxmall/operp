@@ -155,7 +155,7 @@ operator。
 1. **资金池 + submit（rollup）** — 常备池 `pool_<addr> >= 1000 GBYTE`（`{pool:1}` 按净流入减 10000 fee 累加）；每次提交只付 10000 bounce 费。在途 `last_submitted-last_finalized < 50` 允许 h 未终结就发 h+1。组合单元：header `temp_data`（`frames_blob` 或 `packages`+`data_root`，gzip 帧）+ `{submit, height, 双根, trace/units/ops/fills 根}`。多包时 package 单元先发，da_unit 以一单元承载 header + submit。`h == last_submitted+1`；活高度重发 → `height taken`（欺诈重开的后续高度可自由覆盖）。窗从 `submitted_at` 起算 3600 s。
 2. **揭发（dispute / dispute_fill）** — 窗内任何人提交一枪谓词（deposit/withdraw/omit/fill_math/ghost/skip）。验不过 bounce `no fraud`，高度不动；验过则 `{verdict:'fraud'}`，rollup 从 operator 常备池扣 5e11、高度重开。无应诉回合。
 3. **finalize（rollup）** — `submitted_at+3600` 且未冻结 → `last_finalized=h`，竞速奖 20000 bytes，不再记 sbond。链空闲（`last_submitted==last_finalized`）时 `{claim:'pool'}` 取回池子。`{escape_finalize}` 为 7 天停滞门。
-4. **withdraw（vault）** — 只读 `var[ROLLUP]['aa_forest_'||last_finalized]`，原 16 深 Merkle 折叠与 W 防重放不变。`{escape_withdraw}` 仍弹 `no escape withdraw`。
+4. **withdraw（vault）** — 只读 `var[ROLLUP]['aa_forest_'||last_finalized]`，原 16 深 Merkle 折叠与 W 防重放不变。`{escape_withdraw}` 在 vault AA 中无对应 case（vault 只有 `deposit` / `deposit_perp` / `withdraw`），按未匹配触发 bounce。
 5. **force（rollup inbox）** — `{force, unit_id}` 抗审查；漏收可 P-omit。
 
 | 门 | 原点 | 时长 |
@@ -210,7 +210,7 @@ cargo run -p operp-settle --example export_batch
 
 # AA 生命周期集成测试（本地 devnet；需 node + C++ 工具链以编译
 # vendored aa-testkit 的原生 rocksdb/sqlite3——见「验证状态」）
-cd obyte-local && node test_vault_aa.js
+cd obyte-local && node test_settlement_aa.js
 
 # 部署 vault AA 到 Obyte 测试网
 cd obyte-local && node deploy_testnet.js
@@ -253,8 +253,9 @@ cd obyte-local && node post_batch.js
    视为累计烧毁额。
 7. ~~**在任 operator 免费重启稳定计时器。**~~ **已关闭**：单候选组合单元，
    后续 submit bounce `height taken`。欺诈成立才重开。
-8. AA 未做正式安全审计。各 AA 复杂度须 ≤100（fill AA 实测约 21）。探针：
-   `node obyte-local/tools/check_aa_complexity.js agents/*.aa`。
+8. AA 未做正式安全审计。各 AA 每 formula 复杂度须 ≤100、Σops ≤2000
+   （fill AA 实测：max 21、ops 1513）。探针：
+   `cd obyte-local && node tools/check_aa_complexity.js agents/*.aa`。
 9. **重放去重窗口 2048**（`REPLAY_ACTIVATION_HEIGHT = 0`）。窗口外重复操作
    逃过侧链去重；AA 侧 `wd_`/`wp_` 仍封顶。
 10. AA 强制 `amount + wd_ <= min(collateral, withdrawn)`，且叶子数字字段
@@ -296,7 +297,7 @@ PnL 定标、`RetryMismatch`/`AddrTooLong` DAG 防护、meta 叶对全部共识�
 承诺扩展（`state_root` 格式破坏性变更）、canonical `data_hash`/`data_length`
 经 ocore `getJsonSource` 在 Rust/JS 两侧统一、充值证据携带完整 joint 单元、
 `PERP_ASSET_ID` 未设置的 fail-fast、lock 债券门（`active_bond_` 在位）、
-分片 aa 森林、`escape_finalize`/`escape_withdraw`、commit-reveal v2、
+分片 aa 森林、`escape_finalize`、commit-reveal v2、
 WantUnits gossip、资金费外部锚接线。
 
 审计后追加：恢复 `{deposit_perp}` 入账（vault 保留 PERP 并镜像记入
@@ -308,9 +309,9 @@ WantUnits gossip、资金费外部锚接线。
 [`docs/mainnet/`](docs/mainnet/) 的十一个设计全部实现（按 v1 保守版 +
 v2 扩展分期；偏差与延期积压见下）：
 
-- [x] **01 欺诈罚没** — `01-fraud-slashing.md`：50%/50% 烧毁/奖励劈分 +
-  `validity_proof_hash` 插槽，Oscript 不做撮合重执行 *（AA 失败 finalize 把
-  提交债券劈成 `slash_reward_` + 烧毁半）*
+- [x] **01 欺诈罚没** — `01-fraud-slashing.md`：`validity_proof_hash` 插槽 +
+  谓词判决罚没（dispute 验过 → rollup 从 operator 常备池扣 5e11 记
+  `slash_reward_<challenger>`、高度重开），Oscript 不做撮合重执行
 - [x] **02 充值独立验证** — blob 内 per-frame `e` 携带完整 Obyte
   joint 单元；`unit_hash(joint)` 在 `validate_against` 内经
   `operp_settle::obyte_hash::get_unit_hash` 复算；收款人/资产以调用方提供的
@@ -334,15 +335,16 @@ v2 扩展分期；偏差与延期积压见下）：
   即时中位数（`FUNDING_EXTERNAL_MAX_STALENESS = 32`）
 - [x] **07 逃生舱** — **本轮落地**，为预算并入既有分支：`{escape_finalize: 1}`
   搭载 finalize 分支（任意调用者，`ESCAPE_STALL_SECS = 604800` 主网 /
-  3600 testnet)；`{escape_withdraw}` 已移除（弹回 `no escape withdraw`）；偏差（doc07 §4 豁免）：escape_finalize
-  只做本地停滞门
+  3600 testnet)；`{escape_withdraw}` 已移除（无对应 case，未匹配触发 bounce）；偏差（doc07 §4 豁免）：escape_finalize
   只做本地停滞门
 - [x] **08 烧毁记账（Rust + checkpoint）** — `meta_leaf` 中 `perp_burned`，
   经 `Checkpoint.perp_burned` / `temp_data` 披露；AA 侧镜像变量为预算删除，
   `holdings−supply==burned` 保持 watcher 可验证
 - [x] **09 复杂度审计** — 单 sha256 折叠、统一 claim 分发（`claim:'kind'`）、
-  lock-merge 重构；探针：`node tools/check_aa_complexity.js`。当前 **76/100**
-  （ops 976/2000）——≤85 门以内
+  lock-merge 重构；探针：`node obyte-local/tools/check_aa_complexity.js
+  obyte-local/agents/*.aa`。当前：每 formula 最大复杂度 18–21（CI 门：
+  任一 formula > 100 失败），各 AA Σops 524–1513（探针同时对 Σops > 2000
+  设门）
 - [x] **10 AA 树分片（v2）** — 本轮干净切换：单个 1024-hex `aa_forest` 变量 =
   16 个拼接的 shard 根（恰好命中 `MAX_STATE_VAR_VALUE_LENGTH`）、空 shard
   哨兵根、深度保持 16 → 每批约 100 万账户；doc 的 v1 depth-18 路径按其
@@ -359,12 +361,14 @@ v2 扩展分期；偏差与延期积压见下）：
 - **结算 v2**：无 lock / 无付钱挑战；谓词揭发；claim 在 rollup（`reward|sbond|slash`）。
 - **单 shard 深度 16**；提案表并发上限 64。
 
-见 [`docs/mainnet/`](docs/mainnet/)（历史 11 篇）与 [ROLLUP-UPGRADE.md](docs/ROLLUP-UPGRADE.md)。
-验证：`cargo test --workspace`、`check_aa_complexity.js`、`node test_settlement_aa.js`（Linux/CI）。
+见 [`docs/mainnet/`](docs/mainnet/)（历史 11 篇——pre-v2 设计记录）与
+[ROLLUP-UPGRADE.md](docs/ROLLUP-UPGRADE.md)。
+验证：`cargo test --workspace`、`check_aa_complexity.js`（复杂度+ops 门）、
+`node test_settlement_aa.js`（Linux/CI）。
 
 ## 验证状态
 
-- **Rust / js-checks / e2e**：CI 跑 workspace 测试、四份 AA 复杂度、golden vector、`test_settlement_aa.js`（win32 skip）。
+- **Rust / js-checks / e2e**：CI 跑 workspace 测试、四份 AA 复杂度门（每 formula ≤100 且 Σops ≤2000）、golden vector、`test_settlement_aa.js`（win32 skip）。
 - **Watcher：** `operp-watch` 组 `proof.json` 打 dispute（`--pred --proof`，需 `OPERP_WATCH_MNEMONIC` 与 `--vault/--rollup`）。未设助记词仅报警。须与 poster 分钥。
 
 ## 许可证
