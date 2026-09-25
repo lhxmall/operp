@@ -111,6 +111,10 @@ reduce_only      : equity·10000 ≤ mm·12000
   (spot − index)/index（钳 ±50bps）在多空之间转移。付款方借记被钳在其
   可用抵押内，收款方入账以实际扣减总额封顶——严格守恒、不产生负余额；
   保险基金作为普通账户参与（可持有清算对冲仓位）。
+  `funding_rate` 市场不走溢价结算：报价只写 `last_index`，mark 由
+  fill 写入，资金费按 peg 结算（`settle_funding_peg`：新鲜已质押报告 ≥2
+  才 arm `last_funding_height`，之后每 14_400 高度至多结算一次，diff =
+  clamp((mark−index)/FUNDING_BPS_UNIT, ±50)；时钟进 meta 叶承诺）。
 
 ### 2.5 市场准入与存款白名单
 
@@ -147,9 +151,10 @@ account_leaf = sha256("acct" ‖ id32 ‖ collateral_i128le16 ‖ realized_i128l
                       ‖ pos_count_u32 ‖ [market_le4 qty_le8 entry_le8]*
                       ‖ perp_u128le16)
                # perp = PERP 治理余额（§7），与抵押并列进入承诺
-book_leaf    = sha256(params_58B ‖ 簿承诺)
-               # params_58B = symbol16‖tick_le8‖im_le8‖mm_le8‖taker_le8
-               #   ‖keeper_le8‖delisted1B‖spot_only1B——市场参数本身成为被承诺状态
+book_leaf    = sha256(params_59B ‖ 簿承诺)
+               # params_59B = symbol16‖tick_le8‖im_le8‖mm_le8‖taker_le8
+               #   ‖keeper_le8‖delisted1B‖spot_only1B‖funding_rate1B
+               #   ——市场参数本身成为被承诺状态
 meta_leaf    = sha256("meta" ‖ height_le ‖ seq_le ‖ last_unit
                       ‖ perp_burned_le16 ‖ next_market_id_le4
                       ‖ next_proposal_id_le8)

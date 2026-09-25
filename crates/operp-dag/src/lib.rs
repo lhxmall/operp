@@ -71,6 +71,11 @@ pub enum Op {
         /// Fixed at creation. Old JSON without this field parses as `false`.
         #[serde(default)]
         spot_only: bool,
+        /// Funding-rate market: book price is an encoded external funding
+        /// rate; reports write the index only, fills write the mark.
+        /// Fixed at creation. Old JSON without this field parses as `false`.
+        #[serde(default)]
+        funding_rate: bool,
     },
     /// On-chain parameter proposal for `market`; `key` is a `ParamKey` u8.
     CreateProposal {
@@ -275,6 +280,7 @@ fn encode_op(b: &mut Vec<u8>, op: &Op) {
             taker_fee_bps,
             keeper_reward_bps,
             spot_only,
+            funding_rate,
         } => {
             b.push(10);
             b.extend_from_slice(&creator.0);
@@ -285,6 +291,7 @@ fn encode_op(b: &mut Vec<u8>, op: &Op) {
             b.extend_from_slice(&taker_fee_bps.to_le_bytes());
             b.extend_from_slice(&keeper_reward_bps.to_le_bytes());
             b.push(*spot_only as u8);
+            b.push(*funding_rate as u8);
         }
         Op::CreateProposal {
             creator,

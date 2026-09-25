@@ -97,6 +97,9 @@ pub struct ChainState {
     pub external_price_ring: BTreeMap<MarketId, VecDeque<ExternalSample>>,
     /// Keeper accounts allowed to post `UpdateExternalPrice` (governed).
     pub external_sources: BTreeSet<AccountId>,
+    /// Funding-rate peg clock: height of the last settled (or first armed)
+    /// peg window per funding-rate market. Empty for every other market.
+    pub last_funding_height: BTreeMap<MarketId, Height>,
 }
 
 /// A registered commit-reveal commitment (doc 03 §2.3.3). `commit_unit`
@@ -208,6 +211,7 @@ impl ChainState {
             commits: BTreeMap::new(),
             external_price_ring: BTreeMap::new(),
             external_sources: BTreeSet::new(),
+            last_funding_height: BTreeMap::new(),
             next_proposal_id: 1,
             seen_aa_units: HashMap::new(),
             seen_client_seq: HashMap::new(),
@@ -618,6 +622,18 @@ impl ChainState {
         // Funding index: unclamped median, so the premium reflects true
         // reporter consensus even while the spot mark lags behind the cap.
         self.last_index.insert(market, median);
+        // Funding-rate markets: the oracle writes the index only. The mark
+        // comes from fills, so the ±10% band, the premium block, and the
+        // TWAP sample are all skipped; funding settles as the peg instead.
+        if self
+            .markets
+            .get(&market)
+            .map(|p| p.funding_rate)
+            .unwrap_or(false)
+        {
+            self.settle_funding_peg(market);
+            return Ok(());
+        }
         // Signed marks: the ±10% band is measured on the old mark's
         // magnitude, so a negative mark can still move by capped steps.
         let capped = match self.marks.get(&market) {
@@ -649,53 +665,118 @@ impl ChainState {
                     operp_types::FUNDING_CAP_BPS as i128,
                 );
                 if diff_bps != 0 {
-                    // Phase 1: signed payments in ascending AccountId order.
-                    let payments: Vec<(AccountId, i128)> = self
-                        .accounts
-                        .iter()
-                        .filter_map(|(id, a)| {
-                            a.positions.get(&market).map(|pos| {
-                                (
-                                    *id,
-                                    operp_types::signed_notional_usd(pos.qty, funding_index)
-                                        * diff_bps
-                                        / 10_000,
-                                )
-                            })
-                        })
-                        .filter(|(_, p)| *p != 0)
-                        .collect();
-                    // Phase 2a: debit payers, clamped at non-negative collateral.
-                    let mut budget: i128 = 0;
-                    for (id, payment) in &payments {
-                        if *payment <= 0 {
-                            continue;
-                        }
-                        if let Some(a) = self.accounts.get_mut(id) {
-                            let debit = (*payment).min(a.collateral.max(0));
-                            a.collateral -= debit;
-                            budget += debit;
-                        }
-                    }
-                    // Phase 2b: credit receivers until the budget is spent.
-                    for (id, payment) in &payments {
-                        if budget == 0 {
-                            break;
-                        }
-                        if *payment >= 0 {
-                            continue;
-                        }
-                        let want = -*payment;
-                        let credit = want.min(budget);
-                        if let Some(a) = self.accounts.get_mut(id) {
-                            a.collateral += credit;
-                        }
-                        budget -= credit;
-                    }
+                    self.transfer_funding(market, funding_index, diff_bps);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Two-phase peer-to-peer funding transfer: Phase 1 collects signed
+    /// payments in ascending AccountId order, Phase 2a debits payers clamped
+    /// at non-negative collateral into a budget, Phase 2b credits receivers
+    /// until the budget is spent. Conservation is exact; insurance
+    /// participates like any account.
+    fn transfer_funding(&mut self, market: MarketId, funding_index: Price, diff_bps: i128) {
+        // Phase 1: signed payments in ascending AccountId order.
+        let payments: Vec<(AccountId, i128)> = self
+            .accounts
+            .iter()
+            .filter_map(|(id, a)| {
+                a.positions.get(&market).map(|pos| {
+                    (
+                        *id,
+                        operp_types::signed_notional_usd(pos.qty, funding_index) * diff_bps
+                            / 10_000,
+                    )
+                })
+            })
+            .filter(|(_, p)| *p != 0)
+            .collect();
+        // Phase 2a: debit payers, clamped at non-negative collateral.
+        let mut budget: i128 = 0;
+        for (id, payment) in &payments {
+            if *payment <= 0 {
+                continue;
+            }
+            if let Some(a) = self.accounts.get_mut(id) {
+                let debit = (*payment).min(a.collateral.max(0));
+                a.collateral -= debit;
+                budget += debit;
+            }
+        }
+        // Phase 2b: credit receivers until the budget is spent.
+        for (id, payment) in &payments {
+            if budget == 0 {
+                break;
+            }
+            if *payment >= 0 {
+                continue;
+            }
+            let want = -*payment;
+            let credit = want.min(budget);
+            if let Some(a) = self.accounts.get_mut(id) {
+                a.collateral += credit;
+            }
+            budget -= credit;
+        }
+    }
+
+    /// Funding-rate peg settlement for a `funding_rate` market:
+    /// - needs both an oracle index and a fill-written mark, else no-op;
+    /// - needs at least 2 bonded reporters with a history sample fresher
+    ///   than `FUNDING_EXTERNAL_MAX_STALENESS`, else no-op;
+    /// - the first fully-armed window arms `last_funding_height` and pays
+    ///   nothing; every window at least `FUNDING_PEG_INTERVAL_HEIGHTS` after
+    ///   the armed height pays (diff clamped to ±FUNDING_CAP_BPS) and re-arms;
+    /// - `index == 0` and stale reports never touch the clock.
+    fn settle_funding_peg(&mut self, market: MarketId) {
+        let (&index, &mark) = match (self.last_index.get(&market), self.marks.get(&market)) {
+            (Some(i), Some(m)) => (i, m),
+            _ => return,
+        };
+        if index == 0 {
+            return;
+        }
+        let height = self.height;
+        let fresh = self
+            .oracle_report_history
+            .iter()
+            .filter(|((m, o), _)| *m == market && self.oracle_bonds.contains_key(o))
+            .filter(|((_, _), q)| {
+                q.back()
+                    .map(|s| s.height + FUNDING_EXTERNAL_MAX_STALENESS > height)
+                    .unwrap_or(false)
+            })
+            .count();
+        if fresh < 2 {
+            return;
+        }
+        match self.last_funding_height.get(&market).copied() {
+            // First armed window: start the interval clock, pay nothing.
+            None => {
+                self.last_funding_height.insert(market, height);
+            }
+            Some(last) => {
+                if height < last + operp_types::FUNDING_PEG_INTERVAL_HEIGHTS {
+                    return;
+                }
+                // Rate-domain diff: both prices are offset-encoded, so the
+                // raw difference already carries bps (FUNDING_BPS_UNIT per
+                // bps). Dividing by `index` (≈ offset, 10^12) instead would
+                // truncate every realistic rate gap to zero.
+                let diff_bps =
+                    ((mark as i128 - index as i128) / operp_types::FUNDING_BPS_UNIT as i128).clamp(
+                        -(operp_types::FUNDING_CAP_BPS as i128),
+                        operp_types::FUNDING_CAP_BPS as i128,
+                    );
+                if diff_bps != 0 {
+                    self.transfer_funding(market, index, diff_bps);
+                }
+                // diff_bps == 0 still advances the clock.
+                self.last_funding_height.insert(market, height);
+            }
+        }
     }
 
     pub fn book_mut(&mut self, market: MarketId) -> &mut OrderBook {
@@ -772,6 +853,23 @@ impl ChainState {
                 let ins = self.account_mut(INSURANCE_ACCOUNT);
                 ins.collateral -= shortfall;
             }
+        }
+        // Funding-rate markets: fills are the mark source. The 100 USD gate,
+        // the oracle lock, and the ±10% band are all skipped; tiny fills
+        // (< 1% notional) leave the mark untouched.
+        if self
+            .markets
+            .get(&fill.market)
+            .map(|p| p.funding_rate)
+            .unwrap_or(false)
+        {
+            if fill.qty >= operp_types::QTY_SCALE / 100 {
+                self.marks.insert(fill.market, fill.price);
+                // The mark just moved: re-evaluate the peg so its interval
+                // clock arms as soon as index + mark + fresh reports exist.
+                self.settle_funding_peg(fill.market);
+            }
+            return Ok(());
         }
         // Mark oracle guards: fills move the mark only for markets where NO
         // bonded reporter has spoken yet (oracles are authoritative once
@@ -880,10 +978,11 @@ pub fn account_leaf(acct: &Account, perp: u128, withdrawn: i128) -> [u8; 32] {
 
 /// Fixed-width per-market params encoding committed by the book leaf:
 /// symbol[16] || tick le8 || im le8 || mm le8 || taker_fee le8 ||
-/// keeper_reward le8 || delisted byte || spot_only byte — 58 bytes total.
+/// keeper_reward le8 || delisted byte || spot_only byte || funding_rate byte
+/// — 59 bytes total.
 /// Books are created lazily only for markets that already have params.
-fn market_params_bytes(p: &MarketParams) -> [u8; 58] {
-    let mut b = [0u8; 58];
+fn market_params_bytes(p: &MarketParams) -> [u8; 59] {
+    let mut b = [0u8; 59];
     b[..16].copy_from_slice(&p.symbol);
     b[16..24].copy_from_slice(&p.tick_size.to_le_bytes());
     b[24..32].copy_from_slice(&p.im_bps.to_le_bytes());
@@ -892,6 +991,7 @@ fn market_params_bytes(p: &MarketParams) -> [u8; 58] {
     b[48..56].copy_from_slice(&p.keeper_reward_bps.to_le_bytes());
     b[56] = p.delisted as u8;
     b[57] = p.spot_only as u8;
+    b[58] = p.funding_rate as u8;
     b
 }
 
@@ -902,7 +1002,7 @@ fn book_leaf(book: &OrderBook, markets: &BTreeMap<MarketId, MarketParams>) -> [u
     let p = markets
         .get(&book.market())
         .unwrap_or_else(|| panic!("book without params for market {}", book.market().0));
-    let mut b = Vec::with_capacity(58 + book.commitment_bytes().len());
+    let mut b = Vec::with_capacity(59 + book.commitment_bytes().len());
     b.extend_from_slice(&market_params_bytes(p));
     b.extend_from_slice(&book.commitment_bytes());
     sha256(&b)
@@ -980,6 +1080,13 @@ fn meta_leaf(state: &ChainState) -> [u8; 32] {
     b.extend_from_slice(&(state.external_sources.len() as u32).to_le_bytes());
     for acct in &state.external_sources {
         b.extend_from_slice(&acct.0);
+    }
+    // Funding-rate peg clock: per-market last settled (or first armed) peg
+    // height, so replays cannot diverge on which windows have settled.
+    b.extend_from_slice(&(state.last_funding_height.len() as u32).to_le_bytes());
+    for (m, h) in &state.last_funding_height {
+        b.extend_from_slice(&m.0.to_le_bytes());
+        b.extend_from_slice(&h.to_le_bytes());
     }
     // Pending commit-reveal commitments (doc 03 §2.3.3): keyed by commit
     // hash, BTreeMap order is deterministic.

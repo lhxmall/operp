@@ -411,6 +411,7 @@ impl Engine {
                 taker_fee_bps,
                 keeper_reward_bps,
                 spot_only,
+                funding_rate,
             } => self.create_market(
                 *creator,
                 *symbol,
@@ -420,6 +421,7 @@ impl Engine {
                 *taker_fee_bps,
                 *keeper_reward_bps,
                 *spot_only,
+                *funding_rate,
             ),
             Op::CreateProposal {
                 creator,
@@ -927,7 +929,14 @@ impl Engine {
         taker_fee_bps: Bps,
         keeper_reward_bps: Bps,
         spot_only: bool,
+        funding_rate: bool,
     ) -> Result<Vec<Fill>, RejectReason> {
+        // A funding-rate market needs a reporter index, which spot_only
+        // rejects outright — mutually exclusive kinds, rejected before any
+        // PERP changes hands.
+        if spot_only && funding_rate {
+            return Err(RejectReason::Risk);
+        }
         // Signed price grid: tick stays strictly positive; a zero or
         // negative grid would break limit alignment (`price % tick_size`).
         if tick_size <= 0
@@ -978,6 +987,7 @@ impl Engine {
                 taker_fee_bps,
                 keeper_reward_bps,
                 spot_only,
+                funding_rate,
                 delisted: false,
             },
         );
@@ -1971,6 +1981,7 @@ mod tests {
                 taker_fee_bps: 5,
                 keeper_reward_bps: 100,
                 spot_only: false,
+                funding_rate: false,
             },
             secret,
         )
@@ -1991,6 +2002,7 @@ mod tests {
                 taker_fee_bps: 5,
                 keeper_reward_bps: 100,
                 spot_only,
+                funding_rate: false,
             },
             secret,
         )
@@ -2361,6 +2373,7 @@ mod tests {
                 taker_fee_bps: 5,
                 keeper_reward_bps: 20_000, // 200% — unbounded keeper drain
                 spot_only: false,
+                funding_rate: false,
             },
             &sk(1),
         );
@@ -2703,6 +2716,7 @@ mod tests {
                 keeper_reward_bps: operp_types::KEEPER_REWARD_BPS,
                 delisted: false,
                 spot_only: false,
+                funding_rate: false,
             },
         );
         eng.state
@@ -3755,5 +3769,353 @@ mod tests {
             operp_types::FUNDING_CAP_BPS as u64,
         );
         assert!(moved <= cap as i128 + USD_SCALE as i128, "cap holds");
+    }
+
+    #[test]
+    fn funding_rate_market_peg_settles_on_interval() {
+        let mut eng = activated_engine();
+        let g = genesis_id();
+        // Fresh creator (sk(1)) pays the listing fee; alice/bob deposit
+        // collateral separately below.
+        let d = gov_dep(vec![g], &sk(1), CREATE_MARKET_FEE_PERP, 7);
+        let mut tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let mut symbol = [0u8; 16];
+        symbol[..6].copy_from_slice(b"FUNDUS");
+        let cm = sign_unit(
+            vec![tip],
+            Op::CreateMarket {
+                creator: acct_of(&sk(1)),
+                symbol,
+                tick_size: 1,
+                im_bps: 1000,
+                mm_bps: 500,
+                taker_fee_bps: 5,
+                keeper_reward_bps: 100,
+                spot_only: false,
+                funding_rate: true,
+            },
+            &sk(1),
+        );
+        tip = unit_id(&cm);
+        eng.ingest(cm).unwrap();
+        let mkt = MarketId(2);
+        assert!(eng.state.markets[&mkt].funding_rate);
+        let alice = sk(2);
+        let bob = sk(3);
+        let oa = sk(5);
+        let ob = sk(6);
+        eng.state
+            .oracle_bonds
+            .insert(acct_of(&oa), ORACLE_BOND_PERP);
+        eng.state
+            .oracle_bonds
+            .insert(acct_of(&ob), ORACLE_BOND_PERP);
+        let d1 = deposit(vec![tip], &alice, 1_000_000 * USD_SCALE as i128, 1);
+        tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![tip], &bob, 1_000_000 * USD_SCALE as i128, 2);
+        tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+
+        // Pair 1: reporters set the index at encode(12). No fill has set a
+        // mark yet: no payment, no collateral move, clock not armed.
+        let idx = operp_types::encode_funding_price(12);
+        let mark_px = operp_types::encode_funding_price(20);
+        // `report_unit` hardcodes BTC_USD; the peg market needs its reports
+        // to land on mkt.
+        let report_mkt = |parents: Vec<UnitId>, secret: &[u8; 32]| {
+            sign_unit(
+                parents,
+                Op::ReportPrice {
+                    oracle: acct_of(secret),
+                    market: mkt,
+                    price: idx,
+                },
+                secret,
+            )
+        };
+        let pre_long = eng.state.accounts[&acct_of(&alice)].collateral;
+        let pre_short = eng.state.accounts[&acct_of(&bob)].collateral;
+        for secret in [&oa, &ob] {
+            let r = report_mkt(vec![tip], secret);
+            tip = unit_id(&r);
+            eng.ingest(r).unwrap();
+        }
+        assert_eq!(eng.state.last_index.get(&mkt).copied(), Some(idx));
+        assert!(
+            !eng.state.marks.contains_key(&mkt),
+            "reports must not write the mark"
+        );
+        assert!(
+            !eng.state.last_funding_height.contains_key(&mkt),
+            "missing mark must not arm the peg clock"
+        );
+        assert_eq!(eng.state.accounts[&acct_of(&alice)].collateral, pre_long);
+        assert_eq!(eng.state.accounts[&acct_of(&bob)].collateral, pre_short);
+
+        // Fill at encode(20), qty exactly QTY_SCALE/100: sets the mark
+        // despite bonded reporters (the ±10% band and oracle lock are
+        // skipped) and arms the peg clock.
+        let ask = place_on(
+            vec![tip],
+            &bob,
+            mkt,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            mark_px,
+            QTY_SCALE / 100,
+            1,
+        );
+        tip = unit_id(&ask);
+        let evs = eng.ingest(ask).unwrap();
+        assert!(
+            evs.iter().all(|e| !matches!(e, ExecEvent::Rejected { .. })),
+            "ask rejected: {evs:?}"
+        );
+        let bid = place_on(
+            vec![tip],
+            &alice,
+            mkt,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            mark_px,
+            QTY_SCALE / 100,
+            1,
+        );
+        tip = unit_id(&bid);
+        let evs = eng.ingest(bid).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                ExecEvent::Applied { fills, .. } if !fills.is_empty()
+            )),
+            "no fill; events={evs:?}"
+        );
+        assert_eq!(eng.state.marks.get(&mkt).copied(), Some(mark_px));
+        assert_eq!(
+            eng.state.last_funding_height.get(&mkt).copied(),
+            Some(eng.state.height),
+            "the fill must arm the peg clock at its own height"
+        );
+
+        // After a full peg interval, the next report pair settles.
+        eng.state.height += operp_types::FUNDING_PEG_INTERVAL_HEIGHTS;
+        let pay_height = eng.state.height;
+        let pre_long = eng.state.accounts[&acct_of(&alice)].collateral;
+        let pre_short = eng.state.accounts[&acct_of(&bob)].collateral;
+        for secret in [&oa, &ob] {
+            let r = report_mkt(vec![tip], secret);
+            tip = unit_id(&r);
+            eng.ingest(r).unwrap();
+        }
+        let diff_bps = ((mark_px as i128 - idx as i128) / operp_types::FUNDING_BPS_UNIT as i128)
+            .clamp(
+                -(operp_types::FUNDING_CAP_BPS as i128),
+                operp_types::FUNDING_CAP_BPS as i128,
+            );
+        assert_eq!(diff_bps, 8, "rate-domain diff: (20-12) bps");
+        let expected =
+            operp_types::signed_notional_usd((QTY_SCALE / 100) as i64, idx) * diff_bps / 10_000;
+        // Delta = change in collateral (post − pre): mark > index → long pays.
+        let long_delta = eng.state.accounts[&acct_of(&alice)].collateral - pre_long;
+        let short_delta = eng.state.accounts[&acct_of(&bob)].collateral - pre_short;
+        assert_eq!(long_delta, -expected, "long pays when mark > index");
+        assert_eq!(short_delta, expected, "short receives the negation");
+        assert_eq!(
+            eng.state.last_funding_height.get(&mkt).copied(),
+            Some(pay_height),
+            "the interval window advances the clock"
+        );
+
+        // One height later: no payment, no clock movement.
+        eng.state.height += 1;
+        let pre_long = eng.state.accounts[&acct_of(&alice)].collateral;
+        let pre_short = eng.state.accounts[&acct_of(&bob)].collateral;
+        for secret in [&oa, &ob] {
+            let r = report_mkt(vec![tip], secret);
+            tip = unit_id(&r);
+            eng.ingest(r).unwrap();
+        }
+        assert_eq!(eng.state.accounts[&acct_of(&alice)].collateral, pre_long);
+        assert_eq!(eng.state.accounts[&acct_of(&bob)].collateral, pre_short);
+        assert_eq!(
+            eng.state.last_funding_height.get(&mkt).copied(),
+            Some(pay_height),
+            "clock must not advance before the next interval"
+        );
+    }
+
+    #[test]
+    fn create_market_both_flags_risk_without_burn() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        let d = gov_dep(vec![g], &sk(1), CREATE_MARKET_FEE_PERP, 7);
+        let tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let mut symbol = [0u8; 16];
+        symbol[..6].copy_from_slice(b"BOTHFL");
+        let cm = sign_unit(
+            vec![tip],
+            Op::CreateMarket {
+                creator: acct_of(&sk(1)),
+                symbol,
+                tick_size: 1,
+                im_bps: 1000,
+                mm_bps: 500,
+                taker_fee_bps: 5,
+                keeper_reward_bps: 100,
+                spot_only: true,
+                funding_rate: true,
+            },
+            &sk(1),
+        );
+        let evs = eng.ingest(cm).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::Risk,
+                ..
+            }
+        )));
+        assert_eq!(eng.state.next_market_id, 2, "no market id allocated");
+        assert_eq!(
+            eng.state.perp_balances[&acct_of(&sk(1))],
+            CREATE_MARKET_FEE_PERP,
+            "listing fee must not burn"
+        );
+        assert_eq!(eng.state.perp_burned, 0);
+    }
+
+    #[test]
+    fn funding_peg_rate_series_pays_caps_and_keeps_clock() {
+        // Realistic funding-rate series through the peg: normal gap (long
+        // pays), zero gap (money frozen, clock still advances), peg break
+        // (diff clamped to ±FUNDING_CAP_BPS), and negative index rates.
+        let mut eng = activated_engine();
+        let g = genesis_id();
+        let d = gov_dep(vec![g], &sk(1), CREATE_MARKET_FEE_PERP, 7);
+        let mut tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let mut symbol = [0u8; 16];
+        symbol[..6].copy_from_slice(b"DEMOFR");
+        let cm = sign_unit(
+            vec![tip],
+            Op::CreateMarket {
+                creator: acct_of(&sk(1)),
+                symbol,
+                tick_size: 1,
+                im_bps: 1000,
+                mm_bps: 500,
+                taker_fee_bps: 5,
+                keeper_reward_bps: 100,
+                spot_only: false,
+                funding_rate: true,
+            },
+            &sk(1),
+        );
+        tip = unit_id(&cm);
+        eng.ingest(cm).unwrap();
+        let mkt = MarketId(2);
+        let alice = sk(2);
+        let bob = sk(3);
+        let oa = sk(5);
+        let ob = sk(6);
+        eng.state
+            .oracle_bonds
+            .insert(acct_of(&oa), ORACLE_BOND_PERP);
+        eng.state
+            .oracle_bonds
+            .insert(acct_of(&ob), ORACLE_BOND_PERP);
+        let d1 = deposit(vec![tip], &alice, 1_000_000 * USD_SCALE as i128, 1);
+        tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![tip], &bob, 1_000_000 * USD_SCALE as i128, 2);
+        tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+        let mark_px = operp_types::encode_funding_price(20);
+        let qty = (QTY_SCALE / 100) as i64;
+        let report_on = |tip: UnitId, secret: &[u8; 32], px: Price| {
+            sign_unit(
+                vec![tip],
+                Op::ReportPrice {
+                    oracle: acct_of(secret),
+                    market: mkt,
+                    price: px,
+                },
+                secret,
+            )
+        };
+        // Seed index at 12 bps (no mark yet), then fill at 20 bps → arm.
+        for s in [&oa, &ob] {
+            let r = report_on(tip, s, operp_types::encode_funding_price(12));
+            tip = unit_id(&r);
+            eng.ingest(r).unwrap();
+        }
+        let ask = place_on(
+            vec![tip],
+            &bob,
+            mkt,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            mark_px,
+            QTY_SCALE / 100,
+            1,
+        );
+        tip = unit_id(&ask);
+        eng.ingest(ask).unwrap();
+        let bid = place_on(
+            vec![tip],
+            &alice,
+            mkt,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            mark_px,
+            QTY_SCALE / 100,
+            1,
+        );
+        tip = unit_id(&bid);
+        eng.ingest(bid).unwrap();
+        assert_eq!(eng.state.marks.get(&mkt).copied(), Some(mark_px));
+        println!(
+            "armed: mark=20bps, index=12bps, height={}",
+            eng.state.height
+        );
+        for (i, idx_bps) in [12i64, 20, 520, -3].into_iter().enumerate() {
+            eng.state.height += operp_types::FUNDING_PEG_INTERVAL_HEIGHTS;
+            let h = eng.state.height;
+            let idx = operp_types::encode_funding_price(idx_bps);
+            let pre_long = eng.state.accounts[&acct_of(&alice)].collateral;
+            let pre_short = eng.state.accounts[&acct_of(&bob)].collateral;
+            for s in [&oa, &ob] {
+                let r = report_on(tip, s, idx);
+                tip = unit_id(&r);
+                eng.ingest(r).unwrap();
+            }
+            let diff = ((mark_px as i128 - idx as i128) / operp_types::FUNDING_BPS_UNIT as i128)
+                .clamp(
+                    -(operp_types::FUNDING_CAP_BPS as i128),
+                    operp_types::FUNDING_CAP_BPS as i128,
+                );
+            let expected = operp_types::signed_notional_usd(qty, idx) * diff / 10_000;
+            let long_delta = eng.state.accounts[&acct_of(&alice)].collateral - pre_long;
+            let short_delta = eng.state.accounts[&acct_of(&bob)].collateral - pre_short;
+            println!(
+                "round {i}: index={idx_bps:>4}bps  diff={diff:>3}bps  expected={expected:>8}  long_delta={long_delta:>8}  short_delta={short_delta:>8}  clock={:?}",
+                eng.state.last_funding_height.get(&mkt)
+            );
+            assert_eq!(long_delta, -expected, "round {i}: long delta vs formula");
+            assert_eq!(short_delta, expected, "round {i}: short delta vs formula");
+            assert_eq!(
+                eng.state.last_funding_height.get(&mkt).copied(),
+                Some(h),
+                "round {i}: clock must land on this height"
+            );
+        }
     }
 }

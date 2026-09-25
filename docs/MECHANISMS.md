@@ -100,7 +100,7 @@ Unit {
 | Liquidate | 7 | caller, target, market_le4 |
 | GovDeposit | 8 | account, amount_le16, aa_unit_32 |
 | GovWithdraw | 9 | account, amount_le16, nonce_le8 |
-| CreateMarket | 10 | creator, symbol16, tick_size_le8, im_bps_le8, mm_bps_le8, taker_fee_bps_le8, keeper_reward_bps_le8, spot_only_u8（0/1） |
+| CreateMarket | 10 | creator, symbol16, tick_size_le8, im_bps_le8, mm_bps_le8, taker_fee_bps_le8, keeper_reward_bps_le8, spot_only_u8（0/1）, funding_rate_u8（0/1） |
 | CreateProposal | 11 | creator, market_le4, key_u8（ParamKey）, value_le8 |
 | Vote | 12 | voter, proposal_id_le8, approve_u8（0/1） |
 | FinalizeProposal | 13 | caller, proposal_id_le8 |
@@ -352,6 +352,26 @@ TWAP；环空或最新样本超过 `FUNDING_EXTERNAL_MAX_STALENESS = 32` 个高�
 `UpdateExternalPrice` 均以 `NotFound` 驳回），有效报告数恒为 0，
 资金费永不触发。
 
+`funding_rate` 市场（§16.2，建时定死）走**外部费率 peg**，与上面的
+溢价模式正交（普通 perp 不变）：
+
+- **编码**：簿价从不是裸费率。stored price =
+  `FUNDING_PRICE_OFFSET(10^12) + rate_bps × FUNDING_BPS_UNIT(10^4)`，
+  恒正、0 bps 可表示，`price == 0` 仍保留"无效/市价单"语义。
+- **预言机只写 index**：报告仍过 zero/bond 过滤、写 `oracle_reports`/
+  history/`last_index`，但**不写 mark**（无 ±10% 钳位）、不跑溢价块、
+  不记 TWAP，随后走 `settle_funding_peg`。`UpdateExternalPrice` 不喂此 peg。
+- **fill 写 mark**：跳过 100 USD 下限、oracle 锁与 ±10% 带；`qty ≥
+  QTY_SCALE/100` 才无钳位写 `marks`，并顺带重评 peg。
+- **结算**（`settle_funding_peg`）：缺 index 或 mark → 不推进；新鲜报告
+  （`back().height + FUNDING_EXTERNAL_MAX_STALENESS > height` 的已质押者）
+  < 2 → 不付不推进；首窗只 arm `last_funding_height`；此后 `height ≥
+  last + FUNDING_PEG_INTERVAL_HEIGHTS(14_400)` 才结算（付款公式同上，
+  diff 改为**费率域** `clamp((mark−index)/FUNDING_BPS_UNIT, ±50)`——
+  两价均带 offset，除 index 会把现实费率差截断成 0），付完置位；`diff == 0`
+  仍推进时钟，`index == 0` 跳过不推进。`UpdateExternalPrice` 不参与。
+- meta 叶承诺 `last_funding_height` 时钟；时钟以高度计，不读墙钟。
+
 ### 6.3 dust 说明
 
 整数除法截断产生亚微美元残差，随交易数线性累积，经济上可忽略。
@@ -510,11 +530,12 @@ account_leaf = sha256("acct" ‖ id32 ‖ collateral_i128le16
                       ‖ perp_u128le16)
                # perp 取自 perp_balances（PERP 治理余额，§16），
                # 与 collateral 并列进入承诺
-book_leaf    = sha256(params_58B ‖ b"book" ‖ market_le4 ‖ [price_le8 ‖
+book_leaf    = sha256(params_59B ‖ b"book" ‖ market_le4 ‖ [price_le8 ‖
                (order_id32 ‖ remaining_le8)*]*)
-               # params_58B = symbol16 ‖ tick_size_le8 ‖ im_bps_le8
+               # params_59B = symbol16 ‖ tick_size_le8 ‖ im_bps_le8
                #   ‖ mm_bps_le8 ‖ taker_fee_bps_le8 ‖ keeper_reward_bps_le8
-               #   ‖ delisted_u8 ‖ spot_only_u8（定宽 58 字节）——市场参数本身成为被承诺
+               #   ‖ delisted_u8 ‖ spot_only_u8 ‖ funding_rate_u8（定宽 59 字节）
+               #   ——市场参数本身成为被承诺
                #   的共识状态；同时提交每一个价格档与每个活单，
                #   簿深度与参数都逃不过审计
 meta_leaf    = sha256(b"meta" ‖ height ‖ seq ‖ last_unit
@@ -523,6 +544,7 @@ meta_leaf    = sha256(b"meta" ‖ height ‖ seq ‖ last_unit
                       ‖ oracle_bonds ‖ oracle_unbonding ‖ oracle_slash_nonce
                       ‖ oracle_twap ‖ funding_twap ‖ funding_index_twap
                       ‖ external_price_ring ‖ external_sources
+                      ‖ last_funding_height(资金费 peg 时钟)
                       ‖ commits(commit-reveal) ‖ funding_source
                       ‖ oracle_configs ‖ oracle_reports
                       ‖ oracle_report_history
@@ -536,6 +558,9 @@ meta_leaf    = sha256(b"meta" ‖ height ‖ seq ‖ last_unit
 共识破坏记录（主网未发，无迁移）：`CreateMarket` canonical 尾部追加
 `spot_only_u8`；book 叶市场参数承诺 57B→58B；`Price` 由 u64 改为 i64
 （`tick_size` 同为 i64 但恒为正；`price == 0` 仍拒绝/忽略）。
+其后又追加 `funding_rate_u8`（tag 10 尾部）：book 叶参数 58B→59B、
+`meta_leaf` 在 `external_sources` 后提交 `last_funding_height`、
+snapshot 格式版本 1→2（v1 快照不再加载）。
 正数 canonical 字节逐字节不变。
 
 meta_leaf 绑定 height（from_applied 先把 engine.state.height 推到
@@ -783,7 +808,7 @@ asset id。发币时只需改一个常量并重新部署 AA。
 **CreateMarket**（tag 10）：任何人可上架，代价是烧毁
 `CREATE_MARKET_FEE_PERP = 10_000` PERP 上架费。市场参数随 op 提交
 （symbol、tick_size、im_bps、mm_bps、taker_fee_bps、keeper_reward_bps、
-`spot_only`），
+`spot_only`、`funding_rate`），
 存入 `markets[market_id]`——IM/MM/taker fee/keeper 奖励从全局常量变为
 **每市场参数**（§4.2/§5.2/§6.1 相应改为读参数）。除 tick_size 或任一 bps
 为 0 → Risk 拒绝外，还有一层硬上限（exec `create_market`）：任一 bps
@@ -794,6 +819,14 @@ asset id。发币时只需改一个常量并重新部署 AA。
 `spot_only` 建时定死：无 `ParamKey` 可翻转。`true` 的市场为纯合约/meme
 市场——拒收一切报价（双通道 `NotFound`，见 §6.2）、永无资金费；
 成交仍可定 mark（首笔合格 fill 写 `marks`）。可 delist 照旧（与 spot 正交）。
+
+`funding_rate` 同样建时定死、无 `ParamKey` 翻转：资金费率市场，簿价是
+外部交易所资金费率的编码价（`encode_funding_price`，offset 域内恒正，
+0 bps 可表示）。报价只写 `last_index`（不写 mark、不进 ±10% 钳位、不记
+TWAP）；fill 写 mark（≥ 1% 数量，无钳位）；资金费按 peg 结算——需
+index+mark+2 份新鲜报告才启动 `last_funding_height` 时钟，此后每
+14_400 高度至多结算一次（`settle_funding_peg`）。与 `spot_only` 互斥：
+两者同时为 true → `Risk` 拒绝（烧费之前）。
 
 delisted 市场（见 16.3 Delist 提案）拒绝新挂单；撤单与清算平仓仍允许
 (清算路径不经 place 校验)。MVP 不做强制拍卖：存量仓位只能平仓或被清算。
