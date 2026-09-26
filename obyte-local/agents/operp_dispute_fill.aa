@@ -160,7 +160,7 @@
 						OR trigger.data.pre_meta_proof.root != $pre_wit)
 						bounce('bad pre meta proof');
 					$M = split($pre_meta, ':');
-					if (array_length($M) != 9 OR $M[1] != $market) bounce('bad pre meta');
+					if (array_length($M) != 11 OR $M[1] != $market) bounce('bad pre meta');
 					$fee_bps = $M[5] + 0;
 					// Oscript / is Decimal division; Rust truncates each step.
 					// floor() restores truncation (all legs non-negative here).
