@@ -17,6 +17,12 @@ pub const OBYTE_MERKLE_ROOT_LEN: usize = 44;
 pub const WIT_EMPTY_ELEMENT: &str = "empty";
 pub const IM_RATE_BPS: u64 = 1000;
 pub const MM_RATE_BPS: u64 = 500;
+/// Minimum equity required to open any new position: $1. Below this an
+/// "open" order carries no real collateral behind its IM estimate.
+pub const MIN_OPEN_EQUITY: Usd = USD_SCALE as Usd;
+/// Live resting-order cap per account across all books. Bounds the
+/// resting-order IM reservation loop and book bloat per account.
+pub const MAX_LIVE_ORDERS_PER_ACCOUNT: usize = 64;
 pub const LIQ_RATIO_BPS: u64 = 10_500;
 pub const REDUCE_ONLY_RATIO_BPS: u64 = 12_000;
 /// Taker fee (bps of notional), routed to the insurance fund so it has
@@ -38,6 +44,11 @@ pub const FUNDING_BPS_UNIT: Price = (PRICE_SCALE / 10_000) as Price;
 /// Funding-rate markets settle the peg at most once per this many heights
 /// (deterministic height counter, never a wall clock).
 pub const FUNDING_PEG_INTERVAL_HEIGHTS: Height = 14_400;
+/// Freshness grace for peg settlement reporters: a report counts as fresh
+/// when it is at most this many heights old. Wider than the external-index
+/// staleness window so one silent reporter cannot freeze settlement for a
+/// full peg interval.
+pub const FUNDING_PEG_FRESH_GRACE_HEIGHTS: Height = 14_400;
 
 /// Encode a funding rate in bps into the stored (offset) price domain.
 pub fn encode_funding_price(rate_bps: i64) -> Price {
@@ -191,13 +202,40 @@ pub type Seq = u64;
 pub type Height = u64;
 pub type Bps = u64;
 
+/// Single listing/param-update gate for the four market risk parameters.
+/// Funding-cap linkage (`im_bps >= 10 * FUNDING_CAP_BPS`) is kept as its own
+/// conjunct so it does not silently disappear if the MM floor moves.
+pub fn risk_params_ok(
+    im_bps: Bps,
+    mm_bps: Bps,
+    taker_fee_bps: Bps,
+    keeper_reward_bps: Bps,
+) -> bool {
+    im_bps != 0
+        && mm_bps != 0
+        && taker_fee_bps != 0
+        && keeper_reward_bps != 0
+        && im_bps <= 10_000
+        && mm_bps <= 10_000
+        && taker_fee_bps <= 10_000
+        && keeper_reward_bps <= 10_000
+        && im_bps > mm_bps
+        && mm_bps >= 500
+        && im_bps <= 5000
+        && taker_fee_bps <= 200
+        && keeper_reward_bps <= 500
+        && im_bps >= 10 * (FUNDING_CAP_BPS as u64)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MarketId(pub u32);
 
 pub const BTC_USD: MarketId = MarketId(1);
 /// Insurance fund vault account (sidechain-internal). Seeded at genesis.
 pub const INSURANCE_ACCOUNT: AccountId = AccountId([0u8; 32]);
-/// Keeper reward paid from the insurance fund on successful liquidation fill.
+/// Keeper reward paid on successful liquidation fill, seized from the
+/// liquidatee's collateral (capped at its positive balance); the insurance
+/// fund only absorbs negative equity.
 pub const KEEPER_REWARD_BPS: u64 = 100;
 /// Genesis seed collateral of the insurance fund: 10_000 USD.
 pub const INSURANCE_SEED: Usd = 10_000 * USD_SCALE as Usd;

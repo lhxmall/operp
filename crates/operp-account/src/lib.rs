@@ -1,6 +1,6 @@
 use operp_types::{
-    bps, notional_usd, signed_notional_usd, AccountId, MarketId, Price, Qty, Side, Usd,
-    IM_RATE_BPS, LIQ_RATIO_BPS, MM_RATE_BPS, PRICE_SCALE, QTY_SCALE, REDUCE_ONLY_RATIO_BPS,
+    bps, notional_usd, signed_notional_usd, AccountId, MarketId, MarketParams, Price, Qty, Side,
+    Usd, IM_RATE_BPS, LIQ_RATIO_BPS, MM_RATE_BPS, PRICE_SCALE, QTY_SCALE, REDUCE_ONLY_RATIO_BPS,
     USD_SCALE,
 };
 use std::collections::BTreeMap;
@@ -139,7 +139,11 @@ impl Account {
         Ok(())
     }
 
-    pub fn snapshot(&self, marks: &BTreeMap<MarketId, Price>) -> RiskSnapshot {
+    pub fn snapshot(
+        &self,
+        marks: &BTreeMap<MarketId, Price>,
+        params: &BTreeMap<MarketId, MarketParams>,
+    ) -> RiskSnapshot {
         let mut upnl: Usd = 0;
         let mut mm: Usd = 0;
         let mut im: Usd = 0;
@@ -155,11 +159,15 @@ impl Account {
                     continue;
                 }
             };
+            // Per-market margin rates; a market absent from the map (stale
+            // book, e.g. unit tests) falls back to the genesis rates.
+            let im_bps = params.get(m).map(|p| p.im_bps).unwrap_or(IM_RATE_BPS);
+            let mm_bps = params.get(m).map(|p| p.mm_bps).unwrap_or(MM_RATE_BPS);
             upnl +=
                 signed_notional_usd(pos.qty, mark) - signed_notional_usd(pos.qty, pos.entry_price);
             let abs_n = notional_usd(pos.qty.unsigned_abs(), mark).abs();
-            mm += bps(abs_n, MM_RATE_BPS);
-            im += bps(abs_n, IM_RATE_BPS);
+            mm += bps(abs_n, mm_bps);
+            im += bps(abs_n, im_bps);
         }
         // Realized PnL settles into `collateral` at close time, so equity is
         // collateral + unrealized. realized_pnl is a cumulative stat only.
@@ -199,6 +207,7 @@ impl Account {
         &mut self,
         amount: Usd,
         marks: &BTreeMap<MarketId, Price>,
+        params: &BTreeMap<MarketId, MarketParams>,
     ) -> Result<(), AccountError> {
         if amount <= 0 {
             return Err(AccountError::NonPositive);
@@ -207,7 +216,7 @@ impl Account {
             return Err(AccountError::Insufficient);
         }
         self.collateral -= amount;
-        let snap = self.snapshot(marks);
+        let snap = self.snapshot(marks, params);
         if snap.reduce_only {
             self.collateral += amount;
             return Err(AccountError::Insufficient);
@@ -264,8 +273,12 @@ mod tests {
             BTC_USD,
         )
         .unwrap();
-        let before = a.snapshot(&marks(100_000 * PRICE_SCALE as i64)).equity;
-        let after = a.snapshot(&marks(110_000 * PRICE_SCALE as i64)).equity;
+        let before = a
+            .snapshot(&marks(100_000 * PRICE_SCALE as i64), &BTreeMap::new())
+            .equity;
+        let after = a
+            .snapshot(&marks(110_000 * PRICE_SCALE as i64), &BTreeMap::new())
+            .equity;
         assert!(after > before);
     }
     #[test]
@@ -281,7 +294,7 @@ mod tests {
         )
         .unwrap();
         // Long 1 @ -100k, mark -90k: upnl = (-90k) - (-100k) = +10k.
-        let s = a.snapshot(&marks(-90_000 * PRICE_SCALE as i64));
+        let s = a.snapshot(&marks(-90_000 * PRICE_SCALE as i64), &BTreeMap::new());
         assert_eq!(s.equity, 110_000 * USD_SCALE as i128);
         // Margin is charged on |notional| = 90k: mm = 5% = 4500, im = 9000.
         assert_eq!(s.mm, 4_500 * USD_SCALE as i128);
@@ -338,7 +351,8 @@ mod tests {
         .unwrap();
         let m = marks(110_000 * PRICE_SCALE as i64);
         // Full balance (deposit + settled profit) is withdrawable.
-        a.debit(20_000 * USD_SCALE as i128, &m).unwrap();
+        a.debit(20_000 * USD_SCALE as i128, &m, &BTreeMap::new())
+            .unwrap();
         assert_eq!(a.collateral, 0);
     }
     #[test]
@@ -353,16 +367,16 @@ mod tests {
         )
         .unwrap();
         let mark = 2_000 * PRICE_SCALE as i64;
-        let mm = a.snapshot(&marks(mark)).mm;
+        let mm = a.snapshot(&marks(mark), &BTreeMap::new()).mm;
         assert_eq!(mm, 100 * USD_SCALE as i128);
         a.collateral = 105 * USD_SCALE as i128;
-        let s = a.snapshot(&marks(mark));
+        let s = a.snapshot(&marks(mark), &BTreeMap::new());
         assert!(s.liquidatable);
         a.collateral = 104 * USD_SCALE as i128;
-        let s = a.snapshot(&marks(mark));
+        let s = a.snapshot(&marks(mark), &BTreeMap::new());
         assert!(s.liquidatable);
         a.collateral = 106 * USD_SCALE as i128;
-        let s = a.snapshot(&marks(mark));
+        let s = a.snapshot(&marks(mark), &BTreeMap::new());
         assert!(!s.liquidatable);
     }
 
@@ -379,9 +393,9 @@ mod tests {
         )
         .unwrap();
         let m = marks(100 * PRICE_SCALE as i64);
-        let s = a.snapshot(&m);
+        let s = a.snapshot(&m, &BTreeMap::new());
         assert!(s.reduce_only);
-        assert!(a.debit(1, &m).is_err());
+        assert!(a.debit(1, &m, &BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -398,7 +412,7 @@ mod tests {
         .unwrap();
         // Empty marks map: the position's market has no mark.
         let empty = BTreeMap::new();
-        let s = a.snapshot(&empty);
+        let s = a.snapshot(&empty, &BTreeMap::new());
         // Equity undistorted (no phantom full-notional loss for the long).
         assert_eq!(s.equity, 10_000 * USD_SCALE as i128);
         assert_eq!(s.mm, 0);
