@@ -169,8 +169,8 @@ fn dump_if_reject(
     let Some(reason) = rej else { return false };
     let sa = eng.state.accounts.get(&a).unwrap();
     let sb = eng.state.accounts.get(&b).unwrap();
-    let na = sa.snapshot(&eng.state.marks);
-    let nb = sb.snapshot(&eng.state.marks);
+    let na = sa.snapshot(&eng.state.marks, &eng.state.markets);
+    let nb = sb.snapshot(&eng.state.marks, &eng.state.markets);
     let pa = sa.positions.get(&BTC_USD);
     let pb = sb.positions.get(&BTC_USD);
     let book = &eng.state.books[&BTC_USD];

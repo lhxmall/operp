@@ -1,9 +1,10 @@
 pub use operp_account::Account;
 use operp_book::{Fill, OrderBook};
 use operp_types::{
-    bps, genesis_params, notional_usd, sha256, AccountId, ExternalSample, FundingSourceKind,
-    Height, MarketId, MarketParams, OracleConfig, Price, ReportSample, Seq, TwapSample, UnitId,
-    Usd, BTC_USD, FUNDING_EXTERNAL_MAX_STALENESS, FUNDING_TWAP_MIN_SAMPLES, FUNDING_TWAP_WINDOW,
+    bps, funding_rate_bps, genesis_params, notional_usd, sha256, AccountId, ExternalSample,
+    FundingSourceKind, Height, MarketId, MarketParams, OracleConfig, Price, ReportSample, Seq,
+    TwapSample, UnitId, Usd, BTC_USD, FUNDING_EXTERNAL_MAX_STALENESS,
+    FUNDING_PEG_FRESH_GRACE_HEIGHTS, FUNDING_TWAP_MIN_SAMPLES, FUNDING_TWAP_WINDOW,
     INSURANCE_ACCOUNT, INSURANCE_SEED, PRICE_SCALE, USD_SCALE,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -97,8 +98,10 @@ pub struct ChainState {
     pub external_price_ring: BTreeMap<MarketId, VecDeque<ExternalSample>>,
     /// Keeper accounts allowed to post `UpdateExternalPrice` (governed).
     pub external_sources: BTreeSet<AccountId>,
-    /// Funding-rate peg clock: height of the last settled (or first armed)
-    /// peg window per funding-rate market. Empty for every other market.
+    /// Funding settlement clock per market. Non-peg markets store the
+    /// height of the last funding consideration (dedupe: pay once per
+    /// height); peg markets store their settlement-interval clock. Empty
+    /// means that market has never considered funding.
     pub last_funding_height: BTreeMap<MarketId, Height>,
 }
 
@@ -364,8 +367,7 @@ impl ChainState {
         if last.height + FUNDING_EXTERNAL_MAX_STALENESS <= self.height {
             return None;
         }
-        let sum: u128 = q.iter().map(|s| s.price as u128).sum();
-        Some((sum / q.len() as u128) as Price)
+        Self::mean_price(q.iter().map(|s| s.price), q.len())
     }
 
     /// Bounded cleanup for expired commit-reveal commitments: entries whose
@@ -375,13 +377,31 @@ impl ChainState {
         self.commits.retain(|_, e| e.ttl_height >= min_height);
     }
 
+    /// Signed mean over at most `FUNDING_TWAP_WINDOW` `i64` samples. The
+    /// `i128` sum cannot overflow (window cap 1800); `try_from` is only the
+    /// backstop. Returns `None` on `n == 0` or an impossible conversion —
+    /// never panics, never substitutes `0`.
+    fn mean_price(samples: impl Iterator<Item = i64>, n: usize) -> Option<Price> {
+        if n == 0 {
+            return None;
+        }
+        let sum: i128 = samples.map(i128::from).sum();
+        i64::try_from(sum / n as i128).ok()
+    }
+
+    /// Mark must stay within ±10% of the funding index (the external
+    /// anchor): anchor 0 means no index exists, so nothing to anchor to.
+    fn within_band(candidate: Price, anchor: Price) -> bool {
+        anchor == 0
+            || (i128::from(candidate) - i128::from(anchor)).abs() <= i128::from(anchor).abs() / 10
+    }
+
     pub fn compute_twap(&self, market: MarketId) -> Option<Price> {
         let q = self.oracle_twap.get(&market)?;
         if q.len() < 2 {
             return None;
         }
-        let sum: u128 = q.iter().map(|s| s.median as u128).sum();
-        Some((sum / q.len() as u128) as Price)
+        Self::mean_price(q.iter().map(|s| s.median), q.len())
     }
 
     pub fn compute_funding_twap(&self, market: MarketId) -> Option<Price> {
@@ -389,8 +409,7 @@ impl ChainState {
         if q.len() < 2 {
             return None;
         }
-        let sum: u128 = q.iter().map(|s| s.median as u128).sum();
-        Some((sum / q.len() as u128) as Price)
+        Self::mean_price(q.iter().map(|s| s.median), q.len())
     }
     pub fn effective_funding_index(&self, market: MarketId, median: Price) -> Price {
         if self.height < operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT {
@@ -623,20 +642,22 @@ impl ChainState {
         // reporter consensus even while the spot mark lags behind the cap.
         self.last_index.insert(market, median);
         // Funding-rate markets: the oracle writes the index only. The mark
-        // comes from fills, so the ±10% band, the premium block, and the
-        // TWAP sample are all skipped; funding settles as the peg instead.
+        // comes from fills, so the ±10% band and the premium block are
+        // skipped; funding settles as the peg instead. The TWAP ring is
+        // still recorded so slash sees the reporter's sample.
         if self
             .markets
             .get(&market)
             .map(|p| p.funding_rate)
             .unwrap_or(false)
         {
+            self.record_twap_sample(market, median, caller_seq);
             self.settle_funding_peg(market);
             return Ok(());
         }
         // Signed marks: the ±10% band is measured on the old mark's
         // magnitude, so a negative mark can still move by capped steps.
-        let capped = match self.marks.get(&market) {
+        let mut capped = match self.marks.get(&market) {
             Some(&old) if old != 0 => {
                 let dev = (median as i128 - old as i128).abs();
                 if dev <= (old as i128).abs() / 10 {
@@ -647,6 +668,20 @@ impl ChainState {
             }
             _ => median,
         };
+        // Index band: a median outside ±10% of the funding index must not
+        // become the mark. Keep the previous mark if one exists (do not
+        // walk a legacy out-of-band mark toward the index); with no mark,
+        // bootstrap directly to the index rather than the out-of-band
+        // median.
+        let index = self.effective_funding_index(market, median);
+        if index != 0 && !Self::within_band(capped, index) {
+            capped = self
+                .marks
+                .get(&market)
+                .copied()
+                .filter(|p| *p != 0)
+                .unwrap_or(index);
+        }
         self.marks.insert(market, capped);
         // Record TWAP sample after median update
         self.record_twap_sample(market, median, caller_seq);
@@ -660,12 +695,20 @@ impl ChainState {
             let index = funding_index as i128;
             let spot = capped as i128;
             if index != 0 {
-                let diff_bps = ((spot - index) * 10_000 / index).clamp(
-                    -(operp_types::FUNDING_CAP_BPS as i128),
-                    operp_types::FUNDING_CAP_BPS as i128,
-                );
-                if diff_bps != 0 {
-                    self.transfer_funding(market, funding_index, diff_bps);
+                // Pay at most once per height: reporters report in batch at
+                // the same height, and a non-zero premium must not transfer
+                // again for every report tick at that height.
+                if self.last_funding_height.get(&market) != Some(&self.height) {
+                    let diff_bps = ((spot - index) * 10_000 / index).clamp(
+                        -(operp_types::FUNDING_CAP_BPS as i128),
+                        operp_types::FUNDING_CAP_BPS as i128,
+                    );
+                    if diff_bps != 0 {
+                        self.transfer_funding(market, funding_index, diff_bps);
+                    }
+                    // Record consideration even when diff_bps == 0: a later
+                    // report at this height must not pay either.
+                    self.last_funding_height.insert(market, self.height);
                 }
             }
         }
@@ -725,7 +768,9 @@ impl ChainState {
     /// Funding-rate peg settlement for a `funding_rate` market:
     /// - needs both an oracle index and a fill-written mark, else no-op;
     /// - needs at least 2 bonded reporters with a history sample fresher
-    ///   than `FUNDING_EXTERNAL_MAX_STALENESS`, else no-op;
+    ///   than `FUNDING_PEG_FRESH_GRACE_HEIGHTS`, else no-op (the grace is a
+    ///   full peg interval, so one reporter silent right after arming still
+    ///   settles; beyond the grace the freeze is unchanged);
     /// - the first fully-armed window arms `last_funding_height` and pays
     ///   nothing; every window at least `FUNDING_PEG_INTERVAL_HEIGHTS` after
     ///   the armed height pays (diff clamped to ±FUNDING_CAP_BPS) and re-arms;
@@ -745,7 +790,7 @@ impl ChainState {
             .filter(|((m, o), _)| *m == market && self.oracle_bonds.contains_key(o))
             .filter(|((_, _), q)| {
                 q.back()
-                    .map(|s| s.height + FUNDING_EXTERNAL_MAX_STALENESS > height)
+                    .map(|s| s.height + FUNDING_PEG_FRESH_GRACE_HEIGHTS > height)
                     .unwrap_or(false)
             })
             .count();
@@ -834,7 +879,7 @@ impl ChainState {
             }
             let shortfall = {
                 let s = match self.accounts.get(&party) {
-                    Some(a) => a.snapshot(&self.marks),
+                    Some(a) => a.snapshot(&self.marks, &self.markets),
                     None => continue,
                 };
                 if s.equity < 0 {
@@ -854,16 +899,35 @@ impl ChainState {
                 ins.collateral -= shortfall;
             }
         }
-        // Funding-rate markets: fills are the mark source. The 100 USD gate,
-        // the oracle lock, and the ±10% band are all skipped; tiny fills
-        // (< 1% notional) leave the mark untouched.
+        // Funding-rate markets: fills are the mark source. Guards: the
+        // notional must be >= 100 USD (dust cannot move the peg) and the
+        // printed rate must step from the current anchor — bootstrapping
+        // from the index, then ≤10% of the old rate (min 1 bps) per fill.
         if self
             .markets
             .get(&fill.market)
             .map(|p| p.funding_rate)
             .unwrap_or(false)
         {
-            if fill.qty >= operp_types::QTY_SCALE / 100 {
+            let notional_ok = notional_usd(fill.qty, fill.price).abs() >= 100 * USD_SCALE as i128;
+            if !notional_ok {
+                return Ok(());
+            }
+            let old = self.marks.get(&fill.market).copied().unwrap_or(0);
+            let step_ok = if old != 0 {
+                let step = (funding_rate_bps(old).unsigned_abs() / 10).max(1) as i64;
+                (funding_rate_bps(fill.price) - funding_rate_bps(old)).abs() <= step
+            } else {
+                // Bootstrap: anchor the first print to the reporter index.
+                match self.last_index.get(&fill.market).copied() {
+                    Some(index) if index != 0 => {
+                        (funding_rate_bps(fill.price) - funding_rate_bps(index)).abs()
+                            <= operp_types::FUNDING_CAP_BPS
+                    }
+                    _ => false,
+                }
+            };
+            if step_ok {
                 self.marks.insert(fill.market, fill.price);
                 // The mark just moved: re-evaluate the peg so its interval
                 // clock arms as soon as index + mark + fresh reports exist.
@@ -881,18 +945,30 @@ impl ChainState {
                 .keys()
                 .any(|(m, o)| *m == fill.market && self.oracle_bonds.contains_key(o))
         {
-            let capped = match self.marks.get(&fill.market) {
-                Some(&old) if old != 0 => {
-                    let dev = (fill.price as i128 - old as i128).abs();
-                    if dev <= (old as i128).abs() / 10 {
-                        fill.price
-                    } else {
-                        old
+            // Unoracled freeze: the first qualifying fill sets the mark
+            // unconditionally, but once a non-zero mark exists only a real
+            // reporter index (`last_index`) may keep it moving — otherwise
+            // every trade walks the mark ±10% with no external anchor.
+            let has_index = self
+                .last_index
+                .get(&fill.market)
+                .map(|i| *i != 0)
+                .unwrap_or(false);
+            let existing = self.marks.get(&fill.market).copied().unwrap_or(0);
+            if existing == 0 || has_index {
+                let capped = match existing {
+                    old if old != 0 => {
+                        let dev = (fill.price as i128 - old as i128).abs();
+                        if dev <= (old as i128).abs() / 10 {
+                            fill.price
+                        } else {
+                            old
+                        }
                     }
-                }
-                _ => fill.price,
-            };
-            self.marks.insert(fill.market, capped);
+                    _ => fill.price,
+                };
+                self.marks.insert(fill.market, capped);
+            }
         }
         Ok(())
     }
@@ -1081,8 +1157,9 @@ fn meta_leaf(state: &ChainState) -> [u8; 32] {
     for acct in &state.external_sources {
         b.extend_from_slice(&acct.0);
     }
-    // Funding-rate peg clock: per-market last settled (or first armed) peg
-    // height, so replays cannot diverge on which windows have settled.
+    // Funding settlement clock: per-market last-considered height (non-peg
+    // dedupe) or peg interval clock, so replays cannot diverge on which
+    // heights/windows settled.
     b.extend_from_slice(&(state.last_funding_height.len() as u32).to_le_bytes());
     for (m, h) in &state.last_funding_height {
         b.extend_from_slice(&m.0.to_le_bytes());
@@ -1513,6 +1590,73 @@ mod tests {
     use operp_types::USD_SCALE;
 
     #[test]
+    fn mean_price_signed_samples_do_not_overflow() {
+        let mut s = ChainState::new();
+        // Negative medians: the pre-fix `u128` cast wrapped in release and
+        // panicked on overflow in debug (`cargo test` is debug).
+        let q = s.oracle_twap.entry(BTC_USD).or_default();
+        for (seq, median) in [(1, -100), (2, -300)] {
+            q.push_back(TwapSample {
+                seq,
+                height: 0,
+                median,
+            });
+        }
+        assert_eq!(s.compute_twap(BTC_USD), Some(-200));
+        // Empty / single-sample rings stay None instead of dividing by zero.
+        assert_eq!(s.compute_twap(operp_types::MarketId(9)), None);
+    }
+
+    #[test]
+    fn peg_mark_band_rejects_dust_and_wild_steps() {
+        use operp_types::{encode_funding_price, QTY_SCALE};
+        let mut s = ChainState::new();
+        // A fresh funding-rate market (no genesis mark) with a 12 bps
+        // reporter index.
+        let m = operp_types::MarketId(2);
+        let mut params = s.markets[&BTC_USD];
+        params.funding_rate = true;
+        s.markets.insert(m, params);
+        s.last_index.insert(m, encode_funding_price(12));
+        let taker = AccountId([9; 32]);
+        let maker = AccountId([8; 32]);
+        for id in [taker, maker] {
+            s.account_mut(id)
+                .credit(10_000_000 * USD_SCALE as i128)
+                .unwrap();
+        }
+        let mk_fill = |price: Price, qty: operp_types::Qty| Fill {
+            taker_id: operp_types::OrderId([0u8; 32]),
+            maker_id: operp_types::OrderId([0u8; 32]),
+            taker,
+            maker,
+            market: m,
+            price,
+            qty,
+            seq: 1,
+            taker_side: operp_types::Side::Bid,
+        };
+        // Raw price 500 with qty >= QTY_SCALE/100 (the old gate's shape):
+        // degenerate rate and negligible notional — mark never appears.
+        s.apply_fill_pair(&mk_fill(500, QTY_SCALE / 100)).unwrap();
+        assert!(s.marks.get(&m).is_none_or(|p| *p == 0));
+        // Bootstrap: encode(20) after index 12 — gap 8 <= FUNDING_CAP_BPS
+        // arms the first mark.
+        s.apply_fill_pair(&mk_fill(encode_funding_price(20), QTY_SCALE))
+            .unwrap();
+        assert_eq!(s.marks.get(&m).copied(), Some(encode_funding_price(20)));
+        // encode(5000): step would be 4980 bps vs max(20/10, 1) = 2 —
+        // rejected, mark untouched.
+        s.apply_fill_pair(&mk_fill(encode_funding_price(5_000), QTY_SCALE))
+            .unwrap();
+        assert_eq!(s.marks.get(&m).copied(), Some(encode_funding_price(20)));
+        // A 1 bps step is always allowed (min step 1).
+        s.apply_fill_pair(&mk_fill(encode_funding_price(21), QTY_SCALE))
+            .unwrap();
+        assert_eq!(s.marks.get(&m).copied(), Some(encode_funding_price(21)));
+    }
+
+    #[test]
     fn merkle_proof_roundtrip() {
         let mut s = ChainState::new();
         let id = AccountId([1; 32]);
@@ -1576,6 +1720,10 @@ mod tests {
             taker_side: operp_types::Side::Bid,
         };
         // +200% spike: rejected by the ±10% cap — mark stays at genesis.
+        // The unoracled freeze needs a reporter index for a non-zero mark to
+        // move at all; this test exercises the band itself, so seed one.
+        s.last_index
+            .insert(BTC_USD, 100_000 * operp_types::PRICE_SCALE as i64);
         s.apply_fill_pair(&mk_fill(300_000 * operp_types::PRICE_SCALE as i64))
             .unwrap();
         assert_eq!(

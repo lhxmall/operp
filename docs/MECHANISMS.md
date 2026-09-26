@@ -249,14 +249,15 @@ O(log depth)。
 
 ```
 upnl   = Σ signed_notional(qty, mark) − signed_notional(qty, entry)
-mm     = Σ bps(|qty·mark|, 500)          # 5%
-im     = Σ bps(|qty·mark|, 1000)         # 10%
+mm     = Σ bps(|qty·mark|, market.mm_bps)    # 创世默认 500
+im     = Σ bps(|qty·mark|, market.im_bps)    # 创世默认 1000
 equity = collateral + upnl               # PnL 已结算进 collateral
 liquidatable : mm>0 ∧ equity×10000 ≤ mm×10500   # ≤1.05
 reduce_only  : has_unmarked ∨ (mm>0 ∧ equity×10000 ≤ mm×12000)  # ≤1.20
 ```
 IM/MM 为**每市场参数**（创世市场默认 500/1000 bps，新市场随 CreateMarket
-提交，§16.2）。
+提交，§16.2；快照按仓位所在市场取 `im_bps`/`mm_bps`，市场不在表中时回退
+全局默认）。
 
 无 mark 仓位：不计入 upnl/mm/im 且强制 reduce_only。否则 mark=0 给多头
 记全额虚亏（可提光）、给空头记全额虚利（可无限加仓）。
@@ -296,8 +297,10 @@ Liquidate { caller, target, market }（caller 签名绑定）:
 ### 5.2 keeper 奖励
 
 reward = Σ bps(每笔成交名义额, KEEPER_REWARD_BPS=100)
-pay    = min(reward, max(insurance.collateral, 0))
-基金枯竭时清算仍发生，keeper 暂无酬但不阻塞清算。
+pay    = min(reward, max(target.collateral, 0))
+奖励从**被清算方抵押**中扣除（以其正余额为上限）；被清算方无正余额时
+keeper 拿 0，但清算仍发生、不被阻塞。保险基金只在 apply_fill_pair 内吸收
+负权益，不为奖励出资。
 keeper 奖励 bps 为**每市场参数**（创世市场默认 100，新市场随 CreateMarket
 提交，§16.2）。
 
@@ -329,7 +332,8 @@ taker fee bps 为**每市场参数**（创世市场默认 5，新市场随 Creat
 §16.2）。
 
 ### 6.2 资金费率（多空互付）
-每次预言机报告触发结算（该市场有效报告数 ≥ 2 时，§7）：
+有效报告数 ≥ 2 时**每高度至多结算一次**（§7；同高度后续报告跳过，
+`last_funding_height` 记该高度，diff == 0 也记）：
 index = 该市场全部已质押报价者最新报价的**中位数**（未钳位）
 spot  = 钳位后的 marks[market]
 diff_bps = clamp((spot−index)×10000/index, ±FUNDING_CAP_BPS=50)
@@ -359,13 +363,17 @@ TWAP；环空或最新样本超过 `FUNDING_EXTERNAL_MAX_STALENESS = 32` 个高�
   `FUNDING_PRICE_OFFSET(10^12) + rate_bps × FUNDING_BPS_UNIT(10^4)`，
   恒正、0 bps 可表示，`price == 0` 仍保留"无效/市价单"语义。
 - **预言机只写 index**：报告仍过 zero/bond 过滤、写 `oracle_reports`/
-  history/`last_index`，但**不写 mark**（无 ±10% 钳位）、不跑溢价块、
-  不记 TWAP，随后走 `settle_funding_peg`。`UpdateExternalPrice` 不喂此 peg。
-- **fill 写 mark**：跳过 100 USD 下限、oracle 锁与 ±10% 带；`qty ≥
-  QTY_SCALE/100` 才无钳位写 `marks`，并顺带重评 peg。
+  history/`last_index`，但**不写 mark**（无 ±10% 钳位）、不跑溢价块；
+  TWAP 环照记（slash 判罚依赖 `oracle_twap` 样本），随后走
+  `settle_funding_peg`。`UpdateExternalPrice` 不喂此 peg。
+- **fill 写 mark**：`notional_usd ≥ 100 USD` 且费率步进合法才写
+  `marks`——首个 mark 要求已存在非零 `last_index` 且费率与 index 差 ≤
+  `FUNDING_CAP_BPS`（自举）；已有 mark 时只允许 ≤ max(|旧费率|/10, 1)
+  bps 的步进。写入后顺带重评 peg；步进不合法则 mark 与 peg 均不动。
 - **结算**（`settle_funding_peg`）：缺 index 或 mark → 不推进；新鲜报告
-  （`back().height + FUNDING_EXTERNAL_MAX_STALENESS > height` 的已质押者）
-  < 2 → 不付不推进；首窗只 arm `last_funding_height`；此后 `height ≥
+  （`back().height + FUNDING_PEG_FRESH_GRACE_HEIGHTS(14_400) > height`
+  的已质押者，宽限覆盖整个 peg 间隔）< 2 → 不付不推进；首窗只 arm
+  `last_funding_height`；此后 `height ≥
   last + FUNDING_PEG_INTERVAL_HEIGHTS(14_400)` 才结算（付款公式同上，
   diff 改为**费率域** `clamp((mark−index)/FUNDING_BPS_UNIT, ±50)`——
   两价均带 offset，除 index 会把现实费率差截断成 0），付完置位；`diff == 0`
@@ -381,13 +389,15 @@ TWAP；环空或最新样本超过 `FUNDING_EXTERNAL_MAX_STALENESS = 32` 个高�
 
 ## 7. 预言机与 mark 价格
 
-### 7.1 mark 的三重防线
+### 7.1 mark 的多重防线
 
 | 防线 | 规则 | 目的 |
 |---|---|---|
 | 名义额门槛 | notional ≥ 100 USD 的成交才有资格动 mark | 灰尘单无法操纵 |
 | 偏离帽 | 新价相对旧 mark 偏移 ≤ ±10%（旧价 > 0 时） | 单笔巨价无法跳变 |
 | 预言机权威 | 一旦市场有任一有效预言机报价，成交永久失去 mark 定价权 | 撮合层与定价层解耦 |
+| 无 index 冻结 | 非零 mark 只有在 `last_index`（报告者指数）非零时才允许成交继续移动 | 无外部锚时成交不能逐步走偏 mark |
+| index 带 | oracle 写入的 mark 必须落在 funding index 的 ±10% 带内：带外中位数被拒（保留旧 mark；无 mark 时以 index 自举） | 中位数被腐化也走不出指数锚 |
 
 ### 7.2 债券注册制 + 中位数定价
 
@@ -417,8 +427,11 @@ slash_reward_bps **烧毁**、余下归挑战者（`apply_slash`：
 - 有效报价者集合 = 有债券且有最新报价的账户；对同一市场取全部价格的
   **中位数**：奇数取正中，偶数取较小中间值（确定性，任何副本一致）
 - `last_index[market] = 中位数`（未钳位，资金费率 index 用）
-- spot 写入 `marks[market]` 前过 ±10% 帽（首个报价无条件设定；帽按旧 mark 量级度量，负 mark 同样可步进）
-- 该市场有效报告数 ≥ 2 时，每次 report 触发一次资金费结算（§6.2）
+- spot 写入 `marks[market]` 先过旧 mark ±10% 帽（首个报价无条件设定；
+  帽按旧 mark 量级度量，负 mark 同样可步进），再过 funding index ±10%
+  带：带外 → 保留旧 mark，无 mark 则以 index 自举（§7.1）
+- 该市场有效报告数 ≥ 2 时，资金费**每高度至多结算一次**（同高度的后续
+  报告不再付，`last_funding_height` 记该高度；§6.2）
 
 解锁到期的债券经 unstake 路径回到 `perp_balances`，走与其他 PERP 相同的
 双币种 Merkle 证明出金路径（§10.5）。`(market, oracle)` 一旦无债券，
@@ -427,7 +440,9 @@ slash_reward_bps **烧毁**、余下归挑战者（`apply_slash`：
 ### 7.3 残余操纵风险
 
 ±10% 帽允许攻击者以每 tick 10% 步进逐渐走偏 mark；中位数要求腐化按
-债券计的多数报价者配合。TWAP 平滑（oracle/funding 双环）与连续偏移罚没
+债券计的多数报价者配合。两处步进现在被外部锚收窄：无 `last_index` 时
+成交把非零 mark 冻结在首个打印价（§7.1），oracle 写入还必须落在 funding
+index ±10% 带内。TWAP 平滑（oracle/funding 双环）与连续偏移罚没
 已落地，但合谋多数仍可在两次罚没之间施压；外部多源锚（§6.2 末）需
 治理启用后才提供第二意见。
 
@@ -810,10 +825,14 @@ asset id。发币时只需改一个常量并重新部署 AA。
 （symbol、tick_size、im_bps、mm_bps、taker_fee_bps、keeper_reward_bps、
 `spot_only`、`funding_rate`），
 存入 `markets[market_id]`——IM/MM/taker fee/keeper 奖励从全局常量变为
-**每市场参数**（§4.2/§5.2/§6.1 相应改为读参数）。除 tick_size 或任一 bps
-为 0 → Risk 拒绝外，还有一层硬上限（exec `create_market`）：任一 bps
-> 10 000、`im_bps <= mm_bps`、`mm_bps < 500`、`im_bps > 5000`、
-`taker_fee_bps > 200`、`keeper_reward_bps > 500` 均 Risk 拒绝。
+**每市场参数**（§4.2/§5.2/§6.1 相应改为读参数）。除 tick_size 为 0 →
+Risk 拒绝外，四个 bps 参数统一过 `risk_params_ok` 谓词（operp-types，
+exec 与治理共用）：任一为 0 或 > 10 000、`im_bps <= mm_bps`、
+`mm_bps < 500`、`im_bps > 5000`、`taker_fee_bps > 200`、
+`keeper_reward_bps > 500`、`im_bps < 10 × FUNDING_CAP_BPS` 均 Risk。
+CreateProposal 对非 Delist 键先按 finalize 同样方式预演参数更新，结果不
+过谓词即 Risk（提案表不写入）；FinalizePropose 落盘前同样复检——通过但
+非法的提案是 no-op（不写字段，提案仍被消耗）。
 簿不预建，沿用 `book_mut` 惰性创建。
 
 `spot_only` 建时定死：无 `ParamKey` 可翻转。`true` 的市场为纯合约/meme
@@ -822,9 +841,12 @@ asset id。发币时只需改一个常量并重新部署 AA。
 
 `funding_rate` 同样建时定死、无 `ParamKey` 翻转：资金费率市场，簿价是
 外部交易所资金费率的编码价（`encode_funding_price`，offset 域内恒正，
-0 bps 可表示）。报价只写 `last_index`（不写 mark、不进 ±10% 钳位、不记
-TWAP）；fill 写 mark（≥ 1% 数量，无钳位）；资金费按 peg 结算——需
-index+mark+2 份新鲜报告才启动 `last_funding_height` 时钟，此后每
+0 bps 可表示）。报价只写 `last_index`（不写 mark、不进 ±10% 钳位；
+TWAP 环照记供 slash 使用）；fill 写 mark 需 ≥ 100 USD 名义额且费率步进
+合法（首印与 index 差 ≤ `FUNDING_CAP_BPS`，此后每笔 ≤ max(|旧费率|/10,
+1) bps，见 §6.2）；资金费按 peg 结算——需
+index+mark+2 份新鲜报告（宽限 `FUNDING_PEG_FRESH_GRACE_HEIGHTS` =
+14_400 高度）才启动 `last_funding_height` 时钟，此后每
 14_400 高度至多结算一次（`settle_funding_peg`）。与 `spot_only` 互斥：
 两者同时为 true → `Risk` 拒绝（烧费之前）。
 
@@ -834,8 +856,10 @@ delisted 市场（见 16.3 Delist 提案）拒绝新挂单；撤单与清算平�
 ### 16.3 提案投票
 
 **CreateProposal**（tag 11）：创建者对指定市场提交参数修改提案，`key` 取
-`ParamKey`（ImBps/MmBps/TakerFeeBps/KeeperRewardBps/Delist）；bps 键的
-value ≤ 10 000、Delist 键的 value 必须为 0，否则 Risk 拒绝。并发上限：
+`ParamKey`（ImBps/MmBps/TakerFeeBps/KeeperRewardBps/Delist）；Delist 键的
+value 必须为 0，否则 Risk 拒绝；bps 键按 finalize 同样的方式预演更新到
+当前 `MarketParams`，结果不过 `risk_params_ok`（§16.2）即 Risk 拒绝。
+并发上限：
 `proposals.len() >= 64` 时新提案 Risk 拒绝（状态膨胀防护，exec
 `create_proposal`）。创建门槛：
 创建者 PERP 余额 ≥ `PROPOSAL_MIN_STAKE_PERP = 1_000`（仅门槛检查，
@@ -861,9 +885,10 @@ yes > no  ∧  yes × PROPOSAL_QUORUM_DEN(100)
 
 即赞成票超过流通量快照的 **10%**。分母用创建时快照而非当前 supply：
 烧毁/提款导致的后续流通量变化不会改写历史提案的通过判定（重放确定性的
-另一面）。通过后立即应用：bps 键写回 `markets[m]` 对应字段；Delist 键置
-`delisted = true`——delisted 市场拒绝新挂单，存量仓位只能平仓或被清算
-（§16.2）。
+另一面）。通过后先复检 `risk_params_ok`（§16.2）：合法才写回
+`markets[m]` 对应字段；非法则**不写任何字段**（提案结果是 no-op，提案
+仍被消耗）。Delist 键置 `delisted = true`——delisted 市场拒绝新挂单，
+存量仓位只能平仓或被清算（§16.2）。
 
 ### 16.4 烧毁语义
 

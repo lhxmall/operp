@@ -115,8 +115,8 @@ fn main() {
     let qa = pa.positions[&BTC_USD].qty;
     let qb = pb.positions[&BTC_USD].qty;
     let marks = &eng.state.marks;
-    let sa = pa.snapshot(marks);
-    let sb = pb.snapshot(marks);
+    let sa = pa.snapshot(marks, &eng.state.markets);
+    let sb = pb.snapshot(marks, &eng.state.markets);
 
     println!(
         "Alice pos={:+} (long) equity=${:.2} mm=${:.2} liq={}",

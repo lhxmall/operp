@@ -5,10 +5,11 @@ use operp_state::journal::{GovNonceJournal, GovNonceRecord};
 use operp_state::persist;
 use operp_state::{ChainState, Proposal};
 use operp_types::{
-    bps, liq_order_id, notional_usd, order_id, valid_obyte_addr, AccountId, Bps, ExecStatus,
-    Height, MarketId, MarketParams, OrderId, OrderType, ParamKey, Price, Qty, Seq, Side,
-    TimeInForce, UnitId, Usd, CREATE_MARKET_FEE_PERP, INSURANCE_ACCOUNT, PROPOSAL_DURATION_SEQS,
-    PROPOSAL_MIN_STAKE_PERP, PROPOSAL_QUORUM_DEN, PROPOSAL_QUORUM_NUM,
+    bps, liq_order_id, notional_usd, order_id, risk_params_ok, valid_obyte_addr, AccountId, Bps,
+    ExecStatus, Height, MarketId, MarketParams, OrderId, OrderType, ParamKey, Price, Qty, Seq,
+    Side, TimeInForce, UnitId, Usd, CREATE_MARKET_FEE_PERP, INSURANCE_ACCOUNT,
+    MAX_LIVE_ORDERS_PER_ACCOUNT, MIN_OPEN_EQUITY, PROPOSAL_DURATION_SEQS, PROPOSAL_MIN_STAKE_PERP,
+    PROPOSAL_QUORUM_DEN, PROPOSAL_QUORUM_NUM,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -514,6 +515,18 @@ impl Engine {
             Some(p) if !p.delisted => {}
             _ => return Err(RejectReason::Risk),
         }
+        // Live-order count cap across every book: applies even to an IOC
+        // that would never rest — otherwise a spam loop of IOC places is
+        // unbounded even though resting state stays bounded.
+        let live_count = self
+            .state
+            .books
+            .values()
+            .map(|b| b.live_orders().filter(|o| o.account == account).count())
+            .sum::<usize>();
+        if live_count >= MAX_LIVE_ORDERS_PER_ACCOUNT {
+            return Err(RejectReason::Risk);
+        }
         // Signed prices: margin must cover the larger *magnitude* — a plain
         // max() would let a short at -100 post margin against mark -1.
         let px_est = if px_for_notional.abs() >= mark.abs() {
@@ -545,8 +558,9 @@ impl Engine {
         let snap = {
             let acct = self.state.accounts.get(&account);
             match acct {
-                Some(a) => a.snapshot(&self.state.marks),
-                None => operp_account::Account::new(account).snapshot(&self.state.marks),
+                Some(a) => a.snapshot(&self.state.marks, &self.state.markets),
+                None => operp_account::Account::new(account)
+                    .snapshot(&self.state.marks, &self.state.markets),
             }
         };
         let pos_qty = self
@@ -580,11 +594,30 @@ impl Engine {
             signed
         };
         if open_qty != 0 {
-            let extra_im = bps(
-                notional_usd(open_qty.unsigned_abs(), px_est),
-                self.state.market_params(market).im_bps,
-            );
-            if snap.equity < snap.im + extra_im {
+            // Unmarked-market hole: with no mark and no limit price, px_est
+            // is 0, so the IM estimate below is 0 and a zero-collateral
+            // account walks straight through the gate.
+            if px_est == 0 {
+                return Err(RejectReason::Risk);
+            }
+            let open_notional = notional_usd(open_qty.unsigned_abs(), px_est);
+            // An opening order must carry real notional; a zero-notional
+            // *reduce* order may still close an unmarked position.
+            if open_notional == 0 {
+                return Err(RejectReason::Risk);
+            }
+            let extra_im = bps(open_notional, self.state.market_params(market).im_bps);
+            // Equity must cover position IM + the IM reserved for resting
+            // opening orders + this order's own opening IM. `snapshot` only
+            // sees booked positions, not the margin pending openings will
+            // demand once they fill; the order being placed is not in the
+            // book yet, so it is not double-counted. Reduce-only orders
+            // cannot grow exposure, so they are not subject to this check.
+            let resting = self.resting_open_im(account);
+            if snap.equity < snap.im + resting + extra_im {
+                return Err(RejectReason::Risk);
+            }
+            if snap.equity < MIN_OPEN_EQUITY {
                 return Err(RejectReason::Risk);
             }
         }
@@ -618,6 +651,67 @@ impl Engine {
         }
         self.state.seen_client_seq.insert(account, client_seq);
         Ok(result.fills)
+    }
+
+    /// IM that the account's currently resting orders will demand once they
+    /// fill and open (or add to) positions. `snapshot` cannot see these —
+    /// booked positions only materialize at fill time — so `place` reserves
+    /// them on top. Per market, only the larger side can ultimately be
+    /// open (fills net the book against the position), so reserve
+    /// `max(bid_im, ask_im)`, not the sum.
+    fn resting_open_im(&self, account: AccountId) -> Usd {
+        let mut total: Usd = 0;
+        for (market, book) in &self.state.books {
+            let mut bid_qty: i64 = 0;
+            let mut ask_qty: i64 = 0;
+            let mut bid_notional: Usd = 0;
+            let mut ask_notional: Usd = 0;
+            for o in book.live_orders().filter(|o| o.account == account) {
+                let px = if o.price != 0 {
+                    o.price
+                } else {
+                    self.state.marks.get(market).copied().unwrap_or(0)
+                };
+                let n = notional_usd(o.remaining, px);
+                match o.side {
+                    Side::Bid => {
+                        bid_qty += o.remaining as i64;
+                        bid_notional += n;
+                    }
+                    Side::Ask => {
+                        ask_qty += o.remaining as i64;
+                        ask_notional += n;
+                    }
+                }
+            }
+            if bid_qty == 0 && ask_qty == 0 {
+                continue;
+            }
+            let pos_qty = self
+                .state
+                .accounts
+                .get(&account)
+                .and_then(|a| a.positions.get(market))
+                .map(|p| p.qty)
+                .unwrap_or(0);
+            // Bids reduce only a short, asks reduce only a long: whichever
+            // side's remaining qty exceeds what it can reduce opens.
+            let bid_opens = bid_qty > (-pos_qty).max(0);
+            let ask_opens = ask_qty > pos_qty.max(0);
+            let im_bps = self.state.market_params(*market).im_bps;
+            let bid_im = if bid_opens {
+                bps(bid_notional, im_bps)
+            } else {
+                0
+            };
+            let ask_im = if ask_opens {
+                bps(ask_notional, im_bps)
+            } else {
+                0
+            };
+            total += bid_im.max(ask_im);
+        }
+        total
     }
 
     fn cancel(&mut self, account: AccountId, order_id: OrderId) -> Result<Vec<Fill>, RejectReason> {
@@ -687,9 +781,10 @@ impl Engine {
             return Err(RejectReason::Risk);
         }
         let marks = self.state.marks.clone();
+        let params = self.state.markets.clone();
         self.state
             .account_mut(account)
-            .debit(amount, &marks)
+            .debit(amount, &marks, &params)
             .map_err(map_acct)?;
         // Cumulative signed-withdrawal ledger committed as `W` in the AA
         // leaf: the vault AA enforces "this claim + prior claims <= W".
@@ -726,7 +821,7 @@ impl Engine {
             .accounts
             .get(&target)
             .ok_or(RejectReason::NotFound)?
-            .snapshot(&self.state.marks);
+            .snapshot(&self.state.marks, &self.state.markets);
         if !snap.liquidatable {
             return Err(RejectReason::NotLiquidatable);
         }
@@ -775,7 +870,10 @@ impl Engine {
             .state
             .accounts
             .get(&target)
-            .map(|a| a.snapshot(&self.state.marks).liquidatable)
+            .map(|a| {
+                a.snapshot(&self.state.marks, &self.state.markets)
+                    .liquidatable
+            })
             .unwrap_or(false);
         let remaining_pos = self
             .state
@@ -808,23 +906,26 @@ impl Engine {
             self.state.apply_fill_pair(&fill).map_err(map_acct)?;
             fills.push(fill);
         }
-        // Keeper reward: bps of filled notional, paid from the insurance fund.
+        // Keeper reward: bps of filled notional, seized from the liquidatee's
+        // own collateral — the insurance fund absorbs negative equity inside
+        // `apply_fill_pair`, it does not fund the reward. A target with no
+        // positive collateral leaves the keeper with nothing.
         for f in &fills {
             let keeper_bps = self.state.market_params(market).keeper_reward_bps;
             keeper_paid += bps(notional_usd(f.qty, f.price), keeper_bps);
         }
         if keeper_paid > 0 {
-            // Realized PnL settles into collateral, so the fund's spendable
+            // Realized PnL settles into collateral, so the target's spendable
             // balance is just its collateral.
-            let ins_bal = self
+            let bal = self
                 .state
                 .accounts
-                .get(&INSURANCE_ACCOUNT)
+                .get(&target)
                 .map(|a| a.collateral)
                 .unwrap_or(0);
-            let pay = keeper_paid.min(ins_bal.max(0));
+            let pay = keeper_paid.min(bal.max(0));
             if pay > 0 {
-                if let Some(a) = self.state.accounts.get_mut(&INSURANCE_ACCOUNT) {
+                if let Some(a) = self.state.accounts.get_mut(&target) {
                     a.collateral -= pay;
                 }
                 self.state
@@ -939,29 +1040,7 @@ impl Engine {
         }
         // Signed price grid: tick stays strictly positive; a zero or
         // negative grid would break limit alignment (`price % tick_size`).
-        if tick_size <= 0
-            || im_bps == 0
-            || mm_bps == 0
-            || taker_fee_bps == 0
-            || keeper_reward_bps == 0
-        {
-            return Err(RejectReason::Risk);
-        }
-        // A bps parameter above 100% is nonsensical and lets a market creator
-        // set, say, an unbounded keeper reward drained from the insurance fund.
-        if im_bps > 10_000
-            || mm_bps > 10_000
-            || taker_fee_bps > 10_000
-            || keeper_reward_bps > 10_000
-        {
-            return Err(RejectReason::Risk);
-        }
-        if im_bps <= mm_bps
-            || mm_bps < 500
-            || im_bps > 5000
-            || taker_fee_bps > 200
-            || keeper_reward_bps > 500
-        {
+        if tick_size <= 0 || !risk_params_ok(im_bps, mm_bps, taker_fee_bps, keeper_reward_bps) {
             return Err(RejectReason::Risk);
         }
         let bal = self.state.perp_balances.get(&creator).copied().unwrap_or(0);
@@ -1003,21 +1082,28 @@ impl Engine {
         seq: Seq,
     ) -> Result<Vec<Fill>, RejectReason> {
         let key = ParamKey::from_u8(key).ok_or(RejectReason::Risk)?;
-        match key {
-            // Delist carries no value; bps parameters are capped at 100%.
-            ParamKey::Delist => {
-                if value != 0 {
-                    return Err(RejectReason::Risk);
-                }
-            }
-            _ => {
-                if value > 10_000 {
-                    return Err(RejectReason::Risk);
-                }
+        if key == ParamKey::Delist {
+            // Delist carries no value.
+            if value != 0 {
+                return Err(RejectReason::Risk);
             }
         }
         if !self.state.markets.contains_key(&market) {
             return Err(RejectReason::NotFound);
+        }
+        // Bps updates must produce a still-legal parameter set; an illegal
+        // one would be silently dropped at finalize anyway.
+        if key != ParamKey::Delist {
+            let mut params = self.state.markets[&market];
+            apply_param(&mut params, key, value);
+            if !risk_params_ok(
+                params.im_bps,
+                params.mm_bps,
+                params.taker_fee_bps,
+                params.keeper_reward_bps,
+            ) {
+                return Err(RejectReason::Risk);
+            }
         }
         // Threshold check only — the stake is not locked or escrowed.
         let bal = self.state.perp_balances.get(&creator).copied().unwrap_or(0);
@@ -1113,13 +1199,20 @@ impl Engine {
             (pass, p.market, p.key, p.value)
         };
         if pass {
-            if let Some(params) = self.state.markets.get_mut(&market) {
-                match key {
-                    ParamKey::ImBps => params.im_bps = value,
-                    ParamKey::MmBps => params.mm_bps = value,
-                    ParamKey::TakerFeeBps => params.taker_fee_bps = value,
-                    ParamKey::KeeperRewardBps => params.keeper_reward_bps = value,
-                    ParamKey::Delist => params.delisted = true,
+            if let Some(params) = self.state.markets.get(&market) {
+                let mut updated = *params;
+                apply_param(&mut updated, key, value);
+                // A passed-but-illegal proposal is a no-op: never write an
+                // out-of-policy field, but still consume the proposal.
+                let legal = key == ParamKey::Delist
+                    || risk_params_ok(
+                        updated.im_bps,
+                        updated.mm_bps,
+                        updated.taker_fee_bps,
+                        updated.keeper_reward_bps,
+                    );
+                if legal {
+                    self.state.markets.insert(market, updated);
                 }
             }
         }
@@ -1291,6 +1384,18 @@ impl Engine {
         self.state
             .apply_external_price(source, market, price, source_id, caller_seq);
         Ok(Vec::new())
+    }
+}
+
+/// Apply a governance parameter key to a copy of `MarketParams`. Shared by
+/// proposal creation (validation) and finalization (write).
+fn apply_param(params: &mut MarketParams, key: ParamKey, value: u64) {
+    match key {
+        ParamKey::ImBps => params.im_bps = value,
+        ParamKey::MmBps => params.mm_bps = value,
+        ParamKey::TakerFeeBps => params.taker_fee_bps = value,
+        ParamKey::KeeperRewardBps => params.keeper_reward_bps = value,
+        ParamKey::Delist => params.delisted = true,
     }
 }
 
@@ -1590,7 +1695,7 @@ mod tests {
                 .accounts
                 .get(&a)
                 .unwrap()
-                .snapshot(&eng.state.marks)
+                .snapshot(&eng.state.marks, &eng.state.markets)
                 .liquidatable
         );
         let ask2 = place(
@@ -1779,10 +1884,12 @@ mod tests {
         );
         let id4 = unit_id(&bid);
         eng.ingest(bid).unwrap();
-        // crash to 80k: alice goes underwater (shortfall 5k absorbed by the
-        // 10k-seeded insurance) and the liq fill notional (80k USD) yields a
-        // 1% keeper reward of 800 USD that the fund can actually pay.
-        eng.state.marks.insert(BTC_USD, 80_000 * PRICE_SCALE as i64);
+        // Crash to 89k: alice (long 1 @ 100k, 15k deposit) still has 4k
+        // collateral and 4k equity against mm 4.45k → liquidatable. The
+        // closing fill realizes -11k and pays a 5 bps taker fee (44.5 USD),
+        // leaving 3,955.5 USD — comfortably above the 1% keeper reward of
+        // 890 USD, which must come out of HER collateral, not the fund's.
+        eng.state.marks.insert(BTC_USD, 89_000 * PRICE_SCALE as i64);
         let a = acct_of(&alice);
         let ask2 = place(
             vec![id4],
@@ -1790,7 +1897,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            80_000 * PRICE_SCALE as i64,
+            89_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             2,
         );
@@ -1816,6 +1923,21 @@ mod tests {
             e,
             ExecEvent::Applied { fills, .. } if !fills.is_empty()
         )));
+        // Exact money trail: opening taker fee 50 (5 bps of 100k), realize
+        // -11k, closing taker fee 44.5 (5 bps of 89k), seize 890.
+        let fee = 44_500_000i128; // 5 bps of 89k USD
+        let open_fee = 50 * USD_SCALE as i128; // 5 bps of 100k USD
+        let reward = 890 * USD_SCALE as i128; // 100 bps of 89k USD
+        let alice_acct = acct_of(&alice);
+        let target_bal = eng.state.accounts[&alice_acct].collateral;
+        assert_eq!(
+            target_bal,
+            15_000 * USD_SCALE as i128 - open_fee - 11_000 * USD_SCALE as i128 - fee - reward
+        );
+        // Pre-reward balance (3,955.5 after open fee) exceeded the reward:
+        // the seizure was capped at exactly the keeper bps, not at some
+        // fund balance.
+        assert!(3_955_500_000i128 - open_fee > reward);
         let keeper_acct = acct_of(&keeper);
         let keeper_bal = eng
             .state
@@ -1823,14 +1945,16 @@ mod tests {
             .get(&keeper_acct)
             .map(|x| x.collateral)
             .unwrap_or(0);
-        assert!(keeper_bal > 0, "keeper must be rewarded");
+        assert_eq!(keeper_bal, reward, "keeper paid exactly the reward bps");
         let ins_after = eng
             .state
             .accounts
             .get(&INSURANCE_ACCOUNT)
             .unwrap()
             .collateral;
-        assert!(ins_after < ins_before, "insurance pays the reward");
+        // Insurance gained only the taker fee: the reward line is absent
+        // from its balance (fee income in, no payout out).
+        assert_eq!(ins_after, ins_before + fee);
     }
 
     #[test]
@@ -2201,7 +2325,7 @@ mod tests {
         let db = gov_dep(vec![g], &sk(2), 99_000, 8);
         eng.ingest(da).unwrap();
         eng.ingest(db).unwrap();
-        let p = propose(vec![g], &sk(1), 0, 500);
+        let p = propose(vec![g], &sk(1), 0, 1500);
         eng.ingest(p).unwrap();
         let v = cast_vote(vec![g], &sk(1), 1, true);
         eng.ingest(v).unwrap();
@@ -2212,6 +2336,159 @@ mod tests {
         assert!(!eng.state.proposals.contains_key(&1));
         // Genesis im_bps untouched.
         assert_eq!(eng.state.markets[&BTC_USD].im_bps, 1000);
+    }
+
+    #[test]
+    fn proposal_keeper_reward_respects_listing_cap() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        let da = gov_dep(vec![g], &sk(1), 1_000, 7);
+        eng.ingest(da).unwrap();
+        // 1000 bps keeper reward is above the 500 bps listing cap: the
+        // proposal itself must be rejected, not merely dropped at finalize.
+        let p = propose(vec![g], &sk(1), 3, 1_000);
+        let evs = eng.ingest(p).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::Risk,
+                ..
+            }
+        )));
+        assert!(eng.state.proposals.is_empty());
+        assert_eq!(eng.state.markets[&BTC_USD].keeper_reward_bps, 100);
+    }
+
+    #[test]
+    fn zero_mark_market_order_rejected() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        // List market 2; it has no mark (genesis marks BTC_USD only).
+        let d = gov_dep(vec![g], &sk(1), CREATE_MARKET_FEE_PERP, 7);
+        let tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let cm = list_market(vec![tip], &sk(1));
+        let tip = unit_id(&cm);
+        eng.ingest(cm).unwrap();
+        let meme = MarketId(2);
+        assert!(!eng.state.marks.contains_key(&meme));
+        // Zero deposit: px_est = 0 would previously estimate IM as 0 and
+        // pass the margin gate.
+        let p = place_on(
+            vec![tip],
+            &sk(2),
+            meme,
+            Side::Bid,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            0,
+            QTY_SCALE,
+            1,
+        );
+        let evs = eng.ingest(p).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::Risk,
+                ..
+            }
+        )));
+        // With exactly MIN_OPEN_EQUITY ($1) deposited the same market order
+        // must still bounce: the $1 deposit is not what blocks it — the
+        // missing mark is.
+        let d2 = deposit(vec![tip], &sk(2), MIN_OPEN_EQUITY, 2);
+        let tip2 = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+        let p2 = place_on(
+            vec![tip2],
+            &sk(2),
+            meme,
+            Side::Bid,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            0,
+            QTY_SCALE,
+            1,
+        );
+        let evs = eng.ingest(p2).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::Risk,
+                ..
+            }
+        )));
+        assert!(eng
+            .state
+            .accounts
+            .get(&acct_of(&sk(2)))
+            .map(|a| a.positions.is_empty())
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn live_order_cap() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        let alice = sk(1);
+        let d = deposit(vec![g], &alice, 10_000 * USD_SCALE as i128, 1);
+        let mut tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        // 64 small resting limits on the marked BTC market: bid under the
+        // mark, so they rest without crossing.
+        let px = 50_000 * PRICE_SCALE as i64;
+        let qty = QTY_SCALE / 100;
+        for seq in 1..=MAX_LIVE_ORDERS_PER_ACCOUNT as u64 {
+            let o = place(
+                vec![tip],
+                &alice,
+                Side::Bid,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                px,
+                qty,
+                seq,
+            );
+            tip = unit_id(&o);
+            let evs = eng.ingest(o).unwrap();
+            assert!(evs.iter().all(|e| matches!(e, ExecEvent::Applied { .. })));
+        }
+        let live = |eng: &Engine| {
+            eng.state
+                .books
+                .values()
+                .map(|b| {
+                    b.live_orders()
+                        .filter(|o| o.account == acct_of(&alice))
+                        .count()
+                })
+                .sum::<usize>()
+        };
+        assert_eq!(live(&eng), 64);
+        // The 65th is Risk even though it would never rest (cap applies
+        // before submission, not to resting state only).
+        let o65 = place(
+            vec![tip],
+            &alice,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            65,
+        );
+        let evs = eng.ingest(o65).unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            ExecEvent::Rejected {
+                reason: RejectReason::Risk,
+                ..
+            }
+        )));
+        assert_eq!(live(&eng), 64);
     }
 
     #[test]
@@ -2633,7 +2910,11 @@ mod tests {
             2,
         );
         eng.ingest(ask2).unwrap();
-        assert_eq!(eng.state.marks.get(&mkt).copied(), Some(cover));
+        // Unoracled freeze: once a non-zero mark exists with no reporter
+        // index, a further fill must not walk it — the mark stays at the
+        // first print. Realization uses fill price, not mark, so PnL below
+        // is unaffected.
+        assert_eq!(eng.state.marks.get(&mkt).copied(), Some(open));
         assert!(eng.state.accounts[&acct_of(&bob)].positions.is_empty());
         assert!(eng.state.accounts[&acct_of(&alice)].positions.is_empty());
         // Bob (maker both legs): 1M + 10k realized, no fee legs.
@@ -3769,6 +4050,94 @@ mod tests {
             operp_types::FUNDING_CAP_BPS as u64,
         );
         assert!(moved <= cap as i128 + USD_SCALE as i128, "cap holds");
+    }
+
+    #[test]
+    fn funding_pays_once_per_height() {
+        let mut eng = activated_engine();
+        eng.state.height = operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT;
+        eng.state.funding_source = operp_types::FundingSourceKind::AggregatedExternal;
+        let alice = sk(1);
+        let bob = sk(2);
+        let oa = sk(5);
+        let ob = sk(6);
+        let keeper = sk(9);
+        eng.state
+            .oracle_bonds
+            .insert(acct_of(&oa), ORACLE_BOND_PERP);
+        eng.state
+            .oracle_bonds
+            .insert(acct_of(&ob), ORACLE_BOND_PERP);
+        eng.state.external_sources.insert(acct_of(&keeper));
+        let d1 = deposit(vec![genesis_id()], &alice, 1_000_000 * USD_SCALE as i128, 1);
+        let mut tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![tip], &bob, 1_000_000 * USD_SCALE as i128, 2);
+        tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+        // Open a long/short pair at 100k.
+        let px = 100_000 * PRICE_SCALE as i64;
+        let ask = place(
+            vec![tip],
+            &bob,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE / 1000,
+            1,
+        );
+        tip = unit_id(&ask);
+        eng.ingest(ask).unwrap();
+        let bid = place(
+            vec![tip],
+            &alice,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE / 1000,
+            1,
+        );
+        tip = unit_id(&bid);
+        eng.ingest(bid).unwrap();
+        // External index 50k vs bonded reports 100k: non-zero premium.
+        let e1 = external_price_unit(vec![tip], &keeper, 50_000 * PRICE_SCALE as i64, 0);
+        tip = unit_id(&e1);
+        eng.ingest(e1).unwrap();
+        let e2 = external_price_unit(vec![tip], &keeper, 50_000 * PRICE_SCALE as i64, 0);
+        tip = unit_id(&e2);
+        eng.ingest(e2).unwrap();
+        prime_bonded_twap(&mut eng, &mut tip, &oa, &ob, px, 3);
+
+        // Fresh height: the first report with prices.len() >= 2 pays…
+        eng.state.height += 1;
+        let h = eng.state.height;
+        let pre_long = eng.state.accounts[&acct_of(&alice)].collateral;
+        let r1 = report_unit(vec![tip], &oa, px);
+        tip = unit_id(&r1);
+        eng.ingest(r1).unwrap();
+        let after_first = eng.state.accounts[&acct_of(&alice)].collateral;
+        assert!(
+            after_first < pre_long,
+            "first same-height report with prices.len() >= 2 pays"
+        );
+        assert_eq!(
+            eng.state.last_funding_height.get(&BTC_USD).copied(),
+            Some(h)
+        );
+        // …the second report at the same height must not pay again.
+        let r2 = report_unit(vec![tip], &ob, px);
+        eng.ingest(r2).unwrap();
+        assert_eq!(
+            eng.state.accounts[&acct_of(&alice)].collateral,
+            after_first,
+            "second report at the same height does not move collateral"
+        );
+        assert_eq!(
+            eng.state.last_funding_height.get(&BTC_USD).copied(),
+            Some(h)
+        );
     }
 
     #[test]

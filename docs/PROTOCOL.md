@@ -79,18 +79,26 @@ notional = qty · price / PRICE_SCALE · USD_SCALE / QTY_SCALE
 
 每次成交同时更新 taker/maker 两腿：开仓 VWAP 入场价，平仓实现 PnL。
 
-快照（`Account::snapshot`）计算：
+快照（`Account::snapshot`，按市场参数取费率）计算：
 
 ```
-mm (maintenance) = 5%   of Σ|qty|·mark     (MM_RATE_BPS = 500)
-im (initial)     = 10%  of Σ|qty|·mark     (IM_RATE_BPS = 1000)
+mm (maintenance) = bps(|qty|·mark, market.mm_bps)   创世默认 500
+im (initial)     = bps(|qty|·mark, market.im_bps)   创世默认 1000
 equity           = collateral + unrealized_pnl
                    （已实现 PnL 平仓即结算进 collateral）
 liquidatable     : equity·10000 ≤ mm·10500
 reduce_only      : equity·10000 ≤ mm·12000
 ```
 
-开仓前检查 `equity ≥ im + 新增名义额×IM`；提款后检查不得落入 reduce-only。
+开仓前检查 `equity ≥ im(仓位) + resting_open_im(挂单预留) + 本次开仓 im`；
+`resting_open_im` 对每个市场取 `max(bid 侧 im, ask 侧 im)`（两侧最终不会同时
+开仓），只计仍会开仓的挂单侧。挂单数另有上限：每账户全簿 live 单 ≤ 64
+（含不会驻留的 IOC）。开仓单还要求 `equity ≥ $1` 且估算价非零、名义额非零
+（无 mark 的市价单被拒，防零保证金开仓）。市场参数统一经
+`risk_params_ok` 校验（非零、≤10000、im>mm、mm≥500、im≤5000、
+taker≤200、keeper≤500、im ≥ 10×FUNDING_CAP_BPS），CreateMarket 与
+治理提案（创建时预检 + finalize 落盘前复检，非法提案为 no-op 但仍消耗）
+共用同一谓词。提款后检查不得落入 reduce-only。
 
 ### 2.4 清算、keeper 与保险基金
 
@@ -98,16 +106,20 @@ reduce_only      : equity·10000 ≤ mm·12000
   返回 `BadAccount` —— 自我清算禁止。
 - 清算单是 Market IOC 单吃掉对手盘；仍不干净时剩余仓位以 mark 价与保险基金
   对敲平仓。
-- keeper 奖励 = Σ bps(每笔成交名义额, 100)，从保险基金支付。
-  保险基金在创世时注入 10 000 USD 种子金，永不参与清算判定（不可被清算、
-  不自我清算）。
+- keeper 奖励 = Σ bps(每笔成交名义额, 100)，从**被清算方抵押**中扣除
+  （以其正余额为上限，奖励不足时 keeper 拿 0）；保险基金只吸收负权益，
+  不再为奖励出资。保险基金在创世时注入 10 000 USD 种子金，永不参与清算
+  判定（不可被清算、不自我清算）。
 - **坏账封顶**：成交后若 taker equity < 0，其 equity 被钳到恰好 0
   （collateral 吸收缺口），保险基金 collateral 等额扣减——守恒、且后续
   成交不会重复触发。损失社会化到基金，绝不转嫁对手方。
-- **mark 三重防线**：① notional ≥ 100 USD 才可更新；② 新价相对旧 mark
+- **mark 多重防线**：① notional ≥ 100 USD 才可更新；② 新价相对旧 mark
   偏离不得超过 ±10%；③ 一旦市场有债券注册报价者的报价（`Op::ReportPrice`，
-  全部已质押报价者最新价的**中位数**，§7），成交价即失去 mark 定价权。
-  资金费率：有效报告数 ≥ 2 时每次 report 触发一次结算，按
+  全部已质押报价者最新价的**中位数**，§7），成交价即失去 mark 定价权——
+  非零 mark 还需已有 `last_index`（报告者指数）才允许继续移动，否则首个
+  fill 之后 mark 冻结；④ oracle 写入的 mark 还须落在 funding index 的
+  ±10% 带内（带外保留旧 mark，无 mark 则以 index 自举）。
+  资金费率：有效报告数 ≥ 2 时**每高度至多一次**结算，按
   (spot − index)/index（钳 ±50bps）在多空之间转移。付款方借记被钳在其
   可用抵押内，收款方入账以实际扣减总额封顶——严格守恒、不产生负余额；
   保险基金作为普通账户参与（可持有清算对冲仓位）。
