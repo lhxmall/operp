@@ -365,19 +365,22 @@ TWAP；环空或最新样本超过 `FUNDING_EXTERNAL_MAX_STALENESS = 32` 个高�
 - **预言机只写 index**：报告仍过 zero/bond 过滤、写 `oracle_reports`/
   history/`last_index`，但**不写 mark**（无 ±10% 钳位）、不跑溢价块；
   TWAP 环照记（slash 判罚依赖 `oracle_twap` 样本），随后走
-  `settle_funding_peg`。`UpdateExternalPrice` 不喂此 peg。
-- **fill 写 mark**：`notional_usd ≥ 100 USD` 且费率步进合法才写
-  `marks`——首个 mark 要求已存在非零 `last_index` 且费率与 index 差 ≤
-  `FUNDING_CAP_BPS`（自举）；已有 mark 时只允许 ≤ max(|旧费率|/10, 1)
-  bps 的步进。写入后顺带重评 peg；步进不合法则 mark 与 peg 均不动。
-- **结算**（`settle_funding_peg`）：缺 index 或 mark → 不推进；新鲜报告
-  （`back().height + FUNDING_PEG_FRESH_GRACE_HEIGHTS(14_400) > height`
-  的已质押者，宽限覆盖整个 peg 间隔）< 2 → 不付不推进；首窗只 arm
-  `last_funding_height`；此后 `height ≥
-  last + FUNDING_PEG_INTERVAL_HEIGHTS(14_400)` 才结算（付款公式同上，
-  diff 改为**费率域** `clamp((mark−index)/FUNDING_BPS_UNIT, ±50)`——
-  两价均带 offset，除 index 会把现实费率差截断成 0），付完置位；`diff == 0`
-  仍推进时钟，`index == 0` 跳过不推进。`UpdateExternalPrice` 不参与。
+  `settle_funding_peg`。
+- **fill 写 mark**：按 `usd_per_unit` 计的名义额 ≥ 100 USD 且费率步进合法
+  才写 `marks`——首个 mark 以**新鲜外部指数**（`fresh_external_index`，
+  环内 `height + FUNDING_EXTERNAL_MAX_STALENESS > height` 的最新非零样本）
+  自举，费率差 ≤ 该市场 `funding_cap_bps`；已有 mark 时只允许 ≤
+  max(|旧费率|/10, 1) bps 的步进。写入后顺带重评 peg；步进不合法则 mark
+  与 peg 均不动。
+- **结算**（`settle_funding_peg`）：缺 mark → 不推进；首个观测只 arm
+  `last_funding_height`（不要求报告者或外部打印）；此后 `height ≥
+  last + FUNDING_PEG_INTERVAL_HEIGHTS(14_400)` **总是**先重 arm，付款只在
+  存在新鲜外部打印时发生——无新鲜打印则该窗口不付（时钟照走）。diff =
+  `clamp(mark 费率 − 指数费率, ±市场 funding_cap_bps)`，按
+  `funding_rate_cash(qty, diff, usd_per_unit)` 两阶段转移（借记钳在非负
+  抵押内，严格守恒）；`diff == 0` 仍推进时钟。`UpdateExternalPrice` 在
+  funding 市场**跳过** `AggregatedExternal` 选择器（仍需白名单、市场存在、
+  `price != 0`、费率 |bps| ≤ 10_000），落环后即评 peg。
 - meta 叶承诺 `last_funding_height` 时钟；时钟以高度计，不读墙钟。
 
 ### 6.3 dust 说明
@@ -712,7 +715,7 @@ witness 叶（`operp_state::wit_leaves`，排序后 Obyte 原生 Merkle）：
 acct:{acct_hex}:{collateral}:{perp}:{W}
 pos:{acct_hex}:{market}:{qty}:{entry}
 ord:{order_hex}:{market}:{side}:{price}:{seq}:{remaining}:{acct_hex}
-meta:{market}:{tick}:{im}:{mm}:{taker_fee_bps}:{keeper}:{delisted}:{mark}
+meta:{market}:{tick}:{im}:{mm}:{taker_fee_bps}:{keeper}:{delisted}:{mark}:{usd_per_unit}:{funding_cap_bps}
 ```
 
 这些数组在 frames 内按单元拆开（`t`/`o`/`f`/`c`/`l`），header 不再带它们；
@@ -844,10 +847,11 @@ CreateProposal 对非 Delist 键先按 finalize 同样方式预演参数更新�
 0 bps 可表示）。报价只写 `last_index`（不写 mark、不进 ±10% 钳位；
 TWAP 环照记供 slash 使用）；fill 写 mark 需 ≥ 100 USD 名义额且费率步进
 合法（首印与 index 差 ≤ `FUNDING_CAP_BPS`，此后每笔 ≤ max(|旧费率|/10,
-1) bps，见 §6.2）；资金费按 peg 结算——需
-index+mark+2 份新鲜报告（宽限 `FUNDING_PEG_FRESH_GRACE_HEIGHTS` =
-14_400 高度）才启动 `last_funding_height` 时钟，此后每
-14_400 高度至多结算一次（`settle_funding_peg`）。与 `spot_only` 互斥：
+1) bps，见 §6.2）；资金费按 peg 结算——首个观测只 arm
+`last_funding_height`（不要求报告者或外部打印），此后每 14_400 高度窗口
+总是重 arm，且仅在存在新鲜外部打印（`fresh_external_index`）时按
+`funding_rate_cash` 付款（无打印则该窗口不付，时钟照走；diff 钳在该市场
+`funding_cap_bps`，见 §6.2）。与 `spot_only` 互斥：
 两者同时为 true → `Risk` 拒绝（烧费之前）。
 
 delisted 市场（见 16.3 Delist 提案）拒绝新挂单；撤单与清算平仓仍允许

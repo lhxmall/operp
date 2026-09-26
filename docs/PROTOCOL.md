@@ -124,9 +124,11 @@ taker≤200、keeper≤500、im ≥ 10×FUNDING_CAP_BPS），CreateMarket 与
   可用抵押内，收款方入账以实际扣减总额封顶——严格守恒、不产生负余额；
   保险基金作为普通账户参与（可持有清算对冲仓位）。
   `funding_rate` 市场不走溢价结算：报价只写 `last_index`，mark 由
-  fill 写入，资金费按 peg 结算（`settle_funding_peg`：新鲜已质押报告 ≥2
-  才 arm `last_funding_height`，之后每 14_400 高度至多结算一次，diff =
-  clamp((mark−index)/FUNDING_BPS_UNIT, ±50)；时钟进 meta 叶承诺）。
+  fill 写入，资金费按 peg 结算（`settle_funding_peg`：首个观测只 arm
+  `last_funding_height`，此后每 14_400 高度窗口总是重 arm，且仅在存在
+  新鲜外部打印时按 `funding_rate_cash(qty, clamp(mark 费率 − 指数费率,
+  ±市场 funding_cap_bps), usd_per_unit)` 付款——无打印则该窗口不付；
+  时钟进 meta 叶承诺）。
 
 ### 2.5 市场准入与存款白名单
 
