@@ -19,7 +19,7 @@
 	//   acct:{acct_hex_64}:{collateral}:{perp}:{W}
 	//   pos:{acct_hex_64}:{market}:{qty_signed}:{entry}
 	//   ord:{order_hex}:{market}:{side}:{price}:{seq}:{remaining}:{acct_hex}
-	//   meta:{market}:{tick}:{im}:{mm}:{taker_fee_bps}:{keeper}:{delisted}:{mark}
+	//   meta:{market}:{tick}:{im}:{mm}:{taker_fee_bps}:{keeper}:{delisted}:{mark}:{usd_per_unit}:{funding_cap_bps}
 	bounce_fees: { base: 10000 },
 	messages: {
 		cases: [
@@ -160,7 +160,7 @@
 						OR trigger.data.pre_meta_proof.root != $pre_wit)
 						bounce('bad pre meta proof');
 					$M = split($pre_meta, ':');
-					if (array_length($M) != 9 OR $M[1] != $market) bounce('bad pre meta');
+					if (array_length($M) != 11 OR $M[1] != $market) bounce('bad pre meta');
 					$fee_bps = $M[5] + 0;
 					// Oscript / is Decimal division; Rust truncates each step.
 					// floor() restores truncation (all legs non-negative here).

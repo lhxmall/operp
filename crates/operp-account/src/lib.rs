@@ -1,7 +1,7 @@
 use operp_types::{
-    bps, notional_usd, signed_notional_usd, AccountId, MarketId, MarketParams, Price, Qty, Side,
-    Usd, IM_RATE_BPS, LIQ_RATIO_BPS, MM_RATE_BPS, PRICE_SCALE, QTY_SCALE, REDUCE_ONLY_RATIO_BPS,
-    USD_SCALE,
+    bps, funding_notional_usd, funding_rate_bps, funding_rate_cash, notional_usd,
+    signed_notional_usd, AccountId, MarketId, MarketParams, Price, Qty, Side, Usd, IM_RATE_BPS,
+    LIQ_RATIO_BPS, MM_RATE_BPS, PRICE_SCALE, QTY_SCALE, REDUCE_ONLY_RATIO_BPS, USD_SCALE,
 };
 use std::collections::BTreeMap;
 
@@ -52,6 +52,10 @@ impl Account {
         }
     }
 
+    /// `cash_per_bp` is `Some(usd_per_unit)` on funding-rate markets: the
+    /// reducing fill then realizes rate-delta cash instead of the encoded
+    /// price delta (whose dollar scale there is meaningless). `None` keeps
+    /// today's `realize` path.
     pub fn apply_fill(
         &mut self,
         side: Side,
@@ -59,6 +63,7 @@ impl Account {
         price: Price,
         qty: Qty,
         market: MarketId,
+        cash_per_bp: Option<u64>,
     ) -> Result<(), AccountError> {
         if qty > i64::MAX as u64 {
             return Err(AccountError::QtyTooLarge);
@@ -90,7 +95,20 @@ impl Account {
             );
         } else {
             let close = old.unsigned_abs().min(delta.unsigned_abs()) as u64;
-            let pnl = realize(old, pos.entry_price, price, close);
+            let pnl = match cash_per_bp {
+                None => realize(old, pos.entry_price, price, close),
+                // Sign follows the position: long profits when the exit
+                // rate exceeds the entry rate, short the reverse.
+                Some(usd) => funding_rate_cash(
+                    if old > 0 {
+                        close as i64
+                    } else {
+                        -(close as i64)
+                    },
+                    funding_rate_bps(price) - funding_rate_bps(pos.entry_price),
+                    usd,
+                ),
+            };
             // Settle realized PnL into spendable collateral immediately so
             // winners can withdraw profits and the withdrawal-proof leaf
             // (which commits collateral only) reflects true solvency.
@@ -161,6 +179,20 @@ impl Account {
             };
             // Per-market margin rates; a market absent from the map (stale
             // book, e.g. unit tests) falls back to the genesis rates.
+            let fp = params.get(m).filter(|p| p.funding_rate);
+            if let Some(p) = fp {
+                // Funding-rate market: money scales with the listing-time
+                // multiplier — book/marks there encode bps, not dollars.
+                let notional = funding_notional_usd(pos.qty.unsigned_abs(), p.usd_per_unit);
+                upnl += funding_rate_cash(
+                    pos.qty,
+                    funding_rate_bps(mark) - funding_rate_bps(pos.entry_price),
+                    p.usd_per_unit,
+                );
+                mm += bps(notional, p.mm_bps);
+                im += bps(notional, p.im_bps);
+                continue;
+            }
             let im_bps = params.get(m).map(|p| p.im_bps).unwrap_or(IM_RATE_BPS);
             let mm_bps = params.get(m).map(|p| p.mm_bps).unwrap_or(MM_RATE_BPS);
             upnl +=
@@ -271,6 +303,7 @@ mod tests {
             100_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             BTC_USD,
+            None,
         )
         .unwrap();
         let before = a
@@ -291,6 +324,7 @@ mod tests {
             -100_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             BTC_USD,
+            None,
         )
         .unwrap();
         // Long 1 @ -100k, mark -90k: upnl = (-90k) - (-100k) = +10k.
@@ -314,6 +348,7 @@ mod tests {
             100_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             BTC_USD,
+            None,
         )
         .unwrap();
         a.apply_fill(
@@ -322,6 +357,7 @@ mod tests {
             110_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             BTC_USD,
+            None,
         )
         .unwrap();
         assert!(a.positions.is_empty());
@@ -339,6 +375,7 @@ mod tests {
             100_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             BTC_USD,
+            None,
         )
         .unwrap();
         a.apply_fill(
@@ -347,6 +384,7 @@ mod tests {
             110_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             BTC_USD,
+            None,
         )
         .unwrap();
         let m = marks(110_000 * PRICE_SCALE as i64);
@@ -364,6 +402,7 @@ mod tests {
             2_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             BTC_USD,
+            None,
         )
         .unwrap();
         let mark = 2_000 * PRICE_SCALE as i64;
@@ -381,6 +420,46 @@ mod tests {
     }
 
     #[test]
+    fn funding_rate_upnl_uses_multiplier() {
+        use operp_types::{encode_funding_price, funding_rate_cash};
+        let mut p = operp_types::genesis_params();
+        p.funding_rate = true;
+        p.usd_per_unit = 10_000;
+        p.im_bps = 100;
+        p.mm_bps = 50;
+        let mut params = BTreeMap::new();
+        params.insert(MarketId(2), p);
+        let mut marks = BTreeMap::new();
+        let entry = encode_funding_price(12);
+        let mark = encode_funding_price(20);
+        marks.insert(MarketId(2), mark);
+        let mut a = Account::new(AccountId([1; 32]));
+        a.apply_fill(Side::Bid, true, entry, QTY_SCALE, MarketId(2), Some(10_000))
+            .unwrap();
+        // 1 unit long, rate moved 12 → 20 bps: 8 bp on $10_000/unit = $8.
+        // The encoded-price delta would book ~$0.0008 — a 10^4 mismatch.
+        let expected = funding_rate_cash(QTY_SCALE as i64, 8, 10_000);
+        assert_eq!(expected, 8 * USD_SCALE as i128, "sanity: 8bp on $10k");
+        let s = a.snapshot(&marks, &params);
+        assert_eq!(
+            s.equity, expected,
+            "uPnL uses the multiplier, not the encoded price"
+        );
+        // Margin also scales off the multiplier notional: $10_000 notional.
+        assert_eq!(s.mm, 50 * USD_SCALE as i128);
+        assert_eq!(s.im, 100 * USD_SCALE as i128);
+        // Closed at the same rates: realized cash equals the uPnL.
+        let mut b = a.clone();
+        b.apply_fill(Side::Ask, true, mark, QTY_SCALE, MarketId(2), Some(10_000))
+            .unwrap();
+        assert_eq!(
+            b.collateral, expected,
+            "reducing fill realizes the rate cash"
+        );
+        assert!(b.positions.is_empty());
+    }
+
+    #[test]
     fn withdraw_blocked_in_reduce_only() {
         let mut a = Account::new(AccountId([1; 32]));
         a.credit(6 * USD_SCALE as i128).unwrap();
@@ -390,6 +469,7 @@ mod tests {
             100 * PRICE_SCALE as i64,
             QTY_SCALE,
             BTC_USD,
+            None,
         )
         .unwrap();
         let m = marks(100 * PRICE_SCALE as i64);
@@ -408,6 +488,7 @@ mod tests {
             100_000 * PRICE_SCALE as i64,
             QTY_SCALE,
             BTC_USD,
+            None,
         )
         .unwrap();
         // Empty marks map: the position's market has no mark.

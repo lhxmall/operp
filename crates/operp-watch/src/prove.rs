@@ -473,7 +473,7 @@ fn fill_proof(
             None => continue,
         };
         let mparts: Vec<&str> = pre_meta.split(':').collect();
-        if mparts.len() != 9 {
+        if mparts.len() != 11 {
             continue;
         }
         let fee_bps: u128 = match mparts[5].parse() {

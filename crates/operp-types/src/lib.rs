@@ -2,7 +2,10 @@ mod amount;
 mod ids;
 mod order;
 
-pub use amount::{bps, i128_to_le16, notional_usd, sha256, signed_notional_usd};
+pub use amount::{
+    bps, funding_notional_usd, funding_rate_cash, i128_to_le16, notional_usd, sha256,
+    signed_notional_usd,
+};
 pub use ids::{account_id_from_pubkey, liq_order_id, order_id, AccountId, OrderId, UnitId};
 pub use order::{ExecStatus, OrderType, Side, TimeInForce};
 
@@ -203,15 +206,18 @@ pub type Height = u64;
 pub type Bps = u64;
 
 /// Single listing/param-update gate for the four market risk parameters.
-/// Funding-cap linkage (`im_bps >= 10 * FUNDING_CAP_BPS`) is kept as its own
-/// conjunct so it does not silently disappear if the MM floor moves.
+/// Funding-rate markets get the 100x gate (`im_bps >= 100`), a looser MM
+/// floor, and a per-market peg cap that IM must cover 10x over; regular
+/// markets keep today's conjuncts plus `funding_cap_bps == 0`.
 pub fn risk_params_ok(
     im_bps: Bps,
     mm_bps: Bps,
     taker_fee_bps: Bps,
     keeper_reward_bps: Bps,
+    funding_rate: bool,
+    funding_cap_bps: u64,
 ) -> bool {
-    im_bps != 0
+    let shared = im_bps != 0
         && mm_bps != 0
         && taker_fee_bps != 0
         && keeper_reward_bps != 0
@@ -220,11 +226,23 @@ pub fn risk_params_ok(
         && taker_fee_bps <= 10_000
         && keeper_reward_bps <= 10_000
         && im_bps > mm_bps
-        && mm_bps >= 500
         && im_bps <= 5000
-        && taker_fee_bps <= 200
-        && keeper_reward_bps <= 500
-        && im_bps >= 10 * (FUNDING_CAP_BPS as u64)
+        && taker_fee_bps <= 200;
+    if !shared {
+        return false;
+    }
+    if funding_rate {
+        mm_bps >= 50
+            && im_bps >= 100
+            && (1..=500).contains(&funding_cap_bps)
+            && im_bps >= 10 * funding_cap_bps
+            && keeper_reward_bps <= im_bps / 10
+    } else {
+        mm_bps >= 500
+            && keeper_reward_bps <= 500
+            && im_bps >= 10 * (FUNDING_CAP_BPS as u64)
+            && funding_cap_bps == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -318,6 +336,14 @@ pub struct MarketParams {
     /// creation; old JSON without this field parses as `false`.
     #[serde(default)]
     pub funding_rate: bool,
+    /// Dollars per 1.0 qty, listing-time money scale for funding-rate
+    /// markets. 0 unless `funding_rate`. Fixed at creation.
+    #[serde(default)]
+    pub usd_per_unit: u64,
+    /// Per-window peg cap in bps for this funding-rate market. 0 unless
+    /// `funding_rate`. Fixed at creation.
+    #[serde(default)]
+    pub funding_cap_bps: u64,
 }
 
 /// Genesis market BTC_USD: same values as the pre-governance globals.
@@ -334,6 +360,8 @@ pub fn genesis_params() -> MarketParams {
         delisted: false,
         spot_only: false,
         funding_rate: false,
+        usd_per_unit: 0,
+        funding_cap_bps: 0,
     }
 }
 

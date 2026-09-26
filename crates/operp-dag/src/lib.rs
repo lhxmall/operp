@@ -76,6 +76,14 @@ pub enum Op {
         /// Fixed at creation. Old JSON without this field parses as `false`.
         #[serde(default)]
         funding_rate: bool,
+        /// Dollars per 1.0 qty for funding-rate money math; 0 unless
+        /// `funding_rate`. Fixed at creation.
+        #[serde(default)]
+        usd_per_unit: u64,
+        /// Per-window peg cap bps for this funding-rate market; 0 unless
+        /// `funding_rate`. Fixed at creation.
+        #[serde(default)]
+        funding_cap_bps: u64,
     },
     /// On-chain parameter proposal for `market`; `key` is a `ParamKey` u8.
     CreateProposal {
@@ -281,6 +289,8 @@ fn encode_op(b: &mut Vec<u8>, op: &Op) {
             keeper_reward_bps,
             spot_only,
             funding_rate,
+            usd_per_unit,
+            funding_cap_bps,
         } => {
             b.push(10);
             b.extend_from_slice(&creator.0);
@@ -292,6 +302,8 @@ fn encode_op(b: &mut Vec<u8>, op: &Op) {
             b.extend_from_slice(&keeper_reward_bps.to_le_bytes());
             b.push(*spot_only as u8);
             b.push(*funding_rate as u8);
+            b.extend_from_slice(&usd_per_unit.to_le_bytes());
+            b.extend_from_slice(&funding_cap_bps.to_le_bytes());
         }
         Op::CreateProposal {
             creator,
