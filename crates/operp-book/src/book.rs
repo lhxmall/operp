@@ -1,7 +1,22 @@
 use crate::{BookError, Fill, MatchResult, Order};
-use operp_types::{MarketId, OrderId, OrderType, Price, Qty, Side, TimeInForce};
+use operp_types::{AccountId, MarketId, OrderId, OrderType, Price, Qty, Side, TimeInForce, Usd};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+
+/// Share of an order's escrowed isolated margin consumed by one fill:
+/// pro-rata of quantity, floored. The fill that exhausts the order's
+/// remaining quantity takes the whole rest, so the sum across fills is
+/// exact. Cross orders carry `margin_left == 0` → always 0.
+fn pro_rata_post(margin_left: u64, fill_qty: u64, remaining_before: u64) -> u64 {
+    if margin_left == 0 || remaining_before == 0 {
+        return 0;
+    }
+    if fill_qty >= remaining_before {
+        margin_left
+    } else {
+        (u128::from(margin_left) * u128::from(fill_qty) / u128::from(remaining_before)) as u64
+    }
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OrderBook {
@@ -43,7 +58,7 @@ impl OrderBook {
     ///        price le8 || live-order count u32le
     ///        || per live order in deque order (stale ids not present in
     ///           `orders`, if any, are skipped):
-    ///            order_id 32B || remaining le8
+    ///            order_id 32B || remaining le8 || isolated u8 || margin_left le8
     /// BTreeMap iteration makes level order deterministic across replays.
     /// O(book size) — fine for settlement-time commitment.
     pub fn commitment_bytes(&self) -> Vec<u8> {
@@ -60,6 +75,8 @@ impl OrderBook {
                     live += 1;
                     body.extend_from_slice(&o.id.0);
                     body.extend_from_slice(&o.remaining.to_le_bytes());
+                    body.push(o.isolated as u8);
+                    body.extend_from_slice(&o.margin_left.to_le_bytes());
                 }
             }
             b.extend_from_slice(&price.to_le_bytes());
@@ -135,6 +152,7 @@ impl OrderBook {
 
         let mut fills = Vec::new();
         let mut canceled_maker = Vec::new();
+        let mut refunds: Vec<(AccountId, u64)> = Vec::new();
 
         while order.remaining > 0 {
             let head = match order.side {
@@ -173,18 +191,50 @@ impl OrderBook {
                 // Cache: canceled maker's visible qty leaves the level.
                 self.level_add(maker_side, maker_price, -(maker_remaining as i64));
                 canceled_maker.push(maker_id);
+                // The canceled maker never filled: its whole escrow remainder
+                // is refunded to collateral.
+                let maker_margin_left = self
+                    .orders
+                    .get(&maker_id)
+                    .map(|m| m.margin_left)
+                    .unwrap_or(0);
+                if maker_margin_left > 0 {
+                    refunds.push((maker_account, maker_margin_left));
+                }
                 self.orders.remove(&maker_id);
                 self.pop_head(maker_side);
                 continue;
             }
 
-            let (fill_qty, maker_side, maker_acct, maker_done) = {
+            let taker_remaining_before = order.remaining;
+            let (
+                fill_qty,
+                maker_side,
+                maker_acct,
+                maker_done,
+                maker_isolated,
+                maker_post,
+                taker_post,
+            ) = {
                 let maker = self.orders.get_mut(&maker_id).expect("maker present");
+                let maker_remaining_before = maker.remaining;
                 let fill_qty = order.remaining.min(maker.remaining);
+                let maker_post = pro_rata_post(maker.margin_left, fill_qty, maker_remaining_before);
                 maker.remaining -= fill_qty;
+                maker.margin_left -= maker_post;
                 order.remaining -= fill_qty;
+                let taker_post = pro_rata_post(order.margin_left, fill_qty, taker_remaining_before);
+                order.margin_left -= taker_post;
                 let maker_done = maker.remaining == 0;
-                (fill_qty, maker.side, maker.account, maker_done)
+                (
+                    fill_qty,
+                    maker.side,
+                    maker.account,
+                    maker_done,
+                    maker.isolated,
+                    maker_post,
+                    taker_post,
+                )
             };
             // Cache: maker's visible qty shrinks by the filled amount.
             self.level_add(maker_side, maker_price, -(fill_qty as i64));
@@ -199,6 +249,10 @@ impl OrderBook {
                 qty: fill_qty,
                 seq: order.seq,
                 taker_side: order.side,
+                taker_post: taker_post as Usd,
+                maker_post: maker_post as Usd,
+                taker_isolated: order.isolated,
+                maker_isolated: maker_isolated,
             });
 
             if maker_done {
@@ -211,6 +265,7 @@ impl OrderBook {
             order.typ == OrderType::Limit && order.tif == TimeInForce::Gtc && order.remaining > 0;
 
         let taker_remaining = if rest { order.remaining } else { 0 };
+        let taker_margin_left = order.margin_left;
         if rest {
             let (order_side, order_price, q) = (order.side, order.price, order.remaining);
             self.enqueue(order);
@@ -223,6 +278,8 @@ impl OrderBook {
             taker_remaining,
             taker_resting: rest,
             canceled_maker,
+            taker_margin_left,
+            refunds,
         })
     }
 

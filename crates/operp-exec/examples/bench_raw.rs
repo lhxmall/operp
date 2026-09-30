@@ -71,6 +71,8 @@ fn main() {
                     price: px,
                     qty,
                     client_seq: cs,
+                    isolated: false,
+                    margin: 0,
                 },
                 pubkey: keys[who].verifying_key().to_bytes(),
                 sig: [0u8; 64],

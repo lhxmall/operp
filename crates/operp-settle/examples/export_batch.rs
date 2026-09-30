@@ -78,6 +78,8 @@ fn main() {
             price: px,
             qty,
             client_seq: 1,
+            isolated: false,
+            margin: 0,
         },
         &bob,
     );
@@ -96,6 +98,8 @@ fn main() {
             price: px,
             qty,
             client_seq: 1,
+            isolated: false,
+            margin: 0,
         },
         &alice,
     );

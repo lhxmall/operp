@@ -18,6 +18,14 @@ pub enum Op {
         price: Price,
         qty: Qty,
         client_seq: u64,
+        /// Per-order margin mode: `true` = isolated (losses stop at `margin`),
+        /// `false` = cross (today's pooled behavior). Old JSON parses as `false`.
+        #[serde(default)]
+        isolated: bool,
+        /// Escrowed margin for an isolated order, in `USD_SCALE` units.
+        /// Old JSON parses as `0`.
+        #[serde(default)]
+        margin: u64,
     },
     Cancel {
         account: AccountId,
@@ -207,6 +215,8 @@ fn encode_op(b: &mut Vec<u8>, op: &Op) {
             price,
             qty,
             client_seq,
+            isolated,
+            margin,
         } => {
             b.push(1);
             b.extend_from_slice(&account.0);
@@ -217,6 +227,8 @@ fn encode_op(b: &mut Vec<u8>, op: &Op) {
             b.extend_from_slice(&price.to_le_bytes());
             b.extend_from_slice(&qty.to_le_bytes());
             b.extend_from_slice(&client_seq.to_le_bytes());
+            b.push(*isolated as u8);
+            b.extend_from_slice(&margin.to_le_bytes());
         }
         Op::Cancel { account, order_id } => {
             b.push(2);

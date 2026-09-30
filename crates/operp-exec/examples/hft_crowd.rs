@@ -39,6 +39,8 @@ fn ingest_place(
             price,
             qty,
             client_seq,
+            isolated: false,
+            margin: 0,
         },
         secret,
     );

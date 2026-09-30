@@ -174,6 +174,9 @@ pub struct MerkleProof {
     /// Open positions committed by the leaf (qty, entry_price per market);
     /// carried for the same leaf-preimage recomputation.
     pub positions: BTreeMap<MarketId, (i64, Price)>,
+    /// Escrowed isolated margin committed by the leaf; carried for the
+    /// same leaf-preimage recomputation.
+    pub isolated_margin: BTreeMap<MarketId, Usd>,
 }
 
 impl Default for ChainState {
@@ -895,6 +898,8 @@ impl ChainState {
                 fill.qty,
                 fill.market,
                 funding_usd,
+                fill.taker_post,
+                fill.taker_isolated,
             )?;
         }
         {
@@ -906,6 +911,8 @@ impl ChainState {
                 fill.qty,
                 fill.market,
                 funding_usd,
+                fill.maker_post,
+                fill.maker_isolated,
             )?;
         }
         // Taker fee: bps of notional debited from the taker's collateral and
@@ -1082,6 +1089,7 @@ impl ChainState {
                 .values()
                 .map(|p| (p.market, (p.qty, p.entry_price)))
                 .collect(),
+            isolated_margin: acct.isolated_margin.clone(),
         }
     }
 
@@ -1109,6 +1117,14 @@ pub fn account_leaf(acct: &Account, perp: u128, withdrawn: i128) -> [u8; 32] {
         b.extend_from_slice(&m.0.to_le_bytes());
         b.extend_from_slice(&p.qty.to_le_bytes());
         b.extend_from_slice(&p.entry_price.to_le_bytes());
+    }
+    // Escrowed isolated margin per market (BTreeMap order): money outside
+    // `collateral` that backs isolated positions — without it the leaf
+    // would understate the account's committed assets.
+    b.extend_from_slice(&(acct.isolated_margin.len() as u32).to_le_bytes());
+    for (m, margin) in &acct.isolated_margin {
+        b.extend_from_slice(&m.0.to_le_bytes());
+        b.extend_from_slice(&margin.to_le_bytes());
     }
     // Mirrored PERP balance: the vault AA's hex-domain leaf commits the same
     // triple (address, collateral, perp), so both trees cover PERP claims.
@@ -1719,6 +1735,10 @@ mod tests {
             qty,
             seq: 1,
             taker_side: operp_types::Side::Bid,
+            taker_post: 0,
+            maker_post: 0,
+            taker_isolated: false,
+            maker_isolated: false,
         };
         // Raw price 500 with qty >= QTY_SCALE/100 (the old gate's shape):
         // degenerate rate and negligible notional — mark never appears.
@@ -1775,6 +1795,10 @@ mod tests {
             qty: operp_types::QTY_SCALE,
             seq: 1,
             taker_side: operp_types::Side::Bid,
+            taker_post: 0,
+            maker_post: 0,
+            taker_isolated: false,
+            maker_isolated: false,
         };
         s.apply_fill_pair(&fill).unwrap();
         // notional = 100_000 USD → fee @5bps = 50 USD credited to insurance.
@@ -1802,6 +1826,10 @@ mod tests {
             qty: operp_types::QTY_SCALE,
             seq: 1,
             taker_side: operp_types::Side::Bid,
+            taker_post: 0,
+            maker_post: 0,
+            taker_isolated: false,
+            maker_isolated: false,
         };
         // +200% spike: rejected by the ±10% cap — mark stays at genesis.
         // The unoracled freeze needs a reporter index for a non-zero mark to
@@ -1847,6 +1875,10 @@ mod tests {
             qty: operp_types::QTY_SCALE,
             seq: 1,
             taker_side: operp_types::Side::Bid,
+            taker_post: 0,
+            maker_post: 0,
+            taker_isolated: false,
+            maker_isolated: false,
         };
         s.apply_fill_pair(&fill).unwrap();
 
@@ -1899,6 +1931,8 @@ mod tests {
                 operp_types::QTY_SCALE,
                 BTC_USD,
                 None,
+                0,
+                false,
             )
             .unwrap();
         // Taker dumps at 10k: the maker closes with a 90k realized loss
@@ -1915,6 +1949,10 @@ mod tests {
             qty: operp_types::QTY_SCALE,
             seq: 1,
             taker_side: operp_types::Side::Bid,
+            taker_post: 0,
+            maker_post: 0,
+            taker_isolated: false,
+            maker_isolated: false,
         };
         s.apply_fill_pair(&fill).unwrap();
         // Maker clamped to exactly 0. The maker's own 50k collateral absorbs
