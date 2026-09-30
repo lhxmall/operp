@@ -905,6 +905,8 @@ mod tests {
                     price,
                     qty,
                     client_seq: seq,
+                    isolated: false,
+                    margin: 0,
                 },
                 secret,
             )

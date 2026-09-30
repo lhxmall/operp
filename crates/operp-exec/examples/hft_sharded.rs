@@ -104,6 +104,8 @@ fn run_shard(shard_idx: usize, cfg: &Cfg) -> (u64, u64, u64) {
                     price: px,
                     qty,
                     client_seq: cs,
+                    isolated: false,
+                    margin: 0,
                 },
                 &secrets[who],
             );

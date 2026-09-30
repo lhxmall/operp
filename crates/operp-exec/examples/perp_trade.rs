@@ -46,6 +46,8 @@ fn place(
             price,
             qty,
             client_seq,
+            isolated: false,
+            margin: 0,
         },
         secret,
     )

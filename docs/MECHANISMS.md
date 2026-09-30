@@ -92,7 +92,7 @@ Unit {
 
 | op | tag | 字段序 |
 |---|---|---|
-| Place | 1 | account, market_le4, side_u8, typ_u8, tif_u8, price_le8, qty_le8, client_seq_le8 |
+| Place | 1 | account, market_le4, side_u8, typ_u8, tif_u8, price_le8, qty_le8, client_seq_le8, isolated_u8（0/1）, margin_le8 |
 | Cancel | 2 | account, order_id |
 | Deposit | 3 | account, amount_le16, aa_unit_32 |
 | Withdraw | 4 | account, amount_le16, nonce_le8 |
@@ -275,6 +275,33 @@ debit(amount)：amount>0；collateral 足额；debit 后快照落入 reduce-only
 
 引擎侧 withdrawals 映射（防重复 nonce 的提款记录）容量上限
 65 536 条目，防止无界状态增长。
+
+### 4.5 逐仓保证金（per-order isolated margin）
+
+`Place { isolated, margin }` 携带模式与保证金金额（USD_SCALE），无新
+Op；Order/Position 各带 `isolated` 标志。跨仓单 `margin` 必须为 0。
+
+- **模式唯一**：pos_mode（有仓取仓）＞ order_mode（有挂单取首张），
+  与订单 mode 不符 → Risk。同一市场绝不混仓。
+- **开仓门**（isolated）：`margin ≥ max(extra_im, 1)`、`margin ≤
+  collateral`、`equity − margin ≥ im + resting`；无 MIN_OPEN_EQUITY
+  （margin 下限即其等价物）。逐仓纯减仓带 margin → Risk。
+- **托管**：place 时 `collateral -= margin`；每笔成交按
+  `post = fill ≥ remaining_before ? margin_left : margin_left·fill/
+  remaining_before`（floor，末笔吃余数）记入
+  `isolated_margin[market]` 桶；STP 取消、撤单、未驻留余量退回
+  collateral。守恒：`collateral + Σ桶 + Σlive margin_left` 只经
+  存提/PnL 变动。
+- **平仓释放**：`release = 桶·close/old`（全平取整桶）先入
+  collateral，再结算已实现 PnL——桶永不为负；PnL 超桶的缺口落
+  collateral 负值，由 apply_fill_pair 钳零转保险（§5.3 同一路径）。
+  产生开仓量的成交 post 进桶；纯减仓 post 直接回 collateral。
+- **风险隔离**：`snapshot` 跳过 `isolated` 仓位（跨仓 equity/mm/im
+  看不见它）；`isolated_risk(market)` 独立判定：equity = 桶 + uPnL，
+  mark 缺失 → reduce_only 且 equity = 桶。清算入口按目标仓位模式
+  分叉（逐仓 → isolated_risk，跨仓 → snapshot）；离簿资金费清算的
+  target_equity、ADL 排序分母同样分叉。
+- **提款**：debit 只看跨仓快照；桶不属于 collateral，提现碰不到它。
 
 ---
 
@@ -545,11 +572,15 @@ last_unit 不符 ∨ state_root 不符 ∨ 承诺根不符  → RootMismatch
 ```
 account_leaf = sha256("acct" ‖ id32 ‖ collateral_i128le16
                       ‖ realized_i128le16 ‖ pos_count_u32le ‖ positions…
+                      ‖ iso_count_u32le ‖ [market_le4 margin_i128le16]*
                       ‖ perp_u128le16)
+               # positions = 每仓 [market_le4 qty_le8 entry_le8]
+               # iso = 逐仓保证金桶（BTreeMap 序，§4.5）；money 已出
+               #   collateral，漏承诺会低估账户资产
                # perp 取自 perp_balances（PERP 治理余额，§16），
                # 与 collateral 并列进入承诺
 book_leaf    = sha256(params_59B ‖ b"book" ‖ market_le4 ‖ [price_le8 ‖
-               (order_id32 ‖ remaining_le8)*]*)
+               (order_id32 ‖ remaining_le8 ‖ isolated_u8 ‖ margin_left_le8)*]*)
                # params_59B = symbol16 ‖ tick_size_le8 ‖ im_bps_le8
                #   ‖ mm_bps_le8 ‖ taker_fee_bps_le8 ‖ keeper_reward_bps_le8
                #   ‖ delisted_u8 ‖ spot_only_u8 ‖ funding_rate_u8（定宽 59 字节）

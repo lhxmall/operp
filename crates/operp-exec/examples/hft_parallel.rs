@@ -108,6 +108,8 @@ fn generator(
                     price: px,
                     qty,
                     client_seq: cs,
+                    isolated: false,
+                    margin: 0,
                 },
                 &secrets[who],
             );

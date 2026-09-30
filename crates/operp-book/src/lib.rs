@@ -2,7 +2,9 @@ mod book;
 
 pub use book::OrderBook;
 
-use operp_types::{AccountId, MarketId, OrderId, OrderType, Price, Qty, Seq, Side, TimeInForce};
+use operp_types::{
+    AccountId, MarketId, OrderId, OrderType, Price, Qty, Seq, Side, TimeInForce, Usd,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Order {
@@ -16,6 +18,13 @@ pub struct Order {
     pub qty: Qty,
     pub remaining: Qty,
     pub seq: Seq,
+    /// Margin mode of this order: `true` = isolated, `false` = cross.
+    #[serde(default)]
+    pub isolated: bool,
+    /// Un-escrowed remainder of this order's isolated margin (USD_SCALE).
+    /// Always 0 for cross orders.
+    #[serde(default)]
+    pub margin_left: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -29,6 +38,18 @@ pub struct Fill {
     pub qty: Qty,
     pub seq: Seq,
     pub taker_side: Side,
+    /// Taker's share of this fill's isolated margin, allocated pro-rata
+    /// (USD_SCALE). Always 0 when the taker order is cross.
+    #[serde(default)]
+    pub taker_post: Usd,
+    /// Maker's share of this fill's isolated margin, allocated pro-rata
+    /// (USD_SCALE). Always 0 when the maker order is cross.
+    #[serde(default)]
+    pub maker_post: Usd,
+    #[serde(default)]
+    pub taker_isolated: bool,
+    #[serde(default)]
+    pub maker_isolated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -37,6 +58,12 @@ pub struct MatchResult {
     pub taker_remaining: Qty,
     pub taker_resting: bool,
     pub canceled_maker: Vec<OrderId>,
+    /// Local taker's un-escrowed margin remainder at return (USD_SCALE);
+    /// its full remainder when the taker did not rest.
+    pub taker_margin_left: u64,
+    /// Escrowed margin to refund to makers removed without filling
+    /// (self-trade prevention), as (account, amount USD_SCALE).
+    pub refunds: Vec<(AccountId, u64)>,
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -88,6 +115,8 @@ mod tests {
             qty,
             remaining: qty,
             seq,
+            isolated: false,
+            margin_left: 0,
         }
     }
 

@@ -434,6 +434,8 @@ mod tests {
                 price: px,
                 qty,
                 client_seq: 1,
+                isolated: false,
+                margin: 0,
             },
             &bob,
         );
@@ -452,6 +454,8 @@ mod tests {
                 price: px,
                 qty,
                 client_seq: 1,
+                isolated: false,
+                margin: 0,
             },
             &alice,
         );

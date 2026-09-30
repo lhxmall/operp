@@ -1150,6 +1150,7 @@ pub fn check_withdraw(claim: &WithdrawClaim, finalized_root: [u8; 32]) -> Result
     let mut acct = operp_account::Account::new(claim.proof.account);
     acct.collateral = claim.proof.collateral;
     acct.realized_pnl = claim.proof.realized_pnl;
+    acct.isolated_margin = claim.proof.isolated_margin.clone();
     acct.positions = claim
         .proof
         .positions
@@ -1161,6 +1162,7 @@ pub fn check_withdraw(claim: &WithdrawClaim, finalized_root: [u8; 32]) -> Result
                     market: *m,
                     qty: *qty,
                     entry_price: *entry,
+                    isolated: false,
                 },
             )
         })
@@ -1305,6 +1307,8 @@ mod tests {
                 price: px,
                 qty: QTY_SCALE,
                 client_seq: 1,
+                isolated: false,
+                margin: 0,
             },
             &bob,
         );
@@ -1321,6 +1325,8 @@ mod tests {
                 price: px,
                 qty: QTY_SCALE,
                 client_seq: 1,
+                isolated: false,
+                margin: 0,
             },
             &alice,
         );
@@ -1911,6 +1917,8 @@ mod tests {
                 price: PRICE_SCALE as i64,
                 qty: QTY_SCALE,
                 client_seq: 99,
+                isolated: false,
+                margin: 0,
             },
             &sk(6),
         );
@@ -1985,6 +1993,8 @@ mod tests {
             price: 100 * PRICE_SCALE as i64,
             qty: QTY_SCALE / 1000,
             client_seq: 1,
+            isolated: false,
+            margin: 0,
         };
         let salt = [5u8; 32];
         let hash = operp_dag::reveal_commit_hash(&inner, &salt);

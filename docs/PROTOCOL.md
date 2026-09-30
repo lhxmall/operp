@@ -75,11 +75,11 @@ notional = qty · price / PRICE_SCALE · USD_SCALE / QTY_SCALE
   成交扣减、挂单累加、撤单扣减，best_bid/best_ask 读缓存头 → O(log depth)，
   消除了原来 O(深度×队列长) 的扫描。
 
-### 2.3 风险引擎（全仓）
+### 2.3 风险引擎（全仓 + 逐仓）
 
 每次成交同时更新 taker/maker 两腿：开仓 VWAP 入场价，平仓实现 PnL。
 
-快照（`Account::snapshot`，按市场参数取费率）计算：
+**全仓快照**（`Account::snapshot`，按市场参数取费率）计算：
 
 ```
 mm (maintenance) = bps(|qty|·mark, market.mm_bps)   创世默认 500
@@ -99,6 +99,28 @@ reduce_only      : equity·10000 ≤ mm·12000
 taker≤200、keeper≤500、im ≥ 10×FUNDING_CAP_BPS），CreateMarket 与
 治理提案（创建时预检 + finalize 落盘前复检，非法提案为 no-op 但仍消耗）
 共用同一谓词。提款后检查不得落入 reduce-only。
+
+**逐仓模式**（`Place { isolated, margin }`，mode 在 order 上、无新 Op）：
+
+- **模式唯一**：同账户同市场的敞口只有一种模式——已有仓位的模式优先，
+  否则取该市场第一张活挂单的模式；不符即 `Risk`。flat 且无挂单的账户
+  以订单自身的 mode 为准。
+- **保证金字段规则**：跨仓单 `margin` 必须为 0；逐仓纯减仓单 `margin`
+  必须为 0（无开仓敞口可支撑，意义不明即拒）。
+- **开仓门槛**（逐仓分支）：`margin ≥ max(extra_im, 1)`（至少 IM、至少
+  1 个 USD 单位）、`margin ≤ collateral`、escrow 后跨仓池仍健康
+  （equity − margin ≥ im + resting）。**不适用** `MIN_OPEN_EQUITY`——
+  margin 下限就是它的等价物。
+- **托管生命周期**：下单时 `collateral -= margin`；成交按量比例
+  （pro-rata，最后一笔吃掉余数）把 margin 记入该市场的 `isolated_margin`
+  桶并进仓位；撤单/自成交取消（STP）/未驻留余量退回 collateral。
+  守恒不变式：`collateral + Σisolated_margin + Σlive margin_left`
+  只经 deposit/withdraw/PnL 变动。
+- **风险隔离**（`isolated_risk(market)`）：equity = 桶 + 该仓 uPnL，
+  亏损失止于桶；`snapshot` 完全跳过逐仓仓位（跨仓权益/IM/可清算性
+  看不见它）。mark 缺失 → reduce_only，equity = 桶。清算判定逐仓走
+  `isolated_risk`、跨仓走 snapshot；平仓释放比例桶进 collateral 后
+  才结算 PnL，负权益由 apply_fill_pair 既有钳零吸收。
 
 ### 2.4 清算、keeper 与保险基金
 
@@ -163,7 +185,9 @@ taker≤200、keeper≤500、im ≥ 10×FUNDING_CAP_BPS），CreateMarket 与
 ```
 account_leaf = sha256("acct" ‖ id32 ‖ collateral_i128le16 ‖ realized_i128le16
                       ‖ pos_count_u32 ‖ [market_le4 qty_le8 entry_le8]*
+                      ‖ iso_count_u32 ‖ [market_le4 margin_i128le16]*
                       ‖ perp_u128le16)
+               # iso = 逐仓保证金桶（BTreeMap 序，§2.3），已出 collateral
                # perp = PERP 治理余额（§7），与抵押并列进入承诺
 book_leaf    = sha256(params_59B ‖ 簿承诺)
                # params_59B = symbol16‖tick_le8‖im_le8‖mm_le8‖taker_le8

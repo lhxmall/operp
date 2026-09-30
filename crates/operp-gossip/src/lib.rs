@@ -181,6 +181,12 @@ fn decode_op(r: &mut Reader, depth: u32) -> Result<operp_dag::Op, GossipError> {
             price: r.i64()?,
             qty: r.u64()?,
             client_seq: r.u64()?,
+            isolated: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(GossipError::Malformed),
+            },
+            margin: r.u64()?,
         },
         2 => Op::Cancel {
             account: AccountId(r.arr32()?),
@@ -570,6 +576,8 @@ mod tests {
             price: 100,
             qty: 2,
             client_seq: secret as u64,
+            isolated: false,
+            margin: 0,
         };
         operp_dag::sign_unit(parents, op, &[secret; 32])
     }
@@ -601,6 +609,8 @@ mod tests {
                 price: i64::MAX,
                 qty: 7,
                 client_seq: 42,
+                isolated: false,
+                margin: 0,
             },
             Op::Cancel {
                 account: acct,
@@ -697,6 +707,8 @@ mod tests {
                     price: 7,
                     qty: 1,
                     client_seq: 3,
+                    isolated: false,
+                    margin: 0,
                 }),
                 salt: [0xF; 32],
             },
@@ -895,6 +907,8 @@ mod tests {
                 price: 1,
                 qty: 1,
                 client_seq: 0,
+                isolated: false,
+                margin: 0,
             },
             |inner, _| Op::Reveal {
                 account: AccountId([9; 32]),
@@ -921,9 +935,49 @@ mod tests {
 
     #[test]
     fn decode_rejects_messages_over_byte_cap() {
-        let junk = vec![0u8; MAX_MESSAGE_BYTES + 1];
+        let junk = vec![0xAB; MAX_MESSAGE_BYTES + 1];
         assert_eq!(GossipMessage::decode(&junk), Err(GossipError::Oversize));
         assert_eq!(decode_unit(&junk), Err(GossipError::Oversize));
+    }
+
+    #[test]
+    fn place_isolated_roundtrip() {
+        let key = sk(4);
+        let acct = AccountId(account_id_from_pubkey(&key.verifying_key().to_bytes()).0);
+        let op = Op::Place {
+            account: acct,
+            market: MarketId(1),
+            side: operp_types::Side::Bid,
+            typ: operp_types::OrderType::Limit,
+            tif: operp_types::TimeInForce::Gtc,
+            price: 100,
+            qty: 2,
+            client_seq: 7,
+            isolated: true,
+            margin: 12_345,
+        };
+        let unit = operp_dag::sign_unit(vec![genesis_id()], op, &[4u8; 32]);
+        let wire = unit_wire(&unit);
+        let decoded = decode_unit(&wire).unwrap();
+        match &decoded.op {
+            Op::Place {
+                isolated, margin, ..
+            } => {
+                assert!(*isolated);
+                assert_eq!(*margin, 12_345);
+            }
+            _ => panic!("expected Place"),
+        }
+        assert_eq!(decoded, unit);
+
+        // The isolated tail byte rejects values > 1. Offset: magic(4) +
+        // nparents(1) + one parent(32) + tag(1) + account(32) + market(4)
+        // + side/typ/tif(3) + price(8) + qty(8) + client_seq(8).
+        let iso_at = 4 + 1 + 32 + 1 + 32 + 4 + 3 + 8 + 8 + 8;
+        assert_eq!(wire[iso_at], 1, "isolated byte location");
+        let mut bad = wire.clone();
+        bad[iso_at] = 2;
+        assert_eq!(decode_unit(&bad), Err(GossipError::Malformed));
     }
 
     #[test]

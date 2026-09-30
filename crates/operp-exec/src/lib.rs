@@ -332,6 +332,8 @@ impl Engine {
                 price,
                 qty,
                 client_seq,
+                isolated,
+                margin,
             } => self.place(
                 *account,
                 *market,
@@ -342,6 +344,8 @@ impl Engine {
                 *qty,
                 *client_seq,
                 seq,
+                *isolated,
+                *margin,
             ),
             Op::Cancel { account, order_id } => self.cancel(*account, *order_id),
             Op::Deposit {
@@ -484,6 +488,8 @@ impl Engine {
         qty: Qty,
         client_seq: u64,
         seq: Seq,
+        isolated: bool,
+        margin: u64,
     ) -> Result<Vec<Fill>, RejectReason> {
         let last = self
             .state
@@ -574,7 +580,38 @@ impl Engine {
             .and_then(|a| a.positions.get(&market))
             .map(|p| p.qty)
             .unwrap_or(0);
-        if snap.reduce_only {
+        // Mode gate: an account's exposure to one market has one mode —
+        // the position's if it exists, else its first live order's. A
+        // mismatched order would let cross losses leak into a bucket (or
+        // vice versa), so it is rejected before any risk math.
+        let pos_mode = if qty != 0 {
+            self.state
+                .accounts
+                .get(&account)
+                .and_then(|a| a.positions.get(&market))
+                .map(|p| p.isolated)
+        } else {
+            None
+        };
+        let order_mode = self.own_live_order_mode(account, market);
+        if let Some(m) = pos_mode.or(order_mode) {
+            if m != isolated {
+                return Err(RejectReason::Risk);
+            }
+        }
+        // Reduce-only gate: isolated positions are judged on their own
+        // bucket risk, cross positions on the pooled snapshot as today.
+        let reduce_only = if isolated {
+            self.state
+                .accounts
+                .get(&account)
+                .map(|a| a.isolated_risk(market, &self.state.marks, &self.state.markets))
+                .map(|r| r.reduce_only)
+                .unwrap_or(false)
+        } else {
+            snap.reduce_only
+        };
+        if reduce_only {
             let reducing = match side {
                 Side::Bid => pos_qty < 0,
                 Side::Ask => pos_qty > 0,
@@ -597,6 +634,16 @@ impl Engine {
         } else {
             signed
         };
+        // Margin-field rules (before the open block: they apply to pure
+        // reduces too). Cross orders carry no margin; an isolated pure
+        // reduce has no opening exposure to back, so escrow there is
+        // meaningless and rejected.
+        if margin != 0 && !isolated {
+            return Err(RejectReason::Risk);
+        }
+        if isolated && open_qty == 0 && margin != 0 {
+            return Err(RejectReason::Risk);
+        }
         if open_qty != 0 {
             // Unmarked-market hole: with no mark and no limit price, px_est
             // is 0, so the IM estimate below is 0 and a zero-collateral
@@ -617,23 +664,41 @@ impl Engine {
                 return Err(RejectReason::Risk);
             }
             let extra_im = bps(open_notional, params.im_bps);
-            // Equity must cover position IM + the IM reserved for resting
-            // opening orders + this order's own opening IM. `snapshot` only
-            // sees booked positions, not the margin pending openings will
-            // demand once they fill; the order being placed is not in the
-            // book yet, so it is not double-counted. Reduce-only orders
-            // cannot grow exposure, so they are not subject to this check.
             let resting = self.resting_open_im(account);
-            if snap.equity < snap.im + resting + extra_im {
-                return Err(RejectReason::Risk);
-            }
-            if snap.equity < MIN_OPEN_EQUITY {
-                return Err(RejectReason::Risk);
+            if isolated {
+                // Isolated floor: the bucket must cover this order's own IM
+                // (at least 1 USD unit — a zero bucket would be free
+                // exposure), fit inside spendable collateral, and leave the
+                // cross pool healthy after escrow. No MIN_OPEN_EQUITY: the
+                // margin floor is its equivalent.
+                if i128::from(margin) < extra_im.max(1) {
+                    return Err(RejectReason::Risk);
+                }
+                if i128::from(margin) > self.collateral_of(account) {
+                    return Err(RejectReason::Risk);
+                }
+                if snap.equity - i128::from(margin) < snap.im + resting {
+                    return Err(RejectReason::Risk);
+                }
+            } else {
+                // Equity must cover position IM + the IM reserved for resting
+                // opening orders + this order's own opening IM. `snapshot` only
+                // sees booked positions, not the margin pending openings will
+                // demand once they fill; the order being placed is not in the
+                // book yet, so it is not double-counted. Reduce-only orders
+                // cannot grow exposure, so they are not subject to this check.
+                if snap.equity < snap.im + resting + extra_im {
+                    return Err(RejectReason::Risk);
+                }
+                if snap.equity < MIN_OPEN_EQUITY {
+                    return Err(RejectReason::Risk);
+                }
             }
             // Funding-rate open-interest cap: worst-case peg payout
             // (notional × market cap) must fit inside the insurance fund at
             // all times, so a burst of openings can never promise more than
             // the fund can pay. A non-positive fund rejects every opening.
+            // Runs for both margin modes, after the mode's own gates.
             if params.funding_rate {
                 let oi = self.funding_open_interest(market, account, open_qty);
                 let worst_payout = funding_notional_usd(oi, params.usd_per_unit)
@@ -651,6 +716,12 @@ impl Engine {
             }
         }
 
+        // Escrow: margin leaves collateral while the order lives in the
+        // book; it returns via fills (bucket), cancel, or STP refunds.
+        let escrow = if isolated { i128::from(margin) } else { 0 };
+        if escrow != 0 {
+            self.state.account_mut(account).collateral -= escrow;
+        }
         let oid = order_id(account, market, client_seq);
         let order = Order {
             id: oid,
@@ -663,12 +734,19 @@ impl Engine {
             qty,
             remaining: qty,
             seq,
+            isolated,
+            margin_left: if isolated { margin } else { 0 },
         };
-        let result = self
-            .state
-            .book_mut(market)
-            .submit(order)
-            .map_err(RejectReason::Book)?;
+        let result = match self.state.book_mut(market).submit(order) {
+            Ok(r) => r,
+            Err(e) => {
+                // Nothing was matched or escrowed into fills: unwind.
+                if escrow != 0 {
+                    self.state.account_mut(account).collateral += escrow;
+                }
+                return Err(RejectReason::Book(e));
+            }
+        };
         for fill in &result.fills {
             // Invariant: AccountError from apply_fill_pair is unreachable here
             // by construction — intake guards above bound qty·price <
@@ -678,8 +756,36 @@ impl Engine {
             // documented known limitation, not a handled case.
             self.state.apply_fill_pair(fill).map_err(map_acct)?;
         }
+        // Refunds: STP-canceled makers' escrow and the taker's unfilled
+        // remainder (when it did not rest) return to collateral.
+        for (acct, amt) in &result.refunds {
+            if *amt > 0 {
+                self.state.account_mut(*acct).collateral += i128::from(*amt);
+            }
+        }
+        if !result.taker_resting && result.taker_margin_left > 0 {
+            self.state.account_mut(account).collateral += i128::from(result.taker_margin_left);
+        }
         self.state.seen_client_seq.insert(account, client_seq);
         Ok(result.fills)
+    }
+
+    /// First live order of `account` on `books[market]`'s margin mode, if
+    /// any: orders from the same account on one market must share a mode.
+    fn own_live_order_mode(&self, account: AccountId, market: MarketId) -> Option<bool> {
+        self.state
+            .books
+            .get(&market)
+            .and_then(|b| b.live_orders().find(|o| o.account == account))
+            .map(|o| o.isolated)
+    }
+
+    fn collateral_of(&self, account: AccountId) -> Usd {
+        self.state
+            .accounts
+            .get(&account)
+            .map(|a| a.collateral)
+            .unwrap_or(0)
     }
 
     /// Funding-rate open interest for `market`: positive position qty
@@ -736,9 +842,14 @@ impl Engine {
             let mut ask_qty: i64 = 0;
             let mut bid_notional: Usd = 0;
             let mut ask_notional: Usd = 0;
-            for o in book.live_orders().filter(|o| o.account == account) {
+            for o in book
+                .live_orders()
+                .filter(|o| o.account == account && !o.isolated)
+            {
                 // Funding-rate books rest at encoded rates: their margin is
-                // the multiplier notional, not a dollar price.
+                // the multiplier notional, not a dollar price. Isolated
+                // orders are skipped: their margin already left collateral
+                // at place time — counting it here would double-reserve.
                 let n = match self.state.markets.get(market) {
                     Some(p) if p.funding_rate => funding_notional_usd(o.remaining, p.usd_per_unit),
                     _ => {
@@ -801,10 +912,15 @@ impl Engine {
             .find(|(_, book)| book.get(order_id).map(|o| o.account) == Some(account))
             .map(|(m, _)| *m)
             .ok_or(RejectReason::NotFound)?;
-        self.state
+        let canceled = self
+            .state
             .book_mut(market)
             .cancel(order_id)
             .map_err(RejectReason::Book)?;
+        // Isolated escrow rides on the order: cancel returns its remainder.
+        if canceled.margin_left > 0 {
+            self.state.account_mut(account).collateral += i128::from(canceled.margin_left);
+        }
         Ok(Vec::new())
     }
 
@@ -893,22 +1009,39 @@ impl Engine {
             // Insurance fund never liquidates or is liquidated.
             return Err(RejectReason::NotLiquidatable);
         }
-        let snap = self
-            .state
-            .accounts
-            .get(&target)
-            .ok_or(RejectReason::NotFound)?
-            .snapshot(&self.state.marks, &self.state.markets);
-        if !snap.liquidatable {
-            return Err(RejectReason::NotLiquidatable);
-        }
-        let pos_qty = self
+        let pos = self
             .state
             .accounts
             .get(&target)
             .and_then(|a| a.positions.get(&market))
-            .map(|p| p.qty)
-            .unwrap_or(0);
+            .cloned();
+        // Isolation fork: an isolated position is liquidatable on its own
+        // bucket risk (`isolated_risk`), a cross one on the pooled account
+        // snapshot as today.
+        let liquidatable = match &pos {
+            Some(p) if p.isolated => self
+                .state
+                .accounts
+                .get(&target)
+                .map(|a| {
+                    a.isolated_risk(market, &self.state.marks, &self.state.markets)
+                        .liquidatable
+                })
+                .unwrap_or(false),
+            _ => {
+                self.state
+                    .accounts
+                    .get(&target)
+                    .ok_or(RejectReason::NotFound)?
+                    .snapshot(&self.state.marks, &self.state.markets)
+                    .liquidatable
+            }
+        };
+        if !liquidatable {
+            return Err(RejectReason::NotLiquidatable);
+        }
+        let pos_qty = pos.as_ref().map(|p| p.qty).unwrap_or(0);
+        let target_isolated_pos = pos.as_ref().map(|p| p.isolated).unwrap_or(false);
         if pos_qty == 0 {
             return Err(RejectReason::NotLiquidatable);
         }
@@ -938,6 +1071,8 @@ impl Engine {
             qty,
             remaining: qty,
             seq,
+            isolated: false,
+            margin_left: 0,
         };
         let result = self
             .state
@@ -955,15 +1090,25 @@ impl Engine {
             // limitation, not a handled case.
             self.state.apply_fill_pair(fill).map_err(map_acct)?;
         }
-        let still = self
-            .state
-            .accounts
-            .get(&target)
-            .map(|a| {
-                a.snapshot(&self.state.marks, &self.state.markets)
-                    .liquidatable
-            })
-            .unwrap_or(false);
+        let still = if target_isolated_pos {
+            self.state
+                .accounts
+                .get(&target)
+                .map(|a| {
+                    a.isolated_risk(market, &self.state.marks, &self.state.markets)
+                        .liquidatable
+                })
+                .unwrap_or(false)
+        } else {
+            self.state
+                .accounts
+                .get(&target)
+                .map(|a| {
+                    a.snapshot(&self.state.marks, &self.state.markets)
+                        .liquidatable
+                })
+                .unwrap_or(false)
+        };
         let remaining_pos = self
             .state
             .accounts
@@ -981,6 +1126,13 @@ impl Engine {
             } else {
                 Side::Bid
             };
+            let target_isolated = self
+                .state
+                .accounts
+                .get(&target)
+                .and_then(|a| a.positions.get(&market))
+                .map(|p| p.isolated)
+                .unwrap_or(false);
             let fill = Fill {
                 taker_id: oid,
                 maker_id: OrderId([0u8; 32]),
@@ -991,6 +1143,10 @@ impl Engine {
                 qty: close_qty,
                 seq,
                 taker_side: close_side,
+                taker_post: 0,
+                maker_post: 0,
+                taker_isolated: target_isolated,
+                maker_isolated: false,
             };
             self.state.apply_fill_pair(&fill).map_err(map_acct)?;
             fills.push(fill);
@@ -1067,11 +1223,33 @@ impl Engine {
                 .get(&target)
                 .cloned()
                 .map(|mut sim| {
-                    sim.apply_fill(close_side, true, price, mid, market, Some(usd))
-                        .is_ok()
-                        && !sim
-                            .snapshot(&self.state.marks, &self.state.markets)
-                            .liquidatable
+                    let target_isolated = self
+                        .state
+                        .accounts
+                        .get(&target)
+                        .and_then(|a| a.positions.get(&market))
+                        .map(|p| p.isolated)
+                        .unwrap_or(false);
+                    sim.apply_fill(
+                        close_side,
+                        true,
+                        price,
+                        mid,
+                        market,
+                        Some(usd),
+                        0,
+                        target_isolated,
+                    )
+                    .is_ok()
+                        && !if target_isolated {
+                            // Isolated: the simulated close must restore the
+                            // bucket's own health, not the cross snapshot's.
+                            sim.isolated_risk(market, &self.state.marks, &self.state.markets)
+                                .liquidatable
+                        } else {
+                            sim.snapshot(&self.state.marks, &self.state.markets)
+                                .liquidatable
+                        }
                 })
                 .unwrap_or(false);
             if qualifies {
@@ -1111,7 +1289,22 @@ impl Engine {
                             .state
                             .accounts
                             .get(&id)
-                            .map(|x| x.snapshot(&self.state.marks, &self.state.markets).equity)
+                            .map(|x| {
+                                // Isolated cp positions rank on their own
+                                // bucket equity; cross ones on the pooled
+                                // snapshot as today.
+                                let cp_isolated = x
+                                    .positions
+                                    .get(&market)
+                                    .map(|p| p.isolated)
+                                    .unwrap_or(false);
+                                if cp_isolated {
+                                    x.isolated_risk(market, &self.state.marks, &self.state.markets)
+                                        .equity
+                                } else {
+                                    x.snapshot(&self.state.marks, &self.state.markets).equity
+                                }
+                            })
                             .unwrap_or(0)
                             .max(1);
                         funding_notional_usd(q, usd) / e
@@ -1143,15 +1336,47 @@ impl Engine {
                 .get(&cp)
                 .map(|a| a.collateral)
                 .unwrap_or(0);
+            let cp_isolated = self
+                .state
+                .accounts
+                .get(&cp)
+                .and_then(|a| a.positions.get(&market))
+                .map(|p| p.isolated)
+                .unwrap_or(false);
+            let target_isolated = self
+                .state
+                .accounts
+                .get(&target)
+                .and_then(|a| a.positions.get(&market))
+                .map(|p| p.isolated)
+                .unwrap_or(false);
             {
                 let a = self.state.account_mut(cp);
-                a.apply_fill(cp_side, true, price, take, market, Some(usd))
-                    .map_err(map_acct)?;
+                a.apply_fill(
+                    cp_side,
+                    true,
+                    price,
+                    take,
+                    market,
+                    Some(usd),
+                    0,
+                    cp_isolated,
+                )
+                .map_err(map_acct)?;
             }
             {
                 let a = self.state.account_mut(target);
-                a.apply_fill(close_side, false, price, take, market, Some(usd))
-                    .map_err(map_acct)?;
+                a.apply_fill(
+                    close_side,
+                    false,
+                    price,
+                    take,
+                    market,
+                    Some(usd),
+                    0,
+                    target_isolated,
+                )
+                .map_err(map_acct)?;
             }
             let after = self
                 .state
@@ -1174,13 +1399,30 @@ impl Engine {
                 qty: take,
                 seq,
                 taker_side: cp_side,
+                taker_post: 0,
+                maker_post: 0,
+                taker_isolated: cp_isolated,
+                maker_isolated: target_isolated,
             });
             remaining -= take;
         }
         let target_equity = |s: &ChainState| {
             s.accounts
                 .get(&target)
-                .map(|a| a.snapshot(&s.marks, &s.markets).equity)
+                .map(|a| {
+                    // Isolated: residual bucket + remaining uPnL after the
+                    // ADL fills; cross: pooled equity as today.
+                    let tgt_isolated = a
+                        .positions
+                        .get(&market)
+                        .map(|p| p.isolated)
+                        .unwrap_or(false);
+                    if tgt_isolated {
+                        a.isolated_risk(market, &s.marks, &s.markets).equity
+                    } else {
+                        a.snapshot(&s.marks, &s.markets).equity
+                    }
+                })
                 .unwrap_or(0)
         };
         // Insurance absorbs what it can of negative equity; never below 0.
@@ -1194,7 +1436,25 @@ impl Engine {
                     .unwrap_or(0),
             );
             if from_ins > 0 {
-                if let Some(a) = self.state.accounts.get_mut(&target) {
+                // Isolated top-up lands in the bucket while the position
+                // still exists (it is what equity is measured against);
+                // a fully-closed position's hole settled into collateral.
+                let tgt_still_isolated = self
+                    .state
+                    .accounts
+                    .get(&target)
+                    .map(|a| {
+                        a.positions
+                            .get(&market)
+                            .map(|p| p.isolated)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if tgt_still_isolated {
+                    if let Some(a) = self.state.accounts.get_mut(&target) {
+                        *a.isolated_margin.entry(market).or_insert(0) += from_ins;
+                    }
+                } else if let Some(a) = self.state.accounts.get_mut(&target) {
                     a.collateral += from_ins;
                 }
                 if let Some(a) = self.state.accounts.get_mut(&INSURANCE_ACCOUNT) {
@@ -1872,6 +2132,8 @@ mod tests {
                 price,
                 qty,
                 client_seq,
+                isolated: false,
+                margin: 0,
             },
             secret,
         )
@@ -1899,6 +2161,41 @@ mod tests {
                 price,
                 qty,
                 client_seq,
+                isolated: false,
+                margin: 0,
+            },
+            secret,
+        )
+    }
+
+    /// Isolated-mode place; `margin` in USD_SCALE units.
+    #[allow(clippy::too_many_arguments)]
+    fn place_iso(
+        parents: Vec<UnitId>,
+        secret: &[u8; 32],
+        market: MarketId,
+        side: Side,
+        typ: OrderType,
+        tif: TimeInForce,
+        price: operp_types::Price,
+        qty: Qty,
+        client_seq: u64,
+        margin: u64,
+    ) -> Unit {
+        let account = acct_of(secret);
+        sign_unit(
+            parents,
+            Op::Place {
+                account,
+                market,
+                side,
+                typ,
+                tif,
+                price,
+                qty,
+                client_seq,
+                isolated: true,
+                margin,
             },
             secret,
         )
@@ -3435,6 +3732,8 @@ mod tests {
                 price: 90_000 * PRICE_SCALE as i64,
                 qty: QTY_SCALE,
                 client_seq: 99,
+                isolated: false,
+                margin: 0,
             },
             &alice,
         );
@@ -3793,6 +4092,8 @@ mod tests {
                         price: operp_types::PRICE_SCALE as i64 * i64::from(n),
                         qty: QTY_SCALE,
                         client_seq: u64::from(n),
+                        isolated: false,
+                        margin: 0,
                     },
                     &secret,
                 );
@@ -3872,6 +4173,8 @@ mod tests {
             price: 100 * PRICE_SCALE as i64,
             qty: QTY_SCALE / 1000,
             client_seq: 1,
+            isolated: false,
+            margin: 0,
         };
         let salt = [7u8; 32];
         let commit_hash = operp_dag::reveal_commit_hash(&inner, &salt);
@@ -3923,6 +4226,8 @@ mod tests {
             price: 100 * PRICE_SCALE as i64,
             qty: QTY_SCALE / 1000,
             client_seq: 1,
+            isolated: false,
+            margin: 0,
         };
         let salt = [7u8; 32];
         let commit_hash = operp_dag::reveal_commit_hash(&inner, &salt);
@@ -3976,6 +4281,8 @@ mod tests {
             price: 100 * PRICE_SCALE as i64,
             qty: QTY_SCALE / 1000,
             client_seq: 1,
+            isolated: false,
+            margin: 0,
         };
         let salt = [7u8; 32];
         let commit_hash = operp_dag::reveal_commit_hash(&inner, &salt);
@@ -4026,6 +4333,8 @@ mod tests {
             price: 100 * PRICE_SCALE as i64,
             qty: QTY_SCALE / 1000,
             client_seq: 1,
+            isolated: false,
+            margin: 0,
         };
         let salt = [7u8; 32];
         let commit_hash = operp_dag::reveal_commit_hash(&inner, &salt);
@@ -4079,6 +4388,8 @@ mod tests {
             price: 100 * PRICE_SCALE as i64,
             qty: QTY_SCALE / 1000,
             client_seq: seq,
+            isolated: false,
+            margin: 0,
         };
         // Duplicate commit hash bounces (rule 1); distinct commits up to the
         // per-account cap of 8 are admitted; the 9th bounces (§2.3.5).
@@ -4157,6 +4468,8 @@ mod tests {
                 price: 100 * PRICE_SCALE as i64,
                 qty: QTY_SCALE / 1000,
                 client_seq: 1,
+                isolated: false,
+                margin: 0,
             };
             let salt = [3u8; 32];
             let hash = operp_dag::reveal_commit_hash(&inner, &salt);
@@ -5195,6 +5508,7 @@ mod tests {
                     market: mkt,
                     qty: QTY_SCALE as i64,
                     entry_price: entry,
+                    isolated: false,
                 },
             );
         }
@@ -5206,6 +5520,7 @@ mod tests {
                     market: mkt,
                     qty: -(QTY_SCALE as i64),
                     entry_price: entry,
+                    isolated: false,
                 },
             );
         }
@@ -5283,5 +5598,593 @@ mod tests {
             eng.state.accounts[&INSURANCE_ACCOUNT].collateral <= ins_before,
             "insurance only pays, never gains, here"
         );
+    }
+
+    /// Escrow lifecycle: collateral + buckets + live order margin only move
+    /// between the three pots, never out of them (no fills' PnL here).
+    #[test]
+    fn isolated_escrow_conserved() {
+        let usd = |v: i128| v * USD_SCALE as i128;
+        let mut eng = activated_engine();
+        let g = genesis_id();
+        let alice = sk(1);
+        let bob = sk(2);
+        let a = acct_of(&alice);
+        let pots = |eng: &Engine, who: AccountId| -> i128 {
+            let acct = &eng.state.accounts[&who];
+            let bucket: i128 = acct.isolated_margin.values().sum();
+            let live: i128 = eng
+                .state
+                .books
+                .values()
+                .flat_map(|b| b.live_orders())
+                .filter(|o| o.account == who)
+                .map(|o| i128::from(o.margin_left))
+                .sum();
+            acct.collateral + bucket + live
+        };
+
+        let d1 = deposit(vec![g], &alice, usd(10_000), 1);
+        let mut tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![tip], &bob, usd(1_000_000), 2);
+        tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+        assert_eq!(pots(&eng, a), usd(10_000));
+
+        // Isolated open escrows the margin out of collateral.
+        let px = 100_000 * PRICE_SCALE as i64;
+        let qty = QTY_SCALE / 1000;
+        let p1 = place_iso(
+            vec![tip],
+            &alice,
+            BTC_USD,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+            4_000 * USD_SCALE as u64,
+        );
+        tip = unit_id(&p1);
+        let evs = eng.ingest(p1).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+            "{evs:?}"
+        );
+        assert_eq!(eng.state.accounts[&a].collateral, usd(6_000));
+        assert_eq!(pots(&eng, a), usd(10_000));
+
+        // Cancel refunds the whole escrow.
+        let c = sign_unit(
+            vec![tip],
+            Op::Cancel {
+                account: a,
+                order_id: order_id(a, BTC_USD, 1),
+            },
+            &alice,
+        );
+        tip = unit_id(&c);
+        let evs = eng.ingest(c).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+            "{evs:?}"
+        );
+        assert_eq!(eng.state.accounts[&a].collateral, usd(10_000));
+        assert_eq!(pots(&eng, a), usd(10_000));
+
+        // Re-place: escrow leaves collateral again.
+        let p2 = place_iso(
+            vec![tip],
+            &alice,
+            BTC_USD,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            2,
+            4_000 * USD_SCALE as u64,
+        );
+        tip = unit_id(&p2);
+        eng.ingest(p2).unwrap();
+        assert_eq!(eng.state.accounts[&a].collateral, usd(6_000));
+        assert_eq!(pots(&eng, a), usd(10_000));
+
+        // Counter-taker fills it completely: escrow moves into the bucket.
+        let t = place(
+            vec![tip],
+            &bob,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+        );
+        let evs = eng.ingest(t).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                ExecEvent::Applied { fills, .. } if !fills.is_empty()
+            )),
+            "{evs:?}"
+        );
+        let acct = &eng.state.accounts[&a];
+        assert_eq!(acct.collateral, usd(6_000));
+        assert_eq!(
+            acct.isolated_margin.get(&BTC_USD).copied().unwrap_or(0),
+            usd(4_000)
+        );
+        assert_eq!(pots(&eng, a), usd(10_000));
+    }
+
+    /// A bleeding isolated bucket is liquidatable on its own risk while the
+    /// cross snapshot stays healthy: market B liquidates, market A refuses,
+    /// and B's mark-down never moves cross collateral.
+    #[test]
+    fn isolated_shields_cross() {
+        let usd = |v: i128| v * USD_SCALE as i128;
+        let mut eng = activated_engine();
+        let g = genesis_id();
+        let creator = sk(1);
+        let alice = sk(2);
+        let bob = sk(3);
+        let a = acct_of(&alice);
+        let bk = acct_of(&bob);
+
+        // Second market (MarketId 2) via permissionless listing.
+        let d0 = gov_dep(vec![g], &creator, CREATE_MARKET_FEE_PERP, 7);
+        let mut tip = unit_id(&d0);
+        eng.ingest(d0).unwrap();
+        let lm = list_market(vec![tip], &creator);
+        tip = unit_id(&lm);
+        eng.ingest(lm).unwrap();
+        let mkt2 = MarketId(2);
+
+        let d1 = deposit(vec![tip], &alice, usd(1_000_000), 1);
+        tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![tip], &bob, usd(1_000_000), 2);
+        tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+
+        // Cross long 1 BTC in market A: bob rests the ask, alice crosses.
+        let px = 100_000 * PRICE_SCALE as i64;
+        let ask = place(
+            vec![tip],
+            &bob,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
+        tip = unit_id(&ask);
+        eng.ingest(ask).unwrap();
+        let bid = place(
+            vec![tip],
+            &alice,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
+        tip = unit_id(&bid);
+        eng.ingest(bid).unwrap();
+        let pos_a = &eng.state.accounts[&a].positions[&BTC_USD];
+        assert!(pos_a.qty > 0 && !pos_a.isolated);
+
+        // Isolated long in market B with a $100 bucket: alice rests, bob crosses.
+        let px2 = 1_000 * PRICE_SCALE as i64;
+        let iso = place_iso(
+            vec![tip],
+            &alice,
+            mkt2,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px2,
+            QTY_SCALE,
+            2,
+            100 * USD_SCALE as u64,
+        );
+        tip = unit_id(&iso);
+        eng.ingest(iso).unwrap();
+        let cross2 = place_on(
+            vec![tip],
+            &bob,
+            mkt2,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px2,
+            QTY_SCALE,
+            2,
+        );
+        tip = unit_id(&cross2);
+        eng.ingest(cross2).unwrap();
+        let pos_b = &eng.state.accounts[&a].positions[&mkt2];
+        assert!(pos_b.qty > 0 && pos_b.isolated);
+        assert_eq!(eng.state.accounts[&a].isolated_margin[&mkt2], usd(100));
+
+        // Mark A healthy, then drive B's mark from 1000 to 500: the bucket's
+        // uPnL (-500) swallows the $100 bucket → isolated risk liquidatable.
+        eng.state.marks.insert(BTC_USD, px);
+        eng.state.marks.insert(mkt2, px2);
+        let collateral_before = eng.state.accounts[&a].collateral;
+        eng.state.marks.insert(mkt2, 500 * PRICE_SCALE as i64);
+
+        let iso_risk =
+            eng.state.accounts[&a].isolated_risk(mkt2, &eng.state.marks, &eng.state.markets);
+        assert!(
+            iso_risk.liquidatable,
+            "isolated B must be liquidatable: {iso_risk:?}"
+        );
+        let cross_snap = eng.state.accounts[&a].snapshot(&eng.state.marks, &eng.state.markets);
+        assert!(
+            !cross_snap.liquidatable,
+            "cross snapshot must stay healthy: {cross_snap:?}"
+        );
+        // B's bleeding never touched cross collateral.
+        assert_eq!(eng.state.accounts[&a].collateral, collateral_before);
+
+        // Cross market A refuses to liquidate...
+        let r = eng.liquidate(UnitId([9u8; 32]), eng.state.seq, bk, a, BTC_USD);
+        assert!(
+            matches!(r, Err(RejectReason::NotLiquidatable)),
+            "cross market must not liquidate: {r:?}"
+        );
+
+        // ...while isolated market B applies (empty book → insurance force-close).
+        let fills = eng
+            .liquidate(UnitId([8u8; 32]), eng.state.seq, bk, a, mkt2)
+            .expect("isolated liquidation applies");
+        assert!(!fills.is_empty(), "force-close fill expected");
+        assert!(
+            !eng.state.accounts[&a].positions.contains_key(&mkt2),
+            "B position closed"
+        );
+        assert_eq!(
+            eng.state.accounts[&a].isolated_margin[&mkt2], 0,
+            "bucket emptied into collateral"
+        );
+        assert!(
+            eng.state.accounts[&a].collateral >= 0,
+            "A's collateral covers B's realized loss"
+        );
+    }
+
+    /// Every mode/margin rejection from the plan.
+    #[test]
+    fn isolated_mode_gates() {
+        let usd = |v: i128| v * USD_SCALE as i128;
+        let mut eng = activated_engine();
+        let g = genesis_id();
+        let bob = sk(9);
+        let px = 100_000 * PRICE_SCALE as i64;
+        let qty = QTY_SCALE / 1000;
+        let mut tip = g;
+        for (i, secret) in [sk(10), sk(11), sk(12), sk(13), sk(14)].iter().enumerate() {
+            let d = deposit(vec![tip], secret, usd(10_000), (i + 10) as u8);
+            tip = unit_id(&d);
+            eng.ingest(d).unwrap();
+        }
+        let db = deposit(vec![tip], &bob, usd(1_000_000), 20);
+        tip = unit_id(&db);
+        eng.ingest(db).unwrap();
+
+        let expect_risk = |eng: &mut Engine, tip: UnitId, u: Unit| -> UnitId {
+            let id = unit_id(&u);
+            let evs = eng.ingest(u).unwrap();
+            assert!(
+                evs.iter().any(|e| matches!(
+                    e,
+                    ExecEvent::Rejected {
+                        reason: RejectReason::Risk,
+                        ..
+                    }
+                )),
+                "expected Risk rejection: {evs:?} (parent {tip:?})"
+            );
+            id
+        };
+
+        // (a) cross order carrying margin → Risk.
+        let bad_margin = sign_unit(
+            vec![tip],
+            Op::Place {
+                account: acct_of(&sk(10)),
+                market: BTC_USD,
+                side: Side::Bid,
+                typ: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: px,
+                qty,
+                client_seq: 1,
+                isolated: false,
+                margin: 1,
+            },
+            &sk(10),
+        );
+        tip = expect_risk(&mut eng, tip, bad_margin);
+
+        // (c) isolated open with margin = extra_im - 1 → Risk.
+        // extra_im = 10% of $100 notional = $10 → margin one unit short.
+        let short_margin = sign_unit(
+            vec![tip],
+            Op::Place {
+                account: acct_of(&sk(12)),
+                market: BTC_USD,
+                side: Side::Bid,
+                typ: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: px,
+                qty,
+                client_seq: 1,
+                isolated: true,
+                margin: 10 * USD_SCALE as u64 - 1,
+            },
+            &sk(12),
+        );
+        tip = expect_risk(&mut eng, tip, short_margin);
+
+        // (b) needs a filled isolated position: sk(11) rests an isolated bid,
+        // bob crosses it.
+        let iso_open = place_iso(
+            vec![tip],
+            &sk(11),
+            BTC_USD,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+            1_000 * USD_SCALE as u64,
+        );
+        tip = unit_id(&iso_open);
+        let evs = eng.ingest(iso_open).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+            "{evs:?}"
+        );
+        let cross_ask = place(
+            vec![tip],
+            &bob,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+        );
+        tip = unit_id(&cross_ask);
+        let evs = eng.ingest(cross_ask).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+            "{evs:?}"
+        );
+        // isolated pure-reduce with margin = 1 → Risk.
+        let reduce_margin = place_iso(
+            vec![tip],
+            &sk(11),
+            BTC_USD,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            2,
+            1,
+        );
+        tip = expect_risk(&mut eng, tip, reduce_margin);
+
+        // (d) live isolated order, then a cross order on the same market → Risk.
+        let iso_rest = place_iso(
+            vec![tip],
+            &sk(13),
+            BTC_USD,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            90_000 * PRICE_SCALE as i64,
+            qty,
+            1,
+            1_000 * USD_SCALE as u64,
+        );
+        tip = unit_id(&iso_rest);
+        let evs = eng.ingest(iso_rest).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+            "{evs:?}"
+        );
+        let cross_over_iso = place(
+            vec![tip],
+            &sk(13),
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            91_000 * PRICE_SCALE as i64,
+            qty,
+            2,
+        );
+        tip = expect_risk(&mut eng, tip, cross_over_iso);
+
+        // (e) cross position, then an isolated order on the same market → Risk.
+        // Bob rests an ask that does NOT cross sk(13)'s 90k bid (90k < 100k).
+        let bob_ask = place(
+            vec![tip],
+            &bob,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            2,
+        );
+        tip = unit_id(&bob_ask);
+        let evs = eng.ingest(bob_ask).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+            "{evs:?}"
+        );
+        let carol_cross = place(
+            vec![tip],
+            &sk(14),
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+        );
+        tip = unit_id(&carol_cross);
+        let evs = eng.ingest(carol_cross).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+            "{evs:?}"
+        );
+        assert!(eng.state.accounts[&acct_of(&sk(14))]
+            .positions
+            .get(&BTC_USD)
+            .map(|p| !p.isolated)
+            .unwrap_or(false));
+        let iso_over_cross = place_iso(
+            vec![tip],
+            &sk(14),
+            BTC_USD,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            99_000 * PRICE_SCALE as i64,
+            qty,
+            2,
+            1_000 * USD_SCALE as u64,
+        );
+        expect_risk(&mut eng, tip, iso_over_cross);
+    }
+
+    /// An isolated close that realizes more than its bucket leaves negative
+    /// collateral mid-fill; the shortfall loop clamps it to exactly 0 and
+    /// insurance absorbs exactly the hole.
+    #[test]
+    fn isolated_blowthrough_insurance() {
+        let usd = |v: i128| v * USD_SCALE as i128;
+        let mut eng = activated_engine();
+        let g = genesis_id();
+        let alice = sk(1);
+        let bob = sk(2);
+        let a = acct_of(&alice);
+
+        // Alice's entire deposit is the $10 IM-floor margin; bob is the
+        // counterparty. Genesis seeds BTC's mark at $100k.
+        let d1 = deposit(vec![g], &alice, usd(10), 1);
+        let mut tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![tip], &bob, usd(1_000), 2);
+        tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+
+        // Bob rests an ask at $100k for 0.001 BTC ($100 notional → extra_im
+        // $10); alice's isolated bid (margin = $10 = extra_im exactly)
+        // crosses and opens the long with a $10 bucket.
+        let px = 100_000 * PRICE_SCALE as i64;
+        let qty = QTY_SCALE / 1000;
+        let ask = place(
+            vec![tip],
+            &bob,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+        );
+        tip = unit_id(&ask);
+        let evs = eng.ingest(ask).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+            "{evs:?}"
+        );
+        let iso = place_iso(
+            vec![tip],
+            &alice,
+            BTC_USD,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+            10 * USD_SCALE as u64,
+        );
+        tip = unit_id(&iso);
+        let evs = eng.ingest(iso).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+            "{evs:?}"
+        );
+        assert_eq!(eng.state.accounts[&a].collateral, 0);
+        assert_eq!(eng.state.accounts[&a].isolated_margin[&BTC_USD], usd(10));
+
+        let ins_before = eng.state.accounts[&INSURANCE_ACCOUNT].collateral;
+        // Bob rests the closing bid at $50k; alice's isolated market ask
+        // sells into it: release $10, realize −$50 → collateral −$40 (and
+        // the $0.025 taker fee on top) before the shortfall clamp.
+        let bid = place(
+            vec![tip],
+            &bob,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            50_000 * PRICE_SCALE as i64,
+            qty,
+            2,
+        );
+        tip = unit_id(&bid);
+        let evs = eng.ingest(bid).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+            "{evs:?}"
+        );
+        let close = place_iso(
+            vec![tip],
+            &alice,
+            BTC_USD,
+            Side::Ask,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            0,
+            qty,
+            2,
+            0,
+        );
+        tip = unit_id(&close);
+        let evs = eng.ingest(close).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+            "{evs:?}"
+        );
+
+        let acct = &eng.state.accounts[&a];
+        assert!(acct.collateral >= 0, "clamped to non-negative");
+        assert_eq!(acct.collateral, 0, "clamped to exactly zero");
+        assert!(acct.positions.is_empty(), "position fully closed");
+        assert_eq!(acct.isolated_margin[&BTC_USD], 0, "bucket emptied");
+        // Hole = $50 loss − $10 bucket = $40. The close's $0.025 taker fee
+        // credits insurance first, then the clamp debits $40.025 back —
+        // net: insurance absorbs exactly the $40 hole.
+        assert_eq!(
+            eng.state.accounts[&INSURANCE_ACCOUNT].collateral,
+            ins_before - 40 * USD_SCALE as i128,
+            "insurance absorbed exactly the hole"
+        );
+        assert!(eng.state.accounts[&INSURANCE_ACCOUNT].collateral >= 0);
+        let _ = tip;
     }
 }
