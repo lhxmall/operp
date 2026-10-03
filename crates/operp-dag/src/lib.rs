@@ -610,9 +610,7 @@ impl Dag {
         // Deposit/GovDeposit with an oversized withdrawal addr must be
         // rejected on every path, including the orphan buffer.
         match &unit.op {
-            Op::Deposit { addr, .. } | Op::GovDeposit { addr, .. }
-                if addr.len() > MAX_ADDR_LEN =>
-            {
+            Op::Deposit { addr, .. } | Op::GovDeposit { addr, .. } if addr.len() > MAX_ADDR_LEN => {
                 return Err(DagError::AddrTooLong);
             }
             _ => {}

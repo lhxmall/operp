@@ -778,6 +778,24 @@ async function main() {
     await network.witnessUntilStable(pr2.unit);
     delete h3pkg.frames_blob;
     h3pkg.packages = [pr1.unit, pr2.unit];
+    // TEMP DIAG: every operand of the rollup's bad-submit gate.
+    {
+      const sv = await vars(rollup);
+      const L = (v) => (typeof v === "string" ? v.length : typeof v);
+      console.error(
+        "DIAG h=" + sd3pkg.height + " ls=" + sv.last_submitted + " lf=" + sv.last_finalized +
+        " h_eq_ls1=" + (Number(sd3pkg.height) === Number(sv.last_submitted) + 1) +
+        " frozen3=" + sv.frozen_3 + " sr2=" + String(sv.state_root_2).slice(0, 10) +
+        " cid=" + sd3pkg.chain_id + " av=" + sd3pkg.assertion_version +
+        " sr=" + L(sd3pkg.state_root) + " pv=" + L(sd3pkg.prev_state_hash) +
+        " af=" + L(sd3pkg.aa_forest) + " w=" + L(sd3pkg.wit_root) +
+        " t=" + L(sd3pkg.trace_root) + " u=" + L(sd3pkg.units_root) +
+        " us=" + L(sd3pkg.units_set_root) + " o=" + L(sd3pkg.ops_root) +
+        " f=" + L(sd3pkg.fills_root) + " uc=" + sd3pkg.unit_count +
+        " wc=" + sd3pkg.wit_count + " uType=" + typeof sd3pkg.unit_count +
+        " wcType=" + typeof sd3pkg.wit_count
+      );
+    }
     const r3p = await operator.sendMulti({
       messages: [
         tempDataMsg(h3pkg),
