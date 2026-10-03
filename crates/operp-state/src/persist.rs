@@ -116,7 +116,7 @@ fn snapshot_candidates(dir: &Path) -> io::Result<Vec<(Height, PathBuf)>> {
             out.push((h, dir.join(snapshot_name(h))));
         }
     }
-    out.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    out.sort_unstable_by_key(|&(h, _)| std::cmp::Reverse(h));
     Ok(out)
 }
 

@@ -610,10 +610,10 @@ impl Dag {
         // Deposit/GovDeposit with an oversized withdrawal addr must be
         // rejected on every path, including the orphan buffer.
         match &unit.op {
-            Op::Deposit { addr, .. } | Op::GovDeposit { addr, .. } => {
-                if addr.len() > MAX_ADDR_LEN {
-                    return Err(DagError::AddrTooLong);
-                }
+            Op::Deposit { addr, .. } | Op::GovDeposit { addr, .. }
+                if addr.len() > MAX_ADDR_LEN =>
+            {
+                return Err(DagError::AddrTooLong);
             }
             _ => {}
         }
@@ -863,9 +863,9 @@ mod tests {
         assert_eq!(dag2.ready_linearized(), expect);
         // Same total set either way.
         let mut s1 = expect.clone();
-        s1.sort_by(|a, b| a.0.cmp(&b.0));
+        s1.sort_by_key(|a| a.0);
         let mut s2 = vec![unit_id(&u1), unit_id(&u2)];
-        s2.sort_by(|a, b| a.0.cmp(&b.0));
+        s2.sort_by_key(|a| a.0);
         assert_eq!(s1, s2);
     }
 

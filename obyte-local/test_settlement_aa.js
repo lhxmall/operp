@@ -146,6 +146,14 @@ async function vars(aa) {
   return v.vars || v;
 }
 
+// Full bounce diagnostics: reason first, then the response (never sliced
+// short — CI failures must be diagnosable from one log line).
+function bounceDetail(res) {
+  const r = (res && res.response) || {};
+  const reason = r.bounce_message || r.response_error || "";
+  return (reason ? reason + " :: " : "") + JSON.stringify(r).slice(0, 1500);
+}
+
 // Genesis witness tree: the height-1 submit commits WIT_ROOT, so every
 // k==0 predicate (pre_wit == wit_root_1) proves leaves against this tree.
 // Deposit scenario uses DEP_ACCT (old account, pre col 1000000); fill
@@ -264,7 +272,7 @@ async function sendCombinedSubmit(wallet, height, stateRoot, prev) {
   const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
   const log = JSON.stringify(res || {});
   if (log.includes('"bounced":true')) {
-    throw new Error("combined submit bounced: " + log.slice(0, 500));
+    throw new Error("combined submit bounced: " + log.slice(0, 1500));
   }
   return r;
 }
@@ -387,7 +395,7 @@ async function main() {
     await network.witnessUntilStable(r.unit);
     const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
     if (res && res.response && res.response.bounced)
-      throw new Error("h2 submit bounced: " + JSON.stringify(res.response).slice(0, 200));
+      throw new Error("h2 submit bounced: " + bounceDetail(res));
   }
   // H3 pre-tree (genesis leaves + two live orders) is hoisted here because
   // scenario 8's honest h2 submit must ALREADY commit it as wit_root_2:
@@ -410,7 +418,7 @@ async function main() {
     const r = await network.getAaResponseToUnit(t.unit).catch(() => null);
     const inner = r && r.response && (r.response.response || r.response);
     if (r && r.response && r.response.bounced)
-      throw new Error(what + " bounced: " + JSON.stringify(inner).slice(0, 500));
+      throw new Error(what + " bounced: " + bounceDetail(r));
     await network.witnessUntilStable(r.response.response_unit);
   }
   const forcedOmit = sha256Hex("forced-unit");
@@ -544,7 +552,7 @@ async function main() {
     await network.witnessUntilStable(r.unit);
     const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
     if (res && res.response && res.response.bounced)
-      throw new Error("h3 submit bounced: " + JSON.stringify(res.response).slice(0, 200));
+      throw new Error("h3 submit bounced: " + bounceDetail(res));
   }
 
   // ---- 11. fill_math dishonest (liar understates col: -600 vs -500) ------
@@ -616,7 +624,7 @@ async function main() {
     await network.witnessUntilStable(r.unit);
     const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
     if (res && res.response && res.response.bounced)
-      throw new Error("h3 submit bounced: " + JSON.stringify(res.response).slice(0, 200));
+      throw new Error("h3 submit bounced: " + bounceDetail(res));
   }
   await submitH3(TRACE_H_ROOT, FILLS_ROOT1);
   const fillHonest2 = Object.assign({}, fillBase, {
@@ -781,7 +789,7 @@ async function main() {
     await network.witnessUntilStable(r3p.unit);
     const res3p = await network.getAaResponseToUnit(r3p.unit).catch(() => null);
     if (res3p && res3p.response && res3p.response.bounced)
-      throw new Error("h3 2-package submit bounced: " + JSON.stringify(res3p.response).slice(0, 200));
+      throw new Error("h3 2-package submit bounced: " + bounceDetail(res3p));
   }
   const pkgFraud = {
     rollup: ROLLUP_ADDR,
