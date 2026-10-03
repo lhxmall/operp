@@ -66,6 +66,7 @@ impl Account {
     /// reducing fill then realizes rate-delta cash instead of the encoded
     /// price delta (whose dollar scale there is meaningless). `None` keeps
     /// today's `realize` path.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_fill(
         &mut self,
         side: Side,
@@ -105,7 +106,7 @@ impl Account {
             let entry = if old == 0 {
                 price
             } else {
-                vwap(old.unsigned_abs() as u64, pos.entry_price, qty, price)
+                vwap(old.unsigned_abs(), pos.entry_price, qty, price)
             };
             self.positions.insert(
                 market,
@@ -117,7 +118,7 @@ impl Account {
                 },
             );
         } else {
-            let close = old.unsigned_abs().min(delta.unsigned_abs()) as u64;
+            let close = old.unsigned_abs().min(delta.unsigned_abs());
             // Isolated close releases a proportional share of the bucket into
             // collateral BEFORE realized PnL settles, so a loss lands on
             // released margin first and the bucket never goes negative. A
@@ -161,7 +162,7 @@ impl Account {
             self.realized_pnl = self.realized_pnl.saturating_add(pnl);
             let leftover = (old.unsigned_abs() as i64) - (close as i64);
             if leftover == 0 {
-                let open = delta.unsigned_abs() as u64 - close;
+                let open = delta.unsigned_abs() - close;
                 if open == 0 {
                     self.positions.remove(&market);
                 } else {

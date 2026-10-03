@@ -154,6 +154,7 @@ fn fill_n(evs: &[ExecEvent]) -> u64 {
         })
         .sum()
 }
+#[allow(clippy::too_many_arguments)]
 fn dump_if_reject(
     who: &str,
     round: u64,

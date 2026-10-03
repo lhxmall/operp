@@ -91,10 +91,7 @@ fn main() {
     let start = Instant::now();
     let end = start + Duration::from_secs(RUN_SECS);
 
-    println!(
-        "HFT bench: Engine::ingest signed Place, {}s, 0.01 BTC @ 100000",
-        RUN_SECS
-    );
+    println!("HFT bench: Engine::ingest signed Place, {RUN_SECS}s, 0.01 BTC @ 100000");
     println!("elapsed_s\torders\tfills\trejects\tord/s\tfill/s");
 
     let mut round = 0u64;
@@ -183,13 +180,13 @@ fn main() {
 
     let secs = start.elapsed().as_secs_f64();
     println!("---");
-    println!("duration_s\t{:.2}", secs);
-    println!("orders\t{}", orders);
-    println!("fills\t{}", fills);
-    println!("applied\t{}", applied);
-    println!("rejected\t{}", rejected);
+    println!("duration_s\t{secs:.2}");
+    println!("orders\t{orders}");
+    println!("fills\t{fills}");
+    println!("applied\t{applied}");
+    println!("rejected\t{rejected}");
     if let Some(r) = first_reject {
-        println!("first_reject\t{}", r);
+        println!("first_reject\t{r}");
     }
     println!("ord/s\t{:.1}", orders as f64 / secs);
     println!("fill/s\t{:.1}", fills as f64 / secs);
@@ -218,7 +215,7 @@ fn note_reject(evs: &[ExecEvent], first: &mut Option<String>) {
     }
     for e in evs {
         if let ExecEvent::Rejected { reason, .. } = e {
-            *first = Some(format!("{:?}", reason));
+            *first = Some(format!("{reason:?}"));
             return;
         }
     }

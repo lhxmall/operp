@@ -19,12 +19,12 @@ fn get_source_string(v: &Value) -> Result<String, String> {
     let mut comps: Vec<String> = Vec::new();
     fn extract(val: &Value, comps: &mut Vec<String>, root: &Value) -> Result<(), String> {
         if val.is_null() {
-            return Err(format!("null value in {}", root));
+            return Err(format!("null value in {root}"));
         }
         match val {
             Value::String(s) => {
                 if s.contains('\x00') {
-                    return Err(format!("00 byte in string value in {}", root));
+                    return Err(format!("00 byte in string value in {root}"));
                 }
                 comps.push("s".to_string());
                 comps.push(s.clone());
@@ -39,7 +39,7 @@ fn get_source_string(v: &Value) -> Result<String, String> {
             }
             Value::Array(arr) => {
                 if arr.is_empty() {
-                    return Err(format!("empty array in {}", root));
+                    return Err(format!("empty array in {root}"));
                 }
                 comps.push("[".to_string());
                 for el in arr {
@@ -49,16 +49,16 @@ fn get_source_string(v: &Value) -> Result<String, String> {
             }
             Value::Object(map) => {
                 if map.is_empty() {
-                    return Err(format!("empty object in {}", root));
+                    return Err(format!("empty object in {root}"));
                 }
                 let mut keys: Vec<&String> = map.keys().collect();
                 keys.sort();
                 for k in keys {
                     if k.contains('\x00') {
-                        return Err(format!("00 byte in object key in {}", root));
+                        return Err(format!("00 byte in object key in {root}"));
                     }
                     if map.get(k).is_none() {
-                        return Err(format!("undefined at {} of {}", k, root));
+                        return Err(format!("undefined at {k} of {root}"));
                     }
                     comps.push(k.clone());
                     extract(map.get(k).unwrap(), comps, root)?;
@@ -94,7 +94,12 @@ fn canonical_number(n: &serde_json::Number) -> Result<String, String> {
         return Ok(u.to_string());
     }
     let f = n.as_f64().ok_or_else(|| format!("invalid number: {n}"))?;
-    if !f.is_finite() || f.fract() == 0.0 || f.abs() > 9_007_199_254_740_992.0 || f.abs() >= 1e21 {
+    if !f.is_finite()
+        || f.fract() == 0.0
+        || f.abs() > 9_007_199_254_740_992.0
+        || f.abs() >= 1e21
+        || (f.abs() < 1e-6 && f != 0.0)
+    {
         return Err(format!("number {n} has no unambiguous JS canonical string"));
     }
     Ok(f.to_string())
@@ -103,7 +108,7 @@ fn canonical_number(n: &serde_json::Number) -> Result<String, String> {
 fn get_json_source_string(v: &Value) -> Result<String, String> {
     fn stringify(val: &Value, root: &Value, allow_empty: bool) -> Result<String, String> {
         if val.is_null() {
-            return Err(format!("null value in {}", root));
+            return Err(format!("null value in {root}"));
         }
         match val {
             Value::String(s) => Ok(to_well_formed_json_string(s)),
@@ -111,7 +116,7 @@ fn get_json_source_string(v: &Value) -> Result<String, String> {
             Value::Bool(b) => Ok(b.to_string()),
             Value::Array(arr) => {
                 if arr.is_empty() && !allow_empty {
-                    return Err(format!("empty array in {}", root));
+                    return Err(format!("empty array in {root}"));
                 }
                 let mut parts = Vec::with_capacity(arr.len());
                 for el in arr {
@@ -121,7 +126,7 @@ fn get_json_source_string(v: &Value) -> Result<String, String> {
             }
             Value::Object(map) => {
                 if map.is_empty() && !allow_empty {
-                    return Err(format!("empty object in {}", root));
+                    return Err(format!("empty object in {root}"));
                 }
                 let mut keys: Vec<&String> = map.keys().collect();
                 keys.sort();
@@ -130,7 +135,7 @@ fn get_json_source_string(v: &Value) -> Result<String, String> {
                     let v = map.get(k).unwrap();
                     let ks = to_well_formed_json_string(k);
                     let vs = stringify(v, root, allow_empty)?;
-                    parts.push(format!("{}:{}", ks, vs));
+                    parts.push(format!("{ks}:{vs}"));
                 }
                 Ok(format!("{{{}}}", parts.join(",")))
             }
@@ -167,7 +172,7 @@ pub fn get_data_hash(v: &Value) -> [u8; 32] {
 // ---- naked / stripped ----
 fn get_naked_unit(unit: &Value) -> Value {
     let mut naked = unit.clone();
-    if let Value::Object(ref mut map) = naked {
+    if let Value::Object(map) = &mut naked {
         map.remove("unit");
         map.remove("headers_commission");
         map.remove("payload_commission");
@@ -179,13 +184,11 @@ fn get_naked_unit(unit: &Value) -> Value {
         if is_legacy {
             map.remove("timestamp");
         }
-        if let Some(messages) = map.get_mut("messages") {
-            if let Value::Array(ref mut arr) = messages {
-                for msg in arr.iter_mut() {
-                    if let Value::Object(ref mut m) = msg {
-                        m.remove("payload");
-                        m.remove("payload_uri");
-                    }
+        if let Some(Value::Array(arr)) = map.get_mut("messages") {
+            for msg in arr.iter_mut() {
+                if let Value::Object(m) = msg {
+                    m.remove("payload");
+                    m.remove("payload_uri");
                 }
             }
         }
@@ -307,7 +310,6 @@ mod tests {
             "last_ball_unit":"def",
             "timestamp": 1234567890
         });
-        let h1 = get_unit_hash(&unit).unwrap();
         // Provide minimal required fields: but our naked will strip payload -> messages becomes [{app:"payment"}]
         // hash should be stable and not error
         let h1 = get_unit_hash(&unit).unwrap();
@@ -315,7 +317,7 @@ mod tests {
         assert_eq!(h1, h2);
         // Different content -> different hash
         let mut unit2 = unit.clone();
-        if let Value::Object(ref mut m) = unit2 {
+        if let Value::Object(m) = &mut unit2 {
             m.insert("timestamp".to_string(), json!(1234567891));
         }
         let h3 = get_unit_hash(&unit2).unwrap();
@@ -348,24 +350,26 @@ mod tests {
     #[test]
     fn canonical_number_rejects_ambiguous_forms() {
         // `1.0` would print "1.0" in Rust but "1" in JS: fail closed.
-        assert!(canonical_number(&json!(1.0).as_number().unwrap()).is_err());
+        assert!(canonical_number(json!(1.0).as_number().unwrap()).is_err());
         assert!(canonical_number(&serde_json::Number::from_f64(-0.0).unwrap()).is_err());
-        assert!(canonical_number(&json!(1e21).as_number().unwrap()).is_err());
+        assert!(canonical_number(json!(1e21).as_number().unwrap()).is_err());
+        // |x| < 1e-6 (nonzero): Rust prints "0.0000001", JS prints "1e-7".
+        assert!(canonical_number(json!(1e-7).as_number().unwrap()).is_err());
         assert!(
             canonical_number(&serde_json::Number::from_f64(9_007_199_254_740_994.0).unwrap())
                 .is_err()
         );
         // Short decimals and exact integers are fine.
         assert_eq!(
-            canonical_number(&json!(2.5).as_number().unwrap()).as_deref(),
+            canonical_number(json!(2.5).as_number().unwrap()).as_deref(),
             Ok("2.5")
         );
         assert_eq!(
-            canonical_number(&json!(0.001).as_number().unwrap()).as_deref(),
+            canonical_number(json!(0.001).as_number().unwrap()).as_deref(),
             Ok("0.001")
         );
         assert_eq!(
-            canonical_number(&json!(12345678901234567u64).as_number().unwrap()).as_deref(),
+            canonical_number(json!(12345678901234567u64).as_number().unwrap()).as_deref(),
             Ok("12345678901234567")
         );
         // Both hash entry points propagate the rejection.

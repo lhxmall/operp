@@ -1,9 +1,8 @@
 use ed25519_dalek::SigningKey;
 use operp_dag::{genesis_id, sign_unit, unit_id, Op, Unit};
 use operp_exec::{Engine, ExecEvent};
-use operp_settle::Batch;
 use operp_types::{
-    account_id_from_pubkey, AccountId, OrderType, Side, TimeInForce, UnitId, BTC_USD, PRICE_SCALE,
+    account_id_from_pubkey, AccountId, OrderType, Side, TimeInForce, BTC_USD, PRICE_SCALE,
     QTY_SCALE, USD_SCALE,
 };
 use std::path::PathBuf;
@@ -53,7 +52,7 @@ fn parse_args() -> Cfg {
 /// Signing (ed25519) is the parallelizable part; execution stays sequential.
 fn generator(
     idx: usize,
-    n_engines: usize,
+    _n_engines: usize,
     cfg: &Cfg,
     tx: Sender<(usize, Unit)>,
     gen_total: Arc<AtomicU64>,
@@ -61,7 +60,7 @@ fn generator(
     let secrets: Vec<[u8; 32]> = (0..TRADERS_PER_ENGINE)
         .map(|i| sk((((idx * TRADERS_PER_ENGINE + i + 1) * 37 + 11) % 251) as u8))
         .collect();
-    let mut seqs = vec![1u64; TRADERS_PER_ENGINE];
+    let mut seqs = [1u64; TRADERS_PER_ENGINE];
     let px = 100_000 * PRICE_SCALE as i64;
     let qty = QTY_SCALE / 100;
     let mut tip = genesis_id();
@@ -156,7 +155,6 @@ fn main() {
         let fills = Arc::clone(&fills);
         let rx = Arc::clone(&rx);
         let run_ms = cfg.run_ms;
-        let out = cfg.out.clone();
         std::thread::spawn(move || {
             let rx = rx.lock().unwrap_or_else(|e| e.into_inner());
             let mut prev_state = None;
@@ -168,15 +166,12 @@ fn main() {
                         if prev_state.is_none() {
                             prev_state = Some(e.state.clone());
                         }
-                        match e.ingest(u) {
-                            Ok(events) => {
-                                for ev in &events {
-                                    if let ExecEvent::Applied { fills: f, .. } = ev {
-                                        fills.fetch_add(f.len() as u64, Ordering::Relaxed);
-                                    }
+                        if let Ok(events) = e.ingest(u) {
+                            for ev in &events {
+                                if let ExecEvent::Applied { fills: f, .. } = ev {
+                                    fills.fetch_add(f.len() as u64, Ordering::Relaxed);
                                 }
                             }
-                            Err(_) => {}
                         }
                         drop(e);
                         executed.fetch_add(1, Ordering::Relaxed);

@@ -3,8 +3,8 @@ use operp_dag::{genesis_id, sign_unit, unit_id, Op};
 use operp_exec::{Engine, ExecEvent};
 use operp_settle::Batch;
 use operp_types::{
-    account_id_from_pubkey, AccountId, OrderType, Qty, Side, TimeInForce, UnitId, Usd, BTC_USD,
-    PRICE_SCALE, QTY_SCALE, USD_SCALE,
+    account_id_from_pubkey, AccountId, OrderType, Side, TimeInForce, UnitId, BTC_USD, PRICE_SCALE,
+    QTY_SCALE, USD_SCALE,
 };
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -48,7 +48,7 @@ fn main() {
         .markets
         .insert(BTC_USD, operp_types::genesis_params());
     let secrets: Vec<[u8; 32]> = (1..=N as u8).map(sk).collect();
-    let mut seqs = vec![1u64; N];
+    let mut seqs = [1u64; N];
     let px = 100_000 * PRICE_SCALE as i64;
     let qty = QTY_SCALE / 100; // 0.01 BTC
     let mut tip = genesis_id();
@@ -89,7 +89,6 @@ fn main() {
     let mut pair = 0usize;
     let mut last_report = Instant::now();
     let mut last_orders = 0u64;
-    let mut last_fills = 0u64;
     let report_secs: u64 = 30;
 
     while Instant::now() < end {
@@ -186,7 +185,6 @@ fn main() {
             );
             last_report = Instant::now();
             last_orders = orders;
-            last_fills = fills;
         }
     }
 

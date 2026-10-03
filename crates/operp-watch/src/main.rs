@@ -46,7 +46,7 @@ impl HttpHubClient {
             None => (rest.to_string(), 6611),
         };
         if host.is_empty() {
-            return Err(anyhow::anyhow!("invalid hub url: {}", base));
+            return Err(anyhow::anyhow!("invalid hub url: {base}"));
         }
         Ok(Self { host, port })
     }
@@ -126,7 +126,7 @@ impl HubClient for HttpHubClient {
     fn get_joint(&self, unit_hash: &str) -> Result<serde_json::Value, String> {
         let result = self.rpc("getJoint", serde_json::json!([unit_hash]))?;
         if result.is_null() {
-            return Err(format!("404: no joint {}", unit_hash));
+            return Err(format!("404: no joint {unit_hash}"));
         }
         Ok(result)
     }
@@ -182,7 +182,7 @@ fn parse_args() -> Result<Args, String> {
                 print_usage();
                 std::process::exit(0);
             }
-            other => return Err(format!("unknown flag: {}", other)),
+            other => return Err(format!("unknown flag: {other}")),
         }
     }
 
@@ -225,14 +225,14 @@ fn check_height(
     h: u64,
     now: u64,
 ) -> anyhow::Result<Option<String>> {
-    let sa_key = format!("submitted_at_{}", h);
-    let frozen_key = format!("frozen_{}", h);
+    let sa_key = format!("submitted_at_{h}");
+    let frozen_key = format!("frozen_{h}");
     let sa = hub
         .get_aa_state_var(&config.rollup_address, &sa_key)
-        .map_err(|e| anyhow::anyhow!("hub: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("hub: {e}"))?;
     let frozen = hub
         .get_aa_state_var(&config.rollup_address, &frozen_key)
-        .map_err(|e| anyhow::anyhow!("hub: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("hub: {e}"))?;
     let sa_val = sa.and_then(|v| v.as_u64()).unwrap_or(0);
     let frozen_val = frozen.and_then(|v| v.as_u64()).unwrap_or(0);
     let in_window = sa_val != 0 && now < sa_val + 3600 && frozen_val == 0;
@@ -242,14 +242,24 @@ fn check_height(
         Ok(Some(da)) => da,
         Err(WatchError::HubUnavailable(_)) => return Ok(None), // backoff, never mis-challenge
         Err(WatchError::BindingMismatch(msg)) => {
-            let alert = format!("h={} BINDING MISMATCH: {}", h, msg);
+            let alert = format!("h={h} BINDING MISMATCH: {msg}");
             if in_window {
                 maybe_post_challenge(config, h, &alert, None);
             }
             return Ok(Some(alert));
         }
-        Err(e) => return Ok(Some(format!("h={} WATCH ERROR: {}", h, e))),
+        Err(e) => return Ok(Some(format!("h={h} WATCH ERROR: {e}"))),
     };
+    // #16: the joint we fetched must hash to the value the AA recorded in
+    // da_unit_<h> before any downstream step trusts its payload. Same alert
+    // arm as above; never challenged outside the window.
+    if let Err(e) = verify_da_binding(&da) {
+        let alert = format!("h={h} BINDING MISMATCH: {e}");
+        if in_window {
+            maybe_post_challenge(config, h, &alert, None);
+        }
+        return Ok(Some(alert));
+    }
     // Multi-package headers splice the assembled blob as `frames_blob`
     // before `batch_from_data`. 3 tries + backoff, then give up — never
     // mis-challenge on flaky package fetches.
@@ -269,7 +279,7 @@ fn check_height(
                     ));
                 }
                 Err(e) => {
-                    let alert = format!("h={} BINDING MISMATCH: {}", h, e);
+                    let alert = format!("h={h} BINDING MISMATCH: {e}");
                     if in_window {
                         maybe_post_challenge(config, h, &alert, None);
                     }
@@ -318,8 +328,7 @@ fn check_height(
                 Ok(Some(alert))
             } else {
                 Ok(Some(format!(
-                    "h={} ROOT MISMATCH ({}): outside challenge window (informational)",
-                    h, e
+                    "h={h} ROOT MISMATCH ({e}): outside challenge window (informational)"
                 )))
             }
         }
@@ -338,14 +347,11 @@ fn maybe_post_challenge(
     proof: Option<&prove::BuiltProof>,
 ) {
     if env::var_os("OPERP_WATCH_MNEMONIC").is_none() {
-        eprintln!(
-            "WATCH ALERT (print-only, no OPERP_WATCH_MNEMONIC): {}",
-            alert
-        );
+        eprintln!("WATCH ALERT (print-only, no OPERP_WATCH_MNEMONIC): {alert}");
         return;
     }
     let Some(p) = proof else {
-        eprintln!("WATCH ALERT (print-only, no expressible proof): {}", alert);
+        eprintln!("WATCH ALERT (print-only, no expressible proof): {alert}");
         return;
     };
     let script =
@@ -358,7 +364,7 @@ fn maybe_post_challenge(
     let dir = std::env::temp_dir();
     let path = dir.join(format!("operp-proof-{}-{}.json", h, p.pred));
     if std::fs::write(&path, serde_json::to_string(&p.data).unwrap_or_default()).is_err() {
-        eprintln!("WATCH ALERT (print-only, proof write failed): {}", alert);
+        eprintln!("WATCH ALERT (print-only, proof write failed): {alert}");
         return;
     }
     eprintln!(
@@ -387,8 +393,8 @@ fn maybe_post_challenge(
     // from deployment.json / env like the other operator scripts.
     match Command::new("node").args(args).status() {
         Ok(st) if st.success() => {}
-        Ok(st) => eprintln!("post_challenge.js exited {}", st),
-        Err(e) => eprintln!("post_challenge.js spawn failed: {}", e),
+        Ok(st) => eprintln!("post_challenge.js exited {st}"),
+        Err(e) => eprintln!("post_challenge.js spawn failed: {e}"),
     }
 }
 
@@ -420,15 +426,15 @@ fn main() -> anyhow::Result<()> {
         let now = now_ms();
         let ll = hub
             .get_aa_state_var(&config.rollup_address, "last_submitted")
-            .map_err(|e| anyhow::anyhow!("hub last_submitted: {}", e))?
+            .map_err(|e| anyhow::anyhow!("hub last_submitted: {e}"))?
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
         for h in args.from_height..=ll {
             match check_height(&hub, &config, &mut engine, h, now) {
                 Ok(None) => {}
-                Ok(Some(msg)) => println!("WATCH ALERT: {}", msg),
-                Err(e) => println!("WATCH ERROR at h={}: {}", h, e),
+                Ok(Some(msg)) => println!("WATCH ALERT: {msg}"),
+                Err(e) => println!("WATCH ERROR at h={h}: {e}"),
             }
         }
 

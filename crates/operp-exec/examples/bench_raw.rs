@@ -2,8 +2,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use operp_dag::{genesis_id, sign_unit, unit_id, Op, Unit};
 use operp_exec::{Engine, ExecEvent};
 use operp_types::{
-    account_id_from_pubkey, AccountId, MarketId, OrderType, Side, TimeInForce, PRICE_SCALE,
-    QTY_SCALE, USD_SCALE,
+    account_id_from_pubkey, AccountId, MarketId, OrderType, Side, PRICE_SCALE, QTY_SCALE, USD_SCALE,
 };
 use std::time::Instant;
 
@@ -28,7 +27,7 @@ fn main() {
         .map(|k| account_id_from_pubkey(&k.verifying_key().to_bytes()))
         .collect();
     let mut tip = genesis_id();
-    for (i, k) in keys.iter().enumerate() {
+    for (i, _k) in keys.iter().enumerate() {
         let u = sign_unit(
             vec![tip],
             Op::Deposit {

@@ -111,6 +111,15 @@
 						AND trigger.data.perp_amount >= 0
 						AND trigger.data.perp_amount < $unclaimed)
 						? trigger.data.perp_amount : $unclaimed;
+					// #12: PERP redemption is disabled until claim→burn exists
+					// on the sidechain (only GovWithdraw reduces
+					// perp_balances): paying PERP here while the mirrored
+					// balance keeps its vote weight would double-count
+					// governance. Collateral withdrawals are unaffected; wp_
+					// never moves because this bounces first. PERP holders can
+					// still withdraw collateral with `perp_amount: 0`.
+					if ($perp_claimed > 0)
+						bounce('perp claim needs burn');
 					// Length caps come FIRST: OR short-circuits, so a malformed
 					// over-15-digit string must bounce here — reaching `min`
 					// below with such input would fatal (not a decimal) instead

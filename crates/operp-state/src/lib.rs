@@ -103,6 +103,12 @@ pub struct ChainState {
     /// height); peg markets store their settlement-interval clock. Empty
     /// means that market has never considered funding.
     pub last_funding_height: BTreeMap<MarketId, Height>,
+    /// Deposit anchor units already credited, ever (#24): unlike
+    /// `seen_aa_units` this set is never pruned, so a payment whose dedup
+    /// entry fell out of the replay window still cannot credit twice.
+    /// Committed as one `dep:{hex}` leaf per unit in `leaves`, so a second
+    /// credit necessarily changes `state_root`.
+    pub consumed_deposits: HashSet<[u8; 32]>,
 }
 
 /// A registered commit-reveal commitment (doc 03 §2.3.3). `commit_unit`
@@ -235,6 +241,7 @@ impl ChainState {
             funding_source: FundingSourceKind::default(),
             oracle_unbonding: BTreeMap::new(),
             oracle_slash_nonce: 0,
+            consumed_deposits: HashSet::new(),
         }
     }
     /// General window prune (new path, activation-gated). Legacy wrappers below.
@@ -426,9 +433,6 @@ impl ChainState {
         Self::mean_price(q.iter().map(|s| s.median), q.len())
     }
     pub fn effective_funding_index(&self, market: MarketId, median: Price) -> Price {
-        if self.height < operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT {
-            return median;
-        }
         match self.funding_source {
             FundingSourceKind::BondedMedianTwap => self
                 .funding_index_twap
@@ -619,7 +623,7 @@ impl ChainState {
             let q = self
                 .oracle_report_history
                 .entry((market, oracle))
-                .or_insert_with(VecDeque::new);
+                .or_default();
             // Push new sample; dedup same height by overwriting last
             if q.back().map(|s| s.height == self.height).unwrap_or(false) {
                 if let Some(back) = q.back_mut() {
@@ -1058,6 +1062,20 @@ impl ChainState {
             leaves.push(book_leaf(book, &self.markets));
         }
         leaves.push(meta_leaf(self));
+        // Permanently-consumed deposit anchors (#24): one leaf per unit so
+        // a replayed credit changes state_root. Sorted for a deterministic
+        // leaves() vector (merkle_root sorts again regardless).
+        let mut deps: Vec<[u8; 32]> = self
+            .consumed_deposits
+            .iter()
+            .map(|u| {
+                let mut preimage = b"dep".to_vec();
+                preimage.extend_from_slice(u);
+                sha256(&preimage)
+            })
+            .collect();
+        deps.sort();
+        leaves.extend(deps);
         leaves
     }
 
@@ -1102,7 +1120,7 @@ impl ChainState {
     /// exist for markets created at genesis or via CreateMarket, which exec
     /// guarantees before reaching any state path that needs params.
     pub fn market_params(&self, m: MarketId) -> MarketParams {
-        self.markets[&m].clone()
+        self.markets[&m]
     }
 }
 
@@ -1412,9 +1430,8 @@ fn merkle_proof_for(
 ///   leaf  = sha256_hex("acct:" || address || ":" || collateral_decimal
 ///                      || ":" || perp_decimal || ":" || withdrawn_decimal)
 ///   node  = sha256_hex(left_hex || right_hex)
-
 pub fn aa_account_leaf_str(addr: &str, collateral: Usd, perp: u128, withdrawn: i128) -> String {
-    let s = format!("acct:{}:{}:{}:{}", addr, collateral, perp, withdrawn);
+    let s = format!("acct:{addr}:{collateral}:{perp}:{withdrawn}");
     hex::encode(sha256(s.as_bytes()))
 }
 
@@ -1520,7 +1537,6 @@ fn aa_pairs_of(state: &ChainState) -> Vec<(String, Usd, u128, i128)> {
 /// MAX_STATE_VAR_VALUE_LENGTH=1024 exactly and keeps every AA path a single
 /// var operation. Withdrawal proofs stay depth ≤ MAX_AA_TREE_DEPTH *within*
 /// their shard; the AA extracts the claimed shard's root via substring.
-
 pub const AA_SHARD_COUNT: usize = 16;
 
 /// Shard of an address: low 4 bits of sha256(address)[0] — deterministic,
@@ -1535,7 +1551,7 @@ pub fn aa_shard_of(addr: &str) -> u8 {
 /// be reused as another empty shard's root (zero-proof cross-shard hopping,
 /// doc 10 §5.4). Unforgeable: deriving it requires preimaging sha256.
 fn aa_empty_shard_root(shard: usize) -> String {
-    hex::encode(sha256(format!("empty:{}", shard).as_bytes()))
+    hex::encode(sha256(format!("empty:{shard}").as_bytes()))
 }
 
 /// Roots of the 16 per-shard hex-domain trees over `pairs`, bucketed by
@@ -1577,6 +1593,7 @@ pub fn aa_sharded_roots_of_state(state: &ChainState) -> [String; AA_SHARD_COUNT]
 /// claim can never be posted, so it is refused up front. Register PAD/decoy
 /// bindings first (see `gen_withdraw_proof.rs`'s
 /// `format!("{:0<32}", format!("PAD{pad}"))` pattern).
+#[allow(clippy::type_complexity)]
 pub fn aa_sharded_proof_for(
     pairs: &[(String, Usd, u128, i128)],
     addr: &str,
@@ -1596,6 +1613,7 @@ pub fn aa_sharded_proof_for(
 
 /// Sharded proof for an account by sidechain id. See [`aa_sharded_proof_for`]
 /// for the singleton-bucket (PAD decoy) requirement.
+#[allow(clippy::type_complexity)]
 pub fn aa_sharded_proof_for_account(
     state: &ChainState,
     id: &AccountId,
@@ -1621,26 +1639,34 @@ pub fn wit_leaves(state: &ChainState) -> Vec<String> {
             w
         ));
         for (market, pos) in &acct.positions {
+            // isolated 0/1 + the account's escrowed bucket for this market:
+            // the fill predicate needs both to recompute the proportional
+            // margin release on a close.
+            let bucket = acct.isolated_margin.get(market).copied().unwrap_or(0);
             leaves.push(format!(
-                "pos:{}:{}:{}:{}",
+                "pos:{}:{}:{}:{}:{}:{}",
                 hex::encode(id.0),
                 market.0,
                 pos.qty,
-                pos.entry_price
+                pos.entry_price,
+                if pos.isolated { 1 } else { 0 },
+                bucket
             ));
         }
     }
     for book in state.books.values() {
         for o in book.live_orders() {
             leaves.push(format!(
-                "ord:{}:{}:{}:{}:{}:{}:{}",
+                "ord:{}:{}:{}:{}:{}:{}:{}:{}:{}",
                 hex::encode(o.id.0),
                 o.market.0,
                 o.side.as_u8(),
                 o.price,
                 o.seq,
                 o.remaining,
-                hex::encode(o.account.0)
+                hex::encode(o.account.0),
+                if o.isolated { 1 } else { 0 },
+                o.margin_left
             ));
         }
     }
@@ -1739,6 +1765,7 @@ mod tests {
             maker_post: 0,
             taker_isolated: false,
             maker_isolated: false,
+            kind: 0,
         };
         // Raw price 500 with qty >= QTY_SCALE/100 (the old gate's shape):
         // degenerate rate and negligible notional — mark never appears.
@@ -1799,6 +1826,7 @@ mod tests {
             maker_post: 0,
             taker_isolated: false,
             maker_isolated: false,
+            kind: 0,
         };
         s.apply_fill_pair(&fill).unwrap();
         // notional = 100_000 USD → fee @5bps = 50 USD credited to insurance.
@@ -1830,6 +1858,7 @@ mod tests {
             maker_post: 0,
             taker_isolated: false,
             maker_isolated: false,
+            kind: 0,
         };
         // +200% spike: rejected by the ±10% cap — mark stays at genesis.
         // The unoracled freeze needs a reporter index for a non-zero mark to
@@ -1879,6 +1908,7 @@ mod tests {
             maker_post: 0,
             taker_isolated: false,
             maker_isolated: false,
+            kind: 0,
         };
         s.apply_fill_pair(&fill).unwrap();
 
@@ -1953,6 +1983,7 @@ mod tests {
             maker_post: 0,
             taker_isolated: false,
             maker_isolated: false,
+            kind: 0,
         };
         s.apply_fill_pair(&fill).unwrap();
         // Maker clamped to exactly 0. The maker's own 50k collateral absorbs
@@ -1970,7 +2001,7 @@ mod tests {
         // pushes past the AA's fixed 16-step reduce and must yield None.
         let mk = |n: usize| -> Vec<(String, Usd, u128, i128)> {
             (0..n)
-                .map(|i| (format!("A{:031}", i), 1, 0u128, 0i128))
+                .map(|i| (format!("A{i:031}"), 1, 0u128, 0i128))
                 .collect()
         };
         let too_deep = mk((1 << operp_types::MAX_AA_TREE_DEPTH) + 1);
@@ -2094,7 +2125,7 @@ mod tests {
     #[test]
     fn aa_shard_of_is_deterministic_and_bounded() {
         for i in 0..200u32 {
-            let addr = format!("ADDR{}", i);
+            let addr = format!("ADDR{i}");
             assert_eq!(aa_shard_of(&addr), aa_shard_of(&addr));
             assert!(aa_shard_of(&addr) < AA_SHARD_COUNT as u8);
         }
@@ -2106,7 +2137,7 @@ mod tests {
         // plain "empty" root, so a zero-proof cannot hop shards (doc 10 §5.4).
         let roots = aa_sharded_roots_of(&[]);
         for i in 0..AA_SHARD_COUNT {
-            let expected = hex::encode(sha256(format!("empty:{}", i).as_bytes()));
+            let expected = hex::encode(sha256(format!("empty:{i}").as_bytes()));
             assert_eq!(roots[i], expected);
             if i > 0 {
                 assert_ne!(roots[i], roots[i - 1]);
@@ -2120,7 +2151,7 @@ mod tests {
         // Replicate the AA fold: proof within a shard's tree must land on
         // exactly the shard's 64-hex slice of the concatenated forest.
         let pairs: Vec<(String, Usd, u128, i128)> = (0..40u32)
-            .map(|i| (format!("OBADDR{}X", i), 100 + i as Usd, 0, 0))
+            .map(|i| (format!("OBADDR{i}X"), 100 + i as Usd, 0, 0))
             .collect();
         let forest_roots = aa_sharded_roots_of(&pairs);
         let covered: std::collections::HashSet<u8> =
@@ -2130,14 +2161,12 @@ mod tests {
             let (shard, siblings, root) = aa_sharded_proof_for(&pairs, addr).unwrap();
             assert_eq!(root, forest_roots[shard as usize]);
             assert!(siblings.len() <= operp_types::MAX_AA_TREE_DEPTH);
-            let mut acc = hex::encode(sha256(
-                format!("acct:{}:{}:{}:{}", addr, col, perp, w).as_bytes(),
-            ));
+            let mut acc = hex::encode(sha256(format!("acct:{addr}:{col}:{perp}:{w}").as_bytes()));
             for (sib, right) in &siblings {
                 let buf = if *right {
-                    format!("{}{}", acc, sib)
+                    format!("{acc}{sib}")
                 } else {
-                    format!("{}{}", sib, acc)
+                    format!("{sib}{acc}")
                 };
                 acc = hex::encode(sha256(buf.as_bytes()));
             }

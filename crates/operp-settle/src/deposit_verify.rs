@@ -118,15 +118,39 @@ fn verify_one(
     perp_asset: &[u8; 32],
 ) -> Result<([u8; 32], bool), SettleError> {
     // op kind and aa_unit extraction
-    let (op_aa_unit, op_amount_str, op_is_perp) = match op {
+    let (op_aa_unit, op_amount_str, op_is_perp, op_addr) = match op {
         Op::Deposit {
-            aa_unit, amount, ..
-        } => (*aa_unit, amount.to_string(), false),
+            aa_unit,
+            amount,
+            addr,
+            ..
+        } => (*aa_unit, amount.to_string(), false, addr.clone()),
         Op::GovDeposit {
-            aa_unit, amount, ..
-        } => (*aa_unit, amount.to_string(), true),
+            aa_unit,
+            amount,
+            addr,
+            ..
+        } => (*aa_unit, amount.to_string(), true, addr.clone()),
         _ => return Ok(([0u8; 32], false)), // not a deposit, caller filters
     };
+
+    // Payer binding (#8): the evidence's payer must be the joint's first
+    // author AND the sidechain op's bound withdrawal address — otherwise
+    // the first sidechain Deposit referencing someone else's payment
+    // claims the credit.
+    let joint_authors = if let Some(u) = ev.joint.get("unit") {
+        u.get("authors")
+    } else {
+        ev.joint.get("authors")
+    };
+    let first_author = joint_authors
+        .and_then(|a| a.get(0))
+        .and_then(|a| a.get("address"))
+        .and_then(|a| a.as_str());
+    match first_author {
+        Some(a) if a == ev.payer && ev.payer == op_addr => {}
+        _ => return Err(SettleError::DepositContentMismatch),
+    }
 
     // aa_unit hex string must decode and equal op aa_unit
     let ev_bytes = parse_hex32(&ev.aa_unit)?;

@@ -18,11 +18,13 @@
 //  3.  combined submit height 1 (10000 fee) → last_submitted=1; resubmit 'bad submit'
 //  4.  {lock:1} / {challenge:1} have NO cases → auto-bounce, nothing frozen
 //  5.  finalize before 3600s → 'cannot finalize'; after → last_finalized=1, no sbond credit
-//  6.  omit fraud (forced id missing) → verdict freezes h2
-//  7.  dishonest post collateral → verdict fires: frozen=2, last_submitted
+//  6. omit (forced id missing) now bounces 'no fraud' (#23: force pins a
+//      timestamp only, never an existence claim)
+//  7. dishonest post collateral → verdict fires: frozen=2, last_submitted
 //      rolls back, slash_reward_ 500000000000 claimable, pool slashed 5e11
-//  8.  honest deposit → 'no fraud', height stays live
-//  9-13. fill_math/ghost/skip/negative-price predicates on h3 chain
+//  8. honest deposit → 'no fraud', height stays live
+//  9-13. fill_math/ghost/skip predicates on h3 chain (unit-bound via
+//      units_proof; a fake unit hex bounces 'bad unit')
 //  14. two-package (gzip) height deposit fraud → frozen=3
 //  15. re-submit + finalize after fraud works
 //  16. pipeline h4+h5 with no inter-finalize, then finalize in order
@@ -85,13 +87,20 @@ function writeResolved(file, subs, out) {
 }
 
 // Precompute the rollup address from its definition (no placeholders).
-const ROLLUP_ADDR = chashOf(readDef("operp_rollup.aa"));
-const DISPUTE_SRC = writeResolved("operp_dispute.aa", { ROLLUP_AA_HERE: ROLLUP_ADDR }, ".e2e_dispute.aa");
-const FILL_SRC = writeResolved("operp_dispute_fill.aa", { ROLLUP_AA_HERE: ROLLUP_ADDR }, ".e2e_fill.aa");
-const VAULT_SRC = writeResolved("operp_vault.aa", { ROLLUP_AA_HERE: ROLLUP_ADDR, PERP_ASSET_ID_HERE: PERP_ASSET }, ".e2e_vault.aa");
-// dispute AA address is also deterministic — compute AFTER substitution.
+// #13: the rollup hardcodes both dispute addresses (anti-hijack), so they
+// hash FIRST. Dispute/fill carry no rollup address in their definitions —
+// binds and challenges pass it in trigger data — which is what breaks the
+// chash cycle (each address would otherwise be a hash input of the other).
+const DISPUTE_SRC = writeResolved("operp_dispute.aa", {}, ".e2e_dispute.aa");
+const FILL_SRC = writeResolved("operp_dispute_fill.aa", {}, ".e2e_fill.aa");
 const DISPUTE_ADDR = chashOf(fs.readFileSync(DISPUTE_SRC, "utf8"));
 const FILL_ADDR = chashOf(fs.readFileSync(FILL_SRC, "utf8"));
+const ROLLUP_SRC = writeResolved("operp_rollup.aa", {
+  DISPUTE_AA_HERE: DISPUTE_ADDR,
+  DISPUTE_FILL_AA_HERE: FILL_ADDR,
+}, ".e2e_rollup.aa");
+const ROLLUP_ADDR = chashOf(fs.readFileSync(ROLLUP_SRC, "utf8"));
+const VAULT_SRC = writeResolved("operp_vault.aa", { ROLLUP_AA_HERE: ROLLUP_ADDR, PERP_ASSET_ID_HERE: PERP_ASSET }, ".e2e_vault.aa");
 const POOL_FUND_GROSS = 50000000010000; // 50x POOL_MIN net: survives all fraud slashes in this run
 const SUBMIT_FEE = 10000; // submits pay only the bounce fee; pool gates
 const RACE_REWARD = 20000;
@@ -148,7 +157,7 @@ const FILL_TAKER = "b".repeat(64);
 const FILL_TAKER_PRE = `acct:${FILL_TAKER}:0:0:0`;
 const META1 = `meta:1:1:1000:500:5:100:0:100:0:0`;
 const META2 = `meta:2:1:1000:500:5:100:0:100:0:0`;
-const POS2 = `pos:${FILL_TAKER}:2:50000000:90000000`;
+const POS2 = `pos:${FILL_TAKER}:2:50000000:90000000:0:0`;
 const GENESIS_LEAVES = [DEP_PRE, FILL_TAKER_PRE, META1, META2, POS2].sort();
 const WIT_ROOT = merkle.getMerkleRoot(GENESIS_LEAVES);
 const GEN_WIT_COUNT = GENESIS_LEAVES.length;
@@ -266,7 +275,7 @@ async function main() {
   console.log("fill address (precomputed):", FILL_ADDR);
 
   network = await Network.create()
-    .with.agent({ rollup: path.join(__dirname, "agents", "operp_rollup.aa") })
+    .with.agent({ rollup: ROLLUP_SRC })
     .with.agent({ dispute: DISPUTE_SRC })
     .with.agent({ fill: FILL_SRC })
     .with.agent({ vault: VAULT_SRC })
@@ -281,17 +290,21 @@ async function main() {
   if (rollup !== ROLLUP_ADDR) throw new Error(`rollup address mismatch: ${rollup} != ${ROLLUP_ADDR}`);
   console.log("network up:", { rollup, dispute, fill, vault });
 
-  // ---- 1. bind dispute --------------------------------------------------
-  await trigger(operator, dispute, { bind: 1 }, 20000);
-  await trigger(operator, fill, { bind_fill: 1 }, 20000);
+  // ---- 1. bind dispute + fill ------------------------------------------------
+  await trigger(operator, dispute, { bind: 1, rollup: ROLLUP_ADDR }, 20000);
+  await trigger(operator, fill, { bind_fill: 1, rollup: ROLLUP_ADDR }, 20000);
   let st = await vars(rollup);
   if (String(st.dispute_aa) !== dispute) throw new Error("dispute_aa not set: " + JSON.stringify(st.dispute_aa));
   if (String(st.dispute_fill_aa) !== fill) throw new Error("dispute_fill_aa not set: " + JSON.stringify(st.dispute_fill_aa));
   console.log("1. bind ok — dispute_aa + dispute_fill_aa set");
+  // #13: a foreign sender (wallet or any other AA) cannot set_dispute —
+  // the rollup only accepts the two addresses hardcoded into its def.
+  await triggerBounce(operator, rollup, { set_dispute: 1 }, 20000, "not authorized");
+  await triggerBounce(operator, rollup, { set_dispute_fill: 1 }, 20000, "not authorized");
   // A second bind succeeds on the dispute AA (it just re-forwards), but the
   // rollup bounces the secondary 'not authorized' verdict — dispute_aa var
   // must be unchanged afterwards.
-  await trigger(operator, dispute, { bind: 1 }, 20000);
+  await trigger(operator, dispute, { bind: 1, rollup: ROLLUP_ADDR }, 20000);
   st = await vars(rollup);
   if (String(st.dispute_aa) !== dispute) throw new Error("double bind overwrote dispute_aa!");
 
@@ -379,12 +392,19 @@ async function main() {
   // H3 pre-tree (genesis leaves + two live orders) is hoisted here because
   // scenario 8's honest h2 submit must ALREADY commit it as wit_root_2:
   // every h3 k=0 predicate anchors pre_wit on wit_root_2.
-  const MAKER_ORD = `ord:${"d".repeat(64)}:1:1:100000000:7:5:${"c".repeat(64)}`;
-  const BETTER_ORD = `ord:${"e".repeat(63)}f:1:1:90000000:6:9:${"c".repeat(64)}`;
+  const MAKER_ORD = `ord:${"d".repeat(64)}:1:1:100000000:7:5:${"c".repeat(64)}:0:0`;
+  const BETTER_ORD = `ord:${"e".repeat(63)}f:1:1:90000000:6:9:${"c".repeat(64)}:0:0`;
   const H3_PRE = [DEP_PRE, FILL_TAKER_PRE, META1, META2, POS2, MAKER_ORD, BETTER_ORD].sort();
   const H3_PRE_WIT = merkle.getMerkleRoot(H3_PRE);
   const H3_PRE_IDX = {};
   H3_PRE.forEach((l, i) => { H3_PRE_IDX[l] = i; });
+  // h3 commits ONE real unit: fill predicates bind $F[1] to units_root via
+  // units_proof (index == k), so the committed root must be a genuine
+  // merkle root over a unit-hex array, not a seed hash.
+  const H3_UNIT_HEX = sha256Hex("h3-unit");
+  const UNITS3 = pad2([H3_UNIT_HEX], "units3");
+  const UNITS3_ROOT = merkle.getMerkleRoot(UNITS3);
+  const UNITS3_PROOF = merkle.getMerkleProof(UNITS3, 0);
   async function triggerVerdict(wallet, to, data, amount, what) {
     const t = await trigger(wallet, to, data, amount);
     const r = await network.getAaResponseToUnit(t.unit).catch(() => null);
@@ -399,10 +419,17 @@ async function main() {
   const otherId = sha256Hex("other-unit");
   const SET1 = pad2([otherId], "set1");
   const SET_ROOT1 = merkle.getMerkleRoot(SET1);
-  // ---- 6. omit fraud on a REAL committed tree → verdict freezes h2 --------
-  await submitH2(OPS_ROOT1, TRACE_ROOT1, SET_ROOT1, FILLS_ROOT);
+  // ---- 6. omit: force empty hole (#23) → 'no fraud', height stays live ----
+  // The LIAR trace commits here once: scenario 6 cannot freeze, and 7 must
+  // not re-submit the same live height ('height taken').
+  const LIAR_POST1 = pad2([`acct:${acct}:1000000:0:0`], "liar1");
+  const LIAR_WIT1 = merkle.getMerkleRoot(LIAR_POST1);
+  const LIAR_TRACE1 = pad2([LIAR_WIT1], "liartrace1");
+  const LIAR_TRACE_ROOT1 = merkle.getMerkleRoot(LIAR_TRACE1);
+  await submitH2(OPS_ROOT1, LIAR_TRACE_ROOT1, SET_ROOT1, FILLS_ROOT);
   const omitProof = {
-    trace_root: TRACE_ROOT1,
+    rollup: ROLLUP_ADDR,
+    trace_root: LIAR_TRACE_ROOT1,
     ops_root: OPS_ROOT1,
     units_root: UNITS_SET_ROOT,
     units_set_root: SET_ROOT1,
@@ -411,20 +438,16 @@ async function main() {
     left: otherId,
     left_proof: merkle.getMerkleProof(SET1, 0),
   };
-  await triggerVerdict(challenger, dispute, Object.assign({ pred: "omit", height: 2 }, omitProof), 20000, "omit predicate");
+  await triggerBounce(challenger, dispute, Object.assign({ pred: "omit", height: 2 }, omitProof), 20000, "no fraud");
   st = await vars(rollup);
-  if (Number(st.frozen_2) !== 2) throw new Error("omit fraud did not freeze height");
-  console.log("6. omit fraud: missing forced id failed the height");
+  if (Number(st.frozen_2 || 0) !== 0) throw new Error("omit force-hole froze the height!");
+  console.log("6. omit force-hole bounced 'no fraud' — height live");
 
   const depPreIdx = GENESIS_LEAVES.indexOf(preLeaf);
 
-  // ---- 7. deposit fraud on a LIAR trace (h2 reopened) → verdict, slash ----
-  const LIAR_POST1 = pad2([`acct:${acct}:1000000:0:0`], "liar1");
-  const LIAR_WIT1 = merkle.getMerkleRoot(LIAR_POST1);
-  const LIAR_TRACE1 = pad2([LIAR_WIT1], "liartrace1");
-  const LIAR_TRACE_ROOT1 = merkle.getMerkleRoot(LIAR_TRACE1);
-  await submitH2(OPS_ROOT1, LIAR_TRACE_ROOT1, SET_ROOT1, FILLS_ROOT);
+  // ---- 7. deposit fraud on the committed LIAR trace → verdict, slash ----
   const fraudProof = {
+    rollup: ROLLUP_ADDR,
     k: 0,
     op: opD,
     ops_proof: merkle.getMerkleProof(OPS1, 0),
@@ -444,13 +467,13 @@ async function main() {
   await triggerVerdict(challenger, dispute, Object.assign({ pred: "deposit", height: 2 }, fraudProof), 20000, "deposit fraud predicate");
   st = await vars(rollup);
   const chAddr = await challenger.getAddress();
-  // Cumulative: scenario 6's omit verdict already banked one half.
-  if (Number(st["slash_reward_" + chAddr] || 0) !== SLASH_HALF * 2)
+  // First verdict of the run (scenario 6 no longer pays out).
+  if (Number(st["slash_reward_" + chAddr] || 0) !== SLASH_HALF)
     throw new Error("slash reward wrong: " + JSON.stringify(st["slash_reward_" + chAddr]));
-  // Verdict slashes the standing pool by 5e11 per fraud (2 so far).
+  // Verdict slashes the standing pool by 5e11 per fraud (1 so far).
   const opAddr = await operator.getAddress();
   const poolNet = POOL_FUND_GROSS - 10000; // {pool:1} credits net of bounce fee
-  if (Number(st["pool_" + opAddr] || 0) !== Number(poolNet - SLASH_HALF * 2))
+  if (Number(st["pool_" + opAddr] || 0) !== Number(poolNet - SLASH_HALF))
     throw new Error("pool not slashed by fraud: " + JSON.stringify(st["pool_" + opAddr]));
   // Challenger withdraws the banked slash: payout + zeroed key (no double-claim).
   await trigger(challenger, rollup, { claim: "slash" }, 20000);
@@ -463,6 +486,7 @@ async function main() {
   // predicate anchors pre_wit on it.
   await submitH2(OPS_ROOT1, TRACE_ROOT1, SET_ROOT1, FILLS_ROOT, H3_PRE_WIT, H3_PRE.length);
   const honestProof = {
+    rollup: ROLLUP_ADDR,
     k: 0,
     op: opD,
     ops_proof: merkle.getMerkleProof(OPS1, 0),
@@ -488,12 +512,12 @@ async function main() {
   await network.timetravel({ shift: "3600s" });
   await trigger(operator, rollup, { finalize: 1, height: 2 }, 20000);
   st = await vars(rollup);
-  // ---- 10. submit h3 committing a LIAR post tree (taker col 0, real -500) --
+  // ---- 10. submit h3 committing a LIAR post tree (taker col understated) --
   const takerH = FILL_TAKER;
-  const fillStr = `f:${"u".repeat(64)}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"e".repeat(64)}:1:100000000:100000000:9:0`;
+  const fillStr = `f:${H3_UNIT_HEX}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"e".repeat(64)}:1:100000000:100000000:9:0:0`;
   const FILLS1 = pad2([fillStr], "fills1");
   const FILLS_ROOT1 = merkle.getMerkleRoot(FILLS1);
-  const POST_LIAR = [`acct:${takerH}:0:0:0`, META1, `pos:${takerH}:1:100000000:100000000`].sort();
+  const POST_LIAR = [`acct:${takerH}:-600:0:0`, META1, `pos:${takerH}:1:100000000:100000000:0:0`].sort();
   const POST_LIAR_WIT = merkle.getMerkleRoot(POST_LIAR);
   const TRACE_LIAR = pad2([POST_LIAR_WIT], "traceliar");
   const TRACE_LIAR_ROOT = merkle.getMerkleRoot(TRACE_LIAR);
@@ -503,6 +527,7 @@ async function main() {
   sd3.trace_root = TRACE_LIAR_ROOT;
   sd3.fills_root = FILLS_ROOT1;
   sd3.ops_root = OPS_ROOT1;
+  sd3.units_root = UNITS3_ROOT;
   {
     const h3data = { chain_id: "operp-v2", height: 3 };
     const r = await operator.sendMulti({
@@ -522,24 +547,30 @@ async function main() {
       throw new Error("h3 submit bounced: " + JSON.stringify(res.response).slice(0, 200));
   }
 
-  // ---- 11. fill_math dishonest (taker col 0 instead of -500) → fraud -------
+  // ---- 11. fill_math dishonest (liar understates col: -600 vs -500) ------
   // price=1e8 qty=1e8 -> notional 1e6, fee 5bps=500 -> exp col -500.
+  // The AA's direction rule verdicts anything BELOW the engine identity.
   const fillBase = {
+    rollup: ROLLUP_ADDR,
     k: 0,
     trace_root: TRACE_LIAR_ROOT,
     fills_root: FILLS_ROOT1,
     ops_root: OPS_ROOT1,
+    units_root: UNITS3_ROOT,
+    units_proof: UNITS3_PROOF,
     fill: fillStr,
     fill_proof: merkle.getMerkleProof(FILLS1, 0),
+    right: FILLS1[1],
+    right_proof: merkle.getMerkleProof(FILLS1, 1),
     pre_wit: H3_PRE_WIT,
     post_wit: POST_LIAR_WIT,
     post_proof: merkle.getMerkleProof(TRACE_LIAR, 0),
     pre_acct: FILL_TAKER_PRE,
     pre_acct_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[FILL_TAKER_PRE]),
-    post_acct: `acct:${takerH}:0:0:0`, // liar: col 0, expected -500
-    post_acct_proof: merkle.getMerkleProof(POST_LIAR, POST_LIAR.indexOf(`acct:${takerH}:0:0:0`)),
-    post_pos: `pos:${takerH}:1:100000000:100000000`,
-    post_pos_proof: merkle.getMerkleProof(POST_LIAR, POST_LIAR.indexOf(`pos:${takerH}:1:100000000:100000000`)),
+    post_acct: `acct:${takerH}:-600:0:0`, // liar: -600, engine identity -500
+    post_acct_proof: merkle.getMerkleProof(POST_LIAR, POST_LIAR.indexOf(`acct:${takerH}:-600:0:0`)),
+    post_pos: `pos:${takerH}:1:100000000:100000000:0:0`,
+    post_pos_proof: merkle.getMerkleProof(POST_LIAR, POST_LIAR.indexOf(`pos:${takerH}:1:100000000:100000000:0:0`)),
     pre_meta: META1,
     pre_meta_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[META1]),
     pos_absent: true,
@@ -561,7 +592,7 @@ async function main() {
   // ---- 11a. fill_math honest → 'no fraud' ---------------------------------
   // h3 reopened by scenario 11's verdict: re-submit with the HONEST post
   // tree (col -500) and prove honest math bounces.
-  const POST_H = [`acct:${takerH}:-500:0:0`, META1, `pos:${takerH}:1:100000000:100000000`].sort();
+  const POST_H = [`acct:${takerH}:-500:0:0`, META1, `pos:${takerH}:1:100000000:100000000:0:0`].sort();
   const POST_H_WIT = merkle.getMerkleRoot(POST_H);
   const TRACE_H = pad2([POST_H_WIT], "traceh");
   const TRACE_H_ROOT = merkle.getMerkleRoot(TRACE_H);
@@ -572,6 +603,7 @@ async function main() {
     s.trace_root = traceRoot;
     s.fills_root = fillsRoot;
     s.ops_root = OPS_ROOT1;
+    s.units_root = UNITS3_ROOT;
     const h3header = headerFromSubmit(s);
     const r = await operator.sendMulti({
       messages: [
@@ -593,8 +625,8 @@ async function main() {
     post_proof: merkle.getMerkleProof(TRACE_H, 0),
     post_acct: `acct:${takerH}:-500:0:0`,
     post_acct_proof: merkle.getMerkleProof(POST_H, POST_H.indexOf(`acct:${takerH}:-500:0:0`)),
-    post_pos: `pos:${takerH}:1:100000000:100000000`,
-    post_pos_proof: merkle.getMerkleProof(POST_H, POST_H.indexOf(`pos:${takerH}:1:100000000:100000000`)),
+    post_pos: `pos:${takerH}:1:100000000:100000000:0:0`,
+    post_pos_proof: merkle.getMerkleProof(POST_H, POST_H.indexOf(`pos:${takerH}:1:100000000:100000000:0:0`)),
   });
   await triggerBounce(challenger, fill, Object.assign({ pred: "fill_math", height: 3 }, fillHonest2), 20000, "no fraud");
   console.log("11a. fill_math honest bounced 'no fraud'");
@@ -603,7 +635,7 @@ async function main() {
   // maker id "e"*64 has no ord leaf in H3_PRE. Sorted H3_PRE runs
   // ... MAKER_ORD(ord:d, idx4), BETTER_ORD(ord:eee..f, idx5), POS2(idx6):
   // the whole ord:{e*64}: range sits between MAKER_ORD and BETTER_ORD.
-  const ghostOrd = `ord:${"e".repeat(64)}:1:1:100000000:9:3:${"c".repeat(64)}`;
+  const ghostOrd = `ord:${"e".repeat(64)}:1:1:100000000:9:3:${"c".repeat(64)}:0:0`;
   const gSorted = H3_PRE;
   const gMaker = gSorted.indexOf(MAKER_ORD);
   const gBetter = gSorted.indexOf(BETTER_ORD);
@@ -612,10 +644,13 @@ async function main() {
   const ghostHi = `ord:${"e".repeat(64)};`;
   if (!(gSorted[gMaker] < ghostLo && ghostHi <= gSorted[gBetter])) throw new Error("ghost fixture not straddling");
   const ghostProof = {
+    rollup: ROLLUP_ADDR,
     k: 0,
     trace_root: TRACE_H_ROOT,
     fills_root: FILLS_ROOT1,
     ops_root: OPS_ROOT1,
+    units_root: UNITS3_ROOT,
+    units_proof: UNITS3_PROOF,
     fill: fillStr,
     fill_proof: merkle.getMerkleProof(FILLS1, 0),
     pre_wit: H3_PRE_WIT,
@@ -625,7 +660,7 @@ async function main() {
     right: gSorted[gBetter],
     right_proof: merkle.getMerkleProof(gSorted, gBetter),
   };
-  await triggerVerdict(challenger, fill, Object.assign({ pred: "ghost", height: 3 }, ghostProof), 20000, "ghost predicate");
+  await triggerVerdict(challenger, dispute, Object.assign({ pred: "ghost", height: 3 }, ghostProof), 20000, "ghost predicate");
   st = await vars(rollup);
   if (Number(st.frozen_3) !== 2) throw new Error("ghost fraud did not freeze height");
   console.log("12. ghost (absent maker) → frozen=3");
@@ -633,15 +668,18 @@ async function main() {
   // ---- 13. skip: better live order ignored → fraud -------------------------
   const SKIP_TRACE4 = pad2([`skip-post-wit`], "skiptrace4");
   const SKIP_TRACE4_ROOT = merkle.getMerkleRoot(SKIP_TRACE4);
-  const SKIP_FILLS = pad2([`f:${"u".repeat(64)}:0:${FILL_TAKER}:${"c".repeat(64)}:${"d".repeat(64)}:${"d".repeat(64)}:1:100000000:50000000:7:0`], "skipfills");
+  const SKIP_FILLS = pad2([`f:${H3_UNIT_HEX}:0:${FILL_TAKER}:${"c".repeat(64)}:${"d".repeat(64)}:${"d".repeat(64)}:1:100000000:50000000:7:0:0`], "skipfills");
   const SKIP_FILLS_ROOT = merkle.getMerkleRoot(SKIP_FILLS);
   // h3 was frozen by ghost: re-submit carrying the skip assertion's roots.
   await submitH3(SKIP_TRACE4_ROOT, SKIP_FILLS_ROOT);
   const skipProof = {
+    rollup: ROLLUP_ADDR,
     k: 0,
     trace_root: SKIP_TRACE4_ROOT,
     fills_root: SKIP_FILLS_ROOT,
     ops_root: OPS_ROOT1,
+    units_root: UNITS3_ROOT,
+    units_proof: UNITS3_PROOF,
     fill: SKIP_FILLS[0],
     fill_proof: merkle.getMerkleProof(SKIP_FILLS, 0),
     pre_wit: H3_PRE_WIT,
@@ -650,18 +688,18 @@ async function main() {
     better_ord: BETTER_ORD,
     better_proof: merkle.getMerkleProof(H3_PRE, H3_PRE.indexOf(BETTER_ORD)),
   };
-  await triggerVerdict(challenger, fill, Object.assign({ pred: "skip", height: 3 }, skipProof), 20000, "skip predicate");
+  await triggerVerdict(challenger, dispute, Object.assign({ pred: "skip", height: 3 }, skipProof), 20000, "skip predicate");
   st = await vars(rollup);
   if (Number(st.frozen_3) !== 2) throw new Error("skip fraud did not freeze height");
   console.log("13. skip (better order ignored) → frozen=3");
-  // ---- 13a. fill_math with NEGATIVE price (signed fills) → fraud --------
-  // price=-1e8 qty=1e8 -> |notional| 1e6, fee 5bps=500 -> exp col -500.
-  // Liar posts -499: proves Oscript string math holds for negatives.
-  // Market stays 1 (no pre pos -> exact expectation, no averaging division).
-  const NEG_FILL = `f:${"u".repeat(64)}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"e".repeat(64)}:1:-100000000:100000000:9:0`;
+  // ---- 13a. fill with a FAKE unit hex → 'bad unit', no verdict (#1) -------
+  // NEG_FILL's unit hex is u*64, not the h3 unit committed in units_root:
+  // units_proof cannot verify it, so the predicate must bounce before any
+  // math. This is the exact class the old AA let through to a verdict.
+  const NEG_FILL = `f:${"u".repeat(64)}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"e".repeat(64)}:1:-100000000:100000000:9:0:0`;
   const NEG_FILLS = pad2([NEG_FILL], "negfills");
   const NEG_FILLS_ROOT = merkle.getMerkleRoot(NEG_FILLS);
-  const NEG_POST_LIAR = [`acct:${takerH}:-499:0:0`, META1, `pos:${takerH}:1:100000000:-100000000`].sort();
+  const NEG_POST_LIAR = [`acct:${takerH}:-499:0:0`, META1, `pos:${takerH}:1:100000000:-100000000:0:0`].sort();
   const NEG_POST_LIAR_WIT = merkle.getMerkleRoot(NEG_POST_LIAR);
   const NEG_TRACE = pad2([NEG_POST_LIAR_WIT], "negtrace");
   const NEG_TRACE_ROOT = merkle.getMerkleRoot(NEG_TRACE);
@@ -671,20 +709,20 @@ async function main() {
     fills_root: NEG_FILLS_ROOT,
     fill: NEG_FILL,
     fill_proof: merkle.getMerkleProof(NEG_FILLS, 0),
+    right: NEG_FILLS[1],
+    right_proof: merkle.getMerkleProof(NEG_FILLS, 1),
     post_wit: NEG_POST_LIAR_WIT,
     post_proof: merkle.getMerkleProof(NEG_TRACE, 0),
-    post_acct: `acct:${takerH}:-499:0:0`, // liar: col -499, expected -500
+    post_acct: `acct:${takerH}:-499:0:0`,
     post_acct_proof: merkle.getMerkleProof(NEG_POST_LIAR, NEG_POST_LIAR.indexOf(`acct:${takerH}:-499:0:0`)),
-    post_pos: `pos:${takerH}:1:100000000:-100000000`,
-    post_pos_proof: merkle.getMerkleProof(NEG_POST_LIAR, NEG_POST_LIAR.indexOf(`pos:${takerH}:1:100000000:-100000000`)),
+    post_pos: `pos:${takerH}:1:100000000:-100000000:0:0`,
+    post_pos_proof: merkle.getMerkleProof(NEG_POST_LIAR, NEG_POST_LIAR.indexOf(`pos:${takerH}:1:100000000:-100000000:0:0`)),
   });
-  await triggerVerdict(challenger, fill, Object.assign({ pred: "fill_math", height: 3 }, negBase), 20000, "negative-price fill_math predicate");
-  st = await vars(rollup);
-  if (Number(st.frozen_3) !== 2) throw new Error("negative-price fill_math fraud did not freeze height");
-  console.log("13a. fill_math negative-price dishonest → frozen=3 via fill AA");
+  await triggerBounce(challenger, fill, Object.assign({ pred: "fill_math", height: 3 }, negBase), 20000, "bad unit");
+  console.log("13a. fake unit hex bounced 'bad unit' — no verdict");
 
   // ---- 14. two-package height: deposit-fraud predicate fires, height fails --
-  // h3 was frozen by 13a, so last_submitted=2 and a fresh h3 submit is legal.
+  // h3 was frozen by 13 (skip), so last_submitted=2 and a fresh h3 submit is legal.
   // Two 1-unit packages post first (JS join+base64, no helper binary), then
   // the da_unit header nails the real package hashes + data_root. The fraud
   // verdict proves the multi-package DA reveal feeds the same predicate path
@@ -746,6 +784,7 @@ async function main() {
       throw new Error("h3 2-package submit bounced: " + JSON.stringify(res3p.response).slice(0, 200));
   }
   const pkgFraud = {
+    rollup: ROLLUP_ADDR,
     k: 0,
     op: PKG_OP,
     ops_proof: merkle.getMerkleProof(PKG_OPS, 0),

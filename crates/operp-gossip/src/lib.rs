@@ -489,7 +489,7 @@ impl GossipNode {
                 .filter(|id| {
                     self.last_want
                         .get(&(peer, *id))
-                        .map_or(true, |&t| now_ms.saturating_sub(t) >= WANT_DEBOUNCE_MS)
+                        .is_none_or(|&t| now_ms.saturating_sub(t) >= WANT_DEBOUNCE_MS)
                 })
                 .collect();
             if fresh.is_empty() {
@@ -519,9 +519,11 @@ impl GossipNode {
         if missing.len() > MAX_WANT_IDS {
             return None; // drop oversize request
         }
-        if self.last_response.get(&from).map_or(false, |&t| {
-            now_ms.saturating_sub(t) < RESPONSE_RATE_LIMIT_MS
-        }) {
+        if self
+            .last_response
+            .get(&from)
+            .is_some_and(|&t| now_ms.saturating_sub(t) < RESPONSE_RATE_LIMIT_MS)
+        {
             return None; // rate limited
         }
         // Budget consumed on any request past the rate gate, served or not.
@@ -715,12 +717,7 @@ mod tests {
         ];
         for (i, op) in ops.into_iter().enumerate() {
             let unit = operp_dag::sign_unit(g.clone(), op, &[(i + 1) as u8; 32]);
-            assert_eq!(
-                decode_unit(&unit_wire(&unit)).unwrap(),
-                unit,
-                "variant {}",
-                i
-            );
+            assert_eq!(decode_unit(&unit_wire(&unit)).unwrap(), unit, "variant {i}");
         }
     }
 
@@ -796,7 +793,6 @@ mod tests {
     #[test]
     fn handle_want_drops_oversize_and_rate_limits_responses() {
         let mut node = GossipNode::new(vec![PeerId(2)]);
-        let big: Vec<UnitId> = (0..=MAX_WANT_IDS).map(|i| UnitId([i as u8; 32])).collect();
 
         // Rate limit: second response within 100 ms suppressed.
         let u = signed(vec![genesis_id()], 3);

@@ -2,8 +2,8 @@ use ed25519_dalek::SigningKey;
 use operp_dag::{genesis_id, sign_unit, unit_id, Op};
 use operp_exec::Engine;
 use operp_types::{
-    account_id_from_pubkey, AccountId, MarketId, OrderType, Qty, Side, TimeInForce, UnitId,
-    PRICE_SCALE, QTY_SCALE, USD_SCALE,
+    account_id_from_pubkey, AccountId, MarketId, OrderType, Side, TimeInForce, PRICE_SCALE,
+    QTY_SCALE, USD_SCALE,
 };
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 /// Markets share nothing - books, accounts (per-shard isolated margin for the
 /// benchmark), marks. Cross-margin unification happens at settlement; matching
 /// itself is 100% market-local so shards scale linearly.
-
 const TRADERS: usize = 4;
 
 fn sk(n: u8) -> [u8; 32] {
@@ -54,7 +53,7 @@ fn run_shard(shard_idx: usize, cfg: &Cfg) -> (u64, u64, u64) {
     let secrets: Vec<[u8; 32]> = (0..TRADERS)
         .map(|i| sk((((shard_idx * TRADERS + i + 3) * 41 + 7) % 251) as u8))
         .collect();
-    let mut seqs = vec![1u64; TRADERS];
+    let mut seqs = [1u64; TRADERS];
     let px = 100_000 * PRICE_SCALE as i64;
     let qty = QTY_SCALE / 100;
     let mut tip = genesis_id();

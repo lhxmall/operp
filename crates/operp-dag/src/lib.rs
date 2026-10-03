@@ -461,13 +461,13 @@ impl SigVerifier {
     /// Same contract as [`verify_sig_by_id`] with decompression cached.
     pub fn verify_by_id(&mut self, unit: &Unit, id: &UnitId) -> bool {
         let vk = match self.cache.get(&unit.pubkey) {
-            Some(cached) => cached.clone(),
+            Some(cached) => *cached,
             None => {
                 let parsed = VerifyingKey::from_bytes(&unit.pubkey).ok();
                 if self.cache.len() >= Self::CAP {
                     self.cache.clear();
                 }
-                self.cache.insert(unit.pubkey, parsed.clone());
+                self.cache.insert(unit.pubkey, parsed);
                 parsed
             }
         };
@@ -535,6 +535,12 @@ pub struct Dag {
 /// Max buffered orphan units. Beyond this the orphan with the smallest
 /// UnitId is dropped.
 const ORPHAN_CAP: usize = 4096;
+
+impl Default for Dag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Dag {
     pub fn new() -> Self {
@@ -833,7 +839,7 @@ mod tests {
             Op::Deposit {
                 account,
                 addr: test_addr(aa),
-                amount: 1 * USD_SCALE as i128,
+                amount: USD_SCALE as i128,
                 aa_unit: [aa; 32],
             },
             secret,
