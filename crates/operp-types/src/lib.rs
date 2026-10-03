@@ -133,17 +133,12 @@ pub const VAULT_AA_ADDRESS: &str = "";
 pub const DEPOSIT_EVIDENCE_MAX_BYTES: usize = 1_048_576;
 pub const DEPOSIT_VERIFY_ACTIVATION_HEIGHT: Height = 1_000_000;
 /// Funding source selector for funding index anchoring.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum FundingSourceKind {
+    #[default]
     BondedMedianTwap = 0,
     AggregatedExternal = 1,
-}
-
-impl Default for FundingSourceKind {
-    fn default() -> Self {
-        Self::BondedMedianTwap
-    }
 }
 
 /// Per-market oracle governance config.
