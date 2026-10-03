@@ -79,6 +79,7 @@ function submitData(h, prev) {
     counts_root: COUNTS_ROOT,
     unit_count: 1,
     wit_count: 1,
+    fill_count: 0,
   };
 }
 

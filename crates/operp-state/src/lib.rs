@@ -1995,6 +1995,77 @@ mod tests {
         assert_eq!(s.accounts[&INSURANCE_ACCOUNT].collateral, expected_ins);
     }
 
+    /// The bad-debt clamp can RAISE a cross account that still holds a
+    /// position: equity = collateral + upnl < 0 credits the hole back so
+    /// equity lands on exactly 0, while the surviving position keeps its
+    /// leaf. The witness leaves do not commit upnl, so the fill dispute
+    /// cannot recompute this shape — fill_math bounces `no fraud` for
+    /// non-empty ∧ expected < 0 instead of false-verdicting the honest
+    /// batch (see operp_dispute_fill.aa's collateral leg).
+    #[test]
+    fn maker_bad_debt_clamped_with_position() {
+        let mut s = ChainState::new();
+        let taker = AccountId([9; 32]);
+        let maker = AccountId([8; 32]);
+        s.account_mut(taker)
+            .credit(1_000_000 * USD_SCALE as i128)
+            .unwrap();
+        s.account_mut(maker)
+            .credit(50_000 * USD_SCALE as i128)
+            .unwrap();
+        // Maker is long 2 BTC @ 100k.
+        s.account_mut(maker)
+            .apply_fill(
+                operp_types::Side::Bid,
+                false,
+                100_000 * operp_types::PRICE_SCALE as i64,
+                2 * operp_types::QTY_SCALE,
+                BTC_USD,
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+        // Taker buys 1 BTC at 10k: the maker sells half, realizing a 90k
+        // loss against 50k collateral → pre-clamp -40k, and the surviving
+        // long 1 @ 100k is worth -90k at the 10k mark (equity -130k).
+        s.marks
+            .insert(BTC_USD, 10_000 * operp_types::PRICE_SCALE as i64);
+        let fill = Fill {
+            taker_id: operp_types::OrderId([0u8; 32]),
+            maker_id: operp_types::OrderId([0u8; 32]),
+            taker,
+            maker,
+            market: BTC_USD,
+            price: 10_000 * operp_types::PRICE_SCALE as i64,
+            qty: operp_types::QTY_SCALE,
+            seq: 1,
+            taker_side: operp_types::Side::Bid,
+            taker_post: 0,
+            maker_post: 0,
+            taker_isolated: false,
+            maker_isolated: false,
+            kind: 0,
+        };
+        s.apply_fill_pair(&fill).unwrap();
+        // Clamp raised the maker from -40000 to 90000 (equity := 0, the
+        // insurance fund absorbs 130k) — while the position leaf survives.
+        assert_eq!(
+            s.accounts[&maker].collateral,
+            90_000 * USD_SCALE as i128,
+            "clamp raised a cross account"
+        );
+        let pos = s.accounts[&maker]
+            .positions
+            .get(&BTC_USD)
+            .expect("half position survives the clamp");
+        assert_eq!(
+            pos.qty,
+            operp_types::QTY_SCALE.try_into().unwrap(),
+            "half position survives the clamp"
+        );
+    }
+
     #[test]
     fn aa_proof_for_refuses_over_deep_trees() {
         // 2^16 leaves need exactly MAX_AA_TREE_DEPTH siblings; one more leaf

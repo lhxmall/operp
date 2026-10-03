@@ -16,27 +16,35 @@
 	//
 	// Fill string (crates/operp-settle/src/lib.rs fills_element):
 	//   f:{unit_hex}:{idx}:{taker_hex}:{maker_hex}:{taker_order_hex}:
-	//   {maker_order_hex}:{market}:{price}:{qty}:{seq}:{side}:{kind}
+	//   {maker_order_hex}:{market}:{price}:{qty}:{seq}:{side}:{kind}:
+	//   {taker_post}
 	// side 0=Bid 1=Ask. kind 0=book 1=funding-cash 2=ADL 3=liquidation.
+	// taker_post = USD_SCALE escrow share this fill moves (0 when the taker
+	// order is cross); the collateral identity below consumes it.
 	// The fill's unit hex ($F[1]) must prove as the k-th element of the
 	// committed units_root, and it must be the unit's ONLY fill (idx 0 +
-	// right-neighbor non-membership) so the pre->post delta is exactly one
-	// fill's worth of collateral math.
+	// right-neighbor non-membership, or the fill_count index-is-last arm)
+	// so the pre->post delta is exactly one fill's worth of collateral math.
 	// Witness leaves (wit_leaves):
 	//   acct:{acct_hex_64}:{collateral}:{perp}:{W}
 	//   pos:{acct_hex_64}:{market}:{qty_signed}:{entry}:{isolated:0|1}:{bucket}
 	//   ord:{order_hex}:{market}:{side}:{price}:{seq}:{remaining}:{acct_hex}:{isolated:0|1}:{margin_left}
 	//   meta:{market}:{tick}:{im}:{mm}:{taker_fee_bps}:{keeper}:{delisted}:{mark}:{usd_per_unit}:{funding_cap_bps}
 	//
-	// Collateral identity (engine-exact): fill-stage collateral =
-	//   pre + isolated-release + pnl(kind) - taker-fee (+ maker post refund).
-	// Post-fill the engine's bad-debt clamp can only RAISE collateral, so:
-	//   - with the account's post position range provably empty, equity ==
-	//     collateral and the expected post is max(exp, 0) exactly;
-	//   - otherwise a posted value >= exp is accepted (fail-closed) and a
-	//     value < exp is fraud (the engine never lowers collateral here).
+	// Collateral identity (engine-exact, EQUALITY only — no direction
+	// range): fill-stage collateral =
+	//   pre + isolated-release + pnl(kind) - taker-fee (+ maker post refund)
+	//   and, when the taker's unit op is an isolated Place, additionally
+	//   - (taker_post + still): escrow left collateral at place, the
+	//   fill's escrow share moved to the bucket (or back on a pure
+	//   reduce), and the post ord leaf holds the un-rested remainder.
+	// Post-fill the engine's bad-debt clamp RAISES a negative cross equity
+	// to exactly 0 (insurance absorbs the hole); with the account's post
+	// position range provably empty equity == collateral, so the expected
+	// post there is max(exp, 0). A non-empty range keeps the exact value.
 	// kind 2 (ADL) and the insurance account are unmodelable (top-up /
 	// haircut / fee exemptions live outside the fill) and always bounce.
+	// Missing proofs (ops/ord) bounce without a verdict.
 	bounce_fees: { base: 10000 },
 	messages: {
 		cases: [
@@ -107,26 +115,33 @@
 						OR trigger.data.fill_proof.root != trigger.data.fills_root)
 						bounce('bad fill proof');
 					$F = split($fill, ':');
-					if (array_length($F) != 13) bounce('bad fill');
+					if (array_length($F) != 14) bounce('bad fill');
 					if ($F[11] != '0' AND $F[11] != '1') bounce('bad fill');
 					if ($F[12] != '0' AND $F[12] != '1' AND $F[12] != '2' AND $F[12] != '3') bounce('bad fill');
 					if (length($F[1]) != 64 OR length($F[3]) != 64 OR length($F[4]) != 64) bounce('bad fill');
+					// Taker escrow share of this fill (USD_SCALE, 0 for a
+					// cross taker); non-numeric input bounces on coercion.
+					$tpost = $F[13] + 0;
 					// Unit identity: the fill's unit hex must be the k-th
 					// element of the committed units_root (#1).
 					if (!trigger.data.units_proof OR trigger.data.units_proof.index != $k
 						OR trigger.data.units_proof.root != trigger.data.units_root
 						OR !is_valid_merkle_proof($F[1], trigger.data.units_proof))
 						bounce('bad unit');
-					// Single-fill completeness: idx 0 plus a right neighbor
-					// outside this unit's prefix proves this is the unit's
-					// only fill, so pre->post delta is exactly this fill.
+					// Single-fill completeness: idx 0 plus either a right
+					// neighbor outside this unit's prefix, or the proven
+					// last position in the fills list (nothing can follow
+					// it), proves this is the unit's only fill, so pre->post
+					// delta is exactly this fill.
 					if ($F[2] != '0') bounce('no fraud');
-					if (!trigger.data.right
-						OR !is_valid_merkle_proof(trigger.data.right, trigger.data.right_proof)
-						OR trigger.data.right_proof.root != trigger.data.fills_root
-						OR trigger.data.right_proof.index != trigger.data.fill_proof.index + 1
-						OR starts_with(trigger.data.right, 'f:' || $F[1] || ':'))
-						bounce('no fraud');
+					$fc = (var[$rollup]['fill_count_' || $h] otherwise 0);
+					$right_ok = trigger.data.right
+						AND is_valid_merkle_proof(trigger.data.right, trigger.data.right_proof)
+						AND trigger.data.right_proof.root == trigger.data.fills_root
+						AND trigger.data.right_proof.index == trigger.data.fill_proof.index + 1
+						AND !starts_with(trigger.data.right, 'f:' || $F[1] || ':');
+					$last_ok = ($fc > 0 AND trigger.data.fill_proof.index == $fc - 1);
+					if (!$right_ok AND !$last_ok) bounce('no fraud');
 					$who = trigger.data.who;
 					if ($who != 'taker' AND $who != 'maker') bounce('bad who');
 					$acct_hex = ($who == 'taker') ? $F[3] : $F[4];
@@ -246,8 +261,9 @@
 					// Is the challenged account's POST position range provably
 					// empty? Then equity == collateral and the engine's clamp
 					// outcome is exact: expected = max(exp, 0). Non-empty or
-					// unprovable -> equity unknown -> fail-closed direction
-					// rule below (the clamp only ever RAISES collateral).
+					// unprovable -> equity unknown -> exact identity only
+					// (the clamp can only raise, through a cross upnl the
+					// leaves do not commit).
 					$eplo = 'pos:' || $acct_hex || ':';
 					$ephi = 'pos:' || $acct_hex || ';';
 					$pe1 = trigger.data.eleft AND is_valid_merkle_proof(trigger.data.eleft, trigger.data.eleft_proof)
@@ -291,6 +307,13 @@
 						$exp_entry = ($old_qty == 0) ? $price : floor(($abs_old * $old_entry + $qty * $price) / ($abs_old + $qty));
 						$exp_absent = false;
 						$exp_fill = ($who == 'taker') ? ($old_col - $tfee) : $old_col;
+						// Same-sign fills never release escrow or settle
+						// realized PnL, and always produce open qty, so the
+						// taker's post escrows into the bucket, not
+						// collateral.
+						$release = 0;
+						$pnl = 0;
+						$pback = 0;
 					} else {
 						$close = ($abs_old < $abs_delta) ? $abs_old : $abs_delta;
 						// Isolated release: engine releases bucket*close/old
@@ -327,6 +350,11 @@
 						$exp_fill = ($who == 'taker')
 							? ($old_col + $release + $pnl - $tfee)
 							: ($old_col + $release + $pnl + $mpost);
+						// Engine apply_fill puts the taker's post into the
+						// bucket iff the fill produced open qty (same-sign
+						// handled above; here: leftover 0 and open > 0),
+						// otherwise returns it to collateral.
+						$pback = ($leftover == 0 AND $open > 0) ? 0 : $tpost;
 						if ($leftover == 0 AND $open == 0){
 							$exp_qty = 0;
 							$exp_entry = 0;
@@ -424,22 +452,99 @@
 							$col_bail = true;
 						}
 					} else {
-						// An isolated taker PLACE that reduces returns the
-						// order's pro-rata escrow to collateral; the fill
-						// string carries no escrow fields, so that leg can
-						// only raise collateral — direction check only.
-						if ($who == 'taker' AND $iso == '1' AND !$same) {
-							$col_ok = ($post_col >= $exp_fill);
+						// Taker collateral: EXACT identity (no direction
+						// range — a larger post is fraud, not honesty). The
+						// fill's unit op must be this taker's own Place: the
+						// escrow the identity models happens inside that op.
+						if ($who == 'taker') {
+							$op = trigger.data.op;
+							if (!trigger.data.ops_proof OR trigger.data.ops_proof.index != $k
+								OR trigger.data.ops_proof.root != trigger.data.ops_root
+								OR !is_valid_merkle_proof($op, trigger.data.ops_proof))
+								bounce('bad ops proof');
+							// A fill kind 0/1 only ever comes from a place;
+							// anything else at k is unmodelable here. A place
+							// can only refund the unfilled remainder — an
+							// escrowed own maker is rejected outright
+							// (SelfTrade::Reject), so no other cash leg can
+							// move this account's collateral in this unit.
+							if (!starts_with($op, 'p:')) bounce('no fraud');
+							$OP = split($op, ':');
+							// p:{acct}:{market}:{side}:{price}:{qty}:
+							//    {isolated}:{margin}:{tif}
+							if (array_length($OP) != 9 OR ($OP[6] != '0' AND $OP[6] != '1'))
+								bounce('bad op');
+							$margin = $OP[7] + 0;
+							if ($OP[6] == '1') {
+								// Isolated taker order: margin left
+								// collateral at escrow and the unit-end
+								// refund returns (margin - taker_post -
+								// still), so the net escrow effect collapses
+								// to -(taker_post + still). `still` is the
+								// post ord leaf's margin_left: prove member
+								// (id = $F[5], acct = $F[3]) or prefix
+								// non-membership over post_wit.
+								$to = 'ord:' || $F[5] || ':';
+								$thi = 'ord:' || $F[5] || ';';
+								if (trigger.data.tord AND starts_with(trigger.data.tord, $to)
+									AND is_valid_merkle_proof(trigger.data.tord, trigger.data.tord_proof)
+									AND trigger.data.tord_proof.root == $post_wit) {
+									$TO = split(trigger.data.tord, ':');
+									if (array_length($TO) != 10 OR $TO[7] != $F[3])
+										bounce('bad ord proof');
+									$still = $TO[9] + 0;
+								} else {
+									// Same three-way straddle the AA already
+									// uses for pos absence (straddle /
+									// before-min / final-tree after-max).
+									$oh1 = trigger.data.oleft AND is_valid_merkle_proof(trigger.data.oleft, trigger.data.oleft_proof)
+										AND trigger.data.oleft_proof.root == $post_wit
+										AND trigger.data.oright AND is_valid_merkle_proof(trigger.data.oright, trigger.data.oright_proof)
+										AND trigger.data.oright_proof.root == $post_wit
+										AND trigger.data.oleft_proof.index + 1 == trigger.data.oright_proof.index
+										AND trigger.data.oleft < $to AND $thi <= trigger.data.oright;
+									$oh2 = trigger.data.oleft AND is_valid_merkle_proof(trigger.data.oleft, trigger.data.oleft_proof)
+										AND trigger.data.oleft_proof.root == $post_wit
+										AND trigger.data.oleft_proof.index == 0
+										AND $thi <= trigger.data.oleft;
+									$oh3 = ($k + 1 == $n) AND trigger.data.oleft AND is_valid_merkle_proof(trigger.data.oleft, trigger.data.oleft_proof)
+										AND trigger.data.oleft_proof.root == $post_wit
+										AND trigger.data.oleft_proof.index == (var[$rollup]['wit_count_' || $h] otherwise 1) - 1
+										AND trigger.data.oleft < $to;
+									if (!$oh1 AND !$oh2 AND !$oh3) bounce('bad ord proof');
+									$still = 0;
+								}
+								$exp_t = $old_col - $tpost - $still + $pback + $release + $pnl - $tfee;
+							} else {
+								// Cross taker order carries no escrow: the
+								// fill-stage identity is exp_fill as-is.
+								$exp_t = $exp_fill;
+							}
+						} else {
+							$exp_t = $exp_fill;
+						}
+						// Non-empty range + negative expected: the engine's
+						// bad-debt clamp may have raised an honest account
+						// to -upnl while its position leaf survives
+						// (operp-state's maker_bad_debt_clamped_with_position
+						// pins that shape). The leaves don't commit upnl, so
+						// this is unverifiable either way — bounce instead
+						// of false-verdicting an honest height.
+						if ($empty == '0' AND $exp_t < 0) bounce('no fraud');
+						// The engine's bad-debt clamp raises a negative
+						// cross equity to exactly 0 (insurance absorbs the
+						// hole); with the pos range provably empty equity IS
+						// collateral, so expected = max(exp, 0) there. A
+						// non-empty range keeps the exact identity — the
+						// clamp can only reach it through a cross upnl the
+						// leaves do not commit.
+						if ($empty == '1') {
+							$exp_post = ($exp_t < 0) ? 0 : $exp_t;
+							$col_ok = ($post_col == $exp_post);
 							$col_bail = false;
 						} else {
-							if ($empty == '1') {
-								$exp_post = ($exp_fill < 0) ? 0 : $exp_fill;
-								$col_ok = ($post_col == $exp_post);
-								$col_bail = false;
-							} else {
-								$col_ok = ($post_col >= $exp_fill);
-								$col_bail = false;
-							}
+							$col_ok = ($post_col == $exp_t);
+							$col_bail = false;
 						}
 					}
 					// Verdict only when a leg is VERIFIED wrong; a bail

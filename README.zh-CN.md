@@ -91,7 +91,9 @@ MEV——见[局限与主网就绪度](#局限与主网就绪度)。
 
 入口防护在一切算术回绕之前拒绝：`qty > i64::MAX` 或 `qty·price` 溢出
 i128 → 以 `Risk` 拒绝。每价档增量维护的 `visible_qty` 缓存使最优买卖价
-读取保持 O(log depth)。自成交永不成交：taker 遇到自己挂单时 maker 被撤
+读取保持 O(log depth)。自成交永不成交：taker 遇到自己挂单时——带托管
+的自家挂单（`margin_left > 0`）直接拒单（`SelfTrade`，撤单退款是填充
+谓词无法建模的同单元现金腿）；无托管的 cross 挂单照旧撤 maker
 （`canceled_maker`），撮合以 taker 剩余量继续对下一单进行。
 
 ### 3. 风险模型（全仓）
@@ -283,7 +285,8 @@ cd obyte-local && node post_batch.js
 index）、全簿承诺、全局累计提款防重放（`W` 进入每个 aa 树叶）、claim
 取回债券（frozen 高度门控）、有界提款/AA 单元/gov-nonce 账本（256 高度
 重放窗口）、反手单初始保证金门、create-market bps 上限、tick-size 强制、
-仅应用态 `seq` 计账、自成交 cancel-maker 续拍、taker 与 maker 双侧坏账
+仅应用态 `seq` 计账、自成交拦截（带托管自家挂单拒单，cross 撤 maker
+续拍）、taker 与 maker 双侧坏账
 钳入保险基金、提案清理与创建时投票权重快照、充值绑定 Obyte 地址
 （`addr` 字段、首见即定）、资产类别绑定充值背书、`MAX_AA_TREE_DEPTH`
 证明上限、AA 侧 claim-reward 清零、单一在途挑战债券、`frozen == 2` 高度

@@ -750,7 +750,12 @@ impl Engine {
         }
 
         // Escrow: margin leaves collateral while the order lives in the
-        // book; it returns via fills (bucket), cancel, or STP refunds.
+        // book; it returns via fills (bucket), cancel, or the unfilled
+        // remainder. An escrowed own maker is rejected outright
+        // (SelfTrade::Reject): canceling it would refund its margin_left
+        // to collateral inside this same unit — a cash leg no fill
+        // predicate can model, so the dispute's exact identity would
+        // false-verdict the honest batch.
         let escrow = if isolated { i128::from(margin) } else { 0 };
         if escrow != 0 {
             self.state.account_mut(account).collateral -= escrow;
@@ -770,7 +775,11 @@ impl Engine {
             isolated,
             margin_left: if isolated { margin } else { 0 },
         };
-        let mut result = match self.state.book_mut(market).submit(order) {
+        let mut result = match self
+            .state
+            .book_mut(market)
+            .submit_with(order, operp_book::SelfTrade::Reject)
+        {
             Ok(r) => r,
             Err(e) => {
                 // Nothing was matched or escrowed into fills: unwind.
@@ -1123,6 +1132,9 @@ impl Engine {
             .book_mut(market)
             .submit(order)
             .map_err(RejectReason::Book)?;
+        // Default self-trade policy: cancel-maker-continue (the target's
+        // book must clear for the close to execute; kind 3's identity is
+        // unchanged by this PR).
         let mut fills = result.fills;
         // Liquidation book fills carry the keeper reward, distinct from a
         // plain place (kind 0/1): the AA subtracts the reward on taker legs.
@@ -5974,6 +5986,276 @@ mod tests {
             usd(4_000)
         );
         assert_eq!(pots(&eng, a), usd(10_000));
+    }
+
+    /// Pins the dispute AA's taker collateral identity against the engine
+    /// for an honest isolated open, both fill shapes:
+    ///
+    ///   post = old_col - taker_post - still - tfee
+    ///     (release = pnl = post_back = 0 for an open)
+    ///
+    /// where `taker_post` is the fill's escrow share (into the bucket) and
+    /// `still` the taker order's post-unit margin_left. The escrow `margin`
+    /// itself cancels algebraically: net = -taker_post - still = -margin
+    /// when the order fully fills, -margin when it rests (still holds the
+    /// remainder), -taker_post on a non-resting partial (refund returns
+    /// margin - taker_post). The plan's shorthand `old - margin + still`
+    /// only coincides at full fill; this test pins the engine so the AA
+    /// formula is never guessed.
+    #[test]
+    fn isolated_open_collateral_identity() {
+        let usd = |v: i128| v * USD_SCALE as i128;
+        let taker_fee = |notional_usd: i128| notional_usd * 5 / 10_000; // 5 bps
+
+        // --- Shape A: full fill — order consumed, no post ord leaf -------
+        let mut eng = activated_engine();
+        let g = genesis_id();
+        let alice = sk(1);
+        let bob = sk(2);
+        let a = acct_of(&alice);
+        let px = 100_000 * PRICE_SCALE as i64;
+        let qty = QTY_SCALE / 1000; // 0.001 BTC = $100 notional
+        let margin = 40 * USD_SCALE; // >= extra_im (10% of $100)
+        let d1 = deposit(vec![g], &alice, usd(10_000), 1);
+        let mut tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![tip], &bob, usd(1_000_000), 2);
+        tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+        let old_col = eng.state.accounts[&a].collateral;
+        let ask = place(
+            vec![tip],
+            &bob,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+        );
+        tip = unit_id(&ask);
+        eng.ingest(ask).unwrap();
+        let bid = place_iso(
+            vec![tip],
+            &alice,
+            BTC_USD,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+            margin,
+        );
+        let evs = eng.ingest(bid).unwrap();
+        let fills = evs
+            .iter()
+            .find_map(|e| match e {
+                ExecEvent::Applied { fills, .. } if !fills.is_empty() => Some(fills.clone()),
+                _ => None,
+            })
+            .expect("isolated open filled");
+        assert_eq!(fills.len(), 1, "single fill");
+        let fee = taker_fee(100 * USD_SCALE as i128); // $100 notional, 5 bps
+                                                      // still: the taker order is gone (full fill, not resting) -> 0.
+        let still = 0;
+        assert_eq!(
+            eng.state.accounts[&a].collateral,
+            old_col - fills[0].taker_post - still - fee,
+            "A: full fill — identity old - taker_post - still - fee"
+        );
+        assert_eq!(
+            eng.state.accounts[&a]
+                .isolated_margin
+                .get(&BTC_USD)
+                .copied()
+                .unwrap_or(0),
+            fills[0].taker_post,
+            "A: taker_post moved to the bucket (produced_open)"
+        );
+        // Plan shorthand coincidence at full fill: taker_post == margin.
+        assert_eq!(fills[0].taker_post, i128::from(margin));
+        assert_eq!(
+            eng.state.accounts[&a].collateral,
+            old_col - i128::from(margin) - fee
+        );
+
+        // --- Shape B: partial fill, order rests — still > 0 ---------------
+        let mut eng = activated_engine();
+        let mut tip = {
+            let d1 = deposit(vec![g], &alice, usd(10_000), 1);
+            let id = unit_id(&d1);
+            eng.ingest(d1).unwrap();
+            id
+        };
+        let d2 = deposit(vec![tip], &bob, usd(1_000_000), 2);
+        tip = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+        let old_col = eng.state.accounts[&a].collateral;
+        let qty_small = QTY_SCALE / 2000; // resting ask: 0.0005 BTC
+        let qty_big = QTY_SCALE / 1000; // crossing bid: 0.001 BTC -> rests
+        let ask = place(
+            vec![tip],
+            &bob,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty_small,
+            1,
+        );
+        tip = unit_id(&ask);
+        eng.ingest(ask).unwrap();
+        let bid = place_iso(
+            vec![tip],
+            &alice,
+            BTC_USD,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty_big,
+            1,
+            margin,
+        );
+        let evs = eng.ingest(bid).unwrap();
+        let fills = evs
+            .iter()
+            .find_map(|e| match e {
+                ExecEvent::Applied { fills, .. } if !fills.is_empty() => Some(fills.clone()),
+                _ => None,
+            })
+            .expect("partial isolated fill");
+        assert_eq!(fills.len(), 1, "single fill");
+        let taker_post = fills[0].taker_post;
+        // pro-rata: margin * fill/remaining = 40 * (0.0005/0.001) = 20.
+        assert_eq!(taker_post, 20 * USD_SCALE as i128);
+        let still: i128 = eng
+            .state
+            .books
+            .values()
+            .flat_map(|b| b.live_orders())
+            .filter(|o| o.account == a)
+            .map(|o| i128::from(o.margin_left))
+            .sum();
+        assert_eq!(
+            still,
+            20 * USD_SCALE as i128,
+            "resting remainder stays escrowed"
+        );
+        let fee = taker_fee(50 * USD_SCALE as i128); // fill notional $50
+        assert_eq!(
+            eng.state.accounts[&a].collateral,
+            old_col - taker_post - still - fee,
+            "B: partial resting — identity old - taker_post - still - fee"
+        );
+        assert_eq!(
+            eng.state.accounts[&a]
+                .isolated_margin
+                .get(&BTC_USD)
+                .copied()
+                .unwrap_or(0),
+            taker_post,
+            "B: only the fill's escrow share reached the bucket"
+        );
+        // The plan's literal `old - margin + still` disagrees here
+        // (old - 40 + 20 != old - 20 - 20): -taker_post - still is the
+        // engine-exact net escrow effect the AA must use.
+        assert_ne!(
+            eng.state.accounts[&a].collateral,
+            old_col - i128::from(margin) + still - fee
+        );
+    }
+
+    /// Place-path self-trade against an ESCROWED own order is rejected
+    /// outright: canceling that maker would refund its margin_left into
+    /// collateral inside the same fill-bearing unit — a cash leg no fill
+    /// predicate can model, so the dispute's exact identity would
+    /// false-verdict the honest batch. Cross self-trades still take the
+    /// cancel-maker-continue path (book tests pin both modes), and
+    /// liquidation keeps it.
+    #[test]
+    fn isolated_self_trade_place_rejected() {
+        let usd = |v: i128| v * USD_SCALE as i128;
+        let mut eng = activated_engine();
+        let g = genesis_id();
+        let alice = sk(1);
+        let a = acct_of(&alice);
+        let px = 100_000 * PRICE_SCALE as i64;
+        let qty = QTY_SCALE / 1000;
+        let margin = 40 * USD_SCALE;
+        let pots = |eng: &Engine| -> i128 {
+            let acct = &eng.state.accounts[&a];
+            let bucket: i128 = acct.isolated_margin.values().sum();
+            let live: i128 = eng
+                .state
+                .books
+                .values()
+                .flat_map(|b| b.live_orders())
+                .filter(|o| o.account == a)
+                .map(|o| i128::from(o.margin_left))
+                .sum();
+            acct.collateral + bucket + live
+        };
+        let d1 = deposit(vec![g], &alice, usd(10_000), 1);
+        let mut tip = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        // Rest an isolated bid (escrowed own maker).
+        let bid = place_iso(
+            vec![tip],
+            &alice,
+            BTC_USD,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+            margin,
+        );
+        tip = unit_id(&bid);
+        eng.ingest(bid).unwrap();
+        let col_before = eng.state.accounts[&a].collateral;
+        let pots_before = pots(&eng);
+        assert_eq!(col_before, usd(10_000) - i128::from(margin));
+        // The same account now crosses its own isolated bid with an
+        // isolated ask at the same price: place must reject.
+        let ask = place_iso(
+            vec![tip],
+            &alice,
+            BTC_USD,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            2,
+            margin,
+        );
+        let evs = eng.ingest(ask).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                ExecEvent::Rejected {
+                    reason: RejectReason::Book(BookError::SelfTrade),
+                    ..
+                }
+            )),
+            "escrowed self-trade must reject: {evs:?}"
+        );
+        // The rejection unwound the new escrow before touching the book:
+        // collateral, the live maker and the pots are as before the try.
+        assert_eq!(eng.state.accounts[&a].collateral, col_before);
+        assert_eq!(pots(&eng), pots_before);
+        let live: Vec<_> = eng
+            .state
+            .books
+            .values()
+            .flat_map(|b| b.live_orders())
+            .filter(|o| o.account == a)
+            .collect();
+        assert_eq!(live.len(), 1, "own maker untouched");
+        assert_eq!(i128::from(live[0].margin_left), i128::from(margin));
     }
 
     /// A bleeding isolated bucket is liquidatable on its own risk while the

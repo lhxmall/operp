@@ -24,7 +24,7 @@
 	//   submitted_at_<h>, state_root_<h>, aa_forest_<h> (1024 hex),
 	//   prev_<h>, wit_root_<h>, trace_root_<h>, units_root_<h>,
 	//   units_set_root_<h>, ops_root_<h>, fills_root_<h>,
-	//   unit_count_<h>, wit_count_<h>, da_unit_<h>, active_bond_<h>,
+	//   unit_count_<h>, wit_count_<h>, fill_count_<h>, da_unit_<h>, active_bond_<h>,
 	//   fee_winner_<h>, frozen_<h> (absent/0 live, 2 failed),
 	//   inbox_upto_<h> (submit timestamp: forces older than this belong here)
 	//   pool_<addr> (standing submit pool; submits need >= 1e12)
@@ -126,8 +126,9 @@
 						OR !trigger.data.ops_root OR length(trigger.data.ops_root) != 44
 						OR !trigger.data.fills_root OR length(trigger.data.fills_root) != 44
 						OR !is_integer(trigger.data.unit_count) OR trigger.data.unit_count < 1 OR trigger.data.unit_count > 200000
-						OR !is_integer(trigger.data.wit_count) OR trigger.data.wit_count < 1)
-						bounce('bad submit');
+						OR !is_integer(trigger.data.wit_count) OR trigger.data.wit_count < 1
+						OR !is_integer(trigger.data.fill_count) OR trigger.data.fill_count < 0)
+					bounce('bad submit');
 					if ($ls > 0 AND (var['frozen_' || $ls] otherwise 0) != 2
 						AND trigger.data.prev_state_hash != var['state_root_' || $ls])
 						bounce('prev mismatch');
@@ -156,6 +157,7 @@
 							var['fills_root_' || trigger.data.height] = trigger.data.fills_root;
 							var['unit_count_' || trigger.data.height] = trigger.data.unit_count;
 							var['wit_count_' || trigger.data.height] = trigger.data.wit_count;
+							var['fill_count_' || trigger.data.height] = trigger.data.fill_count;
 							var['da_unit_' || trigger.data.height] = trigger.unit || '';
 							var['inbox_upto_' || trigger.data.height] = timestamp;
 							var['active_bond_' || trigger.data.height] = trigger.address;

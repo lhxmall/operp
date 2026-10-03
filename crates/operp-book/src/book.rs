@@ -1,4 +1,4 @@
-use crate::{BookError, Fill, MatchResult, Order};
+use crate::{BookError, Fill, MatchResult, Order, SelfTrade};
 use operp_types::{AccountId, MarketId, OrderId, OrderType, Price, Qty, Side, TimeInForce, Usd};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -136,7 +136,20 @@ impl OrderBook {
         }
     }
 
-    pub fn submit(&mut self, mut order: Order) -> Result<MatchResult, BookError> {
+    /// Submit with the default self-trade policy: cancel-maker-continue
+    /// (money-neutral for cross makers; liquidation and the tests rely on
+    /// it). Place-path callers opt into [`SelfTrade::Reject`] via
+    /// `submit_with` so an escrowed own maker can never refund into
+    /// collateral inside a fill-bearing unit.
+    pub fn submit(&mut self, order: Order) -> Result<MatchResult, BookError> {
+        self.submit_with(order, SelfTrade::CancelMaker)
+    }
+
+    pub fn submit_with(
+        &mut self,
+        mut order: Order,
+        self_trade: SelfTrade,
+    ) -> Result<MatchResult, BookError> {
         if order.market != self.market {
             return Err(BookError::WrongMarket);
         }
@@ -186,18 +199,27 @@ impl OrderBook {
                 }
             };
             if maker_account == order.account {
-                // STP (cancel-maker-continue): the taker hit its own resting
-                // order; cancel that maker and keep matching the queue.
-                // Cache: canceled maker's visible qty leaves the level.
-                self.level_add(maker_side, maker_price, -(maker_remaining as i64));
-                canceled_maker.push(maker_id);
-                // The canceled maker never filled: its whole escrow remainder
-                // is refunded to collateral.
+                // The canceled maker's escrow remainder would return to
+                // collateral inside THIS unit — a cash leg no fill
+                // predicate can model. Place-path callers therefore
+                // reject the incoming order when the own maker holds
+                // escrow; cross makers (margin_left == 0) move no cash
+                // and keep cancel-maker-continue.
                 let maker_margin_left = self
                     .orders
                     .get(&maker_id)
                     .map(|m| m.margin_left)
                     .unwrap_or(0);
+                if self_trade == SelfTrade::Reject && maker_margin_left > 0 {
+                    return Err(BookError::SelfTrade);
+                }
+                // STP (cancel-maker-continue): the taker hit its own resting
+                // order; cancel that maker and keep matching the queue.
+                // Cache: canceled maker's visible qty leaves the level.
+                self.level_add(maker_side, maker_price, -(maker_remaining as i64));
+                canceled_maker.push(maker_id);
+                // The canceled maker never filled: its escrow remainder
+                // (if any) is refunded to collateral.
                 if maker_margin_left > 0 {
                     refunds.push((maker_account, maker_margin_left));
                 }

@@ -85,12 +85,30 @@ pub enum BookError {
     DuplicateOrder,
     #[error("wrong market")]
     WrongMarket,
+    #[error("self trade with escrowed own order")]
+    SelfTrade,
+}
+
+/// How `OrderBook::submit` treats a self-trade (the incoming order
+/// crosses a resting order of the SAME account).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelfTrade {
+    /// Cancel the own maker and keep matching. The liquidation path needs
+    /// this: the target's book must clear for its close order to execute.
+    CancelMaker,
+    /// Reject the incoming order outright when the own maker holds
+    /// escrowed margin: canceling it would move that margin_left into
+    /// collateral inside the same unit — a cash leg no fill predicate can
+    /// model, so the exact-identity dispute would false-verdict the honest
+    /// batch. Cross makers (`margin_left == 0`) move no cash and still
+    /// take the cancel-maker path. The place path uses this.
+    Reject,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use operp_types::{order_id, BTC_USD, PRICE_SCALE, QTY_SCALE};
+    use operp_types::{order_id, BTC_USD, PRICE_SCALE, QTY_SCALE, USD_SCALE};
 
     fn acct(n: u8) -> AccountId {
         AccountId([n; 32])
@@ -321,6 +339,60 @@ mod tests {
         assert_eq!(book.get(oid(a, 2)).unwrap().remaining, QTY_SCALE);
         // Ask level is fully drained (cancel + fill), no phantom qty.
         assert_eq!(book.best_ask(), None);
+    }
+
+    #[test]
+    fn escrowed_self_trade_rejects_in_reject_mode() {
+        // An own maker holding ESCROWED margin must not be canceled by a
+        // place-path submit: the refund would move its margin_left into
+        // collateral inside the same fill-bearing unit — a cash leg no
+        // fill predicate can model. Reject mode fails the whole submit
+        // with the book untouched; CancelMaker (liquidation path) keeps
+        // the historical cancel-and-continue behavior.
+        let mut book = OrderBook::new(BTC_USD);
+        let a = acct(1);
+        let px = 100 * PRICE_SCALE as i64;
+        let mut iso = order(
+            a,
+            1,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
+        iso.isolated = true;
+        iso.margin_left = 5 * USD_SCALE;
+        book.submit(iso).unwrap();
+
+        let cross = || {
+            let mut o = order(
+                a,
+                2,
+                Side::Bid,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                px,
+                QTY_SCALE,
+                2,
+            );
+            o.isolated = true;
+            o
+        };
+        // Reject mode: the self-trade error fires before any mutation —
+        // maker still in the book, nothing canceled, nothing filled.
+        let err = book.submit_with(cross(), SelfTrade::Reject);
+        assert_eq!(err, Err(BookError::SelfTrade));
+        assert_eq!(book.get(oid(a, 1)).unwrap().margin_left, 5 * USD_SCALE);
+        assert!(book.get(oid(a, 2)).is_none());
+
+        // CancelMaker: the own maker is canceled and its escrow refund is
+        // reported (the caller returns it to collateral).
+        let r = book.submit(cross()).unwrap();
+        assert_eq!(r.canceled_maker, vec![oid(a, 1)]);
+        assert_eq!(r.refunds, vec![(a, 5 * USD_SCALE)]);
+        assert!(book.get(oid(a, 1)).is_none());
     }
 
     #[test]
