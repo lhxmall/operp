@@ -523,9 +523,9 @@ async function main() {
   st = await vars(rollup);
   // ---- 10. submit h3 committing the honest post tree (taker col -500) ----
   // exp = -500 (flat pre col 0, 5 bps fee on the 1e6 notional): a negative
-  // expected value with a surviving position is exactly the clamp-bail
-  // shape — a committed lie at this shape is deliberately unchallengeable
-  // (the honest clamp may have raised the account); verdict coverage for
+  // expected post is exactly the claw-bail shape — a committed lie at this
+  // shape is deliberately unchallengeable (an honest loser can stay
+  // negative when the winner cannot pay the claw); verdict coverage for
   // provable lies moved to 19a (isolated) and 19b (cross, empty range).
   const takerH = FILL_TAKER;
   const fillStr = `f:${H3_UNIT_HEX}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"e".repeat(64)}:1:100000000:100000000:9:0:0:0`;
@@ -569,12 +569,12 @@ async function main() {
       throw new Error("h3 submit bounced: " + bounceDetail(res));
   }
 
-  // ---- 11. fill_math honest cross (bail: non-empty ∧ exp < 0) ------------
+  // ---- 11. fill_math honest cross (bail: exp < 0) ------------------------
   // price=1e8 qty=1e8 -> notional 1e6, fee 5bps=500 -> exp col -500.
-  // The committed leaves are honest AND the shape is the clamp-bail one:
-  // the AA bounces 'no fraud' before any identity comparison (the honest
-  // bad-debt clamp may have raised a still-positioned account —
-  // operp-state::maker_bad_debt_clamped_with_position).
+  // The committed leaves are honest AND the shape is the claw-bail one:
+  // the AA bounces 'no fraud' before any identity comparison (an honest
+  // loser can remain negative when the winner cannot pay the claw —
+  // operp-state::claw_cannot_cover_leaves_both_negative).
   const fillBase = {
     rollup: ROLLUP_ADDR,
     k: 0,
@@ -613,7 +613,7 @@ async function main() {
   await triggerBounce(challenger, fill, Object.assign({ pred: "fill_math", height: 3 }, fillBase), 20000, "no fraud");
   st = await vars(rollup);
   if (Number(st.frozen_3 || 0) !== 0) throw new Error("honest fill_math froze h3!");
-  console.log("11. fill_math (non-empty, exp<0) bounced 'no fraud' — height live");
+  console.log("11. fill_math (exp<0) bounced 'no fraud' — height live");
 
   async function submitH3(traceRoot, fillsRoot) {
     const s = submitData(3, STATE_ROOT, STATE_ROOT);

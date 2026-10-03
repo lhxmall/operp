@@ -110,11 +110,13 @@ into collateral immediately at close time**, so winners can withdraw profits
 and the withdrawal-proof leaf (which commits `collateral`) reflects true
 solvency. Snapshots compute maintenance margin (5% of abs notional) and
 initial margin (10%). Liquidation is keeper-initiated and pays the keeper 1%
-of filled notional from the insurance fund; if the liquidated account still
-goes negative, its equity is clamped to exactly 0 and the shortfall is
-debited from the insurance fund's collateral — never leaked to
-counterparties. Insurance is seeded at genesis (10 000 USD), can never be
-liquidated itself, and never self-liquidates.
+of filled notional, seized from the liquidated account's own collateral. A
+fill whose loser cannot fund it is clawed back zero-sum from the winner —
+insurance never pays a trading loss — and whatever the winner cannot cover
+stays as negative equity on the account, never printed. A position that is
+still liquidatable after its book IOC is force-sold in the same unit: ADL
+onto opposite positions at the mark. Insurance is seeded at genesis
+(10 000 USD), can never be liquidated itself, and never self-liquidates.
 
 Mark prices only move on fills with notional ≥ 100 USD **and within ±10% of
 the previous mark** (the first qualifying fill on an unmarked market sets it)
@@ -277,8 +279,9 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
 
 1. ~~**Money can kill an honest root.**~~ **RESOLVED (settlement v2).** Fraud
    must pass a dispute predicate; `{challenge:1}` has no case on rollup or
-   vault. Bogus proofs bounce `no fraud`. Still open: the insurance clamp is
-   not on-chain verifiable; fill_math carries a ±1 tolerance; `temp_data`
+   vault. Bogus proofs bounce `no fraud`. Still open: a negative expected post
+   (claw remainder) is unverifiable, so fill_math bounces it instead of
+   verdicting; fill_math carries a ±1 tolerance; `temp_data`
    bodies vanish after 24 h; deposit joints are mainly checked off-chain in
    `validate_against` (an empty `OPERP_VAULT_AA` with evidences present is
    rejected). The 10k-node wall is closed by frames-in-base64; remaining DA
@@ -356,7 +359,7 @@ AA-unit/gov-nonce ledgers (256-height replay window), flip-order initial-margin
 gate on open quantity, create-market bps ceilings, tick-size enforcement,
 applied-only `seq` accounting, self-trade prevention (escrowed own
 maker rejects the incoming place; cross makers cancel-maker-continue),
-taker AND maker bad-debt clamping into the insurance fund, proposal cleanup
+taker and maker loss clawing (insurance never pays a trading loss), proposal cleanup
 with creation-time voting-weight snapshots, Obyte-address binding on
 deposits (`addr` field, first-seen-wins), asset-kind-bound deposit
 endorsements, `MAX_AA_TREE_DEPTH` proof cap, AA-side claim-reward zeroing,

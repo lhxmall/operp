@@ -438,14 +438,18 @@ fn aa_fill_verdict(
                 None => (false, true),
             }
         }
-    } else if acct_empty {
-        // Empty range: equity IS collateral, the engine clamp lands it on
-        // max(expected, 0) exactly (both cross and isolated takers — see
-        // operp-exec's isolated_blowthrough_insurance).
-        (post_col == expected.max(0), false)
     } else {
-        // Non-empty range: exact identity, never a direction range — a
-        // larger committed post is the inflation the plan hunts.
+        // Negative expected post: the engine claws a fill's hole back
+        // from the winner (zero-sum, insurance untouched) and any
+        // remainder the winner cannot cover stays as negative collateral
+        // — the AA bounces with no verdict for that shape (empty range
+        // or not), so stay silent instead of expecting post_col == 0.
+        if expected < 0 {
+            return false;
+        }
+        // Exact identity for both range shapes (a non-negative expected
+        // equals max(expected, 0)), never a direction range — a larger
+        // committed post is the inflation the plan hunts.
         (post_col == expected, false)
     };
     // Verdict only when a leg is verified wrong; a bail silences its own
@@ -652,7 +656,7 @@ fn fill_proof(
         }
     }
     // fill_math: mirror the AA's collateral identity — kind fee/pnl,
-    // isolated release, maker pro-rata refund, keeper seize, clamp regime —
+    // isolated release, maker pro-rata refund, keeper seize, claw regime —
     // and emit only when the AA would verdict on the posted legs while
     // staying silent on the honest replay.
     let liquidate_caller: Option<String> = match batch.units.get(k)?.op {

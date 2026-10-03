@@ -38,10 +38,11 @@
 	//   - (taker_post + still): escrow left collateral at place, the
 	//   fill's escrow share moved to the bucket (or back on a pure
 	//   reduce), and the post ord leaf holds the un-rested remainder.
-	// Post-fill the engine's bad-debt clamp RAISES a negative cross equity
-	// to exactly 0 (insurance absorbs the hole); with the account's post
-	// position range provably empty equity == collateral, so the expected
-	// post there is max(exp, 0). A non-empty range keeps the exact value.
+	// Post-fill, a negative expected collateral never gets a verdict:
+	// the engine claws a fill's hole back from the winner (zero-sum,
+	// insurance untouched) and any remainder stays negative — a shape
+	// these leaves cannot pin down. A non-negative expectation keeps
+	// the exact identity, empty range or not.
 	// kind 2 (ADL) and the insurance account are unmodelable (top-up /
 	// haircut / fee exemptions live outside the fill) and always bounce.
 	// Missing proofs (ops/ord) bounce without a verdict.
@@ -85,7 +86,7 @@
 			{
 				// P-fill_math (taker or maker): the proven post acct/pos legs
 				// disagree with the engine's collateral identity for this
-				// fill (release + kind pnl + fee, keeper and clamp stages).
+				// fill (release + kind pnl + fee, keeper and claw stages).
 				// Covers add (same sign), reduce, flip and full close; close
 				// to flat expects a proven-absent post pos instead of a leaf.
 				if: "{trigger.data.pred == 'fill_math'}",
@@ -224,8 +225,9 @@
 						$iso = $PP[5];
 						$bucket = $PP[6] + 0;
 					}
-					// proven meta leaf of this market: fee/keeper rates,
-					// funding multiplier, current mark (clamp equity uses it).
+					// proven meta leaf of this market: fee/keeper rates
+					// and the funding multiplier — fill_math never reads
+					// the committed mark.
 					$pre_meta = trigger.data.pre_meta;
 					if (typeof($pre_meta) == 'boolean'
 						OR !is_valid_merkle_proof($pre_meta, trigger.data.pre_meta_proof)
@@ -259,11 +261,10 @@
 					if (array_length($A1) != 5 OR $A1[1] != $acct_hex) bounce('bad post acct');
 					$post_col = $A1[2] + 0;
 					// Is the challenged account's POST position range provably
-					// empty? Then equity == collateral and the engine's clamp
-					// outcome is exact: expected = max(exp, 0). Non-empty or
-					// unprovable -> equity unknown -> exact identity only
-					// (the clamp can only raise, through a cross upnl the
-					// leaves do not commit).
+					// empty? Then equity == collateral and a non-negative
+					// expected lands exact on its own. Either way a negative
+					// expected never verdicts — the claw's remainder is
+					// unprovable from these leaves (see the arm below).
 					$eplo = 'pos:' || $acct_hex || ':';
 					$ephi = 'pos:' || $acct_hex || ';';
 					$pe1 = trigger.data.eleft AND is_valid_merkle_proof(trigger.data.eleft, trigger.data.eleft_proof)
@@ -423,8 +424,9 @@
 						}
 					}
 					// Collateral leg. kind 3 taker = liquidation: the keeper
-					// reward is seized from the target after the clamp, so it
-					// is only exact in the provable no-positions regime.
+					// reward is seized from the target after the fills and
+					// claw, so it is only exact in the provable
+					// no-positions regime.
 					if ($kind == 3 AND $who == 'taker') {
 						if ($empty == '1') {
 							$bal = ($exp_fill < 0) ? 0 : $exp_fill;
@@ -523,29 +525,17 @@
 						} else {
 							$exp_t = $exp_fill;
 						}
-						// Non-empty range + negative expected: the engine's
-						// bad-debt clamp may have raised an honest account
-						// to -upnl while its position leaf survives
-						// (operp-state's maker_bad_debt_clamped_with_position
-						// pins that shape). The leaves don't commit upnl, so
-						// this is unverifiable either way — bounce instead
-						// of false-verdicting an honest height.
-						if ($empty == '0' AND $exp_t < 0) bounce('no fraud');
-						// The engine's bad-debt clamp raises a negative
-						// cross equity to exactly 0 (insurance absorbs the
-						// hole); with the pos range provably empty equity IS
-						// collateral, so expected = max(exp, 0) there. A
-						// non-empty range keeps the exact identity — the
-						// clamp can only reach it through a cross upnl the
-						// leaves do not commit.
-						if ($empty == '1') {
-							$exp_post = ($exp_t < 0) ? 0 : $exp_t;
-							$col_ok = ($post_col == $exp_post);
-							$col_bail = false;
-						} else {
-							$col_ok = ($post_col == $exp_t);
-							$col_bail = false;
-						}
+						// Negative expected post: the engine claws a fill's
+						// hole back from the winner (zero-sum, insurance
+						// untouched) and any remainder the winner cannot
+						// cover stays as negative collateral — unverifiable
+						// from these leaves either way, so bounce instead of
+						// false-verdicting an honest height. Applies whether
+						// the position range is empty or not; a non-negative
+						// expectation keeps the exact identity.
+						if ($exp_t < 0) bounce('no fraud');
+						$col_ok = ($post_col == $exp_t);
+						$col_bail = false;
 					}
 					// Verdict only when a leg is VERIFIED wrong; a bail
 					// (missing evidence) silences its own leg only.

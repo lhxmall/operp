@@ -940,39 +940,40 @@ impl ChainState {
                 self.account_mut(INSURANCE_ACCOUNT).collateral += fee;
             }
         }
-        // Bad-debt cap: if either side went bankrupt (equity < 0), its equity
-        // is clamped to exactly 0 (collateral absorbs the hole — realized PnL
-        // is settled into collateral since the settlement refactor) and the
-        // insurance fund takes an equal debit. Applied to BOTH fill parties:
-        // a maker resting at a stale price can go underwater exactly like a
-        // taker crossing. A negative insurance balance is explicit socialized
-        // debt repaid by future fee income. Conservation holds; a repeat fill
-        // cannot re-trigger because equity is now 0.
-        // Insurance itself is exempt (never clamped).
+        // Insurance never pays a trading loss. A party whose collateral went
+        // negative in this fill claws back from the counterparty, capped at
+        // what the counterparty can pay: a zero-sum transfer between the two
+        // fill parties only. No snapshot equity is read — only this fill's
+        // collateral deficit counts, so the amount does not depend on other
+        // positions — and insurance is never debited (it is neither clawed
+        // from nor clawed into). Whatever the claw cannot cover stays as
+        // negative collateral on the loser and is never printed.
         for party in [fill.taker, fill.maker] {
             if party == INSURANCE_ACCOUNT {
                 continue;
             }
-            let shortfall = {
-                let s = match self.accounts.get(&party) {
-                    Some(a) => a.snapshot(&self.marks, &self.markets),
-                    None => continue,
-                };
-                if s.equity < 0 {
-                    -s.equity
-                } else {
-                    0
-                }
+            let counterparty = if party == fill.taker {
+                fill.maker
+            } else {
+                fill.taker
             };
-            if shortfall > 0 {
-                if let Some(a) = self.accounts.get_mut(&party) {
-                    // equity = collateral + upnl < 0 ⇒ collateral := -upnl,
-                    // i.e. credit back |equity| so equity lands on exactly 0
-                    // and the insurance debit equals the socialized loss.
-                    a.collateral += shortfall;
+            // Insurance never funds a user's loss.
+            if counterparty == INSURANCE_ACCOUNT {
+                continue;
+            }
+            let pay = match (self.accounts.get(&party), self.accounts.get(&counterparty)) {
+                (Some(p), Some(cp)) if p.collateral < 0 => {
+                    (-p.collateral).min(cp.collateral.max(0))
                 }
-                let ins = self.account_mut(INSURANCE_ACCOUNT);
-                ins.collateral -= shortfall;
+                _ => 0,
+            };
+            if pay > 0 {
+                if let Some(a) = self.accounts.get_mut(&party) {
+                    a.collateral += pay;
+                }
+                if let Some(a) = self.accounts.get_mut(&counterparty) {
+                    a.collateral -= pay;
+                }
             }
         }
         // Funding-rate markets: fills are the mark source. Guards: the
@@ -1986,22 +1987,43 @@ mod tests {
             kind: 0,
         };
         s.apply_fill_pair(&fill).unwrap();
-        // Maker clamped to exactly 0. The maker's own 50k collateral absorbs
-        // the first leg of the 90k loss; insurance takes only the residual
-        // 40k shortfall (plus the taker fee credit).
-        assert_eq!(s.accounts[&maker].collateral, 0);
+        // Insurance never pays: only the taker's fee lands in the fund —
+        // no `SEED + fee - 40k` debit exists any more.
         let fee = bps(notional_usd(fill.qty, fill.price), 5);
-        let expected_ins = INSURANCE_SEED + fee - 40_000 * USD_SCALE as i128;
-        assert_eq!(s.accounts[&INSURANCE_ACCOUNT].collateral, expected_ins);
+        assert_eq!(
+            s.accounts[&INSURANCE_ACCOUNT].collateral,
+            INSURANCE_SEED + fee
+        );
+        // The maker's 40k hole is clawed from the taker (who covers all
+        // of it): the maker lands on 0 via the claw, not via insurance,
+        // and the taker is lower by exactly min(40k, its post-pnl
+        // collateral).
+        let taker_post_pnl = 1_000_000 * USD_SCALE as i128 - fee;
+        let claw = (40_000 * USD_SCALE as i128).min(taker_post_pnl.max(0));
+        assert_eq!(
+            s.accounts[&maker].collateral,
+            -40_000 * USD_SCALE as i128 + claw
+        );
+        assert_eq!(s.accounts[&taker].collateral, taker_post_pnl - claw);
+        // Claw and fee are both internal to the trio: their sum equals the
+        // post-PnL balances plus the seed — the shortfall handling moves
+        // no sum, only the fee travels from taker to insurance.
+        assert_eq!(
+            s.accounts[&taker].collateral
+                + s.accounts[&maker].collateral
+                + s.accounts[&INSURANCE_ACCOUNT].collateral,
+            1_000_000 * USD_SCALE as i128 - 40_000 * USD_SCALE as i128 + INSURANCE_SEED
+        );
     }
 
-    /// The bad-debt clamp can RAISE a cross account that still holds a
-    /// position: equity = collateral + upnl < 0 credits the hole back so
-    /// equity lands on exactly 0, while the surviving position keeps its
-    /// leaf. The witness leaves do not commit upnl, so the fill dispute
-    /// cannot recompute this shape — fill_math bounces `no fraud` for
-    /// non-empty ∧ expected < 0 instead of false-verdicting the honest
-    /// batch (see operp_dispute_fill.aa's collateral leg).
+    /// The fill claw reads collateral only: a cross account still holding
+    /// a position gets its negative collateral raised to 0 by the
+    /// counterparty payment (insurance untouched), while the surviving
+    /// position — still underwater at the mark — keeps its leaf. The
+    /// witness leaves do not commit upnl, so the fill dispute cannot
+    /// recompute this shape: fill_math bounces `no fraud` for a negative
+    /// expected post instead of false-verdicting the honest batch (see
+    /// operp_dispute_fill.aa's collateral leg).
     #[test]
     fn maker_bad_debt_clamped_with_position() {
         let mut s = ChainState::new();
@@ -2048,21 +2070,112 @@ mod tests {
             kind: 0,
         };
         s.apply_fill_pair(&fill).unwrap();
-        // Clamp raised the maker from -40000 to 90000 (equity := 0, the
-        // insurance fund absorbs 130k) — while the position leaf survives.
+        // The claw covers the maker's 40k collateral hole from the taker
+        // (who can pay it); insurance moves only by the fee. No
+        // equity-based raise to 90k exists — the surviving position's
+        // -90k upnl never touches collateral.
+        let fee = bps(notional_usd(fill.qty, fill.price), 5);
         assert_eq!(
-            s.accounts[&maker].collateral,
-            90_000 * USD_SCALE as i128,
-            "clamp raised a cross account"
+            s.accounts[&maker].collateral, 0,
+            "claw covered the maker's collateral hole"
+        );
+        assert_eq!(
+            s.accounts[&taker].collateral,
+            1_000_000 * USD_SCALE as i128 - fee - 40_000 * USD_SCALE as i128,
+            "the taker paid the claw"
+        );
+        assert_eq!(
+            s.accounts[&INSURANCE_ACCOUNT].collateral,
+            INSURANCE_SEED + fee,
+            "insurance untouched but for the fee"
         );
         let pos = s.accounts[&maker]
             .positions
             .get(&BTC_USD)
-            .expect("half position survives the clamp");
+            .expect("half position survives the claw");
         assert_eq!(
             pos.qty,
             operp_types::QTY_SCALE.try_into().unwrap(),
-            "half position survives the clamp"
+            "half position survives the claw"
+        );
+    }
+
+    /// Neither side can cover the hole: the claw pays 0 in both
+    /// directions, so both collaterals stay negative, insurance is
+    /// untouched (only the fee credit lands), and no balance increases.
+    #[test]
+    fn claw_cannot_cover_leaves_both_negative() {
+        let mut s = ChainState::new();
+        let taker = AccountId([9; 32]);
+        let maker = AccountId([8; 32]);
+        s.account_mut(taker)
+            .credit(20_000 * USD_SCALE as i128)
+            .unwrap();
+        s.account_mut(maker)
+            .credit(2_000 * USD_SCALE as i128)
+            .unwrap();
+        // Taker is long 1 BTC @ 100k, maker is short 1 BTC @ 5k.
+        s.account_mut(taker)
+            .apply_fill(
+                operp_types::Side::Bid,
+                true,
+                100_000 * operp_types::PRICE_SCALE as i64,
+                operp_types::QTY_SCALE,
+                BTC_USD,
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+        s.account_mut(maker)
+            .apply_fill(
+                operp_types::Side::Ask,
+                false,
+                5_000 * operp_types::PRICE_SCALE as i64,
+                operp_types::QTY_SCALE,
+                BTC_USD,
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+        // Taker sells 1 @ 10k: taker realizes −90k (20k → −70k, fee on
+        // top), maker realizes −5k buying back (2k → −3k). Both negative.
+        s.marks
+            .insert(BTC_USD, 10_000 * operp_types::PRICE_SCALE as i64);
+        let fill = Fill {
+            taker_id: operp_types::OrderId([0u8; 32]),
+            maker_id: operp_types::OrderId([0u8; 32]),
+            taker,
+            maker,
+            market: BTC_USD,
+            price: 10_000 * operp_types::PRICE_SCALE as i64,
+            qty: operp_types::QTY_SCALE,
+            seq: 1,
+            taker_side: operp_types::Side::Ask,
+            taker_post: 0,
+            maker_post: 0,
+            taker_isolated: false,
+            maker_isolated: false,
+            kind: 0,
+        };
+        s.apply_fill_pair(&fill).unwrap();
+        let fee = bps(notional_usd(fill.qty, fill.price), 5);
+        // Neither collateral rose: the claw moved nothing.
+        assert_eq!(
+            s.accounts[&taker].collateral,
+            -70_000 * USD_SCALE as i128 - fee,
+            "taker stays negative — no counterparty could pay"
+        );
+        assert_eq!(
+            s.accounts[&maker].collateral,
+            -3_000 * USD_SCALE as i128,
+            "maker stays negative — no counterparty could pay"
+        );
+        // Insurance gains only the fee credit; the holes are not printed.
+        assert_eq!(
+            s.accounts[&INSURANCE_ACCOUNT].collateral,
+            INSURANCE_SEED + fee
         );
     }
 
