@@ -105,7 +105,7 @@ pub fn fetch_da_unit<H: HubClient>(
     vault: &str,
     height: u64,
 ) -> Result<Option<DaUnit>, WatchError> {
-    let key = format!("da_unit_{}", height);
+    let key = format!("da_unit_{height}");
     let val = hub
         .get_aa_state_var(vault, &key)
         .map_err(WatchError::HubUnavailable)?;
@@ -134,8 +134,7 @@ pub fn fetch_da_unit<H: HubClient>(
 /// `da_unit_<h>` must be exactly the joint we fetched (`get_unit_hash`).
 /// `validate_against` separately proves the root points at this data package.
 pub fn verify_da_binding(da: &DaUnit) -> Result<(), WatchError> {
-    let recomputed =
-        obyte_hash::get_unit_hash(&da.joint).map_err(|e| WatchError::BindingMismatch(e))?;
+    let recomputed = obyte_hash::get_unit_hash(&da.joint).map_err(WatchError::BindingMismatch)?;
     let recomputed_hex = hex::encode(recomputed);
     if recomputed_hex != da.unit_hash {
         return Err(WatchError::BindingMismatch(format!(
@@ -194,7 +193,7 @@ pub fn assemble_frames<H: HubClient>(
             "data_root mismatch: want {want} got {got}"
         )));
     }
-    Ok(base64::engine::general_purpose::STANDARD.encode(&operp_settle::gzip_bytes(&concat)))
+    Ok(base64::engine::general_purpose::STANDARD.encode(operp_settle::gzip_bytes(&concat)))
 }
 
 /// Replay a posted batch against the running engine and assert it reproduces
@@ -287,7 +286,7 @@ mod tests {
             self.joints
                 .get(unit_hash)
                 .cloned()
-                .ok_or_else(|| format!("404: no joint {}", unit_hash))
+                .ok_or_else(|| format!("404: no joint {unit_hash}"))
         }
     }
 
@@ -505,9 +504,9 @@ mod tests {
         let f1 = "{\"u\":1}".to_string();
         let f2 = "{\"u\":2}".to_string();
         let b1 = base64::engine::general_purpose::STANDARD
-            .encode(&operp_settle::gzip_bytes(f1.as_bytes()));
+            .encode(operp_settle::gzip_bytes(f1.as_bytes()));
         let b2 = base64::engine::general_purpose::STANDARD
-            .encode(&operp_settle::gzip_bytes(f2.as_bytes()));
+            .encode(operp_settle::gzip_bytes(f2.as_bytes()));
         let mut concat = Vec::new();
         concat.extend_from_slice(f1.as_bytes());
         concat.extend_from_slice(f2.as_bytes());

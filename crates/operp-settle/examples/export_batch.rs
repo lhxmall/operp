@@ -3,8 +3,8 @@ use operp_dag::{genesis_id, sign_unit, unit_id, Op};
 use operp_exec::Engine;
 use operp_settle::Batch;
 use operp_types::{
-    account_id_from_pubkey, AccountId, OrderType, Qty, Side, TimeInForce, UnitId, Usd, BTC_USD,
-    PRICE_SCALE, QTY_SCALE, USD_SCALE,
+    account_id_from_pubkey, AccountId, OrderType, Side, TimeInForce, BTC_USD, PRICE_SCALE,
+    QTY_SCALE, USD_SCALE,
 };
 use std::path::PathBuf;
 

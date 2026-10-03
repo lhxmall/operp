@@ -318,11 +318,14 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    **RESOLVED**: single-candidate combined units; further submits bounce
    `height taken`; only a proven fraud reopens the height.
 8. No formal AA audit. Every AA must stay ≤100 per-formula complexity and
-   ≤2000 ops (fill AA: max 21, ops 1513).
+   ≤2000 ops (dispute AA: max 20, ops 1868 — ghost/skip moved here from
+   the fill AA; fill AA: max 38, ops 1610).
    Probe: `cd obyte-local && node tools/check_aa_complexity.js agents/*.aa`.
 9. **Replay-dedup window is 2048** (`REPLAY_ACTIVATION_HEIGHT = 0`).
-   Duplicates outside the window escape sidechain dedup; AA-side `wd_`/`wp_`
-   caps still hold.
+   Withdrawal/GovWithdraw entries outside the window can re-execute
+   (AA-side `wd_`/`wp_` caps still hold), but deposit anchors are
+   permanently nullified (`consumed_deposits`, committed into `state_root`)
+   so one payment can never credit twice.
 10. AA enforces `amount + wd_ <= min(collateral, withdrawn)`, and leaf
     numeric fields are capped at 15 decimal digits (< 2^53).
 11. Single-account shard proof generation requires registering PAD decoy

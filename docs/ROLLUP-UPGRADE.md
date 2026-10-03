@@ -80,7 +80,7 @@ poster, submitted_at = timestamp
 | P-fill-math | 这一笔成交的抵押/仓位/VWAP 算错 | 2 个账户叶 + 1 个挂单叶 + 算术 |
 | P-ghost | 成交打在前状态不存在的挂单上 | 挂单成员证明失败即成立 |
 | P-skip | 有更优价时序的活单没吃 | 出示那张更好的活单叶子，比价、比 seq |
-| P-omit | inbox 里到期的 `unit_id` 不在本批 | 读 inbox 变量 + merkle 不包含 |
+| P-omit | inbox 里到期的 `unit_id` 不在本批 | 读 inbox 变量 + merkle 不包含（**#23 后暂禁用**：force 只钉时间戳、无法证明单元存在，谓词恒 bounce `no fraud`，待存在性证明设计） |
 
 P-skip 替代「在 AA 里重放订单簿」：不必证明「这是最优」，只要证明「存在更优却没成交」。
 

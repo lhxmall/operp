@@ -139,12 +139,24 @@ async function buildDepositEvidences(batchData, vaultAddress) {
     }
     // joint carries the FULL joint unit object: the watcher recomputes
     // unit_hash(joint.unit) via operp_settle::obyte_hash::get_unit_hash and
-    // compares against the sidechain deposit's aa_unit.
+    // compares against the sidechain deposit's aa_unit. The payer binds the
+    // credit: it must be the joint's first author AND the op's addr (#8).
+    const authors = Array.isArray(joint.unit.authors) ? joint.unit.authors : [];
+    const payer = authors[0] && authors[0].address;
+    if (typeof payer !== "string") {
+      throw new Error("deposit joint has no authors: " + aaUnit.slice(0, 16));
+    }
+    if (dep.addr && dep.addr !== payer) {
+      throw new Error(
+        `deposit payer ${payer} != sidechain op addr ${dep.addr}: ` + aaUnit.slice(0, 16)
+      );
+    }
     evidences.push({
       aa_unit: aaUnit,
       is_perp: isPerp,
       amount: String(dep.amount),
       vault_address: vaultAddress,
+      payer,
       joint: joint.unit,
     });
   }

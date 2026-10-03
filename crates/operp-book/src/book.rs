@@ -252,7 +252,8 @@ impl OrderBook {
                 taker_post: taker_post as Usd,
                 maker_post: maker_post as Usd,
                 taker_isolated: order.isolated,
-                maker_isolated: maker_isolated,
+                maker_isolated,
+                kind: 0,
             });
 
             if maker_done {

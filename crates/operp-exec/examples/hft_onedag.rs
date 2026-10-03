@@ -5,9 +5,7 @@ use operp_types::{
     account_id_from_pubkey, AccountId, MarketId, OrderType, Side, TimeInForce, PRICE_SCALE,
     QTY_SCALE, USD_SCALE,
 };
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// Single node, ONE DAG, multiple markets matched in parallel:
@@ -15,7 +13,6 @@ use std::time::{Duration, Instant};
 /// linearizes globally; book matching is routed to per-market worker
 /// threads so different markets match concurrently while seq assignment,
 /// risk checks and account application remain exactly ordered.
-
 const TRADERS: usize = 4;
 
 fn sk(n: u8) -> [u8; 32] {
@@ -87,27 +84,25 @@ fn main() {
                 match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok((_g, u)) => {
                         empty = 0;
-                        match eng.lock().unwrap_or_else(|e| e.into_inner()).ingest(u) {
-                            Ok(events) => {
-                                for e in &events {
-                                    match e {
-                                        ExecEvent::Applied { fills: f, .. } => {
-                                            fills.fetch_add(
-                                                f.len() as u64,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
-                                        }
-                                        ExecEvent::Rejected { .. } => {
-                                            rejected.fetch_add(1, Ordering::Relaxed);
-                                        }
+                        if let Ok(events) = eng.lock().unwrap_or_else(|e| e.into_inner()).ingest(u)
+                        {
+                            for e in &events {
+                                match e {
+                                    ExecEvent::Applied { fills: f, .. } => {
+                                        fills.fetch_add(
+                                            f.len() as u64,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    }
+                                    ExecEvent::Rejected { .. } => {
+                                        rejected.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
-                                executed.fetch_add(
-                                    events.len() as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
                             }
-                            Err(_) => {}
+                            executed.fetch_add(
+                                events.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                         }
                     }
                     Err(_) => {
@@ -127,15 +122,11 @@ fn main() {
     let mut gens = Vec::new();
     for g in 0..cfg.generators {
         let tx = tx.clone();
-        let c = Cfg {
-            run_ms: cfg.run_ms,
-            ..cfg.clone()
-        };
         gens.push(std::thread::spawn(move || {
             let secrets: Vec<[u8; 32]> = (0..TRADERS)
                 .map(|i| sk((((g * TRADERS + i + 5) * 43 + 3) % 251) as u8))
                 .collect();
-            let mut seqs = vec![1u64; TRADERS];
+            let mut seqs = [1u64; TRADERS];
             let px = 100_000 * PRICE_SCALE as i64;
             let qty = QTY_SCALE / 100;
 
@@ -172,7 +163,6 @@ fn main() {
             }
             let funded_tip = dep_tip;
             // DAG still merges everything on one net with real concurrency.
-            let mut tips: Vec<operp_types::UnitId> = (0..cfg.markets).map(|_| funded_tip).collect();
             let mut trader_tip: Vec<operp_types::UnitId> =
                 (0..TRADERS).map(|_| funded_tip).collect();
 

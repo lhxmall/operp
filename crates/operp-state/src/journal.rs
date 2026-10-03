@@ -146,18 +146,16 @@ impl GovNonceJournal {
         let tmp = self.path.with_extension("tmp");
         {
             let mut f = File::create(&tmp)?;
-            let mut seq = 0u64;
             // Sorted for deterministic on-disk layout.
-            for (account, nonce) in watermarks {
+            for (i, (account, nonce)) in watermarks.iter().enumerate() {
                 let mut rec = Vec::with_capacity(RECORD_LEN);
-                rec.extend_from_slice(&seq.to_le_bytes());
+                rec.extend_from_slice(&(i as u64).to_le_bytes());
                 rec.extend_from_slice(&account.0);
                 rec.extend_from_slice(&nonce.to_le_bytes());
                 rec.extend_from_slice(&0u64.to_le_bytes()); // height unknown post-compact
                 let crc = crc32(&rec);
                 rec.extend_from_slice(&crc.to_le_bytes());
                 f.write_all(&rec)?;
-                seq += 1;
             }
             f.sync_all()?;
         }

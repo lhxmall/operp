@@ -103,6 +103,15 @@ impl Default for Engine {
         Self::new()
     }
 }
+/// One pro-rata share of an ADL residual hole (#9): non-last counterparties
+/// take `hole * delta / total` floored, the last takes the remainder — both
+/// capped at that counterparty's own positive delta so no debit ever exceeds
+/// what it gained. Free of state so the unit test pins the arithmetic.
+fn adl_haircut_share(hole: i128, delta: i128, total: i128, is_last: bool) -> i128 {
+    let raw = if is_last { hole } else { hole * delta / total };
+    raw.min(delta)
+}
+
 impl Engine {
     pub fn new() -> Self {
         Self {
@@ -477,6 +486,7 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn place(
         &mut self,
         account: AccountId,
@@ -563,6 +573,16 @@ impl Engine {
                     return Err(RejectReason::Risk);
                 }
             }
+        }
+        // Funding band (#7): an encoded rate beyond ±100% is a broken feed,
+        // not a market — same comparison as update_external_price. Applies
+        // to closes as well as opens: every margin/OI figure prices off
+        // usd_per_unit, so an out-of-band rate can only promise the
+        // insurance fund money the order never risked. A market order's
+        // price of 0 is far out of band on purpose — funding-rate books
+        // trade explicit rates only.
+        if self.state.market_params(market).funding_rate && funding_rate_bps(price).abs() > 10_000 {
+            return Err(RejectReason::Risk);
         }
 
         let snap = {
@@ -664,6 +684,19 @@ impl Engine {
                 return Err(RejectReason::Risk);
             }
             let extra_im = bps(open_notional, params.im_bps);
+            // Funding-rate opens must also cover this order's own worst-case
+            // peg payout (notional × cap), not just im_bps: the peg pays
+            // rate-cash peer-to-peer up to the cap regardless of the
+            // encoded-price distance.
+            let extra_im = if params.funding_rate {
+                extra_im.max(
+                    funding_notional_usd(open_qty.unsigned_abs(), params.usd_per_unit)
+                        * i128::from(params.funding_cap_bps)
+                        / 10_000,
+                )
+            } else {
+                extra_im
+            };
             let resting = self.resting_open_im(account);
             if isolated {
                 // Isolated floor: the bucket must cover this order's own IM
@@ -737,7 +770,7 @@ impl Engine {
             isolated,
             margin_left: if isolated { margin } else { 0 },
         };
-        let result = match self.state.book_mut(market).submit(order) {
+        let mut result = match self.state.book_mut(market).submit(order) {
             Ok(r) => r,
             Err(e) => {
                 // Nothing was matched or escrowed into fills: unwind.
@@ -747,6 +780,14 @@ impl Engine {
                 return Err(RejectReason::Book(e));
             }
         };
+        // Funding-rate markets realize rate-cash, not price-diff PnL; tag
+        // the fills so the dispute AA picks the funding identity (book
+        // submit defaults to kind 0).
+        if self.state.market_params(market).funding_rate {
+            for f in &mut result.fills {
+                f.kind = 1;
+            }
+        }
         for fill in &result.fills {
             // Invariant: AccountError from apply_fill_pair is unreachable here
             // by construction — intake guards above bound qty·price <
@@ -931,7 +972,9 @@ impl Engine {
         amount: Usd,
         aa_unit: [u8; 32],
     ) -> Result<Vec<Fill>, RejectReason> {
-        if self.state.seen_aa_units.get(&aa_unit).is_some() {
+        if self.state.seen_aa_units.contains_key(&aa_unit)
+            || self.state.consumed_deposits.contains(&aa_unit)
+        {
             return Err(RejectReason::DuplicateDeposit);
         }
         // Deposit must reference a real AA deposit event in this batch window;
@@ -958,6 +1001,7 @@ impl Engine {
             .credit(amount)
             .map_err(map_acct)?;
         self.state.seen_aa_units.insert(aa_unit, self.state.height);
+        self.state.consumed_deposits.insert(aa_unit);
         Ok(Vec::new())
     }
 
@@ -1058,7 +1102,7 @@ impl Engine {
             return self.liquidate_funding_off_book(unit, seq, caller, target, market, pos_qty);
         }
         let side = if pos_qty > 0 { Side::Ask } else { Side::Bid };
-        let qty = pos_qty.unsigned_abs() as u64;
+        let qty = pos_qty.unsigned_abs();
         let oid = liq_order_id(unit);
         let order = Order {
             id: oid,
@@ -1080,6 +1124,11 @@ impl Engine {
             .submit(order)
             .map_err(RejectReason::Book)?;
         let mut fills = result.fills;
+        // Liquidation book fills carry the keeper reward, distinct from a
+        // plain place (kind 0/1): the AA subtracts the reward on taker legs.
+        for f in &mut fills {
+            f.kind = 3;
+        }
         for fill in &fills {
             // Invariant: AccountError from apply_fill_pair is unreachable here
             // by construction — the liquidation order's qty comes from the
@@ -1089,6 +1138,16 @@ impl Engine {
             // with partially-applied state; that is a documented known
             // limitation, not a handled case.
             self.state.apply_fill_pair(fill).map_err(map_acct)?;
+        }
+        // Escrow returns (#10): STP refunds and the liquidation IOC's
+        // unfilled remainder are the target's own money — mirror place().
+        for (acct, amt) in &result.refunds {
+            if *amt > 0 {
+                self.state.account_mut(*acct).collateral += i128::from(*amt);
+            }
+        }
+        if !result.taker_resting && result.taker_margin_left > 0 {
+            self.state.account_mut(target).collateral += i128::from(result.taker_margin_left);
         }
         let still = if target_isolated_pos {
             self.state
@@ -1120,7 +1179,7 @@ impl Engine {
         if still && remaining_pos != 0 {
             let ins = INSURANCE_ACCOUNT;
             let mark = *self.state.marks.get(&market).unwrap_or(&0);
-            let close_qty = remaining_pos.unsigned_abs() as u64;
+            let close_qty = remaining_pos.unsigned_abs();
             let close_side = if remaining_pos > 0 {
                 Side::Ask
             } else {
@@ -1147,6 +1206,7 @@ impl Engine {
                 maker_post: 0,
                 taker_isolated: target_isolated,
                 maker_isolated: false,
+                kind: 3,
             };
             self.state.apply_fill_pair(&fill).map_err(map_acct)?;
             fills.push(fill);
@@ -1403,6 +1463,7 @@ impl Engine {
                 maker_post: 0,
                 taker_isolated: cp_isolated,
                 maker_isolated: target_isolated,
+                kind: 2,
             });
             remaining -= take;
         }
@@ -1465,7 +1526,9 @@ impl Engine {
         }
         // Residual hole: haircut positive-PnL ADL counterparties pro-rata,
         // last in ADL order takes the remainder. Each is debited at most
-        // the positive delta recorded for this call.
+        // the positive delta recorded for this call, and every debit lands
+        // on the target (collateral or isolated bucket) — money moves, it
+        // never vanishes (#9).
         if equity < 0 {
             let mut hole = -equity;
             let total: Usd = pos_deltas.iter().map(|(_, d)| *d).sum();
@@ -1475,16 +1538,32 @@ impl Engine {
                     if hole <= 0 || total <= 0 {
                         break;
                     }
-                    let share = if Some(*id) == last {
-                        hole.min(*delta)
-                    } else {
-                        hole * delta / total
-                    };
+                    let share = adl_haircut_share(hole, *delta, total, Some(*id) == last);
                     if share <= 0 {
                         continue;
                     }
                     if let Some(a) = self.state.accounts.get_mut(id) {
                         a.collateral -= share;
+                    }
+                    // Credit the target through the same isolated-vs-cross
+                    // branch as the insurance top-up above.
+                    let tgt_still_isolated = self
+                        .state
+                        .accounts
+                        .get(&target)
+                        .map(|a| {
+                            a.positions
+                                .get(&market)
+                                .map(|p| p.isolated)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if tgt_still_isolated {
+                        if let Some(a) = self.state.accounts.get_mut(&target) {
+                            *a.isolated_margin.entry(market).or_insert(0) += share;
+                        }
+                    } else if let Some(a) = self.state.accounts.get_mut(&target) {
+                        a.collateral += share;
                     }
                     hole -= share;
                 }
@@ -1525,7 +1604,9 @@ impl Engine {
         amount: u128,
         aa_unit: [u8; 32],
     ) -> Result<Vec<Fill>, RejectReason> {
-        if self.state.seen_aa_units.get(&aa_unit).is_some() {
+        if self.state.seen_aa_units.contains_key(&aa_unit)
+            || self.state.consumed_deposits.contains(&aa_unit)
+        {
             return Err(RejectReason::DuplicateDeposit);
         }
         // PERP deposits are backed by the same on-chain AA feed as collateral;
@@ -1561,6 +1642,7 @@ impl Engine {
         self.state.perp_balances.insert(account, new_bal);
         self.state.perp_supply = new_supply;
         self.state.seen_aa_units.insert(aa_unit, self.state.height);
+        self.state.consumed_deposits.insert(aa_unit);
         Ok(Vec::new())
     }
 
@@ -1601,6 +1683,7 @@ impl Engine {
         Ok(Vec::new())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_market(
         &mut self,
         creator: AccountId,
@@ -1838,18 +1921,11 @@ impl Engine {
     }
 
     fn stake_oracle(&mut self, account: AccountId) -> Result<Vec<Fill>, RejectReason> {
-        // Height-gated: before activation, treat as unknown op -> BadAccount
-        if self.state.height < operp_types::ORACLE_SLASH_ACTIVATION_HEIGHT {
-            return Err(RejectReason::BadAccount);
-        }
         self.state.apply_stake(account).map_err(map_state)?;
         Ok(Vec::new())
     }
 
     fn unstake_oracle(&mut self, account: AccountId) -> Result<Vec<Fill>, RejectReason> {
-        if self.state.height < operp_types::ORACLE_SLASH_ACTIVATION_HEIGHT {
-            return Err(RejectReason::BadAccount);
-        }
         self.state.apply_unstake(account).map_err(map_state)?;
         Ok(Vec::new())
     }
@@ -1860,9 +1936,6 @@ impl Engine {
         target: AccountId,
         market: MarketId,
     ) -> Result<Vec<Fill>, RejectReason> {
-        if self.state.height < operp_types::ORACLE_SLASH_ACTIVATION_HEIGHT {
-            return Err(RejectReason::BadAccount);
-        }
         self.state
             .apply_slash(challenger, target, market)
             .map_err(map_state)?;
@@ -1882,9 +1955,6 @@ impl Engine {
         commit: [u8; 32],
         ttl_height: Height,
     ) -> Result<Vec<Fill>, RejectReason> {
-        if self.state.height < operp_types::COMMIT_REVEAL_ACTIVATION_HEIGHT {
-            return Err(RejectReason::BadCommit);
-        }
         if self.state.commits.contains_key(&commit) {
             return Err(RejectReason::BadCommit);
         }
@@ -1932,9 +2002,6 @@ impl Engine {
         inner: &Op,
         salt: &[u8; 32],
     ) -> Result<Vec<Fill>, RejectReason> {
-        if self.state.height < operp_types::COMMIT_REVEAL_ACTIVATION_HEIGHT {
-            return Err(RejectReason::BadCommit);
-        }
         let entry = match self.state.commits.get(&commit_ref) {
             Some(e) => *e,
             None => return Err(RejectReason::BadCommit),
@@ -1975,9 +2042,6 @@ impl Engine {
         source_id: u8,
         caller_seq: Seq,
     ) -> Result<Vec<Fill>, RejectReason> {
-        if self.state.height < operp_types::FUNDING_TWAP_ACTIVATION_HEIGHT {
-            return Err(RejectReason::NotFound);
-        }
         let funding_rate = self
             .state
             .markets
@@ -2139,6 +2203,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn place(
         parents: Vec<UnitId>,
         secret: &[u8; 32],
@@ -2362,7 +2427,7 @@ mod tests {
         );
         let id4 = unit_id(&bid);
         eng.ingest(bid).unwrap();
-        eng.state.marks.insert(BTC_USD, 1 * PRICE_SCALE as i64);
+        eng.state.marks.insert(BTC_USD, PRICE_SCALE as i64);
         let a = acct_of(&alice);
         assert!(
             eng.state
@@ -2378,7 +2443,7 @@ mod tests {
             Side::Bid,
             OrderType::Limit,
             TimeInForce::Gtc,
-            1 * PRICE_SCALE as i64,
+            PRICE_SCALE as i64,
             QTY_SCALE,
             2,
         );
@@ -3241,7 +3306,7 @@ mod tests {
         let evs = eng.ingest(c).unwrap();
         assert!(evs
             .iter()
-            .all(|e| matches!(e, ExecEvent::Applied { ref fills, .. } if fills.is_empty())));
+            .all(|e| matches!(e, ExecEvent::Applied { fills, .. } if fills.is_empty())));
     }
 
     #[test]
@@ -5244,6 +5309,90 @@ mod tests {
     }
 
     #[test]
+    fn funding_place_rejects_out_of_band_rate() {
+        // #7: an encoded rate beyond ±100% (funding_rate_bps.abs() >
+        // 10_000) is a broken feed — Risk before any match, on opens AND
+        // closes. Funded account so the only Risk source is the band.
+        let mut eng = activated_engine();
+        let creator = acct_of(&sk(1));
+        eng.state
+            .perp_balances
+            .insert(creator, CREATE_MARKET_FEE_PERP);
+        eng.state.perp_supply += CREATE_MARKET_FEE_PERP;
+        let mut symbol = [0u8; 16];
+        symbol[..4].copy_from_slice(b"BAND");
+        eng.create_market(creator, symbol, 1, 100, 50, 5, 10, false, true, 10_000, 10)
+            .unwrap();
+        let m = MarketId(2);
+        let alice = sk(2);
+        let d = deposit(vec![genesis_id()], &alice, 1_000_000 * USD_SCALE as i128, 2);
+        let mut tip = unit_id(&d);
+        eng.ingest(d).unwrap();
+        let over = operp_types::encode_funding_price(10_001); // +10001 bps
+        assert!(funding_rate_bps(over).abs() > 10_000);
+        // Open at the out-of-band limit → Risk.
+        let open = place_on(
+            vec![tip],
+            &alice,
+            m,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            over,
+            QTY_SCALE,
+            1,
+        );
+        tip = unit_id(&open);
+        let evs = eng.ingest(open).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                ExecEvent::Rejected {
+                    reason: RejectReason::Risk,
+                    ..
+                }
+            )),
+            "out-of-band funding open must be Risk: {evs:?}"
+        );
+        // Close at an out-of-band limit → Risk too (band runs before the
+        // open/reduce split).
+        {
+            use operp_account::Position;
+            eng.state.account_mut(acct_of(&alice)).positions.insert(
+                m,
+                Position {
+                    market: m,
+                    qty: -(QTY_SCALE as i64),
+                    entry_price: operp_types::encode_funding_price(12),
+                    isolated: false,
+                },
+            );
+        }
+        let close = place_on(
+            vec![tip],
+            &alice,
+            m,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            over,
+            QTY_SCALE,
+            1, // rejected places never advance the watermark
+        );
+        let evs = eng.ingest(close).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                ExecEvent::Rejected {
+                    reason: RejectReason::Risk,
+                    ..
+                }
+            )),
+            "out-of-band funding close must be Risk: {evs:?}"
+        );
+    }
+
+    #[test]
     fn funding_rate_lists_at_100x() {
         let mut eng = activated_engine();
         let creator = acct_of(&sk(1));
@@ -5395,7 +5544,6 @@ mod tests {
         // clamped at the market cap (50 bps; 8 is under it).
         eng.state.height = paid_height + operp_types::FUNDING_PEG_INTERVAL_HEIGHTS;
         let ep2 = external_price_on(vec![tip], &sk(1), mkt, idx, 0);
-        tip = unit_id(&ep2);
         eng.ingest(ep2).unwrap();
         let expected = operp_types::funding_rate_cash((QTY_SCALE / 100) as i64, 8, 10_000);
         let long_delta = eng.state.accounts[&acct_of(&alice)].collateral - pre_long;
@@ -5482,6 +5630,32 @@ mod tests {
             10 * USD_SCALE as i128
         );
     }
+    #[test]
+    fn adl_haircut_share_caps_and_conserves() {
+        // #9: hole 150 over deltas [40, 60]. First share = 150*40/100 = 60
+        // → capped to 40 (the old code debited 60 — 20 more than the
+        // counterparty gained); the last takes min(110, 60) = 60. Every
+        // debited unit is credited to the target by the same `share`
+        // value, so debits and credits sum equal.
+        let hole = 150i128;
+        let deltas = [40i128, 60i128];
+        let total: i128 = deltas.iter().sum();
+        let mut left = hole;
+        let mut debits = Vec::new();
+        let mut credited = 0i128;
+        for (i, d) in deltas.iter().enumerate() {
+            let share = adl_haircut_share(left, *d, total, i == deltas.len() - 1);
+            assert!(share <= *d, "share {share} exceeds delta {d}");
+            debits.push(share);
+            credited += share; // the loop credits exactly what it debits
+            left -= share;
+        }
+        assert_eq!(debits, vec![40, 60]);
+        let debited: i128 = debits.iter().sum();
+        assert_eq!(debited, credited, "credits to target must equal debits");
+        assert_eq!(left, hole - debited);
+    }
+
     #[test]
     fn funding_liq_off_book_adl() {
         use operp_account::Position;
@@ -5584,7 +5758,7 @@ mod tests {
         let bob_abs = eng.state.accounts[&bob].positions[&mkt].qty.unsigned_abs();
         assert_eq!(
             bob_abs_before - bob_abs,
-            (QTY_SCALE as u64) - alice_qty.unsigned_abs(),
+            QTY_SCALE - alice_qty.unsigned_abs(),
             "the opposite side absorbed exactly the closed qty"
         );
         assert!(alice_qty < QTY_SCALE as i64, "close was partial");
@@ -5598,6 +5772,88 @@ mod tests {
             eng.state.accounts[&INSURANCE_ACCOUNT].collateral <= ins_before,
             "insurance only pays, never gains, here"
         );
+    }
+
+    #[test]
+    fn adl_haircut_credits_target_and_caps_debits() {
+        // #9 end-to-end: insurance exhausted, target ends the off-book
+        // close at -8; the residual hole haircuts bob's +10 delta by 8
+        // (<= delta) and every debited unit lands on the target — money
+        // moves, it never vanishes.
+        use operp_account::Position;
+        let mut eng = activated_engine();
+        let creator = acct_of(&sk(1));
+        eng.state
+            .perp_balances
+            .insert(creator, CREATE_MARKET_FEE_PERP);
+        let mut symbol = [0u8; 16];
+        symbol[..5].copy_from_slice(b"HAIRC");
+        eng.state.perp_supply += CREATE_MARKET_FEE_PERP;
+        eng.create_market(creator, symbol, 1, 100, 50, 5, 10, false, true, 10_000, 10)
+            .unwrap();
+        let mkt = MarketId(2);
+        let alice = acct_of(&sk(2));
+        let bob = acct_of(&sk(3));
+        let keeper = acct_of(&sk(4));
+        let entry = operp_types::encode_funding_price(40);
+        {
+            let a = eng.state.account_mut(alice);
+            a.positions.insert(
+                mkt,
+                Position {
+                    market: mkt,
+                    qty: QTY_SCALE as i64,
+                    entry_price: entry,
+                    isolated: false,
+                },
+            );
+            a.collateral = 2 * USD_SCALE as i128;
+        }
+        {
+            let a = eng.state.account_mut(bob);
+            a.positions.insert(
+                mkt,
+                Position {
+                    market: mkt,
+                    qty: -(QTY_SCALE as i64),
+                    entry_price: entry,
+                    isolated: false,
+                },
+            );
+        }
+        // Mark 20 vs entry 40: the long is $20 underwater on $2 → equity
+        // -18 <= mm*0.5 → liquidatable.
+        eng.state
+            .marks
+            .insert(mkt, operp_types::encode_funding_price(20));
+        // Fresh external index 30: the off-book close realizes -10 for the
+        // target (2 - 10 = -8) and +10 for bob.
+        eng.state
+            .external_price_ring
+            .entry(mkt)
+            .or_default()
+            .push_back(operp_types::ExternalSample {
+                seq: 0,
+                height: eng.state.height,
+                price: operp_types::encode_funding_price(30),
+                source_id: 0,
+            });
+        // Insurance exhausted: the top-up cannot cover the -8 hole.
+        eng.state.account_mut(INSURANCE_ACCOUNT).collateral = 0;
+
+        eng.liquidate(UnitId([9u8; 32]), eng.state.seq, keeper, alice, mkt)
+            .expect("off-book liquidation applies");
+
+        let alice_col = eng.state.accounts[&alice].collateral;
+        let bob_col = eng.state.accounts[&bob].collateral;
+        // Bob gained 10 in the close; the haircut took exactly the target's
+        // 8-unit hole — never more than the 10 he gained.
+        assert_eq!(bob_col, 2 * USD_SCALE as i128, "10 gained - 8 haircut");
+        // The target's -8 hole was transferred, not burned.
+        assert_eq!(alice_col, 0, "-8 + 8 haircut credit == 0");
+        let bob_debit = 10 * USD_SCALE as i128 - bob_col;
+        let target_credit = alice_col - (-8 * USD_SCALE as i128);
+        assert_eq!(bob_debit, target_credit, "debits equal target credits");
     }
 
     /// Escrow lifecycle: collateral + buckets + live order margin only move
@@ -5645,7 +5901,7 @@ mod tests {
             px,
             qty,
             1,
-            4_000 * USD_SCALE as u64,
+            4_000 * USD_SCALE,
         );
         tip = unit_id(&p1);
         let evs = eng.ingest(p1).unwrap();
@@ -5685,7 +5941,7 @@ mod tests {
             px,
             qty,
             2,
-            4_000 * USD_SCALE as u64,
+            4_000 * USD_SCALE,
         );
         tip = unit_id(&p2);
         eng.ingest(p2).unwrap();
@@ -5791,7 +6047,7 @@ mod tests {
             px2,
             QTY_SCALE,
             2,
-            100 * USD_SCALE as u64,
+            100 * USD_SCALE,
         );
         tip = unit_id(&iso);
         eng.ingest(iso).unwrap();
@@ -5806,7 +6062,6 @@ mod tests {
             QTY_SCALE,
             2,
         );
-        tip = unit_id(&cross2);
         eng.ingest(cross2).unwrap();
         let pos_b = &eng.state.accounts[&a].positions[&mkt2];
         assert!(pos_b.qty > 0 && pos_b.isolated);
@@ -5927,7 +6182,7 @@ mod tests {
                 qty,
                 client_seq: 1,
                 isolated: true,
-                margin: 10 * USD_SCALE as u64 - 1,
+                margin: 10 * USD_SCALE - 1,
             },
             &sk(12),
         );
@@ -5945,7 +6200,7 @@ mod tests {
             px,
             qty,
             1,
-            1_000 * USD_SCALE as u64,
+            1_000 * USD_SCALE,
         );
         tip = unit_id(&iso_open);
         let evs = eng.ingest(iso_open).unwrap();
@@ -5995,7 +6250,7 @@ mod tests {
             90_000 * PRICE_SCALE as i64,
             qty,
             1,
-            1_000 * USD_SCALE as u64,
+            1_000 * USD_SCALE,
         );
         tip = unit_id(&iso_rest);
         let evs = eng.ingest(iso_rest).unwrap();
@@ -6064,7 +6319,7 @@ mod tests {
             99_000 * PRICE_SCALE as i64,
             qty,
             2,
-            1_000 * USD_SCALE as u64,
+            1_000 * USD_SCALE,
         );
         expect_risk(&mut eng, tip, iso_over_cross);
     }
@@ -6121,7 +6376,7 @@ mod tests {
             px,
             qty,
             1,
-            10 * USD_SCALE as u64,
+            10 * USD_SCALE,
         );
         tip = unit_id(&iso);
         let evs = eng.ingest(iso).unwrap();

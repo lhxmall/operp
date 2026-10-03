@@ -65,7 +65,7 @@ async function main() {
     const bind = await challenger.triggerAaWithData({
       toAddress: dispute,
       amount: 20000,
-      data: useFill ? { bind_fill: 1 } : { bind: 1 },
+      data: Object.assign({ rollup }, useFill ? { bind_fill: 1 } : { bind: 1 }),
     });
     if (bind.error) throw new Error("bind failed: " + bind.error);
     await network.witnessUntilStable(bind.unit);
@@ -74,7 +74,9 @@ async function main() {
     console.log("dispute already bound:", rvars[boundKey]);
   }
 
-  const data = Object.assign({ height, pred }, proof);
+  // The rollup address rides every challenge (#13: the rollup hardcodes
+  // the dispute addresses, the disputes reference the rollup per-trigger).
+  const data = Object.assign({ height, pred, rollup }, proof);
   const r = await challenger.triggerAaWithData({
     toAddress: dispute,
     amount: 20000,

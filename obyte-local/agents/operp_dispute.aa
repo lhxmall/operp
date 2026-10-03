@@ -9,20 +9,25 @@
 	// challenge bond exists (pay-to-kill is impossible: every bounce path
 	// here refuses to freeze anything).
 	//
-	// Bind: {bind:1} payment 20000 -> forwards 10000 to ROLLUP_AA_HERE with
-	// {set_dispute:1}. The fill-math dispute AA (if split out for
-	// complexity) binds with {bind_fill:1} -> {set_dispute_fill:1}.
-	// Challenge: {height, pred, k, ...proofs} payment 20000.
-	//
-	// ROLLUP_AA_HERE is substituted at deploy/test time.
+	// Bind: {bind:1, rollup:<addr>} payment 20000 -> forwards 10000 to the
+	// rollup with {set_dispute:1}. The fill-math dispute AA binds with
+	// {bind_fill:1, rollup:<addr>} -> {set_dispute_fill:1}.
+	// Challenge: {height, pred, rollup:<addr>, k, ...proofs} payment 20000.
+	// The rollup address rides every trigger instead of living in this
+	// definition: the rollup hardcodes THIS address (#13 anti-hijack), and
+	// mutual hardcoding would be a chash cycle (each address is the hash
+	// of its own definition).
 	// Witness leaves (crates/operp-state/src/lib.rs wit_leaves):
 	//   acct:{acct_hex_64}:{collateral}:{perp}:{W}
-	//   pos:{acct_hex_64}:{market}:{qty_signed}:{entry}
+	//   pos:{acct_hex_64}:{market}:{qty_signed}:{entry}:{isolated:0|1}:{bucket}
+	//   ord:{order_hex}:{market}:{side}:{price}:{seq}:{remaining}:{acct_hex}:{isolated:0|1}:{margin_left}
 	// Op descriptors (crates/operp-settle/src/lib.rs ops_element):
 	//   d:{acct}:{amount}   D:{acct}:{amount}
 	//   w:{acct}:{amount}:{nonce}   W:{acct}:{amount}:{nonce}
+	//   c:{acct}:{order_hex}   p:{acct}:{market}:{side}:{price}:{qty}:{isolated}:{margin}:{tif}
 	// Fill descriptors (fills_element): f:{unit}:{idx}:{taker}:{maker}:
-	//   {taker_order}:{maker_order}:{market}:{price}:{qty}:{seq}:{side}
+	//   {taker_order}:{maker_order}:{market}:{price}:{qty}:{seq}:{side}:{kind}
+	// kind 0=book 1=funding-cash 2=ADL-no-fee 3=liquidation(+keeper)
 	// Empty-sentinel wit root (obyte_merkle::root(["empty"]), pinned by the
 	// Rust unit test): Lhz6grA1wmy7va5jLOoHBRTri3c/YWqur2aOLwvo8Q0=
 	bounce_fees: { base: 10000 },
@@ -32,6 +37,11 @@
 				if: "{trigger.data.bind}",
 				init: "{
 					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
+					// Rollup address arrives per-bind (the rollup hardcodes
+					// THIS address instead — mutual hardcoding would be a
+					// chash cycle); validate it before forwarding.
+					if (typeof(trigger.data.rollup) == 'boolean' OR length(trigger.data.rollup) != 32 OR !is_valid_address(trigger.data.rollup))
+						bounce('bad rollup');
 				}",
 				messages: [
 					{
@@ -40,7 +50,7 @@
 							asset: "base",
 							outputs: [
 								{
-									address: "ROLLUP_AA_HERE",
+									address: "{trigger.data.rollup}",
 									amount: 10000
 								}
 							]
@@ -66,7 +76,15 @@
 				if: "{trigger.data.pred == 'deposit' OR trigger.data.pred == 'withdraw'}",
 				init: "{
 					$h = trigger.data.height;
-					$rollup = 'ROLLUP_AA_HERE';
+					// The rollup address rides every challenge: this AA's
+					// address is hardcoded INTO the rollup (#13), so this
+					// definition must not hardcode the rollup back — mutual
+					// hardcoding is a chash cycle. State checks and the
+					// verdict payment use the same value, so a bogus address
+					// can only bounce here or deliver the verdict to itself.
+					if (typeof(trigger.data.rollup) == 'boolean' OR length(trigger.data.rollup) != 32 OR !is_valid_address(trigger.data.rollup))
+						bounce('bad rollup');
+					$rollup = trigger.data.rollup;
 					$n = var[$rollup]['unit_count_' || $h];
 					if (!$h OR !$n) bounce('no height');
 					if (var[$rollup]['frozen_' || $h] OR timestamp >= (var[$rollup]['submitted_at_' || $h] otherwise 0) + 3600)
@@ -106,6 +124,12 @@
 					$pre_leaf = trigger.data.pre_leaf;
 					$post_leaf = trigger.data.post_leaf;
 					$post_wit = trigger.data.post_wit;
+					// Post binding: post_wit must be the k-th element of the
+					// COMMITTED trace, so the leaf proof below proves against
+					// an operator-committed root instead of an attacker tree.
+					if (!trigger.data.post_proof OR trigger.data.post_proof.index != $k OR trigger.data.post_proof.root != trigger.data.trace_root
+						OR !is_valid_merkle_proof($post_wit, trigger.data.post_proof))
+						bounce('bad post proof');
 					$acct = substring($op, 2, 64);
 					// op = 'd:' || 64-hex || ':' || amount[:nonce]; the colon
 					// after the hex sits at index 66, so start the tail there.
@@ -132,12 +156,16 @@
 					if (trigger.data.pre_absent){
 						$ghost = 'acct:' || $acct || ':';
 						$hit1 = trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+							AND trigger.data.left_proof.root == $pre_wit
 							AND trigger.data.right AND is_valid_merkle_proof(trigger.data.right, trigger.data.right_proof)
+							AND trigger.data.right_proof.root == $pre_wit
 							AND trigger.data.left < $ghost AND $ghost < trigger.data.right;
 						$hit2 = trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+							AND trigger.data.left_proof.root == $pre_wit
 							AND trigger.data.left_proof.index == 0
 							AND $ghost < trigger.data.left;
 						$hit3 = ($k == 0 AND $h > 1) AND trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+							AND trigger.data.left_proof.root == $pre_wit
 							AND trigger.data.left_proof.index == (var[$rollup]['wit_count_' || ($h - 1)] otherwise 0) - 1
 							AND $ghost > trigger.data.left;
 						if (!$hit1 AND !$hit2 AND !$hit3) bounce('no fraud');
@@ -163,7 +191,124 @@
 							asset: "base",
 							outputs: [
 								{
-									address: "ROLLUP_AA_HERE",
+									address: "{trigger.data.rollup}",
+									amount: 10000
+								}
+							]
+						}
+					},
+					{
+						app: "data",
+						payload: {
+							verdict: "fraud",
+							height: "{trigger.data.height}",
+							challenger: "{trigger.address}"
+						}
+					},
+					{
+						app: "state",
+						state: "{
+							var['fraud_' || trigger.data.height] = trigger.address;
+						}"
+					}
+				]
+			},
+			{
+				// P-escrow (cancel only): the proven post collateral moved by
+				// exactly the canceled order's escrow refund — post == pre +
+				// margin_left, exact, no range. `p:` has NO arm: a Place unit
+				// matches inside the same unit (fee/PnL move collateral by an
+				// amount Oscript cannot predict), so any p: range would false-
+				// fire honest fills; place-escrow lies stay uncovered (#6 half).
+				if: "{trigger.data.pred == 'escrow'}",
+				init: "{
+					$h = trigger.data.height;
+					// The rollup address rides every challenge: this AA's
+					// address is hardcoded INTO the rollup (#13), so this
+					// definition must not hardcode the rollup back — mutual
+					// hardcoding is a chash cycle. State checks and the
+					// verdict payment use the same value, so a bogus address
+					// can only bounce here or deliver the verdict to itself.
+					if (typeof(trigger.data.rollup) == 'boolean' OR length(trigger.data.rollup) != 32 OR !is_valid_address(trigger.data.rollup))
+						bounce('bad rollup');
+					$rollup = trigger.data.rollup;
+					$n = var[$rollup]['unit_count_' || $h];
+					if (!$h OR !$n) bounce('no height');
+					if (var[$rollup]['frozen_' || $h] OR timestamp >= (var[$rollup]['submitted_at_' || $h] otherwise 0) + 3600)
+						bounce('challenge not possible');
+					if (trigger.data.trace_root != var[$rollup]['trace_root_' || $h]
+						OR trigger.data.ops_root != var[$rollup]['ops_root_' || $h]
+						OR trigger.data.units_root != var[$rollup]['units_root_' || $h]
+						OR trigger.data.units_set_root != var[$rollup]['units_set_root_' || $h]
+						OR trigger.data.fills_root != var[$rollup]['fills_root_' || $h])
+						bounce('stale roots');
+					$k = trigger.data.k;
+					if (!is_integer($k) OR $k < 0 OR $k >= $n)
+						bounce('bad k');
+					$op = trigger.data.op;
+					if (!starts_with($op, 'c:')) bounce('no fraud');
+					if (!trigger.data.ops_proof OR trigger.data.ops_proof.index != $k OR trigger.data.ops_proof.root != trigger.data.ops_root
+						OR !is_valid_merkle_proof($op, trigger.data.ops_proof))
+						bounce('bad ops proof');
+					$pre_wit = trigger.data.pre_wit;
+					if ($k == 0){
+						if ($h == 1){
+							if ($pre_wit != 'Lhz6grA1wmy7va5jLOoHBRTri3c/YWqur2aOLwvo8Q0=') bounce('bad pre wit');
+						} else {
+							if ($pre_wit != var[$rollup]['wit_root_' || ($h - 1)]) bounce('bad pre wit');
+						}
+					} else {
+						if (!trigger.data.pre_proof OR trigger.data.pre_proof.index != $k - 1 OR trigger.data.pre_proof.root != trigger.data.trace_root
+							OR !is_valid_merkle_proof($pre_wit, trigger.data.pre_proof))
+							bounce('bad pre proof');
+					}
+					$post_wit = trigger.data.post_wit;
+					if (!trigger.data.post_proof OR trigger.data.post_proof.index != $k OR trigger.data.post_proof.root != trigger.data.trace_root
+						OR !is_valid_merkle_proof($post_wit, trigger.data.post_proof))
+						bounce('bad post proof');
+					$acct = substring($op, 2, 64);
+					// op = 'c:' || 64-hex acct || ':' || 64-hex order id;
+					// the second colon sits at index 66, order hex at 67.
+					$order_hex = substring($op, 67, 64);
+					if (length($order_hex) != 64) bounce('bad op');
+					$pre_leaf = trigger.data.pre_leaf;
+					$post_leaf = trigger.data.post_leaf;
+					if (typeof($pre_leaf) == 'boolean'
+						OR !is_valid_merkle_proof($pre_leaf, trigger.data.pre_leaf_proof)
+						OR trigger.data.pre_leaf_proof.root != $pre_wit)
+						bounce('bad leaf proof');
+					if (substring($pre_leaf, 5, 64) != $acct) bounce('bad leaf');
+					if (typeof($post_leaf) == 'boolean'
+						OR !is_valid_merkle_proof($post_leaf, trigger.data.post_leaf_proof)
+						OR trigger.data.post_leaf_proof.root != $post_wit)
+						bounce('bad leaf proof');
+					if (substring($post_leaf, 5, 64) != $acct) bounce('bad leaf');
+					$tail0 = substring($pre_leaf, 70, length($pre_leaf));
+					$col0 = substring($tail0, 0, index_of($tail0, ':'));
+					$tail1 = substring($post_leaf, 70, length($post_leaf));
+					$col1 = substring($tail1, 0, index_of($tail1, ':'));
+					// The canceled order's escrow remainder, from its PRE ord
+					// leaf: order id must match the op, owner the op account.
+					$pre_ord = trigger.data.pre_ord;
+					if (typeof($pre_ord) == 'boolean'
+						OR !starts_with($pre_ord, 'ord:' || $order_hex || ':')
+						OR !is_valid_merkle_proof($pre_ord, trigger.data.pre_ord_proof)
+						OR trigger.data.pre_ord_proof.root != $pre_wit)
+						bounce('bad ord proof');
+					$O = split($pre_ord, ':');
+					if (array_length($O) != 10 OR $O[7] != $acct) bounce('bad ord');
+					$margin_left = $O[9] + 0;
+					if ($col0 + $margin_left == $col1) bounce('no fraud');
+					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
+				}",
+				messages: [
+					{
+						app: "payment",
+						payload: {
+							asset: "base",
+							outputs: [
+								{
+									address: "{trigger.data.rollup}",
 									amount: 10000
 								}
 							]
@@ -193,7 +338,15 @@
 				if: "{trigger.data.pred == 'omit'}",
 				init: "{
 					$h = trigger.data.height;
-					$rollup = 'ROLLUP_AA_HERE';
+					// The rollup address rides every challenge: this AA's
+					// address is hardcoded INTO the rollup (#13), so this
+					// definition must not hardcode the rollup back — mutual
+					// hardcoding is a chash cycle. State checks and the
+					// verdict payment use the same value, so a bogus address
+					// can only bounce here or deliver the verdict to itself.
+					if (typeof(trigger.data.rollup) == 'boolean' OR length(trigger.data.rollup) != 32 OR !is_valid_address(trigger.data.rollup))
+						bounce('bad rollup');
+					$rollup = trigger.data.rollup;
 					$n = var[$rollup]['unit_count_' || $h];
 					if (!$h OR !$n) bounce('no height');
 					if (var[$rollup]['frozen_' || $h] OR timestamp >= (var[$rollup]['submitted_at_' || $h] otherwise 0) + 3600)
@@ -208,6 +361,11 @@
 					if (typeof($id) == 'boolean' OR length($id) != 64) bounce('bad unit_id');
 					$ts = var[$rollup]['inbox_' || $id];
 					if (!$ts OR $ts >= var[$rollup]['inbox_upto_' || $h]) bounce('no fraud');
+					// #23: {force} pins only a timestamp — the id may name a
+					// unit that never existed, and an honest batch correctly
+					// omits it. Omit cannot pay out; the rest of the case is
+					// left unreachable on purpose.
+					bounce('no fraud');
 					$root = trigger.data.units_set_root;
 					$hit1 = trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
 						AND trigger.data.left_proof.root == $root
@@ -233,7 +391,236 @@
 							asset: "base",
 							outputs: [
 								{
-									address: "ROLLUP_AA_HERE",
+									address: "{trigger.data.rollup}",
+									amount: 10000
+								}
+							]
+						}
+					},
+					{
+						app: "data",
+						payload: {
+							verdict: "fraud",
+							height: "{trigger.data.height}",
+							challenger: "{trigger.address}"
+						}
+					},
+					{
+						app: "state",
+						state: "{
+							var['fraud_' || trigger.data.height] = trigger.address;
+						}"
+					}
+				]
+			},
+			{
+				// P-ghost: the fill's maker order leaf is absent from pre_wit.
+				// Non-membership uses the three omit cases against wit_count.
+				if: "{trigger.data.pred == 'ghost'}",
+				init: "{
+					$h = trigger.data.height;
+					// The rollup address rides every challenge: this AA's
+					// address is hardcoded INTO the rollup (#13), so this
+					// definition must not hardcode the rollup back — mutual
+					// hardcoding is a chash cycle. State checks and the
+					// verdict payment use the same value, so a bogus address
+					// can only bounce here or deliver the verdict to itself.
+					if (typeof(trigger.data.rollup) == 'boolean' OR length(trigger.data.rollup) != 32 OR !is_valid_address(trigger.data.rollup))
+						bounce('bad rollup');
+					$rollup = trigger.data.rollup;
+					$n = var[$rollup]['unit_count_' || $h];
+					if (!$h OR !$n) bounce('no height');
+					if (var[$rollup]['frozen_' || $h] OR timestamp >= (var[$rollup]['submitted_at_' || $h] otherwise 0) + 3600)
+						bounce('challenge not possible');
+					if (trigger.data.trace_root != var[$rollup]['trace_root_' || $h]
+						OR trigger.data.fills_root != var[$rollup]['fills_root_' || $h]
+						OR trigger.data.ops_root != var[$rollup]['ops_root_' || $h]
+						OR trigger.data.units_root != var[$rollup]['units_root_' || $h])
+						bounce('stale roots');
+					$k = trigger.data.k;
+					if (!is_integer($k) OR $k < 0 OR $k >= $n)
+						bounce('bad k');
+					$fill = trigger.data.fill;
+					if (typeof($fill) == 'boolean'
+						OR !is_valid_merkle_proof($fill, trigger.data.fill_proof)
+						OR trigger.data.fill_proof.root != trigger.data.fills_root)
+						bounce('bad fill proof');
+					$F = split($fill, ':');
+					if (array_length($F) != 13) bounce('bad fill');
+					if (!trigger.data.units_proof OR trigger.data.units_proof.index != $k
+						OR trigger.data.units_proof.root != trigger.data.units_root
+						OR !is_valid_merkle_proof($F[1], trigger.data.units_proof))
+						bounce('bad unit');
+					$pre_wit = trigger.data.pre_wit;
+					if ($k == 0){
+						if ($h == 1){
+							if ($pre_wit != 'Lhz6grA1wmy7va5jLOoHBRTri3c/YWqur2aOLwvo8Q0=') bounce('bad pre wit');
+						} else {
+							if ($pre_wit != var[$rollup]['wit_root_' || ($h - 1)]) bounce('bad pre wit');
+						}
+					} else {
+						if (!trigger.data.pre_proof OR trigger.data.pre_proof.index != $k - 1 OR trigger.data.pre_proof.root != trigger.data.trace_root
+							OR !is_valid_merkle_proof($pre_wit, trigger.data.pre_proof))
+							bounce('bad pre proof');
+					}
+					// Maker order fields must mirror the fill: maker order
+					// id, market, maker acct, opposite side to the taker,
+					// and fill price == maker price.
+					$ord = trigger.data.maker_ord;
+					if (typeof($ord) == 'boolean') bounce('bad maker ord');
+					$O = split($ord, ':');
+					$exp_side = ($F[11] == '0') ? '1' : '0';
+					if (array_length($O) != 10 OR $O[1] != $F[6] OR $O[2] != $F[7]
+						OR $O[3] != $exp_side OR $O[4] != $F[8]
+						OR $O[7] != $F[4]) bounce('bad maker ord');
+					// Non-membership over the order-ID PREFIX range
+					// [$lo,$hi): ';' sorts after ':' so every leaf
+					// ord:{id}:... is < $hi. Grinding remaining/seq cannot
+					// move the leaf out of the range; an honest book entry
+					// inside the range breaks every straddle. Fail-closed
+					// toward 'no fraud'. The after-max branch needs the
+					// pre-tree leaf count: exact (wit_count_(h-1)) when
+					// k==0, unavailable when k>0 (trace stores roots only)
+					// — then only adjacent and before-min apply.
+					$lo = 'ord:' || $F[6] || ':';
+					$hi = 'ord:' || $F[6] || ';';
+					$hit1 = trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+						AND trigger.data.left_proof.root == $pre_wit
+						AND trigger.data.right AND is_valid_merkle_proof(trigger.data.right, trigger.data.right_proof)
+						AND trigger.data.right_proof.root == $pre_wit
+						AND trigger.data.left_proof.index + 1 == trigger.data.right_proof.index
+						AND trigger.data.left < $lo AND $hi <= trigger.data.right;
+					$hit2 = trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+						AND trigger.data.left_proof.root == $pre_wit
+						AND trigger.data.left_proof.index == 0
+						AND $hi <= trigger.data.left;
+					$hit3 = ($k == 0 AND $h > 1) AND trigger.data.left AND is_valid_merkle_proof(trigger.data.left, trigger.data.left_proof)
+						AND trigger.data.left_proof.root == $pre_wit
+						AND trigger.data.left_proof.index == (var[$rollup]['wit_count_' || ($h - 1)] otherwise 0) - 1
+						AND trigger.data.left < $lo;
+					if (!$hit1 AND !$hit2 AND !$hit3) bounce('no fraud');
+					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
+				}",
+				messages: [
+					{
+						app: "payment",
+						payload: {
+							asset: "base",
+							outputs: [
+								{
+									address: "{trigger.data.rollup}",
+									amount: 10000
+								}
+							]
+						}
+					},
+					{
+						app: "data",
+						payload: {
+							verdict: "fraud",
+							height: "{trigger.data.height}",
+							challenger: "{trigger.address}"
+						}
+					},
+					{
+						app: "state",
+						state: "{
+							var['fraud_' || trigger.data.height] = trigger.address;
+						}"
+					}
+				]
+			},
+			{
+				// P-skip: a strictly better live order sat in pre_wit while
+				// the fill crossed a worse maker. Both orders prove member.
+				if: "{trigger.data.pred == 'skip'}",
+				init: "{
+					$h = trigger.data.height;
+					// The rollup address rides every challenge: this AA's
+					// address is hardcoded INTO the rollup (#13), so this
+					// definition must not hardcode the rollup back — mutual
+					// hardcoding is a chash cycle. State checks and the
+					// verdict payment use the same value, so a bogus address
+					// can only bounce here or deliver the verdict to itself.
+					if (typeof(trigger.data.rollup) == 'boolean' OR length(trigger.data.rollup) != 32 OR !is_valid_address(trigger.data.rollup))
+						bounce('bad rollup');
+					$rollup = trigger.data.rollup;
+					$n = var[$rollup]['unit_count_' || $h];
+					if (!$h OR !$n) bounce('no height');
+					if (var[$rollup]['frozen_' || $h] OR timestamp >= (var[$rollup]['submitted_at_' || $h] otherwise 0) + 3600)
+						bounce('challenge not possible');
+					if (trigger.data.trace_root != var[$rollup]['trace_root_' || $h]
+						OR trigger.data.fills_root != var[$rollup]['fills_root_' || $h]
+						OR trigger.data.ops_root != var[$rollup]['ops_root_' || $h]
+						OR trigger.data.units_root != var[$rollup]['units_root_' || $h])
+						bounce('stale roots');
+					$k = trigger.data.k;
+					if (!is_integer($k) OR $k < 0 OR $k >= $n)
+						bounce('bad k');
+					$fill = trigger.data.fill;
+					if (typeof($fill) == 'boolean'
+						OR !is_valid_merkle_proof($fill, trigger.data.fill_proof)
+						OR trigger.data.fill_proof.root != trigger.data.fills_root)
+						bounce('bad fill proof');
+					$F = split($fill, ':');
+					if (array_length($F) != 13) bounce('bad fill');
+					$side = $F[11];
+					if ($side != '0' AND $side != '1') bounce('bad fill');
+					if (!trigger.data.units_proof OR trigger.data.units_proof.index != $k
+						OR trigger.data.units_proof.root != trigger.data.units_root
+						OR !is_valid_merkle_proof($F[1], trigger.data.units_proof))
+						bounce('bad unit');
+					$pre_wit = trigger.data.pre_wit;
+					if ($k == 0){
+						if ($h == 1){
+							if ($pre_wit != 'Lhz6grA1wmy7va5jLOoHBRTri3c/YWqur2aOLwvo8Q0=') bounce('bad pre wit');
+						} else {
+							if ($pre_wit != var[$rollup]['wit_root_' || ($h - 1)]) bounce('bad pre wit');
+						}
+					} else {
+						if (!trigger.data.pre_proof OR trigger.data.pre_proof.index != $k - 1 OR trigger.data.pre_proof.root != trigger.data.trace_root
+							OR !is_valid_merkle_proof($pre_wit, trigger.data.pre_proof))
+							bounce('bad pre proof');
+					}
+					$maker_ord = trigger.data.maker_ord;
+					$better_ord = trigger.data.better_ord;
+					if (typeof($maker_ord) == 'boolean' OR typeof($better_ord) == 'boolean'
+						OR !is_valid_merkle_proof($maker_ord, trigger.data.maker_proof)
+						OR trigger.data.maker_proof.root != $pre_wit
+						OR !is_valid_merkle_proof($better_ord, trigger.data.better_proof)
+						OR trigger.data.better_proof.root != $pre_wit)
+						bounce('bad ord proof');
+					$MO = split($maker_ord, ':');
+					$BO = split($better_ord, ':');
+					if (array_length($MO) != 10 OR array_length($BO) != 10) bounce('bad ord');
+					if ($MO[2] != $F[7] OR $BO[2] != $F[7]) bounce('no fraud');
+					// Ordinal fields arrive as strings; Oscript forbids
+					// ordered comparison on strings (fatal, not false), so
+					// coerce via +0 (numeric strings -> Decimal) first.
+					$mo_price = $MO[4] + 0;
+					$mo_seq = $MO[5] + 0;
+					$bo_price = $BO[4] + 0;
+					$bo_seq = $BO[5] + 0;
+					$bo_rem = $BO[6] + 0;
+					$fill_price = $F[8] + 0;
+					if ($MO[1] != $F[6] OR $bo_rem <= 0) bounce('no fraud');
+					$bid_better = ($side == '0') AND $BO[3] == '1'
+						AND ($bo_price < $mo_price OR ($bo_price == $mo_price AND $bo_seq < $mo_seq))
+						AND !($bo_price > $fill_price);
+					$ask_better = ($side == '1') AND $BO[3] == '0'
+						AND ($bo_price > $mo_price OR ($bo_price == $mo_price AND $bo_seq < $mo_seq))
+						AND !($bo_price < $fill_price);
+					if (!$bid_better AND !$ask_better) bounce('no fraud');
+					if (trigger.output[[asset=base]] < 20000) bounce('need fee');
+				}",
+				messages: [
+					{
+						app: "payment",
+						payload: {
+							asset: "base",
+							outputs: [
+								{
+									address: "{trigger.data.rollup}",
 									amount: 10000
 								}
 							]
@@ -255,6 +642,7 @@
 					}
 				]
 			}
+
 		]
 	}
 }

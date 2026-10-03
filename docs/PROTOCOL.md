@@ -296,7 +296,8 @@ withdraw     vault：leaf_account==trigger.address；
              amount + wd_<addr> ≤ min(collateral, withdrawn)；
              leaf = sha256('acct:'+address+':'+collateral+':'+perp+':'+withdrawn,'hex')
              reduce(...,16,...) == substring(aa_forest_h, shard*64, 64)
-             → 支付并累加 wd_/wp_
+             → 支付抵押品并累加 wd_（PERP 领取一律 bounce
+             'perp claim needs burn'，见 MECHANISMS 10.5 / #12）
 
 force(id)    rollup：{force, unit_id 64hex} → inbox_<id>=timestamp；
              主张必须把 inbox_upto 之前的 id 全收进 units_set_root，
@@ -329,7 +330,7 @@ Oscript 实现细节（踩过的坑）：
 | 伪造成交/假根 | 双 Merkle 根 + validate_against 重放 + 一枪谓词（含 fill_math/ghost/skip） |
 | 偷 AA 资金 | 提款只认 finalized 森林的 Merkle 证明；leaf 绑定地址；wd_/wp_ 防重放 |
 | 付钱杀根 | 已删除：challenge 无 case；假证明 bounce `no fraud` |
-| 审查 | rollup inbox `{force}` + P-omit |
+| 审查 | rollup inbox `{force}` 钉时间戳；P-omit 按 #23 禁用（force 无法证明单元存在，恒 bounce） |
 | 存款自铸 | deposits_allowed 白名单 + replay 交叉注入 + evidence 绑定 `OPERP_VAULT_AA` |
 | 溢出 DoS / 签名延展 / 乱序 | 入口 checked-mul / verify_strict / orphan 缓冲 |
 

@@ -254,10 +254,13 @@ cd obyte-local && node post_batch.js
 7. ~~**在任 operator 免费重启稳定计时器。**~~ **已关闭**：单候选组合单元，
    后续 submit bounce `height taken`。欺诈成立才重开。
 8. AA 未做正式安全审计。各 AA 每 formula 复杂度须 ≤100、Σops ≤2000
-   （fill AA 实测：max 21、ops 1513）。探针：
+   （dispute 实测 max 20、ops 1868——ghost/skip 已从 fill AA 迁入；
+   fill 实测 max 38、ops 1610）。探针：
    `cd obyte-local && node tools/check_aa_complexity.js agents/*.aa`。
-9. **重放去重窗口 2048**（`REPLAY_ACTIVATION_HEIGHT = 0`）。窗口外重复操作
-   逃过侧链去重；AA 侧 `wd_`/`wp_` 仍封顶。
+9. **重放去重窗口 2048**（`REPLAY_ACTIVATION_HEIGHT = 0`）。窗口外重复的
+   提款/GovWithdraw 可重新执行（AA 侧 `wd_`/`wp_` 仍封顶），但存款锚点
+   被永久作废（`consumed_deposits`，计入 `state_root`）——同一笔付款
+   不可能二次入账。
 10. AA 强制 `amount + wd_ <= min(collateral, withdrawn)`，且叶子数字字段
     上限为 15 位十进制（< 2^53）。
 11. 单账户分片证明生成必须先注册 PAD 诱饵绑定，否则

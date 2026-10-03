@@ -461,13 +461,13 @@ impl SigVerifier {
     /// Same contract as [`verify_sig_by_id`] with decompression cached.
     pub fn verify_by_id(&mut self, unit: &Unit, id: &UnitId) -> bool {
         let vk = match self.cache.get(&unit.pubkey) {
-            Some(cached) => cached.clone(),
+            Some(cached) => *cached,
             None => {
                 let parsed = VerifyingKey::from_bytes(&unit.pubkey).ok();
                 if self.cache.len() >= Self::CAP {
                     self.cache.clear();
                 }
-                self.cache.insert(unit.pubkey, parsed.clone());
+                self.cache.insert(unit.pubkey, parsed);
                 parsed
             }
         };
@@ -535,6 +535,12 @@ pub struct Dag {
 /// Max buffered orphan units. Beyond this the orphan with the smallest
 /// UnitId is dropped.
 const ORPHAN_CAP: usize = 4096;
+
+impl Default for Dag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Dag {
     pub fn new() -> Self {
@@ -604,10 +610,8 @@ impl Dag {
         // Deposit/GovDeposit with an oversized withdrawal addr must be
         // rejected on every path, including the orphan buffer.
         match &unit.op {
-            Op::Deposit { addr, .. } | Op::GovDeposit { addr, .. } => {
-                if addr.len() > MAX_ADDR_LEN {
-                    return Err(DagError::AddrTooLong);
-                }
+            Op::Deposit { addr, .. } | Op::GovDeposit { addr, .. } if addr.len() > MAX_ADDR_LEN => {
+                return Err(DagError::AddrTooLong);
             }
             _ => {}
         }
@@ -833,7 +837,7 @@ mod tests {
             Op::Deposit {
                 account,
                 addr: test_addr(aa),
-                amount: 1 * USD_SCALE as i128,
+                amount: USD_SCALE as i128,
                 aa_unit: [aa; 32],
             },
             secret,
@@ -857,9 +861,9 @@ mod tests {
         assert_eq!(dag2.ready_linearized(), expect);
         // Same total set either way.
         let mut s1 = expect.clone();
-        s1.sort_by(|a, b| a.0.cmp(&b.0));
+        s1.sort_by_key(|a| a.0);
         let mut s2 = vec![unit_id(&u1), unit_id(&u2)];
-        s2.sort_by(|a, b| a.0.cmp(&b.0));
+        s2.sort_by_key(|a| a.0);
         assert_eq!(s1, s2);
     }
 

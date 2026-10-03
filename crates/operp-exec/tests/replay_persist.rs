@@ -151,7 +151,7 @@ fn commit_step(eng: &mut Engine, i: u32) {
     Batch::from_applied(&prev, eng, &[id]).unwrap();
 }
 
-fn rejected<'a>(evs: &'a [ExecEvent]) -> Option<&'a RejectReason> {
+fn rejected(evs: &[ExecEvent]) -> Option<&RejectReason> {
     evs.iter().find_map(|e| match e {
         ExecEvent::Rejected { reason, .. } => Some(reason),
         _ => None,
@@ -235,8 +235,7 @@ fn gov_nonce_watermark_survives_restart_without_snapshot() {
     let evs = eng.ingest(w).unwrap();
     assert!(
         evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
-        "gov_with nonce=5 must apply, got {:?}",
-        evs
+        "gov_with nonce=5 must apply, got {evs:?}"
     );
     operp_settle::Batch::from_applied(&prev, &mut eng, &[wid]).unwrap();
 
@@ -263,16 +262,14 @@ fn gov_nonce_watermark_survives_restart_without_snapshot() {
     let evs = eng2.ingest(gov_dep(vec![g], &alice, 500, 8)).unwrap();
     assert!(
         evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
-        "refund must apply, got {:?}",
-        evs
+        "refund must apply, got {evs:?}"
     );
     let w6 = gov_with(vec![g], &alice, 50, 6);
     let prev3 = eng2.state.clone();
     let evs = eng2.ingest(w6.clone()).unwrap();
     assert!(
         evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
-        "higher nonce must apply, got {:?}",
-        evs
+        "higher nonce must apply, got {evs:?}"
     );
     operp_settle::Batch::from_applied(&prev3, &mut eng2, &[unit_id(&w6)]).unwrap();
     // ...and survives yet another restart.
@@ -470,9 +467,10 @@ fn restart_midstream_recovered_via_validate_against_no_double_apply() {
 /// H2 regression: a validation replay that FAILS must not persist the batch's
 /// gov-withdraw nonces. The batch is produced (and committed) on the producer
 /// engine, then validated against a cloned validator with its own store dir;
-/// validation ingests the GovWithdraw (buffering nonce 5) but fails on a
-/// tampered fills hash. A restart of the validator must boot WITHOUT nonce 5 —
-/// no burning nonces from batches that never committed on this node.
+/// validation runs on a scratch clone (#14), fails on a tampered fills hash
+/// and leaves the caller untouched. A restart of the validator must boot
+/// WITHOUT nonce 5 — no burning nonces from batches that never committed on
+/// this node.
 #[test]
 fn failed_validate_against_does_not_persist_gov_nonce() {
     use operp_settle::SettleError;
@@ -508,12 +506,14 @@ fn failed_validate_against_does_not_persist_gov_nonce() {
         .unwrap_err();
     assert!(matches!(err, SettleError::FillsMismatch), "got {err:?}");
 
-    // The validator replay advanced its in-memory watermark...
+    // #14: validation ran on a scratch clone — the failed replay must not
+    // advance the CALLER's watermark (the pre-#14 behavior mutated it).
     assert_eq!(
         validator.state.seen_gov_nonces.get(&alice).copied(),
-        Some(5)
+        None,
+        "failed validation must leave the caller's watermark untouched"
     );
-    // ...but restart rebuilds from snapshot + journal: nonce 5 must be GONE.
+    // ...and restart rebuilds from snapshot + journal: nonce 5 stays GONE.
     let eng3 = Engine::load_or_genesis(&validator_dir).unwrap();
     assert_eq!(
         eng3.state.seen_gov_nonces.get(&alice).copied(),

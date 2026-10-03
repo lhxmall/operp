@@ -8,7 +8,7 @@
 //! rollup's `submitted_at` for staleness comparison.
 
 use operp_exec::Engine;
-use operp_settle::{fills_element, ops_element, Batch};
+use operp_settle::{ops_element, Batch};
 use operp_state::obyte_merkle;
 
 /// A fraud proof ready for `post_challenge.js --pred PRED --proof PATH`.
@@ -60,10 +60,10 @@ pub fn build_proof(
         }
     }
     // 2+. Walk units: ingest one at a time, compare wit root + ops string.
-    for k in 0..n {
+    for (k, unit_hex) in unit_hexes.iter().enumerate() {
         let pre_leaves = operp_state::wit_leaves(&replay.state);
         let pre_wit = obyte_merkle::root(&pre_leaves);
-        let expected_op = ops_element(&unit_hexes[k], &batch.units[k].op);
+        let expected_op = ops_element(unit_hex, &batch.units[k].op);
         let op_ok = batch.ops.get(k).map(|o| o == &expected_op).unwrap_or(false);
         let wit_ok = batch.trace.get(k).map(|t| t == &pre_wit).unwrap_or(false);
         if !op_ok || !wit_ok {
@@ -77,16 +77,16 @@ pub fn build_proof(
         let post_leaves = operp_state::wit_leaves(&replay.state);
         let op = batch.ops.get(k)?.clone();
         if op.starts_with("d:") || op.starts_with("D:") {
-            if let Some(p) = deposit_proof(batch, k, &op, &pre_leaves, &post_leaves, true) {
+            if let Some(p) = deposit_proof(batch, k, &op, &pre_leaves, true) {
                 return Some(p);
             }
         } else if op.starts_with("w:") || op.starts_with("W:") {
-            if let Some(p) = deposit_proof(batch, k, &op, &pre_leaves, &post_leaves, false) {
+            if let Some(p) = deposit_proof(batch, k, &op, &pre_leaves, false) {
                 return Some(p);
             }
         } else {
             // Fill-bearing unit: check fills of this unit against post state.
-            if let Some(p) = fill_proof(batch, k, &unit_hexes[k], &pre_leaves, &post_leaves) {
+            if let Some(p) = fill_proof(batch, k, unit_hex, &pre_leaves, &post_leaves) {
                 return Some(p);
             }
         }
@@ -119,7 +119,6 @@ fn deposit_proof(
     k: usize,
     op: &str,
     pre_leaves: &[String],
-    post_leaves: &[String],
     is_deposit: bool,
 ) -> Option<BuiltProof> {
     // Parse op: d:{acct}:{amount} (3 parts) or w:{acct}:{amount}:{nonce}.
@@ -133,7 +132,7 @@ fn deposit_proof(
     // pre_absent non-membership geometry over the sorted pre leaves.
     let pre_hit = pre_leaves
         .iter()
-        .find(|l| l.starts_with(&format!("acct:{}:", acct_hex)))
+        .find(|l| l.starts_with(&format!("acct:{acct_hex}:")))
         .cloned();
     let (pre_col, pre_absent_fields): (i128, serde_json::Value) = match pre_hit.clone() {
         Some(pre_leaf) => {
@@ -143,7 +142,7 @@ fn deposit_proof(
         None => {
             let mut sorted = pre_leaves.to_vec();
             sorted.sort();
-            let ghost_key = format!("acct:{}:", acct_hex);
+            let ghost_key = format!("acct:{acct_hex}:");
             let pos = sorted
                 .iter()
                 .position(|s| s.as_str() > ghost_key.as_str())
@@ -182,7 +181,7 @@ fn deposit_proof(
     let posted_post: Vec<String> = batch.leaf_trace.get(k)?.clone();
     let liar_leaf = posted_post
         .iter()
-        .find(|l| l.starts_with(&format!("acct:{}:", acct_hex)))?
+        .find(|l| l.starts_with(&format!("acct:{acct_hex}:")))?
         .clone();
     let liar_col: i128 = liar_leaf.split(':').nth(2)?.parse().ok()?;
     if liar_col == expected {
@@ -263,6 +262,165 @@ fn omit_proof(batch: &Batch, unit_hexes: &[String], id: &str) -> Option<BuiltPro
     })
 }
 
+/// First pair (i, i+1) straddling [lo, hi): everything between the two
+/// adjacent leaves is outside the range — the AA's pe1/ps1 geometry.
+/// `allow_last` enables the final-tree-only branch (AA: k+1==n plus the
+/// committed wit_count), where only a left neighbor below the range exists.
+fn range_straddle(
+    tree: &[String],
+    lo: &str,
+    hi: &str,
+    allow_last: bool,
+) -> Option<(usize, Option<usize>)> {
+    if let Some(i) = tree
+        .windows(2)
+        .position(|w| w[0].as_str() < lo && hi <= w[1].as_str())
+    {
+        return Some((i, Some(i + 1)));
+    }
+    if let Some(first) = tree.first() {
+        if first.as_str() >= hi {
+            return Some((0, None));
+        }
+    }
+    if allow_last {
+        if let Some(last) = tree.last() {
+            if last.as_str() < lo {
+                return Some((tree.len() - 1, None));
+            }
+        }
+    }
+    None
+}
+
+fn acct_pos_range(
+    tree: &[String],
+    acct_hex: &str,
+    allow_last: bool,
+) -> Option<(usize, Option<usize>)> {
+    range_straddle(
+        tree,
+        &format!("pos:{acct_hex}:"),
+        &format!("pos:{acct_hex};"),
+        allow_last,
+    )
+}
+
+fn mkt_pos_range(
+    tree: &[String],
+    acct_hex: &str,
+    market: &str,
+    allow_last: bool,
+) -> Option<(usize, Option<usize>)> {
+    range_straddle(
+        tree,
+        &format!("pos:{acct_hex}:{market}:"),
+        &format!("pos:{acct_hex}:{market};"),
+        allow_last,
+    )
+}
+
+/// Mirror of the fill-math AA's per-leg verdict for one candidate tree
+/// (honest replay or committed post): true = the AA would reach the fee
+/// gate (verdict) on this tree. Callers emit only when the honest tree is
+/// silent AND the committed tree fires — no false positives on replay.
+#[allow(clippy::too_many_arguments)]
+fn aa_fill_verdict(
+    tree: &[String],
+    acct_hex: &str,
+    market: &str,
+    exp_qty: i64,
+    exp_entry: i64,
+    exp_fill: i128,
+    exp_absent: bool,
+    dir_only: bool,
+    kind: u8,
+    who_taker: bool,
+    keeper: Option<&(String, i128, i128)>,
+    allow_last: bool,
+) -> bool {
+    // Missing post acct leaf bounces the AA prelude — no verdict at all.
+    let post_col: i128 = match tree
+        .iter()
+        .find(|l| l.starts_with(&format!("acct:{acct_hex}:")))
+        .and_then(|l| l.split(':').nth(2))
+        .and_then(|c| c.parse().ok())
+    {
+        Some(c) => c,
+        None => return false,
+    };
+    // Position leg.
+    let pos_leaf = tree.iter().find(|l| {
+        l.starts_with("pos:") && {
+            let o: Vec<&str> = l.split(':').collect();
+            o.len() == 7 && o[1] == acct_hex && o[2] == market
+        }
+    });
+    let (pos_ok, pos_bail) = if exp_absent {
+        if pos_leaf.is_some() {
+            (false, false) // surviving leaf where the engine removed it
+        } else if acct_pos_range(tree, acct_hex, allow_last).is_some() {
+            (true, false)
+        } else {
+            match mkt_pos_range(tree, acct_hex, market, allow_last) {
+                Some(_) => (true, false),
+                None => (false, true),
+            }
+        }
+    } else {
+        match pos_leaf {
+            Some(p) => {
+                let o: Vec<&str> = p.split(':').collect();
+                let ok = o[3].parse::<i64>().ok() == Some(exp_qty)
+                    && o[4]
+                        .parse::<i64>()
+                        .map(|e| (e - exp_entry).abs() <= 1)
+                        .unwrap_or(false);
+                (ok, false)
+            }
+            None => (false, true),
+        }
+    };
+    // Collateral leg.
+    let acct_empty = acct_pos_range(tree, acct_hex, allow_last).is_some();
+    let (col_ok, col_bail) = if kind == 3 && who_taker {
+        if !acct_empty {
+            (false, true)
+        } else {
+            match keeper {
+                Some((kh, kpre, reward)) => {
+                    let kcol: Option<i128> = tree
+                        .iter()
+                        .find(|l| l.starts_with(&format!("acct:{kh}:")))
+                        .and_then(|l| l.split(':').nth(2))
+                        .and_then(|c| c.parse().ok());
+                    match kcol {
+                        Some(kcol) => {
+                            let bal = exp_fill.max(0);
+                            let pay = (*reward).min(bal);
+                            (post_col == bal - pay && kcol == *kpre + pay, false)
+                        }
+                        None => (false, true), // AA: missing keeper proof bails
+                    }
+                }
+                None => (false, true),
+            }
+        }
+    } else if dir_only {
+        (post_col >= exp_fill, false)
+    } else if acct_empty {
+        (post_col == exp_fill.max(0), false)
+    } else {
+        (post_col >= exp_fill, false)
+    };
+    // Verdict only when a leg is verified wrong; a bail silences its own
+    // leg (mirrors the AA's $fraud term).
+    if !pos_bail && !pos_ok {
+        return true;
+    }
+    !col_bail && !col_ok
+}
+
 fn fill_proof(
     batch: &Batch,
     k: usize,
@@ -271,7 +429,7 @@ fn fill_proof(
     post_leaves: &[String],
 ) -> Option<BuiltProof> {
     // Reconstruct this unit's fills from the batch fills list (prefix match).
-    let prefix = format!("f:{}:", unit_hex);
+    let prefix = format!("f:{unit_hex}:");
     let unit_fills: Vec<&String> = batch
         .fills
         .iter()
@@ -280,10 +438,17 @@ fn fill_proof(
     if unit_fills.is_empty() {
         return None;
     }
+    let unit_hexes: Vec<String> = batch
+        .checkpoint
+        .unit_ids
+        .iter()
+        .map(|id| hex::encode(id.0))
+        .collect();
+
     // Ghost: maker ord leaf absent from pre leaves.
     for f in &unit_fills {
         let parts: Vec<&str> = f.split(':').collect();
-        if parts.len() != 12 {
+        if parts.len() != 13 {
             continue;
         }
         let maker_hex = parts[4].to_string();
@@ -296,7 +461,7 @@ fn fill_proof(
         // Prefix-range ghost: fraud iff NO pre leaf carries this order id.
         // Any same-id leaf sits inside [$lo,$hi) and breaks every AA
         // straddle, so only emit then.
-        let ord_prefix = format!("ord:{}:", maker_order_hex);
+        let ord_prefix = format!("ord:{maker_order_hex}:");
         let ghost_hit = !pre_leaves.iter().any(|l| l.starts_with(&ord_prefix));
         if ghost_hit {
             let idx = index_of(&batch.fills, f)?;
@@ -304,9 +469,11 @@ fn fill_proof(
                 "trace_root": batch.checkpoint.trace_root,
                 "fills_root": batch.checkpoint.fills_root,
                 "ops_root": batch.checkpoint.ops_root,
+                "units_root": batch.checkpoint.units_root,
                 "k": k,
                 "fill": f,
                 "fill_proof": proof_json(&batch.fills, idx),
+                "units_proof": proof_json(&unit_hexes, k),
             });
             // Non-membership neighbors for the [$lo,$hi) range: reuse omit
             // geometry over the pre wit leaves with wit_count bound.
@@ -320,8 +487,16 @@ fn fill_proof(
             obj.insert(
                 "maker_ord".into(),
                 format!(
-                    "ord:{}:{}:{}:{}:{}:{}:{}",
-                    maker_order_hex, market, opp_side, fill_price, fill_seq, fill_qty, maker_hex
+                    "ord:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                    maker_order_hex,
+                    market,
+                    opp_side,
+                    fill_price,
+                    fill_seq,
+                    fill_qty,
+                    maker_hex,
+                    0,
+                    0
                 )
                 .into(),
             );
@@ -346,7 +521,7 @@ fn fill_proof(
             }
             return Some(BuiltProof {
                 pred: "ghost".into(),
-                fill_aa: true,
+                fill_aa: false,
                 data,
             });
         }
@@ -354,7 +529,7 @@ fn fill_proof(
     // Skip: another live order strictly better than the filled maker.
     for f in &unit_fills {
         let parts: Vec<&str> = f.split(':').collect();
-        if parts.len() != 12 {
+        if parts.len() != 13 {
             continue;
         }
         let maker_order_hex = parts[6].to_string();
@@ -366,19 +541,19 @@ fn fill_proof(
             .find(|l| {
                 l.starts_with("ord:") && {
                     let o: Vec<&str> = l.split(':').collect();
-                    o.len() == 8 && o[1] == maker_order_hex && o[2] == market
+                    o.len() == 10 && o[1] == maker_order_hex && o[2] == market
                 }
             })?
             .clone();
         let mo: Vec<&str> = maker_ord.split(':').collect();
-        let (mo_side, mo_price, mo_seq): (u8, i64, u64) = (
+        let (_mo_side, mo_price, mo_seq): (u8, i64, u64) = (
             mo[3].parse().ok()?,
             mo[4].parse().ok()?,
             mo[5].parse().ok()?,
         );
         for cand in pre_leaves.iter().filter(|l| l.starts_with("ord:")) {
             let o: Vec<&str> = cand.split(':').collect();
-            if o.len() != 8 || o[2] != market {
+            if o.len() != 10 || o[2] != market {
                 continue;
             }
             if o[1] == maker_order_hex {
@@ -410,9 +585,11 @@ fn fill_proof(
                     "trace_root": batch.checkpoint.trace_root,
                     "fills_root": batch.checkpoint.fills_root,
                     "ops_root": batch.checkpoint.ops_root,
+                    "units_root": batch.checkpoint.units_root,
                     "k": k,
                     "fill": f,
                     "fill_proof": proof_json(&batch.fills, idx),
+                    "units_proof": proof_json(&unit_hexes, k),
                     "maker_ord": maker_ord,
                     "better_ord": cand,
                 });
@@ -433,21 +610,52 @@ fn fill_proof(
                 });
                 return Some(BuiltProof {
                     pred: "skip".into(),
-                    fill_aa: true,
+                    fill_aa: false,
                     data,
                 });
             }
         }
     }
-    // fill_math (taker + maker, full apply_fill): expected post col/qty/entry
-    // per side from the pre leaves; the first posted-leg mismatch becomes
-    // the proof. No insurance clamp is modeled: when the honest replay legs
-    // themselves diverge from the no-clamp expectation, the side is skipped
-    // (unprovable, watcher stays silent).
+    // fill_math: mirror the AA's collateral identity — kind fee/pnl,
+    // isolated release, maker pro-rata refund, keeper seize, clamp regime —
+    // and emit only when the AA would verdict on the posted legs while
+    // staying silent on the honest replay.
+    let liquidate_caller: Option<String> = match batch.units.get(k)?.op {
+        operp_dag::Op::Liquidate { caller, .. } => Some(hex::encode(caller.0)),
+        _ => None,
+    };
     for f in &unit_fills {
         let parts: Vec<&str> = f.split(':').collect();
-        if parts.len() != 12 {
+        if parts.len() != 13 {
             continue;
+        }
+        // Single-fill completeness: idx 0 plus a right neighbor outside
+        // this unit's prefix (the AA requires the same); trailing fills
+        // have no neighbor and are unprovable on both sides.
+        let in_unit_idx: usize = match parts[2].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if in_unit_idx != 0 {
+            continue;
+        }
+        let gidx = match index_of(&batch.fills, f) {
+            Some(i) => i,
+            None => continue,
+        };
+        let right = match batch.fills.get(gidx + 1) {
+            Some(r) => r,
+            None => continue,
+        };
+        if right.starts_with(&prefix) {
+            continue;
+        }
+        let kind: i64 = match parts[12].parse() {
+            Ok(v) if (0..=3).contains(&v) => v,
+            _ => continue,
+        };
+        if kind == 2 {
+            continue; // AA bails on ADL fills (top-up/haircut unmodelable)
         }
         let taker_hex = parts[3].to_string();
         let maker_hex = parts[4].to_string();
@@ -467,7 +675,7 @@ fn fill_proof(
         let maker_side = if taker_side == "0" { "1" } else { "0" };
         let pre_meta = match pre_leaves
             .iter()
-            .find(|l| l.starts_with(&format!("meta:{}:", market)))
+            .find(|l| l.starts_with(&format!("meta:{market}:")))
         {
             Some(m) => m.clone(),
             None => continue,
@@ -476,24 +684,46 @@ fn fill_proof(
         if mparts.len() != 11 {
             continue;
         }
-        let fee_bps: u128 = match mparts[5].parse() {
+        let fee_bps: i128 = match mparts[5].parse() {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let notional =
-            qty as u128 * (price as i128).abs() as u128 / 100_000_000 * 1_000_000 / 100_000_000;
-        let fee = (notional * fee_bps / 10_000) as i128;
+        let keeper_bps: i128 = match mparts[6].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let usd: i128 = match mparts[9].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Kind fee, mirroring the engine's i128 trunc chains: funding
+        // markets price off the multiplier, regular ones off the price.
+        let (fee, price_notional): (i128, i128) = if kind == 1 {
+            let fnot = i128::from(qty) * usd * 1_000_000 / 100_000_000;
+            (fnot * fee_bps / 10_000, 0)
+        } else {
+            let t1 = i128::from(qty) * i128::from(price) / 100_000_000;
+            let t2 = t1 * 1_000_000 / 100_000_000;
+            (t2.abs() * fee_bps / 10_000, t2)
+        };
+        let reward = price_notional.abs() * keeper_bps / 10_000;
         // Posted post legs: the commitments the AA checks proofs against.
         let posted_post: Vec<String> = batch
             .leaf_trace
             .get(k)
             .cloned()
             .unwrap_or_else(|| post_leaves.to_vec());
+        let allow_last =
+            k + 1 == batch.units.len() && posted_post.len() == batch.checkpoint.wit_count as usize;
         let sides = [
             ("taker", taker_hex.as_str(), taker_side),
             ("maker", maker_hex.as_str(), maker_side),
         ];
         for (who, acct_hex, side_acct) in sides {
+            if acct_hex == "0000000000000000000000000000000000000000000000000000000000000000" {
+                continue; // AA bails on the insurance account's own leaf
+            }
+            let who_taker = who == "taker";
             let delta: i64 = if side_acct == "0" {
                 qty as i64
             } else {
@@ -501,7 +731,7 @@ fn fill_proof(
             };
             let pre_acct = match pre_leaves
                 .iter()
-                .find(|l| l.starts_with(&format!("acct:{}:", acct_hex)))
+                .find(|l| l.starts_with(&format!("acct:{acct_hex}:")))
             {
                 Some(a) => a.clone(),
                 None => continue,
@@ -519,26 +749,41 @@ fn fill_proof(
                 .find(|l| {
                     l.starts_with("pos:") && {
                         let o: Vec<&str> = l.split(':').collect();
-                        o.len() == 5 && o[1] == acct_hex && o[2] == market
+                        o.len() == 7 && o[1] == acct_hex && o[2] == market
                     }
                 })
                 .cloned();
             let pos_absent = pre_pos_opt.is_none();
-            let (old_qty, old_entry): (i64, i64) = match &pre_pos_opt {
-                None => (0, 0),
+            let (old_qty, old_entry, iso, bucket): (i64, i64, bool, i128) = match &pre_pos_opt {
+                None => (0, 0, false, 0),
                 Some(p) => {
                     let o: Vec<&str> = p.split(':').collect();
-                    match (o[3].parse(), o[4].parse()) {
-                        (Ok(q), Ok(e)) => (q, e),
+                    match (o[3].parse(), o[4].parse(), o[6].parse()) {
+                        (Ok(q), Ok(e), Ok(b)) => (q, e, o[5] == "1", b),
                         _ => continue,
                     }
                 }
             };
-            // Expected legs: Account::apply_fill + taker fee, no clamp.
-            let abs_old = old_qty.abs() as i128;
-            let abs_delta = delta.abs() as i128;
+            // The AA requires the maker's PRE ord leaf whenever the maker
+            // position is isolated (pro-rata escrow refund identity).
+            let maker_ord = if !who_taker && iso {
+                pre_leaves
+                    .iter()
+                    .find(|l| l.starts_with(&format!("ord:{}:", parts[6])))
+                    .cloned()
+            } else {
+                None
+            };
+            if !who_taker && iso && maker_ord.is_none() {
+                continue;
+            }
+            let tfee = if who_taker { fee } else { 0 };
+            // Fill-stage collateral by kind: pre + release + pnl - taker fee
+            // (+ maker pro-rata refund). Exact — the AA recomputes it.
+            let abs_old = old_qty.unsigned_abs() as i128;
+            let abs_delta = delta.unsigned_abs() as i128;
             let same = old_qty == 0 || (old_qty > 0 && delta > 0) || (old_qty < 0 && delta < 0);
-            let (exp_qty, exp_entry, exp_col, exp_pos_absent) = if same {
+            let (exp_qty, exp_entry, exp_fill, exp_absent, dir_only) = if same {
                 let eq = old_qty + delta;
                 let ee = if old_qty == 0 {
                     price
@@ -546,149 +791,170 @@ fn fill_proof(
                     ((abs_old * i128::from(old_entry) + i128::from(qty) * i128::from(price))
                         / (abs_old + i128::from(qty))) as i64
                 };
-                let ec = if who == "taker" {
-                    old_col - fee
-                } else {
-                    old_col
-                };
-                (eq, ee, ec, false)
+                let ec = if who_taker { old_col - tfee } else { old_col };
+                (eq, ee, ec, false, false)
             } else {
                 let close = abs_old.min(abs_delta);
-                let signed: i128 = if old_qty > 0 {
-                    price as i128 - old_entry as i128
+                // Isolated release: engine releases bucket*close/old (whole
+                // bucket on full close) before PnL settles.
+                let release = if iso {
+                    if close == abs_old {
+                        bucket
+                    } else {
+                        bucket * close / abs_old
+                    }
                 } else {
-                    old_entry as i128 - price as i128
+                    0
                 };
-                let pnl = signed * close * 1_000_000 / 100_000_000 / 100_000_000;
-                let ec = if who == "taker" {
-                    old_col + pnl - fee
+                // kind 1 = funding rate cash (rate diff UNCLAMPED, matching
+                // engine apply_fill); kind 0/3 = price-diff realize. Both
+                // truncate toward zero at each division like Rust i128.
+                let pnl: i128 = if kind == 1 {
+                    let bpp = (price - 10_000_000_000_000) / 10_000;
+                    let bpe = (old_entry - 10_000_000_000_000) / 10_000;
+                    let sq: i128 = if old_qty > 0 { close } else { -close };
+                    let x = sq * i128::from(bpp - bpe) * usd * 1_000_000;
+                    let c1 = x / 100_000_000;
+                    c1 / 10_000
                 } else {
-                    old_col + pnl
+                    let signed: i128 = if old_qty > 0 {
+                        price as i128 - old_entry as i128
+                    } else {
+                        old_entry as i128 - price as i128
+                    };
+                    let pr = signed * close * 1_000_000;
+                    let q1 = pr / 100_000_000;
+                    q1 / 100_000_000
                 };
                 let leftover = abs_old - close;
                 let open = abs_delta - close;
+                // Maker escrow returns only when the fill produces no new
+                // open qty (flip fills escrow the post into the bucket).
+                let mpost = if !who_taker && (leftover > 0 || open == 0) {
+                    match maker_ord.as_ref().map(|l| l.split(':').collect::<Vec<_>>()) {
+                        Some(o) if o.len() == 10 => {
+                            let ml: i128 = o[9].parse().unwrap_or(0);
+                            let rem: i128 = o[6].parse().unwrap_or(0);
+                            if rem <= 0 {
+                                0
+                            } else if i128::from(qty) >= rem {
+                                ml
+                            } else {
+                                ml * i128::from(qty) / rem
+                            }
+                        }
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                let ec = if who_taker {
+                    old_col + release + pnl - tfee
+                } else {
+                    old_col + release + pnl + mpost
+                };
                 if leftover == 0 && open == 0 {
-                    (0, 0, ec, true)
-                } else if leftover == 0 {
-                    (
+                    (0, 0, ec, true, false)
+                } else {
+                    let q = if leftover == 0 {
                         if delta > 0 {
                             open as i64
                         } else {
                             -(open as i64)
-                        },
-                        price,
-                        ec,
-                        false,
-                    )
-                } else {
-                    (
-                        if old_qty > 0 {
-                            leftover as i64
-                        } else {
-                            -(leftover as i64)
-                        },
-                        old_entry,
-                        ec,
-                        false,
-                    )
-                }
-            };
-            // Clamp guard: the honest replay legs must match the no-clamp
-            // expectation, else this side is unprovable (skip it).
-            let replay_ok = match post_leaves
-                .iter()
-                .find(|l| l.starts_with(&format!("acct:{}:", acct_hex)))
-            {
-                Some(a) => {
-                    let c: i128 = match a.split(':').nth(2).unwrap_or("").parse() {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    if c != exp_col {
-                        false
-                    } else if exp_pos_absent {
-                        !post_leaves.iter().any(|l| {
-                            l.starts_with("pos:") && {
-                                let o: Vec<&str> = l.split(':').collect();
-                                o.len() == 5 && o[1] == acct_hex && o[2] == market
-                            }
-                        })
-                    } else {
-                        match post_leaves.iter().find(|l| {
-                            l.starts_with("pos:") && {
-                                let o: Vec<&str> = l.split(':').collect();
-                                o.len() == 5 && o[1] == acct_hex && o[2] == market
-                            }
-                        }) {
-                            Some(p) => {
-                                let o: Vec<&str> = p.split(':').collect();
-                                o[3].parse::<i64>().ok() == Some(exp_qty)
-                                    && o[4].parse::<i64>().ok() == Some(exp_entry)
-                            }
-                            None => false,
                         }
-                    }
+                    } else if old_qty > 0 {
+                        leftover as i64
+                    } else {
+                        -(leftover as i64)
+                    };
+                    let e = if leftover == 0 { price } else { old_entry };
+                    // Isolated taker reduces may return pro-rata escrow the
+                    // fill string cannot describe — direction check only.
+                    let d = who_taker && iso;
+                    (q, e, ec, false, d)
                 }
-                None => continue,
             };
-            if !replay_ok {
+            // Keeper leaves for kind 3 taker legs: the caller's pre/post
+            // collateral must show exactly the seized reward.
+            let keeper = if kind == 3 && who_taker {
+                let kh = liquidate_caller.clone()?;
+                let kleaf = pre_leaves
+                    .iter()
+                    .find(|l| l.starts_with(&format!("acct:{kh}:")))?
+                    .clone();
+                let kpre: i128 = kleaf.split(':').nth(2)?.parse().ok()?;
+                Some((kh, kpre, reward))
+            } else {
+                None
+            };
+            // AA verdict mirror: silent unless the honest replay passes
+            // every leg and the committed legs fail one of them.
+            if aa_fill_verdict(
+                post_leaves,
+                acct_hex,
+                &market,
+                exp_qty,
+                exp_entry,
+                exp_fill,
+                exp_absent,
+                dir_only,
+                kind as u8,
+                who_taker,
+                keeper.as_ref(),
+                allow_last,
+            ) {
                 continue;
             }
-            // Posted legs: mismatch with the expectation is the fraud.
+            if !aa_fill_verdict(
+                &posted_post,
+                acct_hex,
+                &market,
+                exp_qty,
+                exp_entry,
+                exp_fill,
+                exp_absent,
+                dir_only,
+                kind as u8,
+                who_taker,
+                keeper.as_ref(),
+                allow_last,
+            ) {
+                continue;
+            }
             let posted_acct = match posted_post
                 .iter()
-                .find(|l| l.starts_with(&format!("acct:{}:", acct_hex)))
+                .find(|l| l.starts_with(&format!("acct:{acct_hex}:")))
             {
                 Some(a) => a.clone(),
                 None => continue,
-            };
-            let posted_col: i128 = match posted_acct.split(':').nth(2).unwrap_or("").parse() {
-                Ok(v) => v,
-                Err(_) => continue,
             };
             let posted_pos_opt = posted_post
                 .iter()
                 .find(|l| {
                     l.starts_with("pos:") && {
                         let o: Vec<&str> = l.split(':').collect();
-                        o.len() == 5 && o[1] == acct_hex && o[2] == market
+                        o.len() == 7 && o[1] == acct_hex && o[2] == market
                     }
                 })
                 .cloned();
-            let posted_ok = if posted_col != exp_col {
-                false
-            } else if exp_pos_absent {
-                posted_pos_opt.is_none()
-            } else {
-                match &posted_pos_opt {
-                    Some(p) => {
-                        let o: Vec<&str> = p.split(':').collect();
-                        o[3].parse::<i64>().ok() == Some(exp_qty)
-                            && o[4].parse::<i64>().ok() == Some(exp_entry)
-                    }
-                    None => false,
-                }
-            };
-            if posted_ok {
-                continue; // honest side — check the other party
-            }
-            if !exp_pos_absent && posted_pos_opt.is_none() {
-                continue; // omitted pos leaf has no membership proof
-            }
             let idx = index_of(&batch.fills, f)?;
             let mut data = serde_json::json!({
                 "trace_root": batch.checkpoint.trace_root,
                 "fills_root": batch.checkpoint.fills_root,
                 "ops_root": batch.checkpoint.ops_root,
+                "units_root": batch.checkpoint.units_root,
                 "k": k,
                 "fill": f,
                 "fill_proof": proof_json(&batch.fills, idx),
+                "units_proof": proof_json(&unit_hexes, k),
+                "right": right,
+                "right_proof": proof_json(&batch.fills, gidx + 1),
                 "who": who,
                 "pre_acct": pre_acct,
                 "post_acct": posted_acct,
                 "pre_meta": pre_meta,
                 "pos_absent": pos_absent,
-                "post_pos_absent": exp_pos_absent,
+                "post_pos_absent": exp_absent,
             });
             let pre_fields = pre_wit_fields(batch, k, pre_leaves);
             let post_wit = batch.trace.get(k)?.clone();
@@ -727,14 +993,14 @@ fn fill_proof(
                 // sorted order; the AA only checks root/index/geometry.
                 let mut sorted = pre_leaves.to_vec();
                 sorted.sort();
-                let plo = format!("pos:{}:{}:", acct_hex, market);
+                let plo = format!("pos:{acct_hex}:{market}:");
                 let pos = sorted
                     .iter()
                     .position(|s| s.as_str() > plo.as_str())
                     .unwrap_or(sorted.len());
                 if pos > 0 && pos < sorted.len() {
                     for (key, idx) in [("pleft", pos - 1), ("pright", pos)] {
-                        obj.insert(format!("{}_proof", key).into(), {
+                        obj.insert(format!("{key}_proof"), {
                             let p = obyte_merkle::proof(&sorted, idx);
                             serde_json::json!({"root": p.root, "siblings": p.siblings, "index": p.index})
                         });
@@ -752,12 +1018,74 @@ fn fill_proof(
                     continue;
                 }
             }
-            if !exp_pos_absent {
-                let lp = posted_pos_opt.clone()?;
-                let li = index_of(&posted_post, &lp)?;
-                obj.insert("post_pos".into(), lp.into());
-                obj.insert("post_pos_proof".into(), {
+            if !exp_absent || posted_pos_opt.is_some() {
+                if let Some(lp) = &posted_pos_opt {
+                    let li = index_of(&posted_post, lp)?;
+                    obj.insert("post_pos".into(), lp.clone().into());
+                    obj.insert("post_pos_proof".into(), {
+                        let p = obyte_merkle::proof(&posted_post, li);
+                        serde_json::json!({"root": p.root, "siblings": p.siblings, "index": p.index})
+                    });
+                }
+            }
+            // Regime proofs: the acct-wide pos range empty on the posted
+            // tree backs the strict max(exp, 0) identity; the market-range
+            // straddle backs a claimed-absent post pos.
+            if let Some((li, rj)) = acct_pos_range(&posted_post, acct_hex, allow_last) {
+                obj.insert("eleft".into(), posted_post[li].clone().into());
+                obj.insert("eleft_proof".into(), {
                     let p = obyte_merkle::proof(&posted_post, li);
+                    serde_json::json!({"root": p.root, "siblings": p.siblings, "index": p.index})
+                });
+                if let Some(rj) = rj {
+                    obj.insert("eright".into(), posted_post[rj].clone().into());
+                    obj.insert("eright_proof".into(), {
+                        let p = obyte_merkle::proof(&posted_post, rj);
+                        serde_json::json!({"root": p.root, "siblings": p.siblings, "index": p.index})
+                    });
+                }
+            }
+            if exp_absent && posted_pos_opt.is_none() {
+                if let Some((li, rj)) = mkt_pos_range(&posted_post, acct_hex, &market, allow_last) {
+                    obj.insert("post_pleft".into(), posted_post[li].clone().into());
+                    obj.insert("post_pleft_proof".into(), {
+                        let p = obyte_merkle::proof(&posted_post, li);
+                        serde_json::json!({"root": p.root, "siblings": p.siblings, "index": p.index})
+                    });
+                    if let Some(rj) = rj {
+                        obj.insert("post_pright".into(), posted_post[rj].clone().into());
+                        obj.insert("post_pright_proof".into(), {
+                            let p = obyte_merkle::proof(&posted_post, rj);
+                            serde_json::json!({"root": p.root, "siblings": p.siblings, "index": p.index})
+                        });
+                    }
+                }
+            }
+            if let Some(mo) = &maker_ord {
+                let mi = index_of(pre_leaves, mo)?;
+                obj.insert("maker_ord".into(), mo.clone().into());
+                obj.insert("maker_ord_proof".into(), {
+                    let p = obyte_merkle::proof(pre_leaves, mi);
+                    serde_json::json!({"root": p.root, "siblings": p.siblings, "index": p.index})
+                });
+            }
+            if let Some((kh, _, _)) = &keeper {
+                let pl = pre_leaves
+                    .iter()
+                    .find(|l| l.starts_with(&format!("acct:{kh}:")))?;
+                let pi = index_of(pre_leaves, pl)?;
+                obj.insert("pre_keeper".into(), pl.clone().into());
+                obj.insert("pre_keeper_proof".into(), {
+                    let p = obyte_merkle::proof(pre_leaves, pi);
+                    serde_json::json!({"root": p.root, "siblings": p.siblings, "index": p.index})
+                });
+                let tl = posted_post
+                    .iter()
+                    .find(|l| l.starts_with(&format!("acct:{kh}:")))?;
+                let ti = index_of(&posted_post, tl)?;
+                obj.insert("post_keeper".into(), tl.clone().into());
+                obj.insert("post_keeper_proof".into(), {
+                    let p = obyte_merkle::proof(&posted_post, ti);
                     serde_json::json!({"root": p.root, "siblings": p.siblings, "index": p.index})
                 });
             }
@@ -930,11 +1258,14 @@ mod tests {
         let mut eng2 = eng.clone();
         let mut batch =
             Batch::from_applied(&prev, &mut eng2, &[id1, id2, id3, id4]).expect("batch");
-        // Liar drops the realized pnl from the taker's posted post col.
+        // Liar drops the taker fee from fill1's posted post col. fill1's
+        // unit is chosen because a trailing fill (batch.fills' last
+        // element) has no right neighbor and cannot complete the AA's
+        // single-fill completeness proof.
         let alice_hex = hex::encode(alice_id.0);
-        if let Some(leaves) = batch.leaf_trace.get_mut(3) {
+        if let Some(leaves) = batch.leaf_trace.get_mut(1) {
             for l in leaves.iter_mut() {
-                if l.starts_with(&format!("acct:{}:", alice_hex)) {
+                if l.starts_with(&format!("acct:{alice_hex}:")) {
                     let p: Vec<&str> = l.split(':').collect();
                     let col: i128 = p[2].parse().unwrap();
                     *l = format!(
@@ -947,7 +1278,7 @@ mod tests {
                 }
             }
         }
-        batch.trace[3] = obyte_merkle::root(&batch.leaf_trace[3]);
+        batch.trace[1] = obyte_merkle::root(&batch.leaf_trace[1]);
         batch.checkpoint.trace_root = obyte_merkle::root(&batch.trace);
         let mut replay = Engine::new();
         fund(&mut replay);

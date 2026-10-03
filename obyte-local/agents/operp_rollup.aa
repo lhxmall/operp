@@ -33,9 +33,14 @@
 	messages: {
 		cases: [
 			{
+				// #13 anti-hijack: only the two addresses hardcoded into this
+				// definition may bind — first-come is irrelevant, nobody can
+				// squat the verdict channel. The dispute AAs carry this rollup
+				// address in their bind trigger data instead of their own
+				// definition (mutual hardcoding would be a chash cycle).
 				if: "{trigger.data.set_dispute}",
 				init: "{
-					if (!is_aa(trigger.address) OR var['dispute_aa'])
+					if (trigger.address != 'DISPUTE_AA_HERE' OR var['dispute_aa'])
 						bounce('not authorized');
 				}",
 				messages: [
@@ -50,7 +55,7 @@
 			{
 				if: "{trigger.data.set_dispute_fill}",
 				init: "{
-					if (!is_aa(trigger.address) OR var['dispute_fill_aa'])
+					if (trigger.address != 'DISPUTE_FILL_AA_HERE' OR var['dispute_fill_aa'])
 						bounce('not authorized');
 				}",
 				messages: [

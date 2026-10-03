@@ -719,8 +719,10 @@ reward_<fee_winner> += 20000（无 sbond 记账）。`{escape_finalize}` 窗口�
 
 `$lf = var[ROLLUP]['last_finalized']`；`$src = var[ROLLUP]['aa_forest_'||$lf]`。
 叶子 `acct:addr:col:perp:W`（hex 域），16 深折叠，
-`amount + wd_ <= min(collateral, withdrawn)`，`perp_amount` 可选部分领取，
-`wp_` 封顶。`{escape_withdraw}` 无对应 case（vault 仅 `deposit` /
+`amount + wd_ <= min(collateral, withdrawn)`；`perp_amount` 领取当前
+一律 `bounce('perp claim needs burn')`（#12：侧链仅 GovWithdraw 减
+`perp_balances`，先兑付会双计投票权；PERP 持有者可传 `perp_amount: 0`
+只提抵押品）。`{escape_withdraw}` 无对应 case（vault 仅 `deposit` /
 `deposit_perp` / `withdraw`），按未匹配触发 bounce。
 
 ### 10.6 pool / force / claim — rollup
@@ -811,7 +813,7 @@ ingest → Applied{status: Optimistic}     # 立即执行、立即成交
 | 伪造成交 / 假根 | 双 Merkle 根 + validate_against 全量重放 + 一枪谓词（含 fill_math/ghost/skip） |
 | 偷 AA 资金 | 提款只认 finalized 分片森林的 Merkle 证明；leaf 绑定提款人地址；wd_/wp_ 累计标记防证明重放 |
 | 付钱杀根 | 已删除：`{challenge:1}` 无 case；假证明 bounce `no fraud` |
-| 审查用户单元 | rollup inbox `{force}` + P-omit 非成员证明 |
+| 审查用户单元 | rollup inbox `{force}` 钉时间戳；P-omit 已按 #23 禁用（force 只钉时间戳、不能证明单元存在，谓词一律 bounce `no fraud`） |
 | 存款凭空铸造 | deposits_allowed 白名单 + replay 交叉校验 + evidence 绑定 `OPERP_VAULT_AA` |
 
 ## 15. 明确的已知边界

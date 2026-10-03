@@ -24,9 +24,9 @@ pub const SNAPSHOT_EVERY: Height = 64;
 /// Old snapshots kept beyond the newest (crash during rename safety).
 const KEEP_SNAPSHOTS: usize = 2;
 /// Version header prefixing every snapshot body. Old formats are not
-/// migrated (mainnet is not live); unknown versions are skipped by
-/// [`load_latest`].
-const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+/// migrated (mainnet is not live); [`load_latest`] skips unknown versions
+/// and falls back to genesis rather than failing startup (#11).
+const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 /// Durability of directory entries (rename) needs a directory fsync on unix;
 /// Windows has no equivalent API, so this is a no-op there.
@@ -64,9 +64,11 @@ pub fn save_snapshot(dir: &Path, state: &ChainState) -> io::Result<PathBuf> {
 
 /// Load the newest readable snapshot in `dir`. Candidates are tried from
 /// newest height down: an unreadable newest file falls back to the previous
-/// height instead of failing startup (M2). Returns Ok(None) on a fresh dir.
+/// height instead of failing startup (M2); a version mismatch or decode
+/// failure skips the candidate; when NO candidate decodes the caller gets
+/// `Ok(None)` and recovers from genesis (#11) — real io errors surface only
+/// from listing the directory itself. Returns Ok(None) on a fresh dir.
 pub fn load_latest(dir: &Path) -> io::Result<Option<(Height, ChainState)>> {
-    let mut last_err: Option<io::Error> = None;
     for (_, path) in snapshot_candidates(dir)? {
         let parsed = (|| -> io::Result<ChainState> {
             let bytes = fs::read(&path)?;
@@ -81,15 +83,11 @@ pub fn load_latest(dir: &Path) -> io::Result<Option<(Height, ChainState)>> {
             bincode::deserialize(&bytes[4..])
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         })();
-        match parsed {
-            Ok(state) => return Ok(Some((state.height, state))),
-            Err(e) => last_err = Some(e),
+        if let Ok(state) = parsed {
+            return Ok(Some((state.height, state)));
         }
     }
-    match last_err {
-        Some(e) => Err(e),
-        None => Ok(None),
-    }
+    Ok(None)
 }
 
 /// All snapshots in `dir` as (height, path), descending by height.
@@ -118,7 +116,7 @@ fn snapshot_candidates(dir: &Path) -> io::Result<Vec<(Height, PathBuf)>> {
             out.push((h, dir.join(snapshot_name(h))));
         }
     }
-    out.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    out.sort_unstable_by_key(|&(h, _)| std::cmp::Reverse(h));
     Ok(out)
 }
 
@@ -207,9 +205,24 @@ mod tests {
         assert_eq!(st.perp_supply, 0);
 
         // A file with an unknown version header is skipped, not fatal.
-        std::fs::write(dir.join(snapshot_name(99)), &[9, 9, 9, 9, 1, 2, 3]).unwrap();
+        std::fs::write(dir.join(snapshot_name(99)), [9, 9, 9, 9, 1, 2, 3]).unwrap();
         let (h, _st) = load_latest(&dir).unwrap().unwrap();
         assert_eq!(h, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn version_2_garbage_falls_back_to_genesis() {
+        // #11: a v2-header file (the old layout) must not decode as live
+        // state; with only such a file the caller gets Ok(None) and starts
+        // from genesis instead of an Err that blocks startup.
+        let dir = std::env::temp_dir().join(format!("operp-snap-v2-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut body = 2u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&[0xFF; 64]);
+        fs::write(dir.join(snapshot_name(7)), &body).unwrap();
+        assert!(load_latest(&dir).unwrap().is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

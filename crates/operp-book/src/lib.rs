@@ -50,6 +50,13 @@ pub struct Fill {
     pub taker_isolated: bool,
     #[serde(default)]
     pub maker_isolated: bool,
+    /// Provenance of this fill, committed by `fills_element` so the dispute
+    /// AA picks the right collateral identity: 0 = book submit (regular
+    /// market), 1 = book submit on a funding-rate market (cash PnL),
+    /// 2 = off-book ADL synthetic (no fee), 3 = book fill inside
+    /// `Engine::liquidate` (keeper reward applies).
+    #[serde(default)]
+    pub kind: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -93,6 +100,7 @@ mod tests {
         order_id(a, BTC_USD, seq)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn order(
         account: AccountId,
         client_seq: u64,

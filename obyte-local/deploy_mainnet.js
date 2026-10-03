@@ -96,30 +96,43 @@ async function main() {
     return new Promise((r) => setTimeout(r, 30000));
   }
 
-  // 1. Rollup first (no placeholders).
-  const rollupSrc = readAa("operp_rollup.aa");
+  // 1. Dispute AAs FIRST (#13): their definitions carry no rollup address,
+  // the rollup hardcodes THEM — mutual hardcoding would be a chash cycle.
+  const disputeSrc = readAa("operp_dispute.aa");
+  const fillSrc = readAa("operp_dispute_fill.aa");
+  const disputeDef = ["autonomous agent", await parseAa(disputeSrc, "operp_dispute.aa")];
+  const fillDef = ["autonomous agent", await parseAa(fillSrc, "operp_dispute_fill.aa")];
+  const dispute = await postDefinition(disputeDef, "dispute");
+  const fill = await postDefinition(fillDef, "fill");
+  await waitBeat(dispute.unit, "dispute");
+
+  // 2. Rollup with both dispute addresses hardcoded, then the vault.
+  const rollupSrc = substitute(readAa("operp_rollup.aa"), {
+    DISPUTE_AA_HERE: dispute.address,
+    DISPUTE_FILL_AA_HERE: fill.address,
+  });
   const rollupDef = ["autonomous agent", await parseAa(rollupSrc, "operp_rollup.aa")];
   const rollup = await postDefinition(rollupDef, "rollup");
   await waitBeat(rollup.unit, "rollup");
 
-  // 2. Dispute, fill, vault with substituted addresses.
-  const disputeSrc = substitute(readAa("operp_dispute.aa"), { ROLLUP_AA_HERE: rollup.address });
-  const fillSrc = substitute(readAa("operp_dispute_fill.aa"), { ROLLUP_AA_HERE: rollup.address });
   const vaultSrc = substitute(readAa("operp_vault.aa"), {
     ROLLUP_AA_HERE: rollup.address,
     PERP_ASSET_ID_HERE: PERP_ASSET_ID,
   });
-  const disputeDef = ["autonomous agent", await parseAa(disputeSrc, "operp_dispute.aa")];
-  const fillDef = ["autonomous agent", await parseAa(fillSrc, "operp_dispute_fill.aa")];
   const vaultDef = ["autonomous agent", await parseAa(vaultSrc, "operp_vault.aa")];
-  const dispute = await postDefinition(disputeDef, "dispute");
-  const fill = await postDefinition(fillDef, "fill");
   const vault = await postDefinition(vaultDef, "vault");
   await waitBeat(vault.unit, "vault");
 
-  // 3. Bind both dispute AAs (20000 each); assert via AA state.
-  await triggerAa({ to: dispute.address, amount: 20000, data: { bind: 1 } }, "dispute bind");
-  await triggerAa({ to: fill.address, amount: 20000, data: { bind_fill: 1 } }, "fill bind");
+  // 3. Bind both dispute AAs (20000 each, rollup address in trigger data);
+  // assert via AA state.
+  await triggerAa(
+    { to: dispute.address, amount: 20000, data: { bind: 1, rollup: rollup.address } },
+    "dispute bind"
+  );
+  await triggerAa(
+    { to: fill.address, amount: 20000, data: { bind_fill: 1, rollup: rollup.address } },
+    "fill bind"
+  );
   await waitBeat("binds", "bind");
   const state = await readAaState(rollup.address);
   if (String(state.dispute_aa) !== String(dispute.address))
