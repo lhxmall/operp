@@ -26,7 +26,8 @@
 	//   w:{acct}:{amount}:{nonce}   W:{acct}:{amount}:{nonce}
 	//   c:{acct}:{order_hex}   p:{acct}:{market}:{side}:{price}:{qty}:{isolated}:{margin}:{tif}
 	// Fill descriptors (fills_element): f:{unit}:{idx}:{taker}:{maker}:
-	//   {taker_order}:{maker_order}:{market}:{price}:{qty}:{seq}:{side}:{kind}
+	//   {taker_order}:{maker_order}:{market}:{price}:{qty}:{seq}:{side}:
+	//   {kind}:{taker_post}
 	// kind 0=book 1=funding-cash 2=ADL-no-fee 3=liquidation(+keeper)
 	// Empty-sentinel wit root (obyte_merkle::root(["empty"]), pinned by the
 	// Rust unit test): Lhz6grA1wmy7va5jLOoHBRTri3c/YWqur2aOLwvo8Q0=
@@ -446,7 +447,7 @@
 						OR trigger.data.fill_proof.root != trigger.data.fills_root)
 						bounce('bad fill proof');
 					$F = split($fill, ':');
-					if (array_length($F) != 13) bounce('bad fill');
+					if (array_length($F) != 14) bounce('bad fill');
 					if (!trigger.data.units_proof OR trigger.data.units_proof.index != $k
 						OR trigger.data.units_proof.root != trigger.data.units_root
 						OR !is_valid_merkle_proof($F[1], trigger.data.units_proof))
@@ -563,7 +564,7 @@
 						OR trigger.data.fill_proof.root != trigger.data.fills_root)
 						bounce('bad fill proof');
 					$F = split($fill, ':');
-					if (array_length($F) != 13) bounce('bad fill');
+					if (array_length($F) != 14) bounce('bad fill');
 					$side = $F[11];
 					if ($side != '0' AND $side != '1') bounce('bad fill');
 					if (!trigger.data.units_proof OR trigger.data.units_proof.index != $k

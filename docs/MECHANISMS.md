@@ -289,9 +289,11 @@ Op；Order/Position 各带 `isolated` 标志。跨仓单 `margin` 必须为 0。
 - **托管**：place 时 `collateral -= margin`；每笔成交按
   `post = fill ≥ remaining_before ? margin_left : margin_left·fill/
   remaining_before`（floor，末笔吃余数）记入
-  `isolated_margin[market]` 桶；STP 取消、撤单、未驻留余量退回
-  collateral。守恒：`collateral + Σ桶 + Σlive margin_left` 只经
-  存提/PnL 变动。
+  `isolated_margin[market]` 桶；撤单、未驻留余量退回 collateral。
+  自成交（STP）：cross 挂单（`margin_left = 0`）撤 maker 续拍；带托管的
+  自家挂单直接拒单（place 路径 `SelfTrade::Reject`）——撤单退款是同一
+  单元内的现金腿，填充谓词的精确恒等式无法建模。守恒：
+  `collateral + Σ桶 + Σlive margin_left` 只经存提/PnL 变动。
 - **平仓释放**：`release = 桶·close/old`（全平取整桶）先入
   collateral，再结算已实现 PnL——桶永不为负；PnL 超桶的缺口落
   collateral 负值，由 apply_fill_pair 钳零转保险（§5.3 同一路径）。
@@ -659,7 +661,7 @@ rollup 状态变量（`<h>` 为高度后缀）：
 last_submitted, last_finalized, dispute_aa, dispute_fill_aa
 submitted_at_h, state_root_h, aa_forest_h(1024 hex), prev_h
 wit_root_h, trace_root_h, units_root_h, units_set_root_h
-ops_root_h, fills_root_h, unit_count_h, wit_count_h
+ops_root_h, fills_root_h, unit_count_h, wit_count_h, fill_count_h
 da_unit_h, active_bond_h, fee_winner_h
 frozen_h ∈ {∅/0=live, 2=failed}
 inbox_<unit_id_hex>, inbox_upto_h
@@ -692,7 +694,7 @@ sbond_<addr>, reward_<addr>, slash_reward_<addr>（sbond 仅遗留 claim 路径�
 |---|---|---|
 | deposit / withdraw（含 D/W gov） | dispute | op 前后余额算术（含 pre_absent 非成员） |
 | omit | dispute | inbox 强收 id 不在 units_set_root（三段几何非成员） |
-| fill_math | dispute_fill | apply_fill 全分支（同向 VWAP / 减仓 / 反手 / 平完）± taker fee；±1 Decimal 容差；claimed-absent 仓位带前缀区间非成员 |
+| fill_math | dispute_fill | apply_fill 全分支（同向 VWAP / 减仓 / 反手 / 平完）± taker fee；精确恒等式（无方向区间）：逐仓 taker = `old - taker_post - still + post_back + release + pnl - fee`（op/ord 证明），空区间 `max(exp,0)` 夹取；非空∧exp<0 直接弹 `no fraud`（坏账钳制可诚实抬升仍持仓账户，upnl 不入叶）；±1 Decimal 容差；claimed-absent 仓位带前缀区间非成员 |
 | ghost | dispute_fill | 成交的 maker 订单 id 前缀区间不在 pre_wit |
 | skip | dispute_fill | pre_wit 中存在更优活单未成交 |
 
@@ -740,14 +742,25 @@ claim 四态：`reward|sbond|slash` 按旧键支付；`pool` 仅链空闲
 witness 叶根）、`trace_root`（每单元 post wit_root 的 Obyte 原生 Merkle，
 按批序）、`units_root` / `units_set_root`（unit_id hex 批序/排序）、
 `ops_root`（op 描述串）、`fills_root`（成交描述串）、`counts_root`
-（每单元叶数）、`unit_count` / `wit_count`。
+（每单元叶数）、`unit_count` / `wit_count` / `fill_count`。
+
+成交描述串（`fills_element`，14 字段）：
+
+```
+f:{unit}:{idx}:{taker}:{maker}:{taker_order}:{maker_order}:{market}:{price}:{qty}:{seq}:{side}:{kind}:{taker_post}
+```
+
+`taker_post` = 该笔成交占用的逐仓托管份额（USD_SCALE，taker 挂单为 cross
+时 0）；fill_math 逐仓恒等式用它 + post `ord` 叶的 `margin_left` 精确核对
+taker 抵押。fill_count 经 submit 存为 `fill_count_h`，末笔成交可走
+index-is-last 完备臂（无需右邻证明）。
 
 witness 叶（`operp_state::wit_leaves`，排序后 Obyte 原生 Merkle）：
 
 ```
 acct:{acct_hex}:{collateral}:{perp}:{W}
-pos:{acct_hex}:{market}:{qty}:{entry}
-ord:{order_hex}:{market}:{side}:{price}:{seq}:{remaining}:{acct_hex}
+pos:{acct_hex}:{market}:{qty}:{entry}:{isolated:0|1}:{bucket}
+ord:{order_hex}:{market}:{side}:{price}:{seq}:{remaining}:{acct_hex}:{isolated:0|1}:{margin_left}
 meta:{market}:{tick}:{im}:{mm}:{taker_fee_bps}:{keeper}:{delisted}:{mark}:{usd_per_unit}:{funding_cap_bps}
 ```
 

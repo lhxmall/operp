@@ -70,7 +70,8 @@ notional = qty · price / PRICE_SCALE · USD_SCALE / QTY_SCALE
 
 - 买卖两侧各一棵 `BTreeMap<Price, VecDeque<OrderId>>`（bid 用 Reverse 包装）；
 - 同价 FIFO；部分成交后余量留在原队列头部；
-- IOC/GTC；taker 与 maker 同账户 = self-trade，取消 taker；
+- IOC/GTC；taker 与 maker 同账户 = self-trade：带托管的自家挂单
+  （`margin_left > 0`）拒单（`SelfTrade`），cross 挂单撤 maker 续拍；
 - 每个 price level 维护增量更新的 `visible_qty` 缓存：
   成交扣减、挂单累加、撤单扣减，best_bid/best_ask 读缓存头 → O(log depth)，
   消除了原来 O(深度×队列长) 的扫描。
@@ -113,7 +114,10 @@ taker≤200、keeper≤500、im ≥ 10×FUNDING_CAP_BPS），CreateMarket 与
   margin 下限就是它的等价物。
 - **托管生命周期**：下单时 `collateral -= margin`；成交按量比例
   （pro-rata，最后一笔吃掉余数）把 margin 记入该市场的 `isolated_margin`
-  桶并进仓位；撤单/自成交取消（STP）/未驻留余量退回 collateral。
+  桶并进仓位；撤单/未驻留余量退回 collateral。自成交（STP）：cross
+  撤 maker 续拍（`margin_left = 0`，不动现金）；带托管的自家挂单由
+  place 路径拒单（`SelfTrade::Reject`）——其撤单退款无法被填充谓词的
+  精确恒等式建模。
   守恒不变式：`collateral + Σisolated_margin + Σlive margin_left`
   只经 deposit/withdraw/PnL 变动。
 - **风险隔离**（`isolated_risk(market)`）：equity = 桶 + 该仓 uPnL，
@@ -249,7 +253,7 @@ TooManyUnits 上限（200000）在 from_applied 就挡住超大批次。
 last_submitted, last_finalized, dispute_aa, dispute_fill_aa
 submitted_at_h, state_root_h, aa_forest_h (1024 hex), prev_h,
   wit_root_h, trace_root_h, units_root_h, units_set_root_h,
-  ops_root_h, fills_root_h, unit_count_h, wit_count_h
+  ops_root_h, fills_root_h, unit_count_h, wit_count_h, fill_count_h
 da_unit_h                     # DA 绑定 = 组合单元 hash
 active_bond_<h>, fee_winner_<h>, frozen_<h> ∈ {∅/0=live, 2=failed}
 inbox_<unit_id_hex>, inbox_upto_<h>   # inbox_upto = submit 时间戳

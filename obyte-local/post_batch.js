@@ -299,6 +299,7 @@ async function main() {
     counts_root: header.counts_root,
     unit_count: header.unit_count,
     wit_count: header.wit_count,
+    fill_count: header.fill_count,
   };
   // Optional audit anchors: the rollup AA does not gate on these, but they
   // ride the submit data for indexers/self-checks (header temp_data carries

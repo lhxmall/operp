@@ -324,6 +324,14 @@ fn mkt_pos_range(
 /// (honest replay or committed post): true = the AA would reach the fee
 /// gate (verdict) on this tree. Callers emit only when the honest tree is
 /// silent AND the committed tree fires — no false positives on replay.
+///
+/// `iso_taker` = `(taker_order_hex, taker_post, post_back)` for a kind 0/1
+/// taker whose unit op is an isolated Place; the collateral expectation
+/// becomes `exp_fill - taker_post - still + post_back` with `still` the
+/// taker order's own post ord leaf (membership, or 0 behind provable
+/// absence). A wrong-account leaf, an unparseable margin_left or an
+/// unprovable absence bounces the AA before any verdict — mirrored here as
+/// `false` (silent).
 #[allow(clippy::too_many_arguments)]
 fn aa_fill_verdict(
     tree: &[String],
@@ -333,7 +341,7 @@ fn aa_fill_verdict(
     exp_entry: i64,
     exp_fill: i128,
     exp_absent: bool,
-    dir_only: bool,
+    iso_taker: Option<(&str, i128, i128)>,
     kind: u8,
     who_taker: bool,
     keeper: Option<&(String, i128, i128)>,
@@ -383,6 +391,30 @@ fn aa_fill_verdict(
     };
     // Collateral leg.
     let acct_empty = acct_pos_range(tree, acct_hex, allow_last).is_some();
+    let expected = match iso_taker {
+        Some((tord, tpost, pback)) => {
+            let key = format!("ord:{tord}:");
+            match tree.iter().find(|l| l.starts_with(&key)) {
+                Some(l) => {
+                    let o: Vec<&str> = l.split(':').collect();
+                    if o.len() != 10 || o[7] != acct_hex {
+                        return false; // AA: 'bad ord proof'
+                    }
+                    match o[9].parse::<i128>() {
+                        Ok(still) => exp_fill - tpost - still + pback,
+                        Err(_) => return false, // AA: coercion bounce
+                    }
+                }
+                None => {
+                    if range_straddle(tree, &key, &format!("ord:{tord};"), allow_last).is_none() {
+                        return false; // AA: absence unprovable → bounce
+                    }
+                    exp_fill - tpost + pback
+                }
+            }
+        }
+        None => exp_fill,
+    };
     let (col_ok, col_bail) = if kind == 3 && who_taker {
         if !acct_empty {
             (false, true)
@@ -406,12 +438,15 @@ fn aa_fill_verdict(
                 None => (false, true),
             }
         }
-    } else if dir_only {
-        (post_col >= exp_fill, false)
     } else if acct_empty {
-        (post_col == exp_fill.max(0), false)
+        // Empty range: equity IS collateral, the engine clamp lands it on
+        // max(expected, 0) exactly (both cross and isolated takers — see
+        // operp-exec's isolated_blowthrough_insurance).
+        (post_col == expected.max(0), false)
     } else {
-        (post_col >= exp_fill, false)
+        // Non-empty range: exact identity, never a direction range — a
+        // larger committed post is the inflation the plan hunts.
+        (post_col == expected, false)
     };
     // Verdict only when a leg is verified wrong; a bail silences its own
     // leg (mirrors the AA's $fraud term).
@@ -448,7 +483,7 @@ fn fill_proof(
     // Ghost: maker ord leaf absent from pre leaves.
     for f in &unit_fills {
         let parts: Vec<&str> = f.split(':').collect();
-        if parts.len() != 13 {
+        if parts.len() != 14 {
             continue;
         }
         let maker_hex = parts[4].to_string();
@@ -529,7 +564,7 @@ fn fill_proof(
     // Skip: another live order strictly better than the filled maker.
     for f in &unit_fills {
         let parts: Vec<&str> = f.split(':').collect();
-        if parts.len() != 13 {
+        if parts.len() != 14 {
             continue;
         }
         let maker_order_hex = parts[6].to_string();
@@ -624,14 +659,25 @@ fn fill_proof(
         operp_dag::Op::Liquidate { caller, .. } => Some(hex::encode(caller.0)),
         _ => None,
     };
+    // The unit's op descriptor. The AA's taker leg requires a well-formed
+    // p: Place (its escrow is what the collateral identity models) and
+    // reads the op's isolated flag to pick that identity; kind 3 keeps its
+    // own keeper branch before the op gate.
+    let op_str = batch.ops.get(k)?.clone();
+    let op_parts: Vec<&str> = op_str.split(':').collect();
+    let op_place = op_parts.len() == 9
+        && op_parts[0] == "p"
+        && (op_parts[6] == "0" || op_parts[6] == "1")
+        && op_parts[7].parse::<i128>().is_ok();
+    let op_iso = op_place && op_parts[6] == "1";
     for f in &unit_fills {
         let parts: Vec<&str> = f.split(':').collect();
-        if parts.len() != 13 {
+        if parts.len() != 14 {
             continue;
         }
-        // Single-fill completeness: idx 0 plus a right neighbor outside
-        // this unit's prefix (the AA requires the same); trailing fills
-        // have no neighbor and are unprovable on both sides.
+        // Single-fill completeness: idx 0 (a later idx means this unit has
+        // other fills, so pre->post delta is bigger than one fill); the
+        // right-neighbor / index-is-last arm is decided at gidx below.
         let in_unit_idx: usize = match parts[2].parse() {
             Ok(v) => v,
             Err(_) => continue,
@@ -643,13 +689,24 @@ fn fill_proof(
             Some(i) => i,
             None => continue,
         };
-        let right = match batch.fills.get(gidx + 1) {
-            Some(r) => r,
-            None => continue,
+        // Single-fill completeness mirror: a right neighbor outside this
+        // unit's prefix, or — when this fill is the list's final element —
+        // the AA's index-is-last arm against the submitted fill_count (a
+        // trailing fill used to be unchallengeable for lack of a neighbor).
+        let right: Option<&String> = match batch.fills.get(gidx + 1) {
+            Some(r) => {
+                if r.starts_with(&prefix) {
+                    continue;
+                }
+                Some(r)
+            }
+            None => {
+                if batch.checkpoint.fill_count as usize != batch.fills.len() {
+                    continue; // header/DA disagree: the last arm would bounce
+                }
+                None
+            }
         };
-        if right.starts_with(&prefix) {
-            continue;
-        }
         let kind: i64 = match parts[12].parse() {
             Ok(v) if (0..=3).contains(&v) => v,
             _ => continue,
@@ -665,6 +722,10 @@ fn fill_proof(
             Err(_) => continue,
         };
         let qty: u64 = match parts[9].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let taker_post: i128 = match parts[13].parse() {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -724,6 +785,9 @@ fn fill_proof(
                 continue; // AA bails on the insurance account's own leaf
             }
             let who_taker = who == "taker";
+            if who_taker && kind != 3 && !op_place {
+                continue; // AA bounces the taker leg on a non-place op
+            }
             let delta: i64 = if side_acct == "0" {
                 qty as i64
             } else {
@@ -783,7 +847,7 @@ fn fill_proof(
             let abs_old = old_qty.unsigned_abs() as i128;
             let abs_delta = delta.unsigned_abs() as i128;
             let same = old_qty == 0 || (old_qty > 0 && delta > 0) || (old_qty < 0 && delta < 0);
-            let (exp_qty, exp_entry, exp_fill, exp_absent, dir_only) = if same {
+            let (exp_qty, exp_entry, exp_fill, exp_absent, pback) = if same {
                 let eq = old_qty + delta;
                 let ee = if old_qty == 0 {
                     price
@@ -792,7 +856,9 @@ fn fill_proof(
                         / (abs_old + i128::from(qty))) as i64
                 };
                 let ec = if who_taker { old_col - tfee } else { old_col };
-                (eq, ee, ec, false, false)
+                // Same-sign fills always produce open qty: the taker's post
+                // escrows into the bucket, never back to collateral.
+                (eq, ee, ec, false, 0)
             } else {
                 let close = abs_old.min(abs_delta);
                 // Isolated release: engine releases bucket*close/old (whole
@@ -828,6 +894,14 @@ fn fill_proof(
                 };
                 let leftover = abs_old - close;
                 let open = abs_delta - close;
+                // Engine apply_fill: a taker post lands in the bucket iff
+                // the fill produced open qty (flip), else returns to
+                // collateral (reduce / full close).
+                let pback: i128 = if leftover == 0 && open > 0 {
+                    0
+                } else {
+                    taker_post
+                };
                 // Maker escrow returns only when the fill produces no new
                 // open qty (flip fills escrow the post into the bucket).
                 let mpost = if !who_taker && (leftover > 0 || open == 0) {
@@ -854,7 +928,7 @@ fn fill_proof(
                     old_col + release + pnl + mpost
                 };
                 if leftover == 0 && open == 0 {
-                    (0, 0, ec, true, false)
+                    (0, 0, ec, true, pback)
                 } else {
                     let q = if leftover == 0 {
                         if delta > 0 {
@@ -868,10 +942,7 @@ fn fill_proof(
                         -(leftover as i64)
                     };
                     let e = if leftover == 0 { price } else { old_entry };
-                    // Isolated taker reduces may return pro-rata escrow the
-                    // fill string cannot describe — direction check only.
-                    let d = who_taker && iso;
-                    (q, e, ec, false, d)
+                    (q, e, ec, false, pback)
                 }
             };
             // Keeper leaves for kind 3 taker legs: the caller's pre/post
@@ -887,6 +958,14 @@ fn fill_proof(
             } else {
                 None
             };
+            // Isolated-taker escrow identity: the AA proves the taker's
+            // post ord leaf for `still`; cross takers and kind 3 keep
+            // exp_fill as-is.
+            let iso_taker = if who_taker && kind != 3 && op_iso {
+                Some((parts[5], taker_post, pback))
+            } else {
+                None
+            };
             // AA verdict mirror: silent unless the honest replay passes
             // every leg and the committed legs fail one of them.
             if aa_fill_verdict(
@@ -897,7 +976,7 @@ fn fill_proof(
                 exp_entry,
                 exp_fill,
                 exp_absent,
-                dir_only,
+                iso_taker,
                 kind as u8,
                 who_taker,
                 keeper.as_ref(),
@@ -913,7 +992,7 @@ fn fill_proof(
                 exp_entry,
                 exp_fill,
                 exp_absent,
-                dir_only,
+                iso_taker,
                 kind as u8,
                 who_taker,
                 keeper.as_ref(),
@@ -947,8 +1026,6 @@ fn fill_proof(
                 "fill": f,
                 "fill_proof": proof_json(&batch.fills, idx),
                 "units_proof": proof_json(&unit_hexes, k),
-                "right": right,
-                "right_proof": proof_json(&batch.fills, gidx + 1),
                 "who": who,
                 "pre_acct": pre_acct,
                 "post_acct": posted_acct,
@@ -965,6 +1042,53 @@ fn fill_proof(
             data.as_object_mut()?
                 .extend(pre_fields.as_object()?.clone());
             let obj = data.as_object_mut()?;
+            // Right-neighbor arm only when a neighbor exists; a trailing
+            // fill omits it and rides the AA's index-is-last arm against
+            // fill_count instead (null fields would be fatal in Oscript).
+            if let Some(r) = right {
+                obj.insert("right".into(), r.clone().into());
+                obj.insert("right_proof".into(), proof_json(&batch.fills, gidx + 1));
+            }
+            if who_taker {
+                // Taker-leg op gate: prove the unit op is this place.
+                obj.insert("op".into(), op_str.clone().into());
+                obj.insert("ops_proof".into(), proof_json(&batch.ops, k));
+            }
+            if let Some((tord, _, _)) = iso_taker {
+                // `still`: the taker order's own post ord leaf, or prefix
+                // non-membership over post_wit (straddle / before-min /
+                // final-tree after-max — the AA's three-way).
+                let key = format!("ord:{tord}:");
+                match posted_post.iter().position(|l| l.starts_with(&key)) {
+                    Some(li) => {
+                        obj.insert("tord".into(), posted_post[li].clone().into());
+                        obj.insert("tord_proof".into(), proof_json(&posted_post, li));
+                    }
+                    None => {
+                        let mut sorted = posted_post.clone();
+                        sorted.sort();
+                        let pos = sorted
+                            .iter()
+                            .position(|s| s.as_str() > key.as_str())
+                            .unwrap_or(sorted.len());
+                        if pos > 0 && pos < sorted.len() {
+                            obj.insert("oleft".into(), sorted[pos - 1].clone().into());
+                            obj.insert("oleft_proof".into(), proof_json(&sorted, pos - 1));
+                            obj.insert("oright".into(), sorted[pos].clone().into());
+                            obj.insert("oright_proof".into(), proof_json(&sorted, pos));
+                        } else if pos == 0 && !sorted.is_empty() {
+                            obj.insert("oleft".into(), sorted[0].clone().into());
+                            obj.insert("oleft_proof".into(), proof_json(&sorted, 0));
+                        } else if allow_last && !sorted.is_empty() {
+                            let last = sorted.len() - 1;
+                            obj.insert("oleft".into(), sorted[last].clone().into());
+                            obj.insert("oleft_proof".into(), proof_json(&sorted, last));
+                        } else {
+                            continue; // AA cannot verify absence: no emit
+                        }
+                    }
+                }
+            }
             obj.insert("post_wit".into(), post_wit.into());
             obj.insert("post_proof".into(), post_proof);
             obj.insert("pre_acct_proof".into(), {
@@ -1259,9 +1383,9 @@ mod tests {
         let mut batch =
             Batch::from_applied(&prev, &mut eng2, &[id1, id2, id3, id4]).expect("batch");
         // Liar drops the taker fee from fill1's posted post col. fill1's
-        // unit is chosen because a trailing fill (batch.fills' last
-        // element) has no right neighbor and cannot complete the AA's
-        // single-fill completeness proof.
+        // unit is chosen for the right-neighbor completeness arm; the
+        // trailing fill2's arm is covered by
+        // fill_math_trailing_fill_builds_last_arm_proof.
         let alice_hex = hex::encode(alice_id.0);
         if let Some(leaves) = batch.leaf_trace.get_mut(1) {
             for l in leaves.iter_mut() {
@@ -1288,6 +1412,230 @@ mod tests {
         assert_eq!(
             proof.data.get("who").and_then(|v| v.as_str()),
             Some("taker")
+        );
+        assert!(
+            proof.data.get("right").is_some(),
+            "non-trailing fill keeps the right-neighbor arm"
+        );
+    }
+
+    #[test]
+    fn fill_math_trailing_fill_builds_last_arm_proof() {
+        // Same 4-unit chain as fill_math_reduce_builds_proof, but the liar
+        // tampers the TRAILING fill's unit (batch.fills' last element).
+        // The watcher must still emit: single-fill completeness rides the
+        // fill_count index-is-last arm, so the payload omits right/right_proof.
+        use operp_types::{
+            OrderType, Side, TimeInForce, UnitId, BTC_USD, PRICE_SCALE, QTY_SCALE, USD_SCALE,
+        };
+        let alice = sk(1);
+        let bob = sk(2);
+        let alice_id = acct_of(&alice);
+        let bob_id = acct_of(&bob);
+        let fund = |eng: &mut Engine| {
+            for id in [alice_id, bob_id] {
+                eng.state
+                    .account_mut(id)
+                    .credit(10_000 * USD_SCALE as i128)
+                    .unwrap();
+            }
+        };
+        let mut eng = Engine::new();
+        fund(&mut eng);
+        let prev = eng.state.clone();
+        let g = genesis_id();
+        let px1 = 100_000 * PRICE_SCALE as i64;
+        let px2 = 105_000 * PRICE_SCALE as i64;
+        let q1 = QTY_SCALE;
+        let q2 = QTY_SCALE / 2;
+        let place = |parents: Vec<UnitId>,
+                     secret: &[u8; 32],
+                     account: AccountId,
+                     side: Side,
+                     price: i64,
+                     qty: u64,
+                     seq: u64| {
+            sign_unit(
+                parents,
+                Op::Place {
+                    account,
+                    market: BTC_USD,
+                    side,
+                    typ: OrderType::Limit,
+                    tif: TimeInForce::Gtc,
+                    price,
+                    qty,
+                    client_seq: seq,
+                    isolated: false,
+                    margin: 0,
+                },
+                secret,
+            )
+        };
+        let ask1 = place(vec![g], &bob, bob_id, Side::Ask, px1, q1, 1);
+        let id1 = unit_id(&ask1);
+        eng.ingest(ask1).unwrap();
+        let bid1 = place(vec![id1], &alice, alice_id, Side::Bid, px1, q1, 1);
+        let id2 = unit_id(&bid1);
+        eng.ingest(bid1).unwrap();
+        let bid2 = place(vec![id2], &bob, bob_id, Side::Bid, px2, q2, 2);
+        let id3 = unit_id(&bid2);
+        eng.ingest(bid2).unwrap();
+        let ask2 = place(vec![id3], &alice, alice_id, Side::Ask, px2, q2, 2);
+        let id4 = unit_id(&ask2);
+        eng.ingest(ask2).unwrap();
+        let mut eng2 = eng.clone();
+        let mut batch =
+            Batch::from_applied(&prev, &mut eng2, &[id1, id2, id3, id4]).expect("batch");
+        assert_eq!(batch.checkpoint.fill_count as usize, batch.fills.len());
+        // Tamper fill2's unit (leaf_trace[3]): alice's realized +2500 pnl
+        // disappears from her posted collateral.
+        let alice_hex = hex::encode(alice_id.0);
+        if let Some(leaves) = batch.leaf_trace.get_mut(3) {
+            for l in leaves.iter_mut() {
+                if l.starts_with(&format!("acct:{alice_hex}:")) {
+                    let p: Vec<&str> = l.split(':').collect();
+                    let col: i128 = p[2].parse().unwrap();
+                    *l = format!(
+                        "acct:{}:{}:{}:{}",
+                        p[1],
+                        col - 2_500 * USD_SCALE as i128,
+                        p[3],
+                        p[4]
+                    );
+                }
+            }
+        }
+        batch.trace[3] = obyte_merkle::root(&batch.leaf_trace[3]);
+        batch.checkpoint.trace_root = obyte_merkle::root(&batch.trace);
+        let mut replay = Engine::new();
+        fund(&mut replay);
+        let proof = build_proof(&batch, &mut replay, &[], 0).expect("proof");
+        assert_eq!(proof.pred, "fill_math");
+        assert!(proof.fill_aa);
+        assert!(
+            proof.data.get("right").is_none() && proof.data.get("right_proof").is_none(),
+            "trailing fill must ride the index-is-last arm, not a missing neighbor"
+        );
+        assert!(
+            proof.data.get("op").is_some(),
+            "taker leg carries the unit op proof"
+        );
+    }
+
+    #[test]
+    fn fill_math_isolated_taker_emits_op_and_ord_proofs() {
+        // Bob rests a cross ask; alice crosses it with an ISOLATED bid that
+        // fully fills (her taker order leaves no post ord leaf). The liar
+        // inflates alice's posted collateral by 1 unit. The payload must
+        // carry the p: op proof (isolated flag) plus the taker-ord absence
+        // straddle, and — as the batch's only fill — no right neighbor.
+        use operp_types::{
+            OrderType, Side, TimeInForce, BTC_USD, PRICE_SCALE, QTY_SCALE, USD_SCALE,
+        };
+        let alice = sk(1);
+        let bob = sk(2);
+        let alice_id = acct_of(&alice);
+        let bob_id = acct_of(&bob);
+        let fund = |eng: &mut Engine| {
+            eng.state
+                .account_mut(alice_id)
+                .credit(10_000 * USD_SCALE as i128)
+                .unwrap();
+            eng.state
+                .account_mut(bob_id)
+                .credit(10_000 * USD_SCALE as i128)
+                .unwrap();
+        };
+        let mut eng = Engine::new();
+        fund(&mut eng);
+        let prev = eng.state.clone();
+        let g = genesis_id();
+        let px = 100_000 * PRICE_SCALE as i64;
+        let q = QTY_SCALE / 1000;
+        let margin = 40 * USD_SCALE;
+        let ask = sign_unit(
+            vec![g],
+            Op::Place {
+                account: bob_id,
+                market: BTC_USD,
+                side: Side::Ask,
+                typ: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: px,
+                qty: q,
+                client_seq: 1,
+                isolated: false,
+                margin: 0,
+            },
+            &bob,
+        );
+        let id1 = unit_id(&ask);
+        eng.ingest(ask).unwrap();
+        let bid = sign_unit(
+            vec![id1],
+            Op::Place {
+                account: alice_id,
+                market: BTC_USD,
+                side: Side::Bid,
+                typ: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: px,
+                qty: q,
+                client_seq: 1,
+                isolated: true,
+                margin,
+            },
+            &alice,
+        );
+        let id2 = unit_id(&bid);
+        eng.ingest(bid).unwrap();
+        let mut eng2 = eng.clone();
+        let mut batch = Batch::from_applied(&prev, &mut eng2, &[id1, id2]).expect("batch");
+        assert_eq!(batch.fills.len(), 1, "one fill, the batch's last element");
+        assert_eq!(batch.checkpoint.fill_count, 1);
+        // Liar: alice's posted collateral inflated by 1 USD unit.
+        let alice_hex = hex::encode(alice_id.0);
+        if let Some(leaves) = batch.leaf_trace.get_mut(1) {
+            for l in leaves.iter_mut() {
+                if l.starts_with(&format!("acct:{alice_hex}:")) {
+                    let p: Vec<&str> = l.split(':').collect();
+                    let col: i128 = p[2].parse().unwrap();
+                    *l = format!("acct:{}:{}:{}:{}", p[1], col + 1, p[3], p[4]);
+                }
+            }
+        }
+        batch.trace[1] = obyte_merkle::root(&batch.leaf_trace[1]);
+        batch.checkpoint.trace_root = obyte_merkle::root(&batch.trace);
+        let mut replay = Engine::new();
+        fund(&mut replay);
+        let proof = build_proof(&batch, &mut replay, &[], 0).expect("proof");
+        assert_eq!(proof.pred, "fill_math");
+        assert!(proof.fill_aa);
+        assert_eq!(
+            proof.data.get("who").and_then(|v| v.as_str()),
+            Some("taker")
+        );
+        let op = proof
+            .data
+            .get("op")
+            .and_then(|v| v.as_str())
+            .expect("op proof emitted");
+        assert!(op.starts_with("p:"), "taker leg requires a Place op");
+        assert_eq!(
+            op.split(':').nth(6),
+            Some("1"),
+            "op carries the isolated flag"
+        );
+        assert!(proof.data.get("ops_proof").is_some());
+        assert!(
+            proof.data.get("tord").is_some()
+                || (proof.data.get("oleft").is_some() && proof.data.get("oright").is_some()),
+            "taker-ord membership or absence straddle is emitted"
+        );
+        assert!(
+            proof.data.get("right").is_none() && proof.data.get("right_proof").is_none(),
+            "sole batch fill rides the index-is-last arm"
         );
     }
     #[test]

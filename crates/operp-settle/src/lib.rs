@@ -280,10 +280,12 @@ pub fn ops_element(unit_hex: &str, op: &operp_dag::Op) -> String {
     }
 }
 /// Fill-descriptor string committed by `fills_root`. `fill_index_in_unit`
-/// starts at 0 per unit.
+/// starts at 0 per unit. Field 13 is `taker_post` (USD_SCALE, 0 when the
+/// taker order is cross): the escrow share this fill moves, which the
+/// dispute AA's collateral identity consumes.
 pub fn fills_element(unit_hex: &str, fill_index_in_unit: usize, fill: &Fill) -> String {
     format!(
-        "f:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "f:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         unit_hex,
         fill_index_in_unit,
         hex::encode(fill.taker.0),
@@ -295,7 +297,8 @@ pub fn fills_element(unit_hex: &str, fill_index_in_unit: usize, fill: &Fill) -> 
         fill.qty,
         fill.seq,
         fill.taker_side.as_u8(),
-        fill.kind
+        fill.kind,
+        fill.taker_post
     )
 }
 

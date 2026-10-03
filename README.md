@@ -51,7 +51,7 @@ cd obyte-local && node deploy_mainnet.js      # deploy the four AAs (needs OPERP
 | Crate | Role |
 |---|---|
 | `operp-types` | Constants (single source of truth), ids (`AccountId = sha256(pubkey)`), fixed-point math |
-| `operp-book` | Central limit order book: price-time priority, partial fills, IOC/GTC, self-trade cancel-maker protection |
+| `operp-book` | Central limit order book: price-time priority, partial fills, IOC/GTC, self-trade protection (escrowed own maker → reject the incoming order, cross maker → cancel-maker) |
 | `operp-account` | Per-account collateral/positions, VWAP entry price, realized PnL, risk snapshot |
 | | `liquidatable` at equity·10000 ≤ mm·10500, `reduce_only` at ≤ 12000 |
 | `operp-state` | ChainState: accounts/books/marks/withdrawals, byte-level Merkle tree (`state_root`) + hex-string tree (`aa_root`) for the AA |
@@ -354,7 +354,8 @@ cumulative withdraw anti-replay (`W` committed inside every aa-tree leaf),
 bond recovery via claim (frozen-height gating), bounded withdrawals/
 AA-unit/gov-nonce ledgers (256-height replay window), flip-order initial-margin
 gate on open quantity, create-market bps ceilings, tick-size enforcement,
-applied-only `seq` accounting, self-trade cancel-maker continuation,
+applied-only `seq` accounting, self-trade prevention (escrowed own
+maker rejects the incoming place; cross makers cancel-maker-continue),
 taker AND maker bad-debt clamping into the insurance fund, proposal cleanup
 with creation-time voting-weight snapshots, Obyte-address binding on
 deposits (`addr` field, first-seen-wins), asset-kind-bound deposit
