@@ -730,7 +730,8 @@ async function main() {
   console.log("13a. fake unit hex bounced 'bad unit' — no verdict");
 
   // ---- 14. two-package height: deposit-fraud predicate fires, height fails --
-  // h3 was frozen by 13 (skip), so last_submitted=2 and a fresh h3 submit is legal.
+  // 13a's NEG submit left last_submitted=3 (a bounce rolls nothing back), so
+  // the two-package assertion goes to h4: prev=STATE_ROOT == state_root_3.
   // Two 1-unit packages post first (JS join+base64, no helper binary), then
   // the da_unit header nails the real package hashes + data_root. The fraud
   // verdict proves the multi-package DA reveal feeds the same predicate path
@@ -749,16 +750,16 @@ async function main() {
   const rawA = zlib.gunzipSync(Buffer.from(blobA, "base64"));
   const rawB = zlib.gunzipSync(Buffer.from(blobB, "base64"));
   const shaHex = (b) => crypto.createHash("sha256").update(b).digest("hex");
-  const sd3pkg = submitData(3, STATE_ROOT, STATE_ROOT);
-  sd3pkg.ops_root = PKG_OPS_ROOT;
-  sd3pkg.trace_root = PKG_TRACE_ROOT;
-  sd3pkg.units_root = UNITS_SET_ROOT;
-  sd3pkg.units_set_root = SET_ROOT1;
+  const sd4pkg = submitData(4, STATE_ROOT, STATE_ROOT);
+  sd4pkg.ops_root = PKG_OPS_ROOT;
+  sd4pkg.trace_root = PKG_TRACE_ROOT;
+  sd4pkg.units_root = UNITS_SET_ROOT;
+  sd4pkg.units_set_root = SET_ROOT1;
   // Full header scalars from the submit (same helper as single-package),
   // then packages = REAL package unit hashes (pr.unit) so watchers can
   // get_joint each entry; data_root = sha256 of concatenated blob bytes.
-  const h3pkg = headerFromSubmit(sd3pkg, PKG_OP);
-  h3pkg.data_root = shaHex(Buffer.concat([rawA, rawB]));
+  const h4pkg = headerFromSubmit(sd4pkg, PKG_OP);
+  h4pkg.data_root = shaHex(Buffer.concat([rawA, rawB]));
   {
     const pkgMsg = (blob) => ({ app: "temp_data", payload_location: "inline", payload: {
       data_length: require("ocore/object_length.js").getLength({ package_blob: blob }, true),
@@ -776,38 +777,20 @@ async function main() {
     });
     if (pr2.error) throw new Error("package 2 post failed: " + pr2.error);
     await network.witnessUntilStable(pr2.unit);
-    delete h3pkg.frames_blob;
-    h3pkg.packages = [pr1.unit, pr2.unit];
-    // TEMP DIAG: every operand of the rollup's bad-submit gate.
-    {
-      const sv = await vars(rollup);
-      const L = (v) => (typeof v === "string" ? v.length : typeof v);
-      console.error(
-        "DIAG h=" + sd3pkg.height + " ls=" + sv.last_submitted + " lf=" + sv.last_finalized +
-        " h_eq_ls1=" + (Number(sd3pkg.height) === Number(sv.last_submitted) + 1) +
-        " frozen3=" + sv.frozen_3 + " sr2=" + String(sv.state_root_2).slice(0, 10) +
-        " cid=" + sd3pkg.chain_id + " av=" + sd3pkg.assertion_version +
-        " sr=" + L(sd3pkg.state_root) + " pv=" + L(sd3pkg.prev_state_hash) +
-        " af=" + L(sd3pkg.aa_forest) + " w=" + L(sd3pkg.wit_root) +
-        " t=" + L(sd3pkg.trace_root) + " u=" + L(sd3pkg.units_root) +
-        " us=" + L(sd3pkg.units_set_root) + " o=" + L(sd3pkg.ops_root) +
-        " f=" + L(sd3pkg.fills_root) + " uc=" + sd3pkg.unit_count +
-        " wc=" + sd3pkg.wit_count + " uType=" + typeof sd3pkg.unit_count +
-        " wcType=" + typeof sd3pkg.wit_count
-      );
-    }
+    delete h4pkg.frames_blob;
+    h4pkg.packages = [pr1.unit, pr2.unit];
     const r3p = await operator.sendMulti({
       messages: [
-        tempDataMsg(h3pkg),
-        { app: "data", payload: sd3pkg },
+        tempDataMsg(h4pkg),
+        { app: "data", payload: sd4pkg },
       ],
       base_outputs: [{ address: rollup, amount: SUBMIT_FEE }],
     });
-    if (r3p.error) throw new Error("h3 2-package submit failed: " + r3p.error);
+    if (r3p.error) throw new Error("h4 2-package submit failed: " + r3p.error);
     await network.witnessUntilStable(r3p.unit);
     const res3p = await network.getAaResponseToUnit(r3p.unit).catch(() => null);
     if (res3p && res3p.response && res3p.response.bounced)
-      throw new Error("h3 2-package submit bounced: " + bounceDetail(res3p));
+      throw new Error("h4 2-package submit bounced: " + bounceDetail(res3p));
   }
   const pkgFraud = {
     rollup: ROLLUP_ADDR,
@@ -827,40 +810,43 @@ async function main() {
     pre_leaf_proof: merkle.getMerkleProof(H3_PRE, H3_PRE_IDX[DEP_PRE]),
     post_leaf_proof: merkle.getMerkleProof(PKG_POST, 0),
   };
-  await triggerVerdict(challenger, dispute, Object.assign({ pred: "deposit", height: 3 }, pkgFraud), 20000, "2-package deposit fraud predicate");
+  await triggerVerdict(challenger, dispute, Object.assign({ pred: "deposit", height: 4 }, pkgFraud), 20000, "2-package deposit fraud predicate");
   st = await vars(rollup);
-  if (Number(st.frozen_3) !== 2) throw new Error("2-package fraud did not freeze height");
-  console.log("14. 2-package height deposit fraud → frozen=3");
+  if (Number(st.frozen_4) !== 2) throw new Error("2-package fraud did not freeze height");
+  console.log("14. 2-package height deposit fraud → frozen=4");
   // ---- 15. re-submit + finalize after fraud works -------------------------
-  await sendCombinedSubmit(operator, 3, STATE_ROOT, STATE_ROOT);
+  await sendCombinedSubmit(operator, 4, STATE_ROOT, STATE_ROOT);
   await network.timetravel({ shift: "3600s" });
+  // Heights finalize in order: h3 (the NEG-submit height, never frauded
+  // away) first, then the re-submitted h4.
   await trigger(operator, rollup, { finalize: 1, height: 3 }, 20000);
+  await trigger(operator, rollup, { finalize: 1, height: 4 }, 20000);
   st = await vars(rollup);
-  if (Number(st.last_finalized) !== 3) throw new Error("re-finalize after fraud failed");
+  if (Number(st.last_finalized) !== 4) throw new Error("re-finalize after fraud failed");
   console.log("15. re-submit + finalize after fraud ok");
-  // ---- 16. pipeline: h4 + h5 with no finalize between ---------------------
+  // ---- 16. pipeline: h5 + h6 with no finalize between ---------------------
   // Occupancy is last_submitted-last_finalized = 2 < 50, so the second submit
   // must NOT bounce. Then timetravel once, finalize in order.
-  await sendCombinedSubmit(operator, 4, STATE_ROOT, STATE_ROOT);
   await sendCombinedSubmit(operator, 5, STATE_ROOT, STATE_ROOT);
+  await sendCombinedSubmit(operator, 6, STATE_ROOT, STATE_ROOT);
   st = await vars(rollup);
-  if (Number(st.last_submitted) !== 5) throw new Error("pipeline submits failed: " + st.last_submitted);
-  if (Number(st.last_finalized) !== 3) throw new Error("pipeline must not finalize early");
-  console.log("16. pipeline h4+h5 submitted with no inter-finalize");
+  if (Number(st.last_submitted) !== 6) throw new Error("pipeline submits failed: " + st.last_submitted);
+  if (Number(st.last_finalized) !== 4) throw new Error("pipeline must not finalize early");
+  console.log("16. pipeline h5+h6 submitted with no inter-finalize");
   await network.timetravel({ shift: "3600s" });
-  await trigger(operator, rollup, { finalize: 1, height: 4 }, 20000);
   await trigger(operator, rollup, { finalize: 1, height: 5 }, 20000);
+  await trigger(operator, rollup, { finalize: 1, height: 6 }, 20000);
   st = await vars(rollup);
-  if (Number(st.last_finalized) !== 5) throw new Error("pipelined finalize failed");
-  console.log("16a. pipelined h4+h5 finalized in order");
+  if (Number(st.last_finalized) !== 6) throw new Error("pipelined finalize failed");
+  console.log("16a. pipelined h5+h6 finalized in order");
   // ---- 17. pool claim when chain idle; pool busy otherwise -----------------
-  // Chain idle (ls==lf==5): operator claims the standing pool back.
+  // Chain idle (ls==lf==6): operator claims the standing pool back.
   const poolBefore = Number(st["pool_" + (await operator.getAddress())] || 0);
   if (!(poolBefore >= 1000000000000)) throw new Error("pool below floor after slashes: " + poolBefore);
-  await sendCombinedSubmit(operator, 6, STATE_ROOT, STATE_ROOT);
+  await sendCombinedSubmit(operator, 7, STATE_ROOT, STATE_ROOT);
   await triggerBounce(operator, rollup, { claim: "pool" }, 20000, "pool busy");
   await network.timetravel({ shift: "3600s" });
-  await trigger(operator, rollup, { finalize: 1, height: 6 }, 20000);
+  await trigger(operator, rollup, { finalize: 1, height: 7 }, 20000);
   await trigger(operator, rollup, { claim: "pool" }, 20000);
   st = await vars(rollup);
   if (Number(st["pool_" + (await operator.getAddress())] || 0) !== 0)
@@ -870,11 +856,11 @@ async function main() {
   // Scenario 17 claimed the operator pool to zero — the same state a
   // slash-depleted operator lands in. Its next submit must bounce
   // 'need pool' until a fresh {pool:1} top-up; then the gate reopens.
-  await triggerBounce(operator, rollup, submitData(7, STATE_ROOT, STATE_ROOT), 20000, "need pool");
+  await triggerBounce(operator, rollup, submitData(8, STATE_ROOT, STATE_ROOT), 20000, "need pool");
   await trigger(operator, rollup, { pool: 1 }, POOL_FUND_GROSS);
-  await sendCombinedSubmit(operator, 7, STATE_ROOT, STATE_ROOT);
+  await sendCombinedSubmit(operator, 8, STATE_ROOT, STATE_ROOT);
   st = await vars(rollup);
-  if (Number(st.last_submitted) !== 7) throw new Error("re-submit after pool top-up failed");
+  if (Number(st.last_submitted) !== 8) throw new Error("re-submit after pool top-up failed");
   console.log("18. depleted pool bounces 'need pool'; top-up reopens submit");
   process.exit(failures === 0 ? 0 : 1);
 }
