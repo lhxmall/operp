@@ -699,8 +699,9 @@ mod tests {
         assert!(a.positions.is_empty());
 
         // Blow-through: loss exceeds the bucket. Bucket stops at 0,
-        // collateral goes negative — the state-level shortfall loop
-        // (operp-exec) clamps it and debits insurance by exactly the hole.
+        // collateral goes negative — the state-level fill claw
+        // (operp-state's apply_fill_pair) recovers what the winner can
+        // pay and leaves the rest as negative collateral.
         let mut b = Account::new(AccountId([2; 32]));
         b.apply_fill(
             Side::Bid,

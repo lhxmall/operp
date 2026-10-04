@@ -50,6 +50,10 @@ pub struct Engine {
     /// entries as `leaf_trace` DA for watcher proof building. Unbounded
     /// per-unit growth is capped by pruning alongside `wit_trace`.
     pub wit_leaf_trace: Vec<Vec<String>>,
+    /// Reentrancy guard: set while `liquidate` is mid-flight so a nested
+    /// call (force-sell from `place`) returns no fills without touching
+    /// state. Cleared on every exit path including `Err`.
+    liquidating: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +129,7 @@ impl Engine {
             wit_trace: Vec::new(),
             wit_count_trace: Vec::new(),
             wit_leaf_trace: Vec::new(),
+            liquidating: false,
         }
     }
 
@@ -157,6 +162,7 @@ impl Engine {
             wit_trace: Vec::new(),
             wit_count_trace: Vec::new(),
             wit_leaf_trace: Vec::new(),
+            liquidating: false,
         })
     }
 
@@ -352,6 +358,7 @@ impl Engine {
                 *price,
                 *qty,
                 *client_seq,
+                id,
                 seq,
                 *isolated,
                 *margin,
@@ -497,6 +504,7 @@ impl Engine {
         price: operp_types::Price,
         qty: Qty,
         client_seq: u64,
+        unit: UnitId,
         seq: Seq,
         isolated: bool,
         margin: u64,
@@ -816,8 +824,69 @@ impl Engine {
         if !result.taker_resting && result.taker_margin_left > 0 {
             self.state.account_mut(account).collateral += i128::from(result.taker_margin_left);
         }
+        // Force-sell: any fill party still liquidatable after this fill is
+        // closed in the same unit (book IOC, then ADL inside `liquidate`).
+        // The user fill is already applied, so a nested liquidation Err is
+        // ignored — never fail the place over it. Returned fills join this
+        // unit's fill list; fill_math bounces a multi-fill unit, so they
+        // must not become a second op.
+        let mut fills = result.fills;
+        let extra = self.force_sell_fill_parties(&fills, unit, seq);
+        fills.extend(extra);
         self.state.seen_client_seq.insert(account, client_seq);
-        Ok(result.fills)
+        Ok(fills)
+    }
+
+    /// Force-sell every fill party that is still liquidatable after a user
+    /// fill, in the same unit. The other fill party is the liquidation
+    /// caller; insurance is never a caller or target. `liquidate` does the
+    /// book IOC first, then ADL onto opposite positions — no insurance
+    /// buyer anywhere. Err (e.g. the snapshot flipped after the claw) is
+    /// ignored: the user fill already applied and there is no retry.
+    fn force_sell_fill_parties(&mut self, fills: &[Fill], unit: UnitId, seq: Seq) -> Vec<Fill> {
+        let mut extra = Vec::new();
+        for fill in fills {
+            for (target, caller) in [(fill.taker, fill.maker), (fill.maker, fill.taker)] {
+                if target == caller || target == INSURANCE_ACCOUNT {
+                    continue;
+                }
+                // Same liquidatable fork as `liquidate`: an isolated
+                // position is judged on its bucket risk, everything else
+                // on the pooled account snapshot.
+                let liquidatable = match self
+                    .state
+                    .accounts
+                    .get(&target)
+                    .and_then(|a| a.positions.get(&fill.market))
+                {
+                    Some(p) if p.isolated => self
+                        .state
+                        .accounts
+                        .get(&target)
+                        .map(|a| {
+                            a.isolated_risk(fill.market, &self.state.marks, &self.state.markets)
+                                .liquidatable
+                        })
+                        .unwrap_or(false),
+                    _ => self
+                        .state
+                        .accounts
+                        .get(&target)
+                        .map(|a| {
+                            a.snapshot(&self.state.marks, &self.state.markets)
+                                .liquidatable
+                        })
+                        .unwrap_or(false),
+                };
+                if !liquidatable {
+                    continue;
+                }
+                if let Ok(fs) = self.liquidate(unit, seq, caller, target, fill.market) {
+                    extra.extend(fs);
+                }
+            }
+        }
+        extra
     }
 
     /// First live order of `account` on `books[market]`'s margin mode, if
@@ -1046,7 +1115,29 @@ impl Engine {
         Ok(Vec::new())
     }
 
+    /// Guarded entry — dispatch and force-sell both land here. A nested
+    /// call (one made while another `liquidate` is mid-flight) returns no
+    /// fills before touching any state, so an outer call's book submit,
+    /// fills, and ADL never interleave with a second cascade. The flag is
+    /// cleared on every exit path, `Err` included.
     fn liquidate(
+        &mut self,
+        unit: UnitId,
+        seq: Seq,
+        caller: AccountId,
+        target: AccountId,
+        market: operp_types::MarketId,
+    ) -> Result<Vec<Fill>, RejectReason> {
+        if self.liquidating {
+            return Ok(Vec::new());
+        }
+        self.liquidating = true;
+        let out = self.liquidate_inner(unit, seq, caller, target, market);
+        self.liquidating = false;
+        out
+    }
+
+    fn liquidate_inner(
         &mut self,
         unit: UnitId,
         seq: Seq,
@@ -1189,14 +1280,38 @@ impl Engine {
             .unwrap_or(0);
         let mut keeper_paid = Usd::from(0u64);
         if still && remaining_pos != 0 {
-            let ins = INSURANCE_ACCOUNT;
+            // ADL remainder: the book did not finish the close, so the
+            // still-liquidatable remainder is walked onto opposite-sign
+            // positions at the current mark — insurance is never the
+            // buyer of last resort. Each take is a zero-sum kind-2 fill
+            // (the dispute AA always bounces kind 2; no haircut formula
+            // here). Candidates exhausted → the unsold qty stays:
+            // negative collateral remains, the target is not credited,
+            // nothing is printed.
             let mark = *self.state.marks.get(&market).unwrap_or(&0);
-            let close_qty = remaining_pos.unsigned_abs();
             let close_side = if remaining_pos > 0 {
                 Side::Ask
             } else {
                 Side::Bid
             };
+            let mut remaining = remaining_pos.unsigned_abs();
+            // Opposite-sign holders only, excluding the target and
+            // insurance. Larger |qty| first, AccountId ascending on ties
+            // (explicit tie-break keeps the order deterministic).
+            let mut candidates: Vec<(AccountId, Qty)> = self
+                .state
+                .accounts
+                .iter()
+                .filter(|(id, a)| {
+                    **id != target
+                        && **id != INSURANCE_ACCOUNT
+                        && a.positions
+                            .get(&market)
+                            .is_some_and(|p| p.qty.signum() == -remaining_pos.signum())
+                })
+                .map(|(id, a)| (*id, a.positions[&market].qty.unsigned_abs()))
+                .collect();
+            candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             let target_isolated = self
                 .state
                 .accounts
@@ -1204,29 +1319,39 @@ impl Engine {
                 .and_then(|a| a.positions.get(&market))
                 .map(|p| p.isolated)
                 .unwrap_or(false);
-            let fill = Fill {
-                taker_id: oid,
-                maker_id: OrderId([0u8; 32]),
-                taker: target,
-                maker: ins,
-                market,
-                price: mark,
-                qty: close_qty,
-                seq,
-                taker_side: close_side,
-                taker_post: 0,
-                maker_post: 0,
-                taker_isolated: target_isolated,
-                maker_isolated: false,
-                kind: 3,
-            };
-            self.state.apply_fill_pair(&fill).map_err(map_acct)?;
-            fills.push(fill);
+            for (maker_acct, maker_qty) in candidates {
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(maker_qty);
+                if take == 0 {
+                    continue;
+                }
+                let fill = Fill {
+                    taker_id: oid,
+                    maker_id: OrderId([0u8; 32]),
+                    taker: target,
+                    maker: maker_acct,
+                    market,
+                    price: mark,
+                    qty: take,
+                    seq,
+                    taker_side: close_side,
+                    taker_post: 0,
+                    maker_post: 0,
+                    taker_isolated: target_isolated,
+                    maker_isolated: false,
+                    kind: 2,
+                };
+                self.state.apply_fill_pair(&fill).map_err(map_acct)?;
+                fills.push(fill);
+                remaining -= take;
+            }
         }
-        // Keeper reward: bps of filled notional, seized from the liquidatee's
-        // own collateral — the insurance fund absorbs negative equity inside
-        // `apply_fill_pair`, it does not fund the reward. A target with no
-        // positive collateral leaves the keeper with nothing.
+        // Keeper reward: bps of filled notional, seized from the
+        // liquidatee's own collateral — insurance never funds the reward.
+        // A target with no positive collateral leaves the keeper with
+        // nothing.
         for f in &fills {
             let keeper_bps = self.state.market_params(market).keeper_reward_bps;
             keeper_paid += bps(notional_usd(f.qty, f.price), keeper_bps);
@@ -1256,10 +1381,10 @@ impl Engine {
 
     /// Funding-rate liquidation, off-book: close the target at the external
     /// index (mark as fallback), ADL the closed qty onto opposite-sign
-    /// positions, insurance covers what it can of any remaining negative
-    /// equity, then positive-PnL counterparties take a pro-rata haircut;
-    /// any hole left after that stays on the account — collateral is never
-    /// printed. Keeper reward is seized from the target afterwards.
+    /// positions, then positive-PnL counterparties take a pro-rata haircut
+    /// of any residual hole — zero-sum, insurance untouched. A hole they
+    /// cannot cover stays on the account: collateral is never printed.
+    /// Keeper reward is seized from the target afterwards.
     /// Returns synthetic fills for the event log (state is already applied).
     fn liquidate_funding_off_book(
         &mut self,
@@ -1498,44 +1623,11 @@ impl Engine {
                 })
                 .unwrap_or(0)
         };
-        // Insurance absorbs what it can of negative equity; never below 0.
-        let mut equity = target_equity(&self.state);
-        if equity < 0 {
-            let from_ins = (-equity).min(
-                self.state
-                    .accounts
-                    .get(&INSURANCE_ACCOUNT)
-                    .map(|a| a.collateral.max(0))
-                    .unwrap_or(0),
-            );
-            if from_ins > 0 {
-                // Isolated top-up lands in the bucket while the position
-                // still exists (it is what equity is measured against);
-                // a fully-closed position's hole settled into collateral.
-                let tgt_still_isolated = self
-                    .state
-                    .accounts
-                    .get(&target)
-                    .map(|a| {
-                        a.positions
-                            .get(&market)
-                            .map(|p| p.isolated)
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if tgt_still_isolated {
-                    if let Some(a) = self.state.accounts.get_mut(&target) {
-                        *a.isolated_margin.entry(market).or_insert(0) += from_ins;
-                    }
-                } else if let Some(a) = self.state.accounts.get_mut(&target) {
-                    a.collateral += from_ins;
-                }
-                if let Some(a) = self.state.accounts.get_mut(&INSURANCE_ACCOUNT) {
-                    a.collateral -= from_ins;
-                }
-                equity += from_ins;
-            }
-        }
+        // No insurance top-up: the fund never pays a loss. The residual
+        // hole below is haircut from positive-PnL ADL counterparties
+        // instead (zero-sum, insurance not debited); whatever they cannot
+        // cover stays on the account as negative equity.
+        let equity = target_equity(&self.state);
         // Residual hole: haircut positive-PnL ADL counterparties pro-rata,
         // last in ADL order takes the remainder. Each is debited at most
         // the positive delta recorded for this call, and every debit lands
@@ -1557,8 +1649,9 @@ impl Engine {
                     if let Some(a) = self.state.accounts.get_mut(id) {
                         a.collateral -= share;
                     }
-                    // Credit the target through the same isolated-vs-cross
-                    // branch as the insurance top-up above.
+                    // Credit the target through the isolated-vs-cross
+                    // branch (bucket while the position still exists,
+                    // collateral once it is gone).
                     let tgt_still_isolated = self
                         .state
                         .accounts
@@ -2475,6 +2568,161 @@ mod tests {
             e,
             ExecEvent::Applied { fills, .. } if !fills.is_empty()
         )));
+    }
+
+    /// Empty book: the liquidation IOC fills nothing, so the still-
+    /// liquidatable remainder is ADL'd onto the opposite holder in the
+    /// same unit — its maker is that counterparty, never
+    /// INSURANCE_ACCOUNT, priced at the current mark.
+    #[test]
+    fn liquidate_adl_remainder_uses_counterparty() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        let alice = sk(1);
+        let bob = sk(2);
+        let keeper = sk(3);
+        let d1 = deposit(vec![g], &alice, 15_000 * USD_SCALE as i128, 1);
+        let id1 = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let d2 = deposit(vec![id1], &bob, 1_000_000 * USD_SCALE as i128, 2);
+        let id2 = unit_id(&d2);
+        eng.ingest(d2).unwrap();
+        let px = 100_000 * PRICE_SCALE as i64;
+        // Bob rests the ask; alice crosses it: alice long 1 @ 100k, bob
+        // short 1 @ 100k — both orders consumed, book empty afterwards.
+        let ask = place(
+            vec![id2],
+            &bob,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
+        let id3 = unit_id(&ask);
+        eng.ingest(ask).unwrap();
+        let bid = place(
+            vec![id3],
+            &alice,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            QTY_SCALE,
+            1,
+        );
+        let id4 = unit_id(&bid);
+        eng.ingest(bid).unwrap();
+        assert_eq!(
+            eng.state
+                .books
+                .get(&BTC_USD)
+                .map(|b| b.live_orders().count())
+                .unwrap_or(0),
+            0,
+            "book is empty"
+        );
+        // Crash the mark: alice is liquidatable with nothing to trade into.
+        eng.state.marks.insert(BTC_USD, PRICE_SCALE as i64);
+        let a = acct_of(&alice);
+        let b = acct_of(&bob);
+        let liq = sign_unit(
+            vec![id4],
+            Op::Liquidate {
+                caller: acct_of(&keeper),
+                target: a,
+                market: BTC_USD,
+            },
+            &keeper,
+        );
+        let evs = eng.ingest(liq).unwrap();
+        let fills: Vec<Fill> = evs
+            .iter()
+            .filter_map(|e| match e {
+                ExecEvent::Applied { fills, .. } => Some(fills.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(!fills.is_empty(), "ADL remainder fill expected");
+        assert!(
+            fills.iter().all(|f| f.maker != INSURANCE_ACCOUNT),
+            "insurance is never the buyer of last resort"
+        );
+        assert_eq!(
+            fills[0].maker, b,
+            "remainder ADL'd onto the short counterparty"
+        );
+        assert_eq!(fills[0].kind, 2, "ADL fill kind");
+        assert_eq!(
+            fills[0].price, PRICE_SCALE as i64,
+            "ADL closes at the current mark"
+        );
+        assert!(
+            eng.state.accounts[&a].positions.is_empty(),
+            "position fully ADL'd away"
+        );
+    }
+
+    /// No opposite-sign holder exists: the ADL candidate list is empty, so
+    /// the liquidatable position stays on the account — the target is not
+    /// credited, nothing is printed, and insurance is unchanged.
+    #[test]
+    fn liquidate_remainder_stays_without_counterparty() {
+        let mut eng = Engine::new();
+        allow_all(&mut eng);
+        let g = genesis_id();
+        let alice = sk(1);
+        let keeper = sk(2);
+        let d1 = deposit(vec![g], &alice, 15_000 * USD_SCALE as i128, 1);
+        let id1 = unit_id(&d1);
+        eng.ingest(d1).unwrap();
+        let a = acct_of(&alice);
+        // Lone long — synthetic state: a real fill would mint a short on
+        // the counterparty, and this scenario needs none to exist.
+        eng.state
+            .account_mut(a)
+            .apply_fill(
+                Side::Bid,
+                true,
+                100_000 * PRICE_SCALE as i64,
+                QTY_SCALE,
+                BTC_USD,
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+        eng.state.marks.insert(BTC_USD, PRICE_SCALE as i64);
+        let ins_before = eng.state.accounts[&INSURANCE_ACCOUNT].collateral;
+        let liq = sign_unit(
+            vec![id1],
+            Op::Liquidate {
+                caller: acct_of(&keeper),
+                target: a,
+                market: BTC_USD,
+            },
+            &keeper,
+        );
+        let evs = eng.ingest(liq).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, ExecEvent::Applied { .. })),
+            "{evs:?}"
+        );
+        assert_eq!(
+            eng.state.accounts[&a]
+                .positions
+                .get(&BTC_USD)
+                .map(|p| p.qty),
+            Some(QTY_SCALE as i64),
+            "position stays — nobody could take the other side"
+        );
+        assert_eq!(
+            eng.state.accounts[&INSURANCE_ACCOUNT].collateral, ins_before,
+            "insurance unchanged"
+        );
     }
 
     #[test]
@@ -6607,8 +6855,9 @@ mod tests {
     }
 
     /// An isolated close that realizes more than its bucket leaves negative
-    /// collateral mid-fill; the shortfall loop clamps it to exactly 0 and
-    /// insurance absorbs exactly the hole.
+    /// collateral mid-fill; the fill claw takes the hole from the winning
+    /// counterparty. Insurance never pays it — the fund only gains the
+    /// taker fee.
     #[test]
     fn isolated_blowthrough_insurance() {
         let usd = |v: i128| v * USD_SCALE as i128;
@@ -6670,9 +6919,11 @@ mod tests {
         assert_eq!(eng.state.accounts[&a].isolated_margin[&BTC_USD], usd(10));
 
         let ins_before = eng.state.accounts[&INSURANCE_ACCOUNT].collateral;
+        let b = acct_of(&bob);
+        let bob_before = eng.state.accounts[&b].collateral;
         // Bob rests the closing bid at $50k; alice's isolated market ask
         // sells into it: release $10, realize −$50 → collateral −$40 (and
-        // the $0.025 taker fee on top) before the shortfall clamp.
+        // the $0.025 taker fee on top) before the fill claw.
         let bid = place(
             vec![tip],
             &bob,
@@ -6709,19 +6960,23 @@ mod tests {
         );
 
         let acct = &eng.state.accounts[&a];
-        assert!(acct.collateral >= 0, "clamped to non-negative");
-        assert_eq!(acct.collateral, 0, "clamped to exactly zero");
+        assert_eq!(acct.collateral, 0, "hole clawed in full, never printed");
         assert!(acct.positions.is_empty(), "position fully closed");
         assert_eq!(acct.isolated_margin[&BTC_USD], 0, "bucket emptied");
-        // Hole = $50 loss − $10 bucket = $40. The close's $0.025 taker fee
-        // credits insurance first, then the clamp debits $40.025 back —
-        // net: insurance absorbs exactly the $40 hole.
+        // Hole = $50 loss − $10 bucket + $0.025 taker fee = $40.025: it
+        // is clawed from bob (the fill's winner). Insurance must not fall
+        // by it — the fund only gains the close's fee.
+        let close_fee = 25_000i128; // 5 bps of $50 notional
         assert_eq!(
             eng.state.accounts[&INSURANCE_ACCOUNT].collateral,
-            ins_before - 40 * USD_SCALE as i128,
-            "insurance absorbed exactly the hole"
+            ins_before + close_fee,
+            "insurance gains only the fee; the $40 hole is clawed instead"
         );
-        assert!(eng.state.accounts[&INSURANCE_ACCOUNT].collateral >= 0);
+        assert_eq!(
+            eng.state.accounts[&b].collateral,
+            bob_before + 50 * USD_SCALE as i128 - (40 * USD_SCALE as i128 + close_fee),
+            "bob paid the whole hole"
+        );
         let _ = tip;
     }
 }
