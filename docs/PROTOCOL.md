@@ -121,24 +121,30 @@ taker≤200、keeper≤500、im ≥ 10×FUNDING_CAP_BPS），CreateMarket 与
   守恒不变式：`collateral + Σisolated_margin + Σlive margin_left`
   只经 deposit/withdraw/PnL 变动。
 - **风险隔离**（`isolated_risk(market)`）：equity = 桶 + 该仓 uPnL，
-  亏损失止于桶；`snapshot` 完全跳过逐仓仓位（跨仓权益/IM/可清算性
+  `snapshot` 完全跳过逐仓仓位（跨仓权益/IM/可清算性
   看不见它）。mark 缺失 → reduce_only，equity = 桶。清算判定逐仓走
   `isolated_risk`、跨仓走 snapshot；平仓释放比例桶进 collateral 后
-  才结算 PnL，负权益由 apply_fill_pair 既有钳零吸收。
+  才结算 PnL。逐仓是风险计算与开仓保证金边界，不是坏账担保：成交可使
+  collateral 为负，随后仅按 §2.4 从非保险对手方可用正抵押有限 clawback；
+  未覆盖的负余额仍保留，保险不补。
 
 ### 2.4 清算、keeper 与保险基金
 
-- Liquidate 由 keeper 发起（op 内含 `caller` 且验签绑定）；`caller == target`
-  返回 `BadAccount` —— 自我清算禁止。
-- 清算单是 Market IOC 单吃掉对手盘；仍不干净时剩余仓位以 mark 价与保险基金
-  对敲平仓。
-- keeper 奖励 = Σ bps(每笔成交名义额, 100)，从**被清算方抵押**中扣除
-  （以其正余额为上限，奖励不足时 keeper 拿 0）；保险基金只吸收负权益，
-  不再为奖励出资。保险基金在创世时注入 10 000 USD 种子金，永不参与清算
-  判定（不可被清算、不自我清算）。
-- **坏账封顶**：成交后若 taker equity < 0，其 equity 被钳到恰好 0
-  （collateral 吸收缺口），保险基金 collateral 等额扣减——守恒、且后续
-  成交不会重复触发。损失社会化到基金，绝不转嫁对手方。
+- `Place` 成交后会复核双方；仍可清算的一方可能在同一单元内被强制卖出。
+  keeper 发起的 `Liquidate` 由 `caller` 签名，禁止自我清算，也不能把保险账户
+  作为 caller 或 target。普通市场先用 Market IOC 吃簿；目标仍可清算时，剩余
+  仓位按 mark 价 ADL 给反向持仓者，按仓位绝对值降序、`AccountId` 升序确定
+  次序。对手仓位不足时剩余仓位保留在目标账户，不由保险基金接盘。
+- 普通双非保险方成交若使一方 collateral 为负，只从另一方可用正 collateral
+  clawback：金额不超过其可支付余额、转账保持零和。余额不足时缺口仍留在负
+  collateral，不会把 equity 钳零或转记保险基金。
+- `funding_rate` 市场走独立离簿清算：以新鲜外部指数平仓、缺失时回退非零 mark，
+  ADL 后的残余缺口按比例从本次 ADL 对手方的正收益扣减；无法覆盖的部分仍留在
+  目标账户。该路径不向保险基金索赔。
+- keeper 奖励按市场 `keeper_reward_bps` 和本次清算成交名义额计算，只从被清算方
+  的正 collateral 扣款；不足则只付可用余额。创世市场默认 100 bps。保险基金创世
+  注入 10 000 USD，接收 taker 手续费，但不支付交易坏账或 keeper 奖励，也不作
+  清算的 ADL 对手方。
 - **mark 多重防线**：① notional ≥ 100 USD 才可更新；② 新价相对旧 mark
   偏离不得超过 ±10%；③ 一旦市场有债券注册报价者的报价（`Op::ReportPrice`，
   全部已质押报价者最新价的**中位数**，§7），成交价即失去 mark 定价权——
@@ -164,10 +170,13 @@ taker≤200、keeper≤500、im ≥ 10×FUNDING_CAP_BPS），CreateMarket 与
   无法撑爆 books / Merkle 叶子集合。
 - `deposits_allowed: HashSet<aa_unit>`：deposit op 引用的 AA 存款事件必须出现在
   本批次窗口的白名单里，否则 `UnbackedDeposit` 拒绝——存款不能凭空铸造。
-  生产路径中该集合来自真实 Obyte AA 存款事件；replay 时由
-  `validate_against` 从批次自身声明的 deposit ops 注入并交叉校验。
+生产路径中该集合来自真实 Obyte AA 存款事件；replay 时由
+`validate_against` 从批次自身声明的 deposit ops 注入并交叉校验。
+Replay 还会核对提供的 joint 哈希、实际付款内容、调用方绑定的 vault/asset，
+并要求 joint 首作者 = evidence payer = 侧链 `addr`。该本地证据校验不证明
+joint 已进入 Obyte 主 DAG 或获得稳定；AA 谓词路径本身不验证这类 L1 事实。
 
-## 3. 结算层：双根承诺
+## 3. 结算层：状态根与争议承诺
 
 每 ≤200000 units（BATCH_MAX_UNITS）/ 2 秒切一个批次，产出 Checkpoint：
 
@@ -184,7 +193,9 @@ taker≤200、keeper≤500、im ≥ 10×FUNDING_CAP_BPS），CreateMarket 与
 
 ### 3.1 state_root（字节域 Merkle 树）
 
-叶子 = 账户叶 ∥ 订单簿叶 ∥ meta 叶，排序后两两合并（奇数复制末位）：
+叶子 = 账户叶 ∥ 订单簿叶 ∥ meta 叶 ∥ 每个已消费充值 `aa_unit` 的独立
+`dep` 前缀叶，排序后两两合并（奇数复制末位）。充值锚点集合永久保留，
+不随普通 replay 窗口剪枝，防止旧 AA 付款再次入账：
 
 ```
 account_leaf = sha256("acct" ‖ id32 ‖ collateral_i128le16 ‖ realized_i128le16
@@ -197,10 +208,10 @@ book_leaf    = sha256(params_59B ‖ 簿承诺)
                # params_59B = symbol16‖tick_le8‖im_le8‖mm_le8‖taker_le8
                #   ‖keeper_le8‖delisted1B‖spot_only1B‖funding_rate1B
                #   ——市场参数本身成为被承诺状态
-meta_leaf    = sha256("meta" ‖ height_le ‖ seq_le ‖ last_unit
-                      ‖ perp_burned_le16 ‖ next_market_id_le4
-                      ‖ next_proposal_id_le8)
-               # 治理游标一并承诺，防重放歧义
+meta_leaf    = sha256("meta" ‖ 全部规范化共识元数据)
+               # 包含 height/seq/last_unit、市场与预言机状态、资金费时钟、
+               # commit-reveal、治理提案/投票及 PERP 供应等；精确序列化见
+               # docs/MECHANISMS.md §9.1，不限于下方示意字段
 ```
 
 **meta_leaf 包含 height**，且 `from_applied` 执行后会把 `engine.state.height`
@@ -226,11 +237,14 @@ AA 侧用纯字符串拼接 + `sha256(x, 'hex')` 在声明的 shard 内复算，
 (地址, 抵押, PERP, W) 集合。空 shard 提交哨兵根
 `hex(sha256("empty:<shard>"))`，零证明无法跨 shard 跳动。
 
-### 3.3 fills_hash / fill_count
+### 3.3 fills_hash / fill_count / fills_root
 
 成交流的规范编码（taker_id‖maker_id‖price‖qty‖seq）哈希。`from_applied` 与
 `validate_against` 共享 `fills_bytes()`，replay 时重算比对——operator 漏报/
-谎报成交会被直接抓住。
+谎报成交会被直接抓住。另有 AA 用的 `fills_root`：成交描述串后追加尾随
+`n:<len>` 长度哨兵，作为末笔成交的右邻证明；它独立于 `fills_hash` 和
+`fill_count`；零成交批次的根是单叶 `n:0`。`fill_count` 仍保留在提交头和
+rollup 状态，但 fill dispute 不依赖该整数来判定末笔。
 
 ```
 assert chain_id == CHAIN_ID          # ChainMismatch
@@ -245,7 +259,7 @@ assert last_unit 一致 ∧ replay.state_root == root   # RootMismatch
 
 TooManyUnits 上限（200000）在 from_applied 就挡住超大批次。
 
-## 4. 结算层：三个 AA（CHAIN_ID=operp-v2）
+## 4. 结算层：四个 AA 实例、三类职责（CHAIN_ID=operp-v2）
 
 状态变量（rollup AA；`<h>` 为高度后缀）：
 
@@ -282,7 +296,11 @@ submit(h)    h == last_submitted+1 ∧ chain_id='operp-v2' ∧ 双根 + 六个 4
                prev 必须等于上一高度 state_root（除非上一高度已 frozen=2）
 
 fraud(h)     窗内（submitted_at+3600）任何人打 dispute / dispute_fill：
-             deposit | withdraw | omit | fill_math | ghost | skip
+             deposit | withdraw | escrow(Cancel only) | fill_math | ghost | skip
+             当前 P-omit 不可用：force 只存时间戳，不能证明 unit 存在，
+             omit case 恒 bounce('no fraud')
+             P-escrow 仅用于 Cancel：post collateral 必须精确等于 pre
+             collateral + pre-order margin_left；Place escrow 无此证明分支
              验不过 → bounce('no fraud')，高度不动；
              验过 → dispute 付 10000 bytes + {verdict:'fraud',height,challenger}
                → rollup frozen_h=2、清根、last_submitted=h-1、
@@ -304,8 +322,7 @@ withdraw     vault：leaf_account==trigger.address；
              'perp claim needs burn'，见 MECHANISMS 10.5 / #12）
 
 force(id)    rollup：{force, unit_id 64hex} → inbox_<id>=timestamp；
-             主张必须把 inbox_upto 之前的 id 全收进 units_set_root，
-             漏收 = P-omit 欺诈
+             仅记录时间戳；当前没有可执行的非成员挑战来证明漏收
 ```
 
 **没有 lock，没有 `{challenge:1}`，没有应诉。** 揭发必须算对那一笔；
@@ -315,9 +332,11 @@ force(id)    rollup：{force, unit_id 64hex} → inbox_<id>=timestamp；
 
 - **余额权威是 proof 叶子**——operator 腐化也改不了提款上限。
 - **leaf_account == trigger.address**：只能为自己证明。
-- **无 owner key**：升级 = 部署新 AA + 同一 finalized 提款路径迁资金。
+- **无 owner key / 无原地升级**：若部署新 AA，用户需自行通过 finalized-root 证明
+  从旧 vault 提款再存入新部署；当前没有自动迁移工具。
 - 常量注释映射 Rust 权威定义（CHAIN_ID / POOL_MIN / POOL_MAX_INFLIGHT /
-  SUBMIT_BOND_NET / CHALLENGE_SECS / ESCAPE_STALL_SECS），避免双源漂移。
+  `SUBMIT_BOND_NET`〔历史命名，现为常备池下限而非逐高度债券〕 /
+  CHALLENGE_SECS / ESCAPE_STALL_SECS），避免双源漂移。
 
 Oscript 实现细节（踩过的坑）：
 
@@ -340,8 +359,11 @@ Oscript 实现细节（踩过的坑）：
 
 ## 6. 已知局限
 
-见 README「局限与主网就绪度」。付钱否决已删；仍未链上验：保险钳制、
-fill_math ±1 容差、24h temp_data 正文。默认执行序 UnitId 字典序
+见 README「局限与主网就绪度」。付钱否决已删；仍未链上验：`fill_math` 对
+负的预期 collateral 只会 bounce `no fraud`，ADL kind-2 没有 fill-proof 分支，
+仓位 entry 比较允许 ±1 最小单位容差；提供的充值 joint 也不证明 Obyte inclusion/
+stability。P-escrow 只验证 Cancel 退款的精确变化，不覆盖 Place escrow。`temp_data`
+正文保留 24h。默认执行序 UnitId 字典序
 （v2 commit-reveal 高度 0 生效）；报价质量受债券多数约束。
 主网部署前需正式 oscript 审计。「纯永续 → 图灵完备」升级路径见
 [ROLLUP-UPGRADE.md](ROLLUP-UPGRADE.md)。

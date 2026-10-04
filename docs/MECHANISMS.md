@@ -157,7 +157,7 @@ orphan 缓冲容量 4096。驱逐按**盐化序**执行：对缓冲单元取
 回归）。这是唯一公开全序——任何副本对同一 pending 集算出同一执行
 顺序，无需通信。该排序即撮合"价格时间优先"中的时间。
 
-### 2.5 v2 commit-reveal 排序（additive，激活门控）
+### 2.5 v2 commit-reveal 排序（additive，高度 0 生效；用户选择使用）
 
 默认排序仍可被"签名多个候选挑最小 id"磨队（MEV）。v2 追加两条操作：
 
@@ -171,7 +171,8 @@ orphan 缓冲容量 4096。驱逐按**盐化序**执行：对缓冲单元取
   commit 作废并剪枝。
 
 与确定性字典序叠加：Commit 阶段外界看不到 op 内容，揭示后按既有全序
-执行。`COMMIT_REVEAL_ACTIVATION_HEIGHT = 0`，部署期翻转。
+执行。`COMMIT_REVEAL_ACTIVATION_HEIGHT = 0`，因此该路径自高度 0 可用；
+用户仍需主动提交 Commit/Reveal 才会使用它。
 
 ### 2.6 WantUnits gossip（纯 P2P 层）
 
@@ -206,16 +207,19 @@ while taker.remaining > 0:
     Limit Ask: maker_price ≥ order.price
     Market:    无条件
 
-  fill_qty = min(taker.remaining, maker.remaining)
-  双方 remaining -= fill_qty；可见量缓存 -= fill_qty（maker level）
-  记录 Fill（成交价 = maker_price）
-
-  maker_done → orders.remove(maker_id); pop_head(maker 自己所在侧)
-  maker.account == taker.account → self_trade，停止撮合，
-  taker 剩余作废不挂单
+  maker.account == taker.account:
+    若策略为 Reject 且 maker.margin_left > 0 → 拒绝 incoming Place，不产生成交
+    否则撤掉 maker；若其有托管则退回；继续匹配下一单
+  否则：
+    fill_qty = min(taker.remaining, maker.remaining)
+    双方 remaining -= fill_qty；可见量缓存 -= fill_qty（maker level）
+    记录 Fill（成交价 = maker_price）
+    maker_done → orders.remove(maker_id); pop_head(maker 自己所在侧)
 ```
 
-TIF：GTC Limit 余量回挂队尾（缓存 += remaining）；IOC/Market 余量丢弃。
+Place 对带托管的自家 maker 使用 Reject，避免同单元退款现金腿无法被填充谓词建模；
+无托管 cross maker 使用 cancel-maker-continue。Liquidate 等其他撮合调用默认
+cancel-maker-continue。TIF：GTC Limit 余量回挂队尾（缓存 += remaining）；IOC/Market 余量丢弃。
 
 ### 3.3 可见量缓存不变量
 
@@ -296,7 +300,9 @@ Op；Order/Position 各带 `isolated` 标志。跨仓单 `margin` 必须为 0。
   `collateral + Σ桶 + Σlive margin_left` 只经存提/PnL 变动。
 - **平仓释放**：`release = 桶·close/old`（全平取整桶）先入
   collateral，再结算已实现 PnL——桶永不为负；PnL 超桶的缺口落
-  collateral 负值，由 apply_fill_pair 钳零转保险（§5.3 同一路径）。
+  collateral 后仍可能为负。逐仓隔离是开仓与风险判定边界，不是坏账担保：
+  普通成交随后仅按 §5.3 从非保险对手方可用正抵押有限 clawback；未覆盖部分
+  保持负抵押，保险不补。
   产生开仓量的成交 post 进桶；纯减仓 post 直接回 collateral。
 - **风险隔离**：`snapshot` 跳过 `isolated` 仓位（跨仓 equity/mm/im
   看不见它）；`isolated_risk(market)` 独立判定：equity = 桶 + uPnL，
@@ -311,42 +317,43 @@ Op；Order/Position 各带 `isolated` 标志。跨仓单 `margin` 必须为 0。
 
 ### 5.1 清算流程
 
-```
-Liquidate { caller, target, market }（caller 签名绑定）:
-  caller == target                      → BadAccount（自我清算禁止）
-  target/caller ∈ {INSURANCE_ACCOUNT}   → NotLiquidatable
-  target 不满足 liquidatable            → NotLiquidatable
-  target 无仓位                         → NotLiquidatable
+`Place` 成交后会立即复核成交双方；仍可清算的非保险账户可能在同一单元内进入
+清算。嵌套清算出错不会回滚已经应用的用户成交，也不会自动重试。
 
-  Market IOC 单：平仓方向，qty=|pos.qty|，account=target
-  吃对手盘至干净；残余仍 liquidatable → 以 mark 与保险基金对敲强平
-  （合成 fill，maker_id = OrderId([0;32])）
-```
+keeper 发起的 `Liquidate { caller, target, market }` 由 `caller` 签名；
+`caller == target`、保险账户作为 caller/target、无仓位或目标不满足清算条件
+均拒绝。普通市场先对订单簿提交平仓方向的 Market IOC；若目标仍可清算，剩余
+数量再以 mark 价 ADL 给反向持仓账户。ADL 候选排除目标和保险账户，按仓位
+绝对值降序、`AccountId` 升序打破平局；对手持仓不足时，未平数量留在目标账户，
+不会由保险基金接盘。
+
+`funding_rate` 市场不走订单簿：按新鲜外部指数平仓，缺失时回退到非零 mark；
+两者都不可用则不执行清算。该路径随后对反向持仓做 ADL；若目标仍有负权益，
+本次 ADL 对手方产生的正收益按比例承担剩余缺口，扣款不超过本次正收益，仍
+未覆盖的部分留在目标账户。保险基金不补差额。
 
 ### 5.2 keeper 奖励
 
-reward = Σ bps(每笔成交名义额, KEEPER_REWARD_BPS=100)
-pay    = min(reward, max(target.collateral, 0))
-奖励从**被清算方抵押**中扣除（以其正余额为上限）；被清算方无正余额时
-keeper 拿 0，但清算仍发生、不被阻塞。保险基金只在 apply_fill_pair 内吸收
-负权益，不为奖励出资。
-keeper 奖励 bps 为**每市场参数**（创世市场默认 100，新市场随 CreateMarket
-提交，§16.2）。
+奖励率是每市场参数（创世市场为 100 bps，§16.2）。普通市场以本次清算产生的
+各笔成交名义额计算；资金费率市场按 multiplier notional 计算。奖励仅从被清算方
+的正 collateral 扣取，不足时只支付可用余额；目标无正 collateral 时 keeper
+拿 0，清算不因此取消。保险基金不为 keeper 奖励出资。
 
-### 5.3 坏账钳零
+### 5.3 普通成交的有限零和 clawback
 
-apply_fill_pair 后 taker snapshot.equity < 0:
-  shortfall = −equity
-  taker.collateral   −= shortfall      # equity 精确归零
-  insurance.collateral −= shortfall    # 基金吸收
+普通双非保险方成交应用后，逐方检查 collateral：若一方为负，则
+`pay = min(-party.collateral, max(counterparty.collateral, 0))`；双方之间
+转移这笔金额，保持零和。
 
-守恒：总权益减少恰为缺口。归零后不会重复触发。保险余额可为负 =
-显式社会化债务，由手续费回补。保险永不被清算/不自我清算（双向排除）。
+该计算不读 account snapshot equity，只看本次成交后的 collateral。即使对手方
+可用余额不足，party 仍可保持负 collateral；缺口不会被打印，也不会记到保险基金。
+涉及保险账户的成交不会从保险处 claw，也不会 claw 入保险。
 
 ### 5.4 保险基金
 
-创世注入 INSURANCE_SEED = 10,000 USD。收入腿：taker 手续费（§6.1）。
-支出腿：坏账吸收 + keeper 奖励。
+创世注入 `INSURANCE_SEED = 10,000 USD`，并接收 taker 手续费（§6.1）；保险
+账户仍可作为普通账户参与资金费（§6.2）。但其不承担用户交易坏账或 keeper
+奖励，也不作为清算目标或普通 ADL 的对手方。
 
 ---
 
@@ -441,7 +448,8 @@ Op::ReportPrice { oracle, market, price }        # canonical tag 6
 报价者；债券记入 `oracle_bonds`，无白名单、无审批。退出走
 `UnstakeOracle`(tag 15) 的 `ORACLE_UNBOND_HEIGHTS = 256` 高度解锁排队，
 期间报价即失效；`SlashOracle`(tag 16) 对 TWAP 连续偏移达标者罚没
-（500 bps 偏移 ×3 连续采样双条件，激活门控）。另有两条可罚性门槛
+（500 bps 偏移 ×3 连续采样双条件，`ORACLE_SLASH_ACTIVATION_HEIGHT = 0`，
+自高度 0 可用）。另有两条可罚性门槛
 （`apply_slash` 前置）：报告历史不足 `SLASH_TWAP_STREAK` 条、或最近一次
 报告距当前高度 > 256（新鲜度），任一成立 → `SlashNotEligible`。
 罚没 = 债券 ×
@@ -606,6 +614,9 @@ meta_leaf    = sha256(b"meta" ‖ height ‖ seq ‖ last_unit
                # 覆盖账户树之外的全部共识状态，重放无法在价格/资金费/
                # 治理/承诺状态上分叉。此为 state_root 格式的破坏性变更。
 ```
+此外，`state_root` 还包含每个已消费充值 anchor 的独立 `dep` 前缀叶；该集合
+永久保留且不并入 `meta_leaf`，同一 anchor 再次入账会改变根。
+
 共识破坏记录（主网未发，无迁移）：`CreateMarket` canonical 尾部追加
 `spot_only_u8`；book 叶市场参数承诺 57B→58B；`Price` 由 u64 改为 i64
 （`tick_size` 同为 i64 但恒为正；`price == 0` 仍拒绝/忽略）。
@@ -613,6 +624,10 @@ meta_leaf    = sha256(b"meta" ‖ height ‖ seq ‖ last_unit
 `meta_leaf` 在 `external_sources` 后提交 `last_funding_height`、
 snapshot 格式版本 1→2（v1 快照不再加载）。
 正数 canonical 字节逐字节不变。
+当前 snapshot 格式头为 v3，不做跨版本迁移。`load_latest` 按高度从新到旧尝试，
+跳过未知版本或不可解码文件；没有可读候选时返回 `None`。`load_or_genesis` 随后
+从 genesis 建立状态并合并 gov-nonce WAL；调用方须从 genesis（或最近可读快照）
+重放 finalized 批次。快照只是恢复加速器，不是共识状态。
 
 meta_leaf 绑定 height（from_applied 先把 engine.state.height 推到
 checkpoint.height 再取根），使 state_root 跨批次成链：改历史高度必然断链。
@@ -651,9 +666,9 @@ AA 只能做字符串拼接与 sha256——它无法解析 i128 LE、无法遍�
 
 ## 10. 结算 AA 状态机（CHAIN_ID=operp-v2）
 
-三个 AA：`operp_rollup.aa`（主张链）、`operp_dispute.aa`（充提/漏单谓词）、
-`operp_dispute_fill.aa`（成交谓词）、`operp_vault.aa`（托管）。金库无
-owner key，claim 在 rollup。
+四个 AA 实例分属三类职责：`operp_rollup.aa`（主张链）、两个 dispute AA
+（`operp_dispute.aa` 充提与 Cancel-only escrow；P-omit 禁用、`operp_dispute_fill.aa` 成交）和
+`operp_vault.aa`（托管）。金库无 owner key，claim 在 rollup。
 
 rollup 状态变量（`<h>` 为高度后缀）：
 
@@ -693,8 +708,9 @@ sbond_<addr>, reward_<addr>, slash_reward_<addr>（sbond 仅遗留 claim 路径�
 | 谓词 | AA | 证明什么 |
 |---|---|---|
 | deposit / withdraw（含 D/W gov） | dispute | op 前后余额算术（含 pre_absent 非成员） |
-| omit | dispute | inbox 强收 id 不在 units_set_root（三段几何非成员） |
-| fill_math | dispute_fill | apply_fill 全分支（同向 VWAP / 减仓 / 反手 / 平完）± taker fee；精确恒等式（无方向区间）：逐仓 taker = `old - taker_post - still + post_back + release + pnl - fee`（op/ord 证明），空区间 `max(exp,0)` 夹取；非空∧exp<0 直接弹 `no fraud`（坏账钳制可诚实抬升仍持仓账户，upnl 不入叶）；±1 Decimal 容差；claimed-absent 仓位带前缀区间非成员 |
+| escrow（P-escrow） | dispute | 仅 Cancel：post collateral 必须精确等于 pre collateral + 被撤订单 pre-leaf 的 `margin_left`；Place escrow 没有此证明分支 |
+| omit | dispute | 当前禁用：force 只记录时间戳，不能证明 unit 存在；该 case 恒 bounce `no fraud` |
+| fill_math | dispute_fill | 普通受支持成交的账户/订单身份与 collateral 恒等式（含逐仓 post、释放、PnL、taker fee）；任何负的预期 collateral 都 bounce `no fraud`，不作欺诈判定；ADL kind-2 不在此证明路径内；仓位 entry 比较容差为 ±1 个最小单位 |
 | ghost | dispute_fill | 成交的 maker 订单 id 前缀区间不在 pre_wit |
 | skip | dispute_fill | pre_wit 中存在更优活单未成交 |
 
@@ -755,7 +771,9 @@ f:{unit}:{idx}:{taker}:{maker}:{taker_order}:{maker_order}:{market}:{price}:{qty
 taker 抵押。`fills_root` 树 = 成交描述串 + 尾随长度哨兵 `n:{len}`
 （`fills_root_elements`）：末笔成交的右邻即该哨兵，fill_math 单笔完备性
 只靠右邻证明即可判定，谓词不读任何提交整数。`fill_count` 仍经 submit 存为
-`fill_count_h`（rollup 门与提交头使用），但 dispute 路径不再读它。
+`fill_count_h`（rollup 门与提交头使用），但 dispute 路径不再读它；零成交批次
+的 `fills_root` 是单叶 `n:0`。当前验证路径只使用带哨兵的新编码，没有旧
+`fills_root` 编码选择/回退；用旧编码生成的离线证明材料须按当前实现重建。
 
 witness 叶（`operp_state::wit_leaves`，排序后 Obyte 原生 Merkle）：
 
@@ -833,10 +851,14 @@ ingest → Applied{status: Optimistic}     # 立即执行、立即成交
 
 ## 15. 明确的已知边界
 
-- 保险钳制不在链上验（watcher 对钳制侧跳过）；fill_math 带 ±1 Decimal 容差
+- `fill_math` 对任何负的预期 collateral 都 bounce `no fraud`，不会判定欺诈；
+  ADL kind-2 成交没有链上 fill-proof 分支，仓位 entry 比较另有 ±1 最小单位容差
+- P-escrow 只证明 Cancel 退款的精确抵押变化，不覆盖 Place 的托管变动；Place 中
+  带托管的自家 maker 会在撮合时拒单，以免产生未建模的同单元退款现金腿
 - `temp_data` 正文 24h 后被节点剥除——揭发必须自带那一笔与证明
-- 充值 joint 主要在链下 `validate_against` 核（`OPERP_VAULT_AA` 空且带
-  evidence 会被 `validate_against` 拒）
+- `validate_against` 对提供的充值 joint 重算哈希、核收款/金额/资产，并要求
+  joint 首作者 = payer = 侧链 `addr`；它不证明 joint 已进入 Obyte DAG 或稳定。
+  `OPERP_VAULT_AA` 为空且带 evidence 会被 `validate_against` 拒
 - 预言机为债券注册制（ORACLE_BOND_PERP = 50_000 PERP，无许可）；按债券计
   的多数合谋仍可在两次罚没之间偏置中位数；外部价锚需治理切换 + keeper 喂价
 - 大载荷内联 temp_data 会触发 ocore 校验器双回调崩溃：post_batch.js 的
@@ -869,7 +891,10 @@ asset id。发币时只需改一个常量并重新部署 AA。
   有界；无 reduce-only 检查；AA 侧走扩展后的双币种 Merkle 证明提款
   （§10.5，叶子含 perp 字段）
 
-`perp_supply` 定义为可赎回流通量：Σ 充值 − 提款 − 烧毁。
+`perp_supply` 是侧链镜像账本的净供应：Σ 充值 − `GovWithdraw` 记账 − 烧毁；
+它本身不代表 vault 已能向用户兑付 PERP。当前 vault 对非零 PERP claim
+bounce `perp claim needs burn`，因此 GovWithdraw 只更新侧链镜像，不是 Obyte
+AA 的 PERP 付款。
 
 **CreateMarket**（tag 10）：任何人可上架，代价是烧毁
 `CREATE_MARKET_FEE_PERP = 10_000` PERP 上架费。市场参数随 op 提交
@@ -901,6 +926,14 @@ TWAP 环照记供 slash 使用）；fill 写 mark 需 ≥ 100 USD 名义额且�
 `funding_rate_cash` 付款（无打印则该窗口不付，时钟照走；diff 钳在该市场
 `funding_cap_bps`，见 §6.2）。与 `spot_only` 互斥：
 两者同时为 true → `Risk` 拒绝（烧费之前）。
+
+下单时，FundingRate 的编码费率超过 ±10,000 bps 会被拒绝（平仓也适用）；
+开仓所需保证金至少为 `max(bps(funding_notional, im_bps),
+funding_notional × funding_cap_bps / 10_000)`，避免只覆盖常规 IM 而未覆盖 peg
+上限风险。此外，按代码计算的市场 open interest 在 `funding_cap_bps` 下的最坏
+赔付须不超过保险账户当前正 collateral，否则新开仓以 `Risk` 拒绝。此项只是
+开仓准入上限，不是赔付承诺：离簿清算的残余缺口仍由本次 ADL 对手方正收益按比例
+承担，保险不扣款。
 
 delisted 市场（见 16.3 Delist 提案）拒绝新挂单；撤单与清算平仓仍允许
 (清算路径不经 place 校验)。MVP 不做强制拍卖：存量仓位只能平仓或被清算。

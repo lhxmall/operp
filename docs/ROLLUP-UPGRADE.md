@@ -1,27 +1,32 @@
 # OPERP 结算层：现在（纯永续）与以后升级
 
-> 状态：**§2「现在」已实现**（三门 AA + 一枪谓词 + inbox；`CHAIN_ID=operp-v2`）。
+> 状态：**§2「现在」已实现**（三类职责、四个 AA 实例；`CHAIN_ID=operp-v2`）。
 > 精确规则见 [MECHANISMS.md](MECHANISMS.md) §10–11。主网部署脚本
 > `deploy_mainnet.js` 就绪，实发待助记词 + 审计。
 > 本文记录：纯永续阶段把乐观结算做成什么样，以及以后若做成图灵完备侧链怎么升级。
-> 现行实现把托管、贴账、揭发拆进三个 AA；揭发必须过谓词，付费否决已删。
+> 现行实现有 rollup、两个 dispute AA 和 vault；付费否决已删。注意：§1 是旧版背景，
+> §3 是未来提案、§6 是历史实施清单；§4 是当前约束、§5 是明确的非目标，均不是
+> 当前可自动执行的升级流程。`{force}` 只钉时间戳，
+> P-omit 目前恒 bounce `no fraud`，不能作为有效漏单挑战。
 
 ---
 
 ## 0. 一句话
 
 - **现在（纯永续）：** 谁先稳定谁贴账；揭发必须指出算错的那一笔；主网用哈希 + 加减法当场核对；对不上才罚，对得上动不了真账。
-- **以后（任意合约）：** 金库和提款树不动；换执行引擎、换裁判；用户从旧金库按同一套证明把钱迁到新金库。
+- **以后（提案，尚未实现）：** 金库和提款树不动；换执行引擎、换裁判；若采用，用户需从旧金库按同一套证明提款后再存入新金库。没有自动迁移工具。
 
 金库只认「已敲定的余额树」，不认永续、不知道成交、不参与升级。
 
 ---
 
-## 1. 现在为什么要推倒结算层
+## 1. 历史背景：移除旧付费否决
 
-现行 `challenge`（`operp_vault.aa`）：已 lock、窗内、付 1000 GBYTE → 立刻 `frozen=2`、清根、回滚高度。AA 不读数据包、不比对根、不要证明。
+早期 v1 的 `challenge`（旧 `operp_vault.aa`）：已 lock、窗内、付 1000 GBYTE
+即可立刻 `frozen=2`、清根、回滚高度；AA 不读数据包、不比对根、不要证明。
+该付费否决已从当前 v2 移除；当前 `{challenge:1}` 在 rollup/vault 无对应 case。
 
-这不是乐观 rollup，是付费否决：诚实根也能被杀。交易所引擎（DAG、撮合、清算、PERP）没有这个问题——执行已经是确定性的。要推倒的是 **贴到 Obyte 之后怎么敲定、怎么抓假账**。
+旧设计的问题是诚实根也能被杀。交易所引擎（DAG、撮合、清算、PERP）没有这个问题——执行已经是确定性的。要重做的是 **贴到 Obyte 之后怎么敲定、怎么抓假账**。
 
 引擎留下。结算层重做。
 
@@ -29,7 +34,7 @@
 
 ## 2. 现在：纯永续乐观结算
 
-### 2.1 三扇门（第一天就拆开）
+### 2.1 三类职责、四个 AA 实例（第一天就拆开）
 
 Oscript 单次复杂度上限 100，现行金库已占约 76。共识不能再塞进托管。
 
@@ -37,7 +42,7 @@ Oscript 单次复杂度上限 100，现行金库已占约 76。共识不能再�
 |---|---|---|---|
 | 金库 | `operp_vault.aa` | 充、提、只认 finalized 的 `aa_forest` | **几乎不改** |
 | 记账 | `operp_rollup.aa`（新） | 谁先稳定谁贴根、开窗、收判决 | 主张加 `version`，争议改派 |
-| 裁判 | `operp_dispute.aa`（新） | 永续专用验算（下一节） | **整扇换掉** 或加新 case |
+| 裁判 | `operp_dispute.aa` + `operp_dispute_fill.aa` | 充提/漏单与成交谓词分别验证 | **两扇均可换掉** 或加新 case |
 
 金库用 `var[ROLLUP_AA]['aa_forest_'||last_finalized]` 读根，自己不记候选、不挑战、不判刑。
 
@@ -45,7 +50,9 @@ Oscript 单次复杂度上限 100，现行金库已占约 76。共识不能再�
 
 ### 2.2 贴批次（based，无许可）
 
-任何人发一笔 **组合单元**：`temp_data` + `{submit}` + 提交债。Obyte 上谁先稳定，这个高度就是谁的。已有未失败主张 → `height taken`。
+任何人可发一笔 **组合单元**：`temp_data` + `{submit}`。poster 必须已有
+`pool_<addr> >= 1e12`（1000 GBYTE）；submit 另付 10000 bytes bounce 费，
+不是逐高度提交债。Obyte 上谁先稳定，这个高度就是谁的。已有未失败主张 → `height taken`。
 
 链上主张只存这类字段（不存仓位、不成交）：
 
@@ -62,13 +69,13 @@ poster, submitted_at = timestamp
 - `state_root`（字节域）给节点重放、链 `prev`。AA 不验。
 - `aa_forest`（hex 域）是 **提款权威**，叶子只承诺钱：`地址 + 抵押 + PERP + 已提`。仓位、挂单不进这棵树。
 
-`temp_data` 里公开：本批 unit、每执行完一笔的 witness 根（≤512，约 32KB）、成交序列。链上只存三个 64 字符根。`TEMP_DATA_PURGE_TIMEOUT = 24h`，揭发时必须把那一笔和证明再交一遍，不能靠 `unit[]` 读已剥掉的 `data`。
+`temp_data` 里公开：本批 unit、每执行完一笔的 witness 根（≤512，约 32KB）、成交序列。链上只存 §2.2 所列的紧凑承诺根与状态字段，不存完整撮合状态。`TEMP_DATA_PURGE_TIMEOUT = 24h`，揭发时必须把那一笔和证明再交一遍，不能靠 `unit[]` 读已剥掉的 `data`。
 
 ### 2.3 主网怎么验（指到那一笔）
 
 主网 **不重跑交易所**。AA 会的只有：sha256、加减乘除、`is_valid_merkle_proof`（复杂度 1）。
 
-揭发者链下用 `Batch::validate_against` 定位第一处分歧，链上只核对他指的那一处。任意一条谓词成立 → 裁判通知记账：`{verdict:'fraud', h}`，主张作废、提交债罚没、高度重开。不成立 → bounce，诚实根不动。
+揭发者链下用 `Batch::validate_against` 定位第一处分歧，链上只核对他指的那一处。任一可用谓词成立 → 裁判通知记账：`{verdict:'fraud', h}`，主张作废、operator 常备池扣减、高度重开。不成立 → bounce，诚实根不动。
 
 **没有应诉回合。** 贴账的人贴完可以下线。数据已在 L1。
 
@@ -77,49 +84,54 @@ poster, submitted_at = timestamp
 | P-trace | 第 k 笔的前后根属于 `trace_root`，unit k 属于 `units_root` | 三次 `is_valid_merkle_proof` |
 | P-deposit | 充值后该账户抵押不是 +amount | 前后叶子 + 加法 |
 | P-withdraw | 提款减法 / nonce 错 | 前后叶子 + 减法 |
+| P-escrow | Cancel 退款与抵押变化不符 | 精确核对 post collateral = pre collateral + pre-order `margin_left`；Place escrow 无此分支 |
 | P-fill-math | 这一笔成交的抵押/仓位/VWAP 算错 | 2 个账户叶 + 1 个挂单叶 + 算术 |
 | P-ghost | 成交打在前状态不存在的挂单上 | 挂单成员证明失败即成立 |
 | P-skip | 有更优价时序的活单没吃 | 出示那张更好的活单叶子，比价、比 seq |
-| P-omit | inbox 里到期的 `unit_id` 不在本批 | 读 inbox 变量 + merkle 不包含（**#23 后暂禁用**：force 只钉时间戳、无法证明单元存在，谓词恒 bounce `no fraud`，待存在性证明设计） |
+| P-omit（禁用） | 设计目标：证明 inbox 中的 unit 未纳入本批 | 当前无可用证明；`force` 只钉时间戳、不能证明 unit 存在，该 case 恒 bounce `no fraud` |
 
 P-skip 替代「在 AA 里重放订单簿」：不必证明「这是最优」，只要证明「存在更优却没成交」。
 
 仓位和挂单放在 **witness 树**（`trace[k]`），不放进提款用的 `aa_forest`。两棵树由同一状态派生，绑在同一主张上：一处假，整高失败。
 
-举例（P-fill-math）：第 17 笔成交后 Alice 抵押他写成 500，你重算是 480。你交：高度、第 17 笔、该笔在 `units_root` 上的证明、成交前 Alice 叶子（600）及其在「第 16 笔之后的根」上的证明、成交价量、成交后他写的叶子（500）及其在「第 17 笔之后的根」上的证明。AA 先对号入座（哈希），再算 `600 ± 盈亏 ≟ 500`。不等则欺诈。
+举例（P-fill-math）：在可验证的普通成交分支中，第 17 笔后 collateral 若应为 480、提交为 500，可用账户/订单证明核对恒等式。不等才构成欺诈；但任何负的预期 collateral 会直接 bounce `no fraud`，ADL kind-2 成交也没有该链上证明分支，不能声称可用此谓词证明。
 
-### 2.4 inbox（审查可证）
+### 2.4 inbox（记录入口；当前不能证明漏单）
 
-用户可直接给记账 AA：`{force:1, unit_id}`。热路径仍是免费 gossip。inbox 是抗审查逃生口。
+用户可给记账 AA：`{force:1, unit_id}`，inbox 只记录时间戳。该触发不证明
+`unit_id` 曾存在，因此当前 P-omit 恒 bounce `no fraud`；这还不是可用的抗审查漏单证明。
 
-主张必须带 `inbox_upto`：所有 `timestamp < submitted_at - 600` 的 id 都得在 `units_root` 里，否则 P-omit。
+当前主张仍记录 `inbox_upto`，但不能据此断言所有时间戳较早的 inbox id 已有可验证存在性；P-omit 的重新启用需先设计该存在性证明。
 
-### 2.5 债券（资本门槛，不是许可名单）
+### 2.5 常备池（资本门槛，不是逐高度债券或许可名单）
 
-| | 规则 |
+| | 当前规则 |
 |---|---|
-| 提交债 | 先稳定者押；finalize 退；欺诈则一半烧、一半给揭发者 |
-| 揭发 | 证明格式错 → bounce，钱回来。验过才吃提交债 |
-| 假揭发 | 验不过就是 bounce，**杀不掉诚实根** |
+| 提交资格 | `{pool:1}` 为 poster 累积常备池；提交前须 `pool >= 1e12`，无逐高度 submit bond |
+| 提交费用 | submit 支付 10000 bytes bounce 费；finalize 不退还所谓提交债 |
+| 假揭发 | 谓词不成立即 bounce `no fraud`，**不能冻结诚实根** |
+| 成功揭发 | rollup 从 operator 常备池扣 5e11（不足时归零），并记入 challenger 的 `slash_reward`，高度重开 |
+| 取回资金 | `{claim:'pool'}` 仅在 `last_submitted == last_finalized` 时可取常备池 |
 | 名单 | 无 |
 
-现行「付 1000 G 即可杀根」作废。
+旧版「付 1000 G 即可杀根」与逐高度提交债均非当前机制。
 
 ### 2.6 生命周期（高度 h）
 
 ```
-任何人：组合单元 + 提交债
+任何人：先使自己的常备池达到 1e12，再提交组合单元 + 10000 bytes 费用
   → 已有未失败主张？bounce height taken
-  → 写下根，窗开始
+  → 写下根，3600 秒挑战窗开始（不锁逐高度债券）
 
 窗内任何人：打裁判，带一条谓词
   → bounce：账不动
-  → fraud：主张清掉，h 重开，罚没
+  → fraud：operator 常备池扣减，主张清掉，h 重开
 
-窗后任何人：{finalize} → last_finalized=h，退提交债
+窗后任何人：{finalize} → last_finalized=h（无提交债退款）
              金库从此对该 aa_forest 付款
 
 7 天无进展：{escape_finalize} 仍在，任意人，不越过未结欺诈
+链空闲后 poster 才可 `{claim:'pool'}` 取回常备池
 ```
 
 ---
@@ -140,13 +152,14 @@ Obyte 单次复杂度仍是 100：验一条指令做得到，验整段程序做�
 |---|---|---|
 | 执行 | 现有永续引擎 | 新 VM，新 crate，不是改 CLOB |
 | 金库 | 认 `aa_forest` 提款 | 新金库同样只认余额树；旧金库仍能提 |
-| 记账 | version=1 + 三个根 | version=2，争议改派新裁判 |
+| 记账 | version=1 + 当前结算承诺根集合 | version=2，争议改派新裁判 |
 | 裁判 | P-deposit / P-fill-math / P-skip / P-omit | 换成单指令验证 |
 | 提款叶子 | `地址 + 抵押 + PERP + 已提` | 仍是「地址 → 钱」，不加仓位、不加合约存储 |
 
 ### 3.2 升级步骤（无管理员一键切）
 
-无 owner。升级 = 新部署 + 用户把钱迁走。
+无 owner。没有原地升级或自动迁移；若部署新 AA，用户需从旧部署按 finalized-root
+证明提款，再自行存入新部署。这是可行的用户操作路径，不是内置升级工具。
 
 1. 部署新裁判（和如需要的新记账 / 新金库）。
 2. 旧链停在某个高度：不再接受 `submit`，或只许把已过窗的主张 `finalize`。
@@ -170,7 +183,7 @@ Obyte 单次复杂度仍是 100：验一条指令做得到，验整段程序做�
 | 层 | 为什么还在 |
 |---|---|
 | Obyte 约 12 个 Order Provider | L1 排序；主张等稳定。基于它做「谁先稳定谁贴」 |
-| 提交债 | 无债则垃圾占位。这是资本门槛，不是地址名单 |
+| 常备池 | `pool_<addr> >= 1e12` 是提交资本门槛；不是逐高度债券，也不是地址名单 |
 | `temp_data` 24h 后删正文 | 揭发必须自带那一笔 |
 | 复杂度 100 | 主网验不了整批撮合 / 整段程序，只能验谓词或单指令 |
 
