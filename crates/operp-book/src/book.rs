@@ -147,6 +147,17 @@ impl OrderBook {
 
     pub fn submit_with(
         &mut self,
+        order: Order,
+        self_trade: SelfTrade,
+    ) -> Result<MatchResult, BookError> {
+        let mut candidate = self.clone();
+        let result = candidate.submit_inner(order, self_trade)?;
+        *self = candidate;
+        Ok(result)
+    }
+
+    fn submit_inner(
+        &mut self,
         mut order: Order,
         self_trade: SelfTrade,
     ) -> Result<MatchResult, BookError> {

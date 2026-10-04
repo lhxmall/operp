@@ -19,6 +19,7 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const zlib = require("zlib");
+const { packFrames } = require("./batch_frames");
 // ===== CONFIG: PERP governance asset ================================
 // Set to the real PERP asset id once issued; must match deploy_testnet.js.
 // devnet (default) has no issued asset: fall back to 'base' — the
@@ -218,23 +219,12 @@ async function main() {
     }
     return JSON.stringify(o);
   });
-  const PACK_CAP = 4000000;
-  const srcLen = (b64) => Buffer.byteLength(getJsonSourceString({ package_blob: b64 }), "utf8");
-  const gzB64 = (text) => zlib.gzipSync(Buffer.from(text, "utf8")).toString("base64");
-  const packages = [];
-  let cur = [];
-  const flush = () => {
-    if (!cur.length) return;
-    packages.push(gzB64(cur.join("\n")));
-    cur = [];
-  };
-  for (const f of stamped) {
-    const trial = cur.length ? cur.join("\n") + "\n" + f : f;
-    const b64 = gzB64(trial);
-    if (cur.length && srcLen(b64) > PACK_CAP) flush();
-    cur.push(f);
-  }
-  flush();
+  // packFrames terminates every package with a newline so raw package-byte
+  // concatenation preserves frame boundaries for the watcher.
+  const packages = packFrames(stamped, {
+    cap: 4000000,
+    getJsonSourceString,
+  });
   const rawBlobs = packages.map((b) => zlib.gunzipSync(Buffer.from(b, "base64")));
   const dataRoot = crypto.createHash("sha256").update(Buffer.concat(rawBlobs)).digest("hex");
   const header = Object.assign({}, batchData);

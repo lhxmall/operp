@@ -230,11 +230,7 @@ pub fn batch_from_data(data: &serde_json::Value) -> Result<Batch, SettleError> {
     let blob = get_str(data, "frames_blob")?;
     let raw = operp_settle::decode_package_blob(blob)?;
     let text = String::from_utf8(raw).map_err(|_| SettleError::RootMismatch)?;
-    let frames: Vec<String> = if text.is_empty() {
-        Vec::new()
-    } else {
-        text.split('\n').map(|s| s.to_string()).collect()
-    };
+    let frames: Vec<String> = text.lines().map(str::to_string).collect();
     operp_settle::batch_from_frames(data, &frames)
 }
 
@@ -501,8 +497,8 @@ mod tests {
     fn assemble_frames_multi_package_roundtrip() {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
-        let f1 = "{\"u\":1}".to_string();
-        let f2 = "{\"u\":2}".to_string();
+        let f1 = "{\"u\":1}\n".to_string();
+        let f2 = "{\"u\":2}\n".to_string();
         let b1 = base64::engine::general_purpose::STANDARD
             .encode(operp_settle::gzip_bytes(f1.as_bytes()));
         let b2 = base64::engine::general_purpose::STANDARD
@@ -532,7 +528,13 @@ mod tests {
             .decode(&got)
             .unwrap();
         let raw = gunzip_blob(&gz).unwrap();
-        assert_eq!(String::from_utf8(raw).unwrap(), format!("{f1}{f2}"));
+        let text = String::from_utf8(raw).unwrap();
+        assert_eq!(text, format!("{f1}{f2}"));
+        let decoded: Vec<_> = text.lines().collect();
+        assert_eq!(decoded, ["{\"u\":1}", "{\"u\":2}"]);
+        for frame in decoded {
+            serde_json::from_str::<serde_json::Value>(frame).unwrap();
+        }
         let bad = serde_json::json!({"packages": [h1], "data_root": "00".repeat(32)});
         assert!(assemble_frames(&hub, &bad).is_err());
         // Invalid gzip maps to BindingMismatch, not HubUnavailable.
@@ -546,5 +548,54 @@ mod tests {
             assemble_frames(&hub2, &hdr2),
             Err(WatchError::BindingMismatch(_))
         ));
+    }
+
+    #[test]
+    fn multi_package_frames_rebuild_a_real_batch() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let da = build_batch_da(false);
+        let expected = batch_from_data(&da.data).unwrap();
+        let mut header = da.data.clone();
+        let blob = header["frames_blob"].as_str().unwrap();
+        let raw = operp_settle::decode_package_blob(blob).unwrap();
+        let text = String::from_utf8(raw).unwrap();
+        let frames: Vec<String> = text.lines().map(str::to_string).collect();
+        assert!(frames.len() >= 2, "fixture needs multiple frames");
+
+        let split = frames.len() / 2;
+        let encode_package = |frames: &[String]| {
+            let mut raw = frames.join("\n").into_bytes();
+            raw.push(b'\n');
+            raw
+        };
+        let raw1 = encode_package(&frames[..split]);
+        let raw2 = encode_package(&frames[split..]);
+        let b1 = base64::engine::general_purpose::STANDARD.encode(operp_settle::gzip_bytes(&raw1));
+        let b2 = base64::engine::general_purpose::STANDARD.encode(operp_settle::gzip_bytes(&raw2));
+        let h1 = hex::encode(Sha256::digest(&raw1));
+        let h2 = hex::encode(Sha256::digest(&raw2));
+        let mut all = raw1.clone();
+        all.extend_from_slice(&raw2);
+        let root = hex::encode(Sha256::digest(&all));
+        header.as_object_mut().unwrap().remove("frames_blob");
+        header["packages"] = serde_json::json!([h1, h2]);
+        header["data_root"] = serde_json::json!(root);
+
+        let pkg = |blob: &str| {
+            serde_json::json!({
+                "messages": [{"app": "temp_data", "payload": {"data": {"package_blob": blob}}}],
+            })
+        };
+        let hub = MockHub {
+            vars: Default::default(),
+            joints: std::collections::HashMap::from([(h1, pkg(&b1)), (h2, pkg(&b2))]),
+        };
+        header["frames_blob"] = serde_json::Value::String(assemble_frames(&hub, &header).unwrap());
+        let rebuilt = batch_from_data(&header).unwrap();
+        assert_eq!(rebuilt.units, expected.units);
+        assert_eq!(rebuilt.trace, expected.trace);
+        assert_eq!(rebuilt.checkpoint, expected.checkpoint);
     }
 }

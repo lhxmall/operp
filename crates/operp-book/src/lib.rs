@@ -396,6 +396,61 @@ mod tests {
     }
 
     #[test]
+    fn reject_after_prior_maker_match_preserves_entire_book() {
+        let mut book = OrderBook::new(BTC_USD);
+        let taker = acct(1);
+        let external_maker = acct(2);
+        let px = 100 * PRICE_SCALE as i64;
+        let qty = QTY_SCALE;
+        book.submit(order(
+            external_maker,
+            1,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+        ))
+        .unwrap();
+        let mut own = order(
+            taker,
+            1,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            2,
+        );
+        own.isolated = true;
+        own.margin_left = 5 * USD_SCALE;
+        book.submit(own).unwrap();
+        let before = book.commitment_bytes();
+
+        let mut incoming = order(
+            taker,
+            2,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            2 * qty,
+            3,
+        );
+        incoming.isolated = true;
+        assert_eq!(
+            book.submit_with(incoming, SelfTrade::Reject),
+            Err(BookError::SelfTrade)
+        );
+        assert_eq!(book.commitment_bytes(), before);
+        assert_eq!(book.order_count(), 2);
+        assert_eq!(book.get(oid(external_maker, 1)).unwrap().remaining, qty);
+        assert_eq!(book.get(oid(taker, 1)).unwrap().margin_left, 5 * USD_SCALE);
+        assert!(book.get(oid(taker, 2)).is_none());
+    }
+
+    #[test]
     fn price_time_fifo_same_price() {
         let mut book = OrderBook::new(BTC_USD);
         let m1 = acct(1);

@@ -765,8 +765,12 @@ impl Engine {
         // predicate can model, so the dispute's exact identity would
         // false-verdict the honest batch.
         let escrow = if isolated { i128::from(margin) } else { 0 };
+        // Matching may mutate earlier makers before a later fill fails.
+        // Stage book, escrow, account fills and refunds together so an Err
+        // discards the entire candidate state.
+        let mut candidate = self.state.clone();
         if escrow != 0 {
-            self.state.account_mut(account).collateral -= escrow;
+            candidate.account_mut(account).collateral -= escrow;
         }
         let oid = order_id(account, market, client_seq);
         let order = Order {
@@ -783,46 +787,33 @@ impl Engine {
             isolated,
             margin_left: if isolated { margin } else { 0 },
         };
-        let mut result = match self
-            .state
+        let mut result = match candidate
             .book_mut(market)
             .submit_with(order, operp_book::SelfTrade::Reject)
         {
             Ok(r) => r,
-            Err(e) => {
-                // Nothing was matched or escrowed into fills: unwind.
-                if escrow != 0 {
-                    self.state.account_mut(account).collateral += escrow;
-                }
-                return Err(RejectReason::Book(e));
-            }
+            Err(e) => return Err(RejectReason::Book(e)),
         };
         // Funding-rate markets realize rate-cash, not price-diff PnL; tag
         // the fills so the dispute AA picks the funding identity (book
         // submit defaults to kind 0).
-        if self.state.market_params(market).funding_rate {
+        if candidate.market_params(market).funding_rate {
             for f in &mut result.fills {
                 f.kind = 1;
             }
         }
         for fill in &result.fills {
-            // Invariant: AccountError from apply_fill_pair is unreachable here
-            // by construction — intake guards above bound qty·price <
-            // i128::MAX and positions fit i64, so its checked arithmetic
-            // cannot overflow. Should it ever fire anyway, this unit would
-            // surface as Rejected with partially-applied state; that is a
-            // documented known limitation, not a handled case.
-            self.state.apply_fill_pair(fill).map_err(map_acct)?;
+            candidate.apply_fill_pair(fill).map_err(map_acct)?;
         }
         // Refunds: STP-canceled makers' escrow and the taker's unfilled
         // remainder (when it did not rest) return to collateral.
         for (acct, amt) in &result.refunds {
             if *amt > 0 {
-                self.state.account_mut(*acct).collateral += i128::from(*amt);
+                candidate.account_mut(*acct).collateral += i128::from(*amt);
             }
         }
         if !result.taker_resting && result.taker_margin_left > 0 {
-            self.state.account_mut(account).collateral += i128::from(result.taker_margin_left);
+            candidate.account_mut(account).collateral += i128::from(result.taker_margin_left);
         }
         // Force-sell: any fill party still liquidatable after this fill is
         // closed in the same unit (book IOC, then ADL inside `liquidate`).
@@ -831,9 +822,10 @@ impl Engine {
         // unit's fill list; fill_math bounces a multi-fill unit, so they
         // must not become a second op.
         let mut fills = result.fills;
+        candidate.seen_client_seq.insert(account, client_seq);
+        self.state = candidate;
         let extra = self.force_sell_fill_parties(&fills, unit, seq);
         fills.extend(extra);
-        self.state.seen_client_seq.insert(account, client_seq);
         Ok(fills)
     }
 
@@ -6504,6 +6496,137 @@ mod tests {
             .collect();
         assert_eq!(live.len(), 1, "own maker untouched");
         assert_eq!(i128::from(live[0].margin_left), i128::from(margin));
+    }
+
+    #[test]
+    fn place_reject_after_prior_maker_match_is_atomic() {
+        let mut eng = activated_engine();
+        let alice = AccountId([1; 32]);
+        let bob = AccountId([2; 32]);
+        let px = 100_000 * PRICE_SCALE as i64;
+        let qty = QTY_SCALE / 1000;
+        let maker_margin = 40 * USD_SCALE;
+        for id in [alice, bob] {
+            eng.state
+                .account_mut(id)
+                .credit(10_000 * USD_SCALE as i128)
+                .unwrap();
+        }
+
+        // Bob is first in the ask queue; Alice's escrowed ask follows it.
+        eng.place(
+            bob,
+            BTC_USD,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+            operp_types::UnitId([11; 32]),
+            1,
+            false,
+            0,
+        )
+        .unwrap();
+        eng.place(
+            alice,
+            BTC_USD,
+            Side::Ask,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+            operp_types::UnitId([12; 32]),
+            2,
+            true,
+            maker_margin,
+        )
+        .unwrap();
+        let before = eng.state.state_root();
+
+        let err = eng.place(
+            alice,
+            BTC_USD,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            2 * qty,
+            2,
+            operp_types::UnitId([13; 32]),
+            3,
+            true,
+            80 * USD_SCALE,
+        );
+        assert_eq!(err, Err(RejectReason::Book(BookError::SelfTrade)));
+        assert_eq!(eng.state.state_root(), before);
+        assert_eq!(eng.state.books[&BTC_USD].order_count(), 2);
+    }
+
+    #[test]
+    fn place_maker_account_error_rolls_back_book_and_taker() {
+        let mut eng = activated_engine();
+        let taker = AccountId([3; 32]);
+        let maker = AccountId([4; 32]);
+        let px = 100_000 * PRICE_SCALE as i64;
+        let qty = QTY_SCALE / 1000;
+        eng.state
+            .account_mut(taker)
+            .credit(10_000 * USD_SCALE as i128)
+            .unwrap();
+
+        // Construct an otherwise-valid resting ask whose maker position
+        // overflows when selling even one additional unit.
+        let mut maker_account = operp_state::Account::new(maker);
+        maker_account.positions.insert(
+            BTC_USD,
+            operp_account::Position {
+                market: BTC_USD,
+                qty: i64::MIN,
+                entry_price: px,
+                isolated: false,
+            },
+        );
+        eng.state.accounts.insert(maker, maker_account);
+        eng.state
+            .book_mut(BTC_USD)
+            .submit(operp_book::Order {
+                id: order_id(maker, BTC_USD, 1),
+                account: maker,
+                market: BTC_USD,
+                side: Side::Ask,
+                typ: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: px,
+                qty,
+                remaining: qty,
+                seq: 1,
+                isolated: false,
+                margin_left: 0,
+            })
+            .unwrap();
+        let before = eng.state.state_root();
+
+        let err = eng.place(
+            taker,
+            BTC_USD,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            px,
+            qty,
+            1,
+            operp_types::UnitId([14; 32]),
+            2,
+            false,
+            0,
+        );
+        assert_eq!(err, Err(RejectReason::Risk));
+        assert_eq!(eng.state.state_root(), before);
+        assert_eq!(eng.state.books[&BTC_USD].order_count(), 1);
+        assert!(!eng.state.accounts[&taker].positions.contains_key(&BTC_USD));
     }
 
     /// A bleeding isolated bucket is liquidatable on its own risk while the

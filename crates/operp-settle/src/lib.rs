@@ -814,7 +814,8 @@ pub fn evidences_from_payload(
         }
     }
 }
-/// Greedy pack: each package = base64(gzip(`\n`-joined frames)) with
+/// Greedy pack: each package = base64(gzip(frames joined by `\n`, plus a
+/// terminal `\n`)) with
 /// `get_json_source({"package_blob": b64}).len() <= cap`. `data_root` hashes
 /// the gunzipped concatenated frame bytes (content, not the gzip wrapper)
 /// so JS `zlib.gunzipSync` + concat + sha256 matches.
@@ -843,7 +844,10 @@ pub fn pack_frames_with_cap(frames: &[String], cap: usize) -> Vec<String> {
         if let Some(e) = extra {
             parts.push(e.as_str());
         }
-        let joined = parts.join("\n");
+        let mut joined = parts.join("\n");
+        if !parts.is_empty() {
+            joined.push('\n');
+        }
         let gz = gzip_bytes(joined.as_bytes());
         let b64 = base64::engine::general_purpose::STANDARD.encode(&gz);
         let obj = serde_json::json!({"package_blob": b64});
@@ -853,11 +857,12 @@ pub fn pack_frames_with_cap(frames: &[String], cap: usize) -> Vec<String> {
         if cur.is_empty() {
             return;
         }
-        let joined = cur
+        let mut joined = cur
             .iter()
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join("\n");
+        joined.push('\n');
         let gz = gzip_bytes(joined.as_bytes());
         out.push(base64::engine::general_purpose::STANDARD.encode(&gz));
         cur.clear();
@@ -2061,7 +2066,7 @@ mod tests {
         assert_eq!(blobs.len(), 1);
         let raw = decode_package_blob(&blobs[0]).unwrap();
         let text = String::from_utf8(raw).unwrap();
-        let frames: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+        let frames: Vec<String> = text.lines().map(str::to_string).collect();
         let rebuilt = batch_from_frames(&header, &frames).unwrap();
         assert_eq!(rebuilt.deposit_evidences.len(), 1);
         assert_eq!(
@@ -2286,8 +2291,8 @@ mod tests {
         let raw = decode_package_blob(&blobs[0]).unwrap();
         let split: Vec<String> = String::from_utf8(raw)
             .unwrap()
-            .split('\n')
-            .map(|s| s.to_string())
+            .lines()
+            .map(str::to_string)
             .collect();
         assert_eq!(split, frames);
         let rebuilt = batch_from_frames(&header, &split).unwrap();
@@ -2317,7 +2322,7 @@ mod tests {
             let obj = serde_json::json!({"package_blob": p});
             assert!(crate::obyte_hash::get_json_source(&obj).len() <= 1000);
             let raw = decode_package_blob(p).unwrap();
-            for line in String::from_utf8(raw).unwrap().split('\n') {
+            for line in String::from_utf8(raw).unwrap().lines() {
                 seen.push(line.to_string());
             }
         }
