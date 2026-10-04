@@ -483,6 +483,9 @@ fn fill_proof(
         .iter()
         .map(|id| hex::encode(id.0))
         .collect();
+    // fills_root tree: fill descriptors + trailing length sentinel. Proof
+    // indices over it match the raw array (the sentinel sits at the end).
+    let fills_tree = operp_settle::fills_root_elements(&batch.fills);
 
     // Ghost: maker ord leaf absent from pre leaves.
     for f in &unit_fills {
@@ -511,7 +514,7 @@ fn fill_proof(
                 "units_root": batch.checkpoint.units_root,
                 "k": k,
                 "fill": f,
-                "fill_proof": proof_json(&batch.fills, idx),
+                "fill_proof": proof_json(&fills_tree, idx),
                 "units_proof": proof_json(&unit_hexes, k),
             });
             // Non-membership neighbors for the [$lo,$hi) range: reuse omit
@@ -627,7 +630,7 @@ fn fill_proof(
                     "units_root": batch.checkpoint.units_root,
                     "k": k,
                     "fill": f,
-                    "fill_proof": proof_json(&batch.fills, idx),
+                    "fill_proof": proof_json(&fills_tree, idx),
                     "units_proof": proof_json(&unit_hexes, k),
                     "maker_ord": maker_ord,
                     "better_ord": cand,
@@ -681,7 +684,7 @@ fn fill_proof(
         }
         // Single-fill completeness: idx 0 (a later idx means this unit has
         // other fills, so pre->post delta is bigger than one fill); the
-        // right-neighbor / index-is-last arm is decided at gidx below.
+        // right-neighbor arm is decided at gidx below.
         let in_unit_idx: usize = match parts[2].parse() {
             Ok(v) => v,
             Err(_) => continue,
@@ -693,23 +696,13 @@ fn fill_proof(
             Some(i) => i,
             None => continue,
         };
-        // Single-fill completeness mirror: a right neighbor outside this
-        // unit's prefix, or — when this fill is the list's final element —
-        // the AA's index-is-last arm against the submitted fill_count (a
-        // trailing fill used to be unchallengeable for lack of a neighbor).
-        let right: Option<&String> = match batch.fills.get(gidx + 1) {
-            Some(r) => {
-                if r.starts_with(&prefix) {
-                    continue;
-                }
-                Some(r)
-            }
-            None => {
-                if batch.checkpoint.fill_count as usize != batch.fills.len() {
-                    continue; // header/DA disagree: the last arm would bounce
-                }
-                None
-            }
+        // Single-fill completeness mirror: the right neighbor outside this
+        // unit's prefix. Over the sentinel tree this always exists — for a
+        // trailing fill it is `n:{len}`, never `f:`-prefixed — so the AA's
+        // right-neighbor conjunction alone decides.
+        let right: &String = match fills_tree.get(gidx + 1) {
+            Some(r) if !r.starts_with(&prefix) => r,
+            _ => continue,
         };
         let kind: i64 = match parts[12].parse() {
             Ok(v) if (0..=3).contains(&v) => v,
@@ -1028,7 +1021,7 @@ fn fill_proof(
                 "units_root": batch.checkpoint.units_root,
                 "k": k,
                 "fill": f,
-                "fill_proof": proof_json(&batch.fills, idx),
+                "fill_proof": proof_json(&fills_tree, idx),
                 "units_proof": proof_json(&unit_hexes, k),
                 "who": who,
                 "pre_acct": pre_acct,
@@ -1046,13 +1039,10 @@ fn fill_proof(
             data.as_object_mut()?
                 .extend(pre_fields.as_object()?.clone());
             let obj = data.as_object_mut()?;
-            // Right-neighbor arm only when a neighbor exists; a trailing
-            // fill omits it and rides the AA's index-is-last arm against
-            // fill_count instead (null fields would be fatal in Oscript).
-            if let Some(r) = right {
-                obj.insert("right".into(), r.clone().into());
-                obj.insert("right_proof".into(), proof_json(&batch.fills, gidx + 1));
-            }
+            // Right-neighbor arm: always present over the sentinel tree
+            // (the trailing fill's neighbor is `n:{len}`).
+            obj.insert("right".into(), right.clone().into());
+            obj.insert("right_proof".into(), proof_json(&fills_tree, gidx + 1));
             if who_taker {
                 // Taker-leg op gate: prove the unit op is this place.
                 obj.insert("op".into(), op_str.clone().into());
@@ -1428,7 +1418,8 @@ mod tests {
         // Same 4-unit chain as fill_math_reduce_builds_proof, but the liar
         // tampers the TRAILING fill's unit (batch.fills' last element).
         // The watcher must still emit: single-fill completeness rides the
-        // fill_count index-is-last arm, so the payload omits right/right_proof.
+        // right-neighbor arm, whose neighbor for the trailing fill is the
+        // fills_root length sentinel `n:{len}`.
         use operp_types::{
             OrderType, Side, TimeInForce, UnitId, BTC_USD, PRICE_SCALE, QTY_SCALE, USD_SCALE,
         };
@@ -1517,9 +1508,22 @@ mod tests {
         let proof = build_proof(&batch, &mut replay, &[], 0).expect("proof");
         assert_eq!(proof.pred, "fill_math");
         assert!(proof.fill_aa);
-        assert!(
-            proof.data.get("right").is_none() && proof.data.get("right_proof").is_none(),
-            "trailing fill must ride the index-is-last arm, not a missing neighbor"
+        let len = batch.fills.len();
+        assert_eq!(
+            proof.data.get("right").and_then(|v| v.as_str()),
+            Some(format!("n:{len}").as_str()),
+            "trailing fill's right neighbor is the length sentinel"
+        );
+        let rp = proof.data.get("right_proof").expect("right_proof");
+        assert_eq!(
+            rp.get("root").and_then(|v| v.as_str()),
+            Some(batch.checkpoint.fills_root.as_str()),
+            "sentinel proof verifies against the posted fills_root"
+        );
+        assert_eq!(
+            rp.get("index").and_then(|v| v.as_u64()),
+            Some(len as u64),
+            "sentinel sits at index len"
         );
         assert!(
             proof.data.get("op").is_some(),
@@ -1533,7 +1537,8 @@ mod tests {
         // fully fills (her taker order leaves no post ord leaf). The liar
         // inflates alice's posted collateral by 1 unit. The payload must
         // carry the p: op proof (isolated flag) plus the taker-ord absence
-        // straddle, and — as the batch's only fill — no right neighbor.
+        // straddle; as the batch's only fill its right neighbor is the
+        // fills_root length sentinel.
         use operp_types::{
             OrderType, Side, TimeInForce, BTC_USD, PRICE_SCALE, QTY_SCALE, USD_SCALE,
         };
@@ -1637,10 +1642,12 @@ mod tests {
                 || (proof.data.get("oleft").is_some() && proof.data.get("oright").is_some()),
             "taker-ord membership or absence straddle is emitted"
         );
-        assert!(
-            proof.data.get("right").is_none() && proof.data.get("right_proof").is_none(),
-            "sole batch fill rides the index-is-last arm"
+        assert_eq!(
+            proof.data.get("right").and_then(|v| v.as_str()),
+            Some(format!("n:{}", batch.fills.len()).as_str()),
+            "sole batch fill's right neighbor is the length sentinel"
         );
+        assert!(proof.data.get("right_proof").is_some());
     }
     #[test]
     fn honest_batch_builds_no_proof() {
