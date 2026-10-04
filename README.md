@@ -17,9 +17,14 @@ users must present a Merkle proof of their balance against a finalized root.
 cargo test --workspace          # all green
 cargo run --release -p operp-exec --example bench_raw        # ~5.5k ops/s
 cargo run --release -p operp-exec --example hft_onedag -- 20000 8 4   # ~9k TPS, 0 rejects
-cd obyte-local && node test_settlement_aa.js  # Linux/CI: three-AA lifecycle (win32 skips)
+cd obyte-local && node test_settlement_aa.js  # Linux/CI: four-AA lifecycle (win32 skips)
 cd obyte-local && node deploy_mainnet.js      # deploy the four AAs (needs OPERP_DEPLOY_MNEMONIC)
 ```
+
+The mainnet script deploys both dispute AAs first, embeds their addresses in
+the rollup definition, deploys the rollup and vault, then binds each expected
+dispute AA once and verifies both bindings. This ordering avoids a
+definition-hash cycle.
 
 ## Architecture
 
@@ -84,8 +89,8 @@ must be signed by their account; liquidations must be signed by the *keeper*
 (`Op::Liquidate { caller, .. }`), which makes self-liquidation impossible.
 
 Default ordering stays UnitId-lexicographic; an additive v2 commit-reveal
-path (`Op::Commit` / `Op::Reveal`, activation-gated) lets users blind-order
-to dodge MEV once enabled — see [Limitations](#limitations--mainnet-readiness).
+path (`Op::Commit` / `Op::Reveal`) is active from height 0 and lets users
+blind-order to reduce ordering MEV — see [Limitations](#limitations--mainnet-readiness).
 
 ### 2. Deterministic matching, integer-only math
 
@@ -99,9 +104,11 @@ is integer fixed-point:
 Intake guards reject before any arithmetic can wrap: `qty > i64::MAX` or
 `qty·price` overflowing i128 → rejected as `Risk`. A per-price-level
 incremental `visible_qty` cache keeps best-bid/best-ask at O(log depth).
-Self-trades never fill: when a taker meets its own resting order, the maker
-order is canceled (`canceled_maker`) and matching continues against the
-next order with the remaining taker quantity.
+Self-trades never fill. On `Place`, an own resting maker with escrow
+(`margin_left > 0`) makes the incoming order reject as `SelfTrade`, because
+refunding that escrow inside a fill-bearing unit is not modeled by the fill
+proof. An own cross maker (`margin_left == 0`) is canceled and matching
+continues; other matching paths use cancel-maker-continue by default.
 
 ### 3. Risk model (cross margin)
 
@@ -109,31 +116,39 @@ Each fill updates both legs (VWAP entry for opens); **realized PnL settles
 into collateral immediately at close time**, so winners can withdraw profits
 and the withdrawal-proof leaf (which commits `collateral`) reflects true
 solvency. Snapshots compute maintenance margin (5% of abs notional) and
-initial margin (10%). Liquidation is keeper-initiated and pays the keeper 1%
-of filled notional, seized from the liquidated account's own collateral. A
-fill whose loser cannot fund it is clawed back zero-sum from the winner —
-insurance never pays a trading loss — and whatever the winner cannot cover
-stays as negative equity on the account, never printed. A position that is
-still liquidatable after its book IOC is force-sold in the same unit: ADL
-onto opposite positions at the mark. Insurance is seeded at genesis
-(10 000 USD), can never be liquidated itself, and never self-liquidates.
+initial margin (10%). A user fill also rechecks both parties and may
+force-sell a still-liquidatable party in the same unit. Keeper liquidation
+first sends a market IOC; if the target remains liquidatable, remaining
+quantity is ADL'd at mark onto opposite-sign holders. If their positions are
+insufficient, the unsold position remains on the target. The market's
+`keeper_reward_bps` is paid only from the target's positive collateral
+(genesis market: 100 bps); if there is not enough, the keeper receives only
+what is available. For a non-insurance fill that leaves a party with negative
+collateral, only the counterparty's available positive collateral is clawed
+back, zero-sum; any uncovered balance stays negative. Insurance never pays
+trading losses. Funding-rate markets use a separate off-book liquidation at
+the fresh external index (nonzero mark as fallback); any residual hole is
+haircutted from positive-PnL ADL counterparties, and any uncovered amount
+remains on the target. The insurance seed is 10 000 USD; the fund is excluded
+from liquidation and bad-debt top-ups.
 
 Mark prices only move on fills with notional ≥ 100 USD **and within ±10% of
 the previous mark** (the first qualifying fill on an unmarked market sets it)
 - minimal manipulation resistance; oracle/funding TWAP rings and
-deviation-streak slashing are live (activation-gated), external anchors are
-opt-in.
+deviation-streak slashing are live from height 0; external price anchoring is
+opt-in through governance and an allowlisted keeper.
 
-### 4. Settlement: two roots per batch
+### 4. Settlement: two state roots plus predicate commitments
 
 Every batch (≤ BATCH_MAX_UNITS=200000 units / 2 s) produces a `Checkpoint`:
 
 ```text
 { height, prev_state_hash, state_root, aa_root, last_unit, seq,
-  unit_ids, fills_hash, fill_count }
+  unit_ids, fills_hash, fill_count, fills_root }
 ```
 
-  - `state_root` — Merkle tree over account leaves, book leaves and a meta leaf
+  - `state_root` — Merkle tree over account leaves, book leaves, a meta leaf,
+  and permanent consumed-deposit anchor leaves
   that commits `height`, `seq`, `last_unit`, governance cursors, every
   market's `(mark, funding index)` plus its TWAP rings, the full oracle set
   (bonds, unbonding queue, latest reports, per-reporter history, slash
@@ -141,6 +156,9 @@ Every batch (≤ BATCH_MAX_UNITS=200000 units / 2 s) produces a `Checkpoint`:
   mirrored PERP balances/supply/burns, pending commit-reveal commitments,
   the external-price ring and allowlist, and the funding-source selector —
   replays cannot diverge on any consensus state outside the account tree.
+  The root also includes a separate, permanent `dep`-prefixed leaf for every
+  consumed deposit anchor, so expiry of the ordinary replay window cannot
+  make a credited payment reusable.
   Roots chain across batches and reorgs break the hash chain visibly.
   Only *applied* units advance the global `seq`; rejected ops do not consume
   sequence numbers.
@@ -162,7 +180,12 @@ Every batch (≤ BATCH_MAX_UNITS=200000 units / 2 s) produces a `Checkpoint`:
   first-seen-wins and enforced at intake.
   `Batch::validate_against` additionally verifies the recomputed forest
   against the checkpoint.
-- `fills_hash`/`fill_count` — commitment to executed trade flow.
+- `fills_hash`/`fill_count` — commitment to executed trade flow. `fills_root`
+  is separate: its leaves are fill descriptors plus a trailing `n:<len>`
+  sentinel (`n:0` for an empty batch). The sentinel is not part of
+  `fills_hash`/`fill_count`; the latter remains in the submit header/state, but
+  fill disputes use the sentinel as the last fill's right neighbor instead of
+  trusting that count.
 
 `Batch::validate_against` replays the posted units through a fresh engine
 and asserts chain id, previous root, recomputed fills hash/count, final
@@ -172,13 +195,16 @@ re-hashed (`get_unit_hash`) and checked to have actually paid the expected
 vault address the claimed amount in the claimed asset (`verify_all` with
 the vault address and PERP asset id as caller-supplied bindings; watchers
 recover evidences from the revealed `temp_data` via
-`evidences_from_payload`). The replayed state is pruned with the same
+`evidences_from_payload`). The joint's first author, evidence payer, and
+sidechain `addr` must also match. This verifies supplied joint content and
+hashes; it does not establish Obyte inclusion or stability. The replayed state is pruned with the same
 window rules as batch application before roots are compared — any honest
 replica can audit the operator.
 
 ### 5. Settlement AAs: optimistic finality + proof-gated exits
 
-Three AAs (`CHAIN_ID=operp-v2`). **No lock, no pay-to-kill.** Collateral is GBYTE.
+Four AA instances across three roles (`operp_rollup`, two dispute AAs, and
+`operp_vault`; `CHAIN_ID=operp-v2`). **No lock, no pay-to-kill.** Collateral is GBYTE.
 
 1. **pool + submit (rollup)** — standing pool `pool_<addr> >= 1000 GBYTE`
    (`{pool:1}` funds net inbound minus 10000 fee); each submit pays only the
@@ -192,8 +218,9 @@ Three AAs (`CHAIN_ID=operp-v2`). **No lock, no pay-to-kill.** Collateral is GBYT
    `height taken` (fraud-reopened successors overwrite freely). Window:
    `submitted_at + 3600 s`.
 2. **Fraud (dispute / dispute_fill)** — inside the window anyone submits a
-   one-shot predicate (deposit/withdraw/omit/fill_math/ghost/skip). Failing
-   predicates bounce `no fraud` and leave the height alone; a proven one
+   one-shot predicates for deposit/withdraw, escrow (Cancel refunds only),
+   fill_math, ghost, and skip. P-omit is disabled. Failing predicates bounce
+   `no fraud` and leave the height alone; a proven one
    forwards `{verdict:'fraud'}` and the rollup slashes 5e11 off the
    operator's standing pool and reopens the height. No response rounds.
 3. **finalize (rollup)** — after `submitted_at+3600` with no verdict:
@@ -206,16 +233,18 @@ Three AAs (`CHAIN_ID=operp-v2`). **No lock, no pay-to-kill.** Collateral is GBYT
    `{escape_withdraw}` has no case in the vault AA (it exposes only
    `deposit` / `deposit_perp` / `withdraw`), so it bounces as an unmatched
    trigger.
-5. **force (rollup inbox)** — `{force, unit_id}` censorship escape; omission
-   is provable via P-omit.
+5. **force (rollup inbox)** — `{force, unit_id}` records a timestamp only.
+   It does not prove that the unit exists, so the current P-omit branch always
+   bounces `no fraud`; this is not yet an effective omission challenge.
 
 | Gate | Origin | Duration |
 |---|---|---|
 | fraud / finalize | `submitted_at_<h>` | 3600 s |
 | escape_finalize | `submitted_at_<h>` | 604800 s |
 
-No owner key. Upgrading = deploy new AAs + migrate funds through the same
-finalized-root withdrawal path.
+No owner key or in-place AA upgrade exists. Moving to a new deployment requires
+users to withdraw against a finalized root and deposit into the new deployment;
+no automatic migration path is provided.
 
 
 ## Repository layout
@@ -225,9 +254,9 @@ crates/                  Rust workspace (9 crates, see table above)
 obyte-local/
   agents/operp_vault.aa          custody (deposit/withdraw)
   agents/operp_rollup.aa         assertion chain
-  agents/operp_dispute.aa        deposit/withdraw/omit predicates
+  agents/operp_dispute.aa        deposit/withdraw/Cancel-escrow; P-omit disabled
   agents/operp_dispute_fill.aa   fill predicates
-  test_settlement_aa.js          three-AA E2E (Linux/CI; win32 skips)
+  test_settlement_aa.js          four-AA E2E (Linux/CI; win32 skips)
   deploy_mainnet.js / issue_perp.js  mainnet AA deploy / PERP issuance
   post_batch.js                  combined temp_data+submit → finalize → claim
   post_challenge.js              predicate CLI (`--pred --proof`)
@@ -263,12 +292,14 @@ cargo run -p operp-settle --example export_batch
 # vendored aa-testkit's native rocksdb/sqlite3; see Verification status)
 cd obyte-local && node test_settlement_aa.js
 
-# deploy the vault AA to Obyte testnet
+# deploy settlement AAs to Obyte testnet (requires an issued PERP asset id)
 cd obyte-local && node deploy_testnet.js
 
 # operator flow: package posts then combined da_unit (header + submit) +
 # finalize + claim race reward (the complete mainnet sequence)
 cd obyte-local && node post_batch.js
+```
+
 Measured on this machine: `bench_raw` ≈ 5 500 ops/s; `hft_onedag` (8 markets,
 4 generators) ≈ 9 000–9 200 TPS aggregate with zero rejections.
 
@@ -279,13 +310,18 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
 
 1. ~~**Money can kill an honest root.**~~ **RESOLVED (settlement v2).** Fraud
    must pass a dispute predicate; `{challenge:1}` has no case on rollup or
-   vault. Bogus proofs bounce `no fraud`. Still open: a negative expected post
-   (claw remainder) is unverifiable, so fill_math bounces it instead of
-   verdicting; fill_math carries a ±1 tolerance; `temp_data`
-   bodies vanish after 24 h; deposit joints are mainly checked off-chain in
-   `validate_against` (an empty `OPERP_VAULT_AA` with evidences present is
-   rejected). The 10k-node wall is closed by frames-in-base64; remaining DA
+   vault. Bogus proofs bounce `no fraud`. Still open: `fill_math` does not
+   adjudicate any negative expected collateral post, and ADL kind-2 fills have
+   no on-chain fill-proof case; the position entry comparison also allows a
+   ±1-unit tolerance. The escrow predicate checks Cancel refunds only; Place
+   escrow changes have no equivalent proof branch. `temp_data` bodies vanish
+   after 24 h. Deposit evidence
+   is checked by `validate_against`, not by an Obyte inclusion/stability proof
+   in the AA predicate path (an empty `OPERP_VAULT_AA` with evidences present
+   is rejected). The 10k-node wall is closed by frames-in-base64; remaining DA
    bound is 5MB/`PACK_SOURCE_CAP` and the 24h purge.
+   The vault also rejects non-zero PERP claims (`perp claim needs burn`): a
+   sidechain `GovWithdraw` update does not itself pay PERP out of the Obyte AA.
 2. **Funding quality is bounded by its price anchor.** Funding stays
    mark-premium based (capped ±50 bps/tick). The default
    `BondedMedianTwap` index derives from bonded reporters' prices; the
@@ -303,8 +339,8 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
    (queue-jumping MEV). The v2 commit-reveal path has landed additively
    (`Op::Commit`/`Op::Reveal`, tags 18/19, TTL 16 heights, 8 live commits
    per account, `reveal_commit_hash = sha256(op_bytes ‖ salt)`), but it is
-   activation-gated like the other v2 paths — until the activation height
-   flips, ordering is unchanged. The fee race and deterministic matching
+   active from height 0; users must choose the Commit/Reveal path to use it.
+   The fee race and deterministic matching
    bound what grinding can extract either way.
 5. **Orphan eviction leaves a transient fork window across replicas.**
    Eviction salts rotate per epoch from `(finalized_root, epoch)`, but
@@ -339,8 +375,11 @@ This codebase meets the plan's bar of *"deployable to Obyte testnet"*. It is
     finalize-batch determinization design lands.
 14. Gov nonce WAL persists at batch commit (`from_applied`); uncommitted
     batches do not burn nonces.
-15. Snapshots carry a format version header (currently v1); cross-version
-    snapshots/journals are incompatible (no migration pre-mainnet).
+15. Snapshots carry format version 3. Unknown/older or unreadable candidates
+    are skipped; there is no cross-version migration. If none can be loaded,
+    `load_or_genesis` initializes genesis and the caller must replay finalized
+    history from genesis (or batches newer than a valid snapshot); the gov-nonce
+    WAL is max-merged on restart.
 
 Recently closed: deposit whitelisting, overflow guards, market whitelist,
 strict signatures, orphan recovery with deterministic eviction plus a
@@ -355,7 +394,7 @@ the diagnostic `bal_` ledger, height-bound `state_root` (meta leaf commits
 the batch height, marks and funding indices), full book commitment, global
 cumulative withdraw anti-replay (`W` committed inside every aa-tree leaf),
 bond recovery via claim (frozen-height gating), bounded withdrawals/
-AA-unit/gov-nonce ledgers (256-height replay window), flip-order initial-margin
+AA-unit/gov-nonce ledgers (2048-height replay window), flip-order initial-margin
 gate on open quantity, create-market bps ceilings, tick-size enforcement,
 applied-only `seq` accounting, self-trade prevention (escrowed own
 maker rejects the incoming place; cross makers cancel-maker-continue),
@@ -364,12 +403,14 @@ with creation-time voting-weight snapshots, Obyte-address binding on
 deposits (`addr` field, first-seen-wins), asset-kind-bound deposit
 endorsements, `MAX_AA_TREE_DEPTH` proof cap, AA-side claim-reward zeroing,
 single-outstanding challenge bonds, and `frozen == 2` height recovery —
-plus PERP governance: sidechain-mirrored PERP deposits/withdrawals (perp
-fields in both Merkle leaves), permissionless market listing with burned
+plus PERP governance: sidechain-mirrored `GovDeposit`/`GovWithdraw` accounting
+(`perp` fields in both Merkle leaves; non-zero vault claims remain unavailable),
+permissionless market listing with burned
 listing fees (per-market risk params), and on-chain parameter proposals with
 snapshot quorum and snapshot-weighted voting.
 
-This round closed the remaining audit findings and roadmap gaps: pruning
+This round also landed additional audit and roadmap work (the known limitations
+above remain): pruning
 parity in `validate_against` (withdrawals / seen-AA-units / deposits_allowed
 pruned exactly like `from_applied`), independent deposit-evidence
 verification inside `validate_against`, epoch-salted orphan eviction
@@ -385,15 +426,17 @@ commit-reveal v2, WantUnits gossip, and the funding
 external-anchor wiring.
 
 Post-audit follow-ups restored `{deposit_perp}` crediting (the vault
-retains PERP and mirrors it into `pperp_<addr>`; the proven leaf stays the
-sole withdrawal authority) and lifted raw engine throughput from 5199 to
-7316 ops/s via cached ed25519 key setup plus release LTO.
+retains PERP and mirrors it into `pperp_<addr>`; the proven leaf remains the
+balance-proof authority, though non-zero PERP claims currently bounce) and
+lifted raw engine throughput from 5199 to 7316 ops/s via cached ed25519 key
+setup plus release LTO.
 
-## Mainnet Roadmap (implemented)
+## Mainnet Roadmap (implementation status)
 
-All eleven designs in [`docs/mainnet/`](docs/mainnet/) are now implemented
-(staged as v1 boring + v2 extensions; deviations and deferred backlogs are
-listed at the end):
+The eleven design tracks in [`docs/mainnet/`](docs/mainnet/) have varying
+implementation status (staged as v1 conservative + v2 extensions). A checked
+track does not mean every proposed sub-feature is available or audited;
+disabled cases and deferred work are listed below and in the mechanism docs:
 
 - [x] **01 Fraud slashing** — `01-fraud-slashing.md`: `validity_proof_hash` plug + dispute-verdict slashing (5e11 off the operator's standing pool to `slash_reward_<challenger>`, height reopens), no matcher re-execution in Oscript
 - [x] **02 Deposit independent verification** — `temp_data.deposit_evidences` carries FULL Obyte joint units; `unit_hash(joint)` recomputed inside `validate_against` via `operp_settle::obyte_hash::get_unit_hash`; payee/asset checked against caller-supplied `expected_vault`/`perp_asset`, failures map to `SettleError::DepositEvidence`; watchers rehydrate via `evidences_from_payload`
@@ -432,4 +475,3 @@ records) and [ROLLUP-UPGRADE.md](docs/ROLLUP-UPGRADE.md). Validation:
 ## License
 
 MIT
-

@@ -15,9 +15,12 @@ autonomous agent 金库）。金库提款受 **Merkle 证明门控**——必须
 cargo test --workspace          # 测试全绿
 cargo run --release -p operp-exec --example bench_raw        # ~5.5k ops/s
 cargo run --release -p operp-exec --example hft_onedag -- 20000 8 4   # ~9k TPS, 零拒绝
-cd obyte-local && node test_settlement_aa.js  # Linux/CI：三门 AA 生命周期（win32 skip）
+cd obyte-local && node test_settlement_aa.js  # Linux/CI：四个 AA 实例生命周期（win32 skip）
 cd obyte-local && node deploy_mainnet.js      # 主网发四个 AA（需 OPERP_DEPLOY_MNEMONIC）
 ```
+
+主网脚本先部署两个 dispute AA，再把其地址嵌入 rollup 定义，随后部署
+rollup 与 vault，最后将两个 dispute AA 各绑定一次并核验绑定状态，以避免定义哈希循环。
 
 ## 架构
 
@@ -77,8 +80,8 @@ WantUnits/HaveUnits gossip 层（`operp-gossip`）按需补齐——它同时服
 （`Op::Liquidate { caller, .. }`），自我清算因此不可能。
 
 默认排序保持 UnitId 字典序；叠加式 v2 commit-reveal 路径
-（`Op::Commit` / `Op::Reveal`，激活门控）启用后允许用户盲序下单规避
-MEV——见[局限与主网就绪度](#局限与主网就绪度)。
+（`Op::Commit` / `Op::Reveal`）从高度 0 生效，允许用户选择盲序下单降低
+排序 MEV——见[局限与主网就绪度](#局限与主网就绪度)。
 
 ### 2. 确定性撮合，纯整数运算
 
@@ -101,31 +104,40 @@ i128 → 以 `Risk` 拒绝。每价档增量维护的 `visible_qty` 缓存使最
 每笔成交同时更新两腿（开仓用 VWAP 入场价）；**平仓瞬间已实现 PnL 即时
 结算进 collateral**，赢利者立刻可提利润，提款证明叶子（承诺
 `collateral`）反映真实偿付能力。快照计算维持保证金（名义额绝对值 5%）与
-初始保证金（10%）。清算由 keeper 发起，从保险基金支付成交名义额 1% 的
-keeper 奖励；若清算后账户仍为负，权益精确钳零、缺口记入保险基金——
-绝不转嫁对手方。保险基金创世注入（10 000 USD），自身永不被清算、也永不
-自我清算。
+初始保证金（10%）。普通 Fill 成交后会复核双方；仍可清算的一方可能在同一
+单元内被强制卖出。keeper 发起的清算先用 market IOC 吃簿；目标仍可清算时，
+剩余仓位按 mark 价 ADL 给反向持仓者；对手仓位不足时，未平数量留在目标账户。
+keeper 奖励按市场 `keeper_reward_bps` 计算，只从目标账户的正抵押中支付
+（创世市场为 100 bps）；余额不足则只支付可用部分。非保险账户之间成交后，
+若一方 collateral 为负，只能从对手方可用的正抵押中有限回拨、保持零和；
+未覆盖部分仍为负。保险基金不支付交易亏损。资金费率市场使用独立的离簿清算：
+按新鲜外部指数（缺失时回退到非零 mark）平仓，ADL 后若仍有缺口，只按比例扣减
+本次 ADL 对手方产生的正收益；无法覆盖的部分继续留在目标账户，保险不补足。
+保险基金创世注入 10 000 USD，不参与清算，也不补交易坏账。
 
 mark 价格只在名义额 ≥ 100 USD **且相对旧 mark 偏移 ≤ ±10%** 的成交上
 移动（无 mark 市场的首个合格成交直接定价）——最小操纵抗性；预言机/资金费
-TWAP 环与连续偏移罚没已上线（激活门控），外部锚为可选启用。
+TWAP 环与连续偏移罚没从高度 0 生效，外部价锚须治理启用并由白名单 keeper 喂价。
 
-### 4. 结算：每批双根
+### 4. 结算：每批两个状态根与谓词承诺根
 
 每批（≤ BATCH_MAX_UNITS=200000 units / 2 s）产出 `Checkpoint`：
 
 ```text
 { height, prev_state_hash, state_root, aa_root, last_unit, seq,
-  unit_ids, fills_hash, fill_count }
+  unit_ids, fills_hash, fill_count, fills_root }
 ```
 
-  - `state_root` — 账户叶、簿叶与 meta 叶构成的 Merkle 树。meta 叶提交
+  - `state_root` — 账户叶、簿叶、meta 叶及永久充值锚点叶构成的 Merkle 树。
+  meta 叶提交
   `height`、`seq`、`last_unit`、治理游标、每市场的 `(mark, 资金费 index)`
   及其 TWAP 环、全套预言机状态（债券、解锁队列、最新报价、每记者历史、
   罚没 nonce、每市场配置）、在途提案及其投票快照、镜像 PERP
   余额/流通量/烧毁、pending commit-reveal 承诺、外部价环与白名单、资金源
   选择器——账户树之外的任何共识状态重放都无法分叉。根跨批次成链，重组
   必然断链可见。只有*已应用*单元推进全局 `seq`；被拒操作不消耗序号。
+  根还包含每个已消费充值锚点各自独立且永久保留的 `dep` 前缀叶；普通重放
+  窗口过期也不会让已入账付款再次使用。
   - `aa_root` — 第二重承诺，十六进制字符串域，打包为 **16 棵分片树组成
   的森林**：账户按地址划入 16 个 shard；shard 内
   `leaf = sha256("acct:" + address + ":" + collateral + ":" + perp + ":" +
@@ -139,33 +151,41 @@ TWAP 环与连续偏移罚没已上线（激活门控），外部锚为可选启
   了 Obyte 地址的账户（经 `Op::Deposit { addr }` / `Op::GovDeposit { addr }`，
   ≤ 128 字符）进入森林；绑定为首见即定、入口强制。
   `Batch::validate_against` 另外把重算的森林对 checkpoint 校验。
-- `fills_hash`/`fill_count` — 对执行成交流的承诺。
+- `fills_hash`/`fill_count` — 对执行成交流的承诺。`fills_root` 独立承诺成交描述串
+  与尾随 `n:<len>` 哨兵（空批为单叶 `n:0`）。哨兵不属于 `fills_hash`/
+  `fill_count`；后者仍保留在提交头和 rollup 状态，但 fill dispute 用哨兵作末笔
+  成交的右邻，不依赖提交计数判定末笔。
 
 `Batch::validate_against` 用全新引擎重放披露的单元，校验 chain id、前根、
 重算 fills hash/count、终根；并且**独立验证充值证据**：批次内任何
 Deposit/GovDeposit 都必须携带证据——对其 Obyte joint 复算哈希
 （`get_unit_hash`），确认 joint 实际向预期 vault 地址支付了所报金额的所报
 资产（`verify_all`，vault 地址与 PERP asset id 由调用方提供绑定；watcher
-经 `evidences_from_payload` 从披露的 `temp_data` 取回证据）。根比对之前，
+经 `evidences_from_payload` 从披露的 `temp_data` 取回证据）。joint 首作者、
+证据 payer 与侧链 `addr` 必须一致。该校验核对被提交 joint 的内容与哈希，
+但不证明它已进入 Obyte 主 DAG 或获得稳定。根比对之前，
 重放态按与批次应用完全相同的窗口规则剪枝——任何诚实副本都能审计
 operator。
 
 ### 5. 结算 AA：乐观最终性 + 证明门控出金
 
-三个 AA（`CHAIN_ID=operp-v2`）。**没有 lock，没有付钱否决。** 保证金是 GBYTE。
+四个 AA 实例、三类职责（rollup、两个 dispute AA、vault；`CHAIN_ID=operp-v2`）。
+**没有 lock，没有付钱否决。** 保证金是 GBYTE。
 
 1. **资金池 + submit（rollup）** — 常备池 `pool_<addr> >= 1000 GBYTE`（`{pool:1}` 按净流入减 10000 fee 累加）；每次提交只付 10000 bounce 费。在途 `last_submitted-last_finalized < 50` 允许 h 未终结就发 h+1。组合单元：header `temp_data`（`frames_blob` 或 `packages`+`data_root`，gzip 帧）+ `{submit, height, 双根, trace/units/ops/fills 根}`。多包时 package 单元先发，da_unit 以一单元承载 header + submit。`h == last_submitted+1`；活高度重发 → `height taken`（欺诈重开的后续高度可自由覆盖）。窗从 `submitted_at` 起算 3600 s。
-2. **揭发（dispute / dispute_fill）** — 窗内任何人提交一枪谓词（deposit/withdraw/omit/fill_math/ghost/skip）。验不过 bounce `no fraud`，高度不动；验过则 `{verdict:'fraud'}`，rollup 从 operator 常备池扣 5e11、高度重开。无应诉回合。
+2. **揭发（dispute / dispute_fill）** — 窗内任何人提交一枪谓词（deposit/withdraw、escrow〔仅 Cancel 退款〕、fill_math、ghost、skip；P-omit 暂不可用）。验不过 bounce `no fraud`，高度不动；验过则 `{verdict:'fraud'}`，rollup 从 operator 常备池扣 5e11、高度重开。无应诉回合。
 3. **finalize（rollup）** — `submitted_at+3600` 且未冻结 → `last_finalized=h`，竞速奖 20000 bytes，不再记 sbond。链空闲（`last_submitted==last_finalized`）时 `{claim:'pool'}` 取回池子。`{escape_finalize}` 为 7 天停滞门。
 4. **withdraw（vault）** — 只读 `var[ROLLUP]['aa_forest_'||last_finalized]`，原 16 深 Merkle 折叠与 W 防重放不变。`{escape_withdraw}` 在 vault AA 中无对应 case（vault 只有 `deposit` / `deposit_perp` / `withdraw`），按未匹配触发 bounce。
-5. **force（rollup inbox）** — `{force, unit_id}` 抗审查；漏收可 P-omit。
+5. **force（rollup inbox）** — `{force, unit_id}` 只记录时间戳，不证明该单元存在；
+   当前 P-omit 分支恒 bounce `no fraud`，尚不能用于有效的漏单挑战。
 
 | 门 | 原点 | 时长 |
 |---|---|---|
 | 揭发 / finalize | `submitted_at_h` | 3600 s |
 | escape_finalize | `submitted_at_h` | 604800 s |
 
-无 owner key。升级 = 新 AA + 同一 finalized 提款路径迁资金。
+无 owner key，也不能原地升级 AA。迁往新部署需用户基于 finalized root 提款、
+再存入新部署；当前没有自动迁移流程。
 
 
 ## 仓库布局
@@ -175,9 +195,9 @@ crates/                  Rust workspace（9 crates，见表）
 obyte-local/
   agents/operp_vault.aa          金库（deposit/withdraw）
   agents/operp_rollup.aa         主张链
-  agents/operp_dispute.aa        充提/漏单谓词
+  agents/operp_dispute.aa        充提/Cancel 托管退款；P-omit 暂不可用
   agents/operp_dispute_fill.aa   成交谓词
-  test_settlement_aa.js          三门 AA E2E（Linux/CI；win32 skip）
+  test_settlement_aa.js          四个 AA 实例 E2E（Linux/CI；win32 skip）
   deploy_mainnet.js / issue_perp.js  主网发 AA / 发 PERP
   post_batch.js                  组合 temp_data+submit → finalize → claim
   post_challenge.js              谓词揭发 CLI（`--pred --proof`）
@@ -214,7 +234,7 @@ cargo run -p operp-settle --example export_batch
 # vendored aa-testkit 的原生 rocksdb/sqlite3——见「验证状态」）
 cd obyte-local && node test_settlement_aa.js
 
-# 部署 vault AA 到 Obyte 测试网
+# 部署结算 AA 到 Obyte 测试网（需已发行的 PERP asset id）
 cd obyte-local && node deploy_testnet.js
 
 # operator 完整流程：package 先发，组合 da_unit（header + submit）+ finalize + 领奖
@@ -231,8 +251,14 @@ cd obyte-local && node post_batch.js
 
 1. ~~**付钱即可杀掉诚实根。**~~ **已关闭（结算 v2）。** 揭发必须过 dispute
    谓词；`{challenge:1}` 在 rollup/vault 上没有 case。假证明 bounce `no fraud`。
-   仍未关闭：保险钳制链上不验；fill_math ±1 容差；`temp_data` 24h 删正文；
-   充值 joint 仍主要在链下 `validate_against`（`OPERP_VAULT_AA` 空且带 evidence 会拒）。10k 节点墙已由 frames-in-base64 关闭；剩余 DA 上限为 5MB/`PACK_SOURCE_CAP` 与 24h 清理。
+   仍未关闭：`fill_math` 不判定任何负的预期 collateral 结果，ADL kind-2 成交
+   没有链上成交证明分支；仓位 entry 比较仍有 ±1 单位容差。`temp_data` 正文
+   24h 后删除。充值 evidence 由 `validate_against` 检查，AA 谓词路径不证明
+   Obyte inclusion/stability（`OPERP_VAULT_AA` 为空且带 evidence 会拒）。
+   10k 节点墙已由 frames-in-base64 关闭；剩余 DA 上限为 5MB/`PACK_SOURCE_CAP`
+   与 24h 清理。P-escrow 只验证 Cancel 退款的精确抵押变化，不覆盖 Place 托管变化。
+   vault 也会拒绝非零 PERP claim（`perp claim needs burn`）：侧链 `GovWithdraw`
+   更新余额镜像，并不代表 Obyte AA 已付出 PERP。
 2. **资金费质量受价格锚限制。** 资金费保持 mark-premium 模型（±50 bps/tick
    封顶）。默认 `BondedMedianTwap` index 来自债券报价者价格；外部锚接线已经
    落地（`Op::UpdateExternalPrice`，tag 17，白名单门控，
@@ -272,8 +298,9 @@ cd obyte-local && node post_batch.js
     finalize-batch 确定性设计落地后回归。
 14. gov nonce WAL 在批次提交（`from_applied`）时持久化；未提交的批次
     不烧毁 nonce。
-15. 快照携带格式版本头（当前 v1）；跨版本的快照/日志互不兼容
-    （主网前不做迁移）。
+15. 快照格式头当前为 v3；未知/旧版或不可读候选会被跳过，不做跨版本迁移。
+    若没有可加载快照，`load_or_genesis` 从 genesis 初始化，调用方须从 genesis
+    重放 finalized 批次；重启时另将 gov-nonce WAL 按最大 nonce 合并。
 
 近期关闭：存款白名单、溢出防护、市场白名单、严格签名、孤儿恢复
 （确定性驱逐 + 缺失父反向索引）、日志按批裁剪、已实现 PnL 即时结算进
@@ -283,18 +310,19 @@ cd obyte-local && node post_batch.js
 正确性**与 deque 幽灵清理**、maker 队列弹出回归、提款证明与诊断 `bal_`
 账本解耦、height 绑定 `state_root`（meta 叶提交批次高度/mark/资金费
 index）、全簿承诺、全局累计提款防重放（`W` 进入每个 aa 树叶）、claim
-取回债券（frozen 高度门控）、有界提款/AA 单元/gov-nonce 账本（256 高度
+取回债券（frozen 高度门控）、有界提款/AA 单元/gov-nonce 账本（2048 高度
 重放窗口）、反手单初始保证金门、create-market bps 上限、tick-size 强制、
 仅应用态 `seq` 计账、自成交拦截（带托管自家挂单拒单，cross 撤 maker
-续拍）、taker 与 maker 双侧坏账
-钳入保险基金、提案清理与创建时投票权重快照、充值绑定 Obyte 地址
+续拍）、成交对手方可用抵押内的零和 clawback（保险不补交易亏损）、提案清理
+与创建时投票权重快照、充值绑定 Obyte 地址
 （`addr` 字段、首见即定）、资产类别绑定充值背书、`MAX_AA_TREE_DEPTH`
 证明上限、AA 侧 claim-reward 清零、单一在途挑战债券、`frozen == 2` 高度
-恢复——以及 PERP 治理：侧链镜像 PERP 充值/提款（两棵 Merkle 叶均含
-perp 字段）、烧毁上架费的无许可市场上架（每市场风险参数）、链上参数提案
+恢复——以及 PERP 治理：侧链 `GovDeposit`/`GovWithdraw` 镜像记账（两棵 Merkle
+叶均含 perp 字段；非零 vault claim 当前不可用）、烧毁上架费的无许可市场上架
+（每市场风险参数）、链上参数提案
 投票（quorum 快照 + 快照权重投票）。
 
-本轮关闭了剩余审计发现与路线图缺口：`validate_against` 剪枝对齐
+本轮还实现了额外审计与路线图事项（已知局限仍见上文）：`validate_against` 剪枝对齐
 （withdrawals / seen-AA-units / deposits_allowed 与 `from_applied` 完全一致
 地剪枝）、`validate_against` 内独立充值证据验证、epoch 盐化孤儿驱逐
 （salt = `sha256(ORDERING_SALT_DOMAIN ‖ root ‖ epoch_le)`；执行序已去盐为
@@ -307,13 +335,13 @@ PnL 定标、`RetryMismatch`/`AddrTooLong` DAG 防护、meta 叶对全部共识�
 WantUnits gossip、资金费外部锚接线。
 
 审计后追加：恢复 `{deposit_perp}` 入账（vault 保留 PERP 并镜像记入
-`pperp_<addr>`；已证明叶子仍是唯一提款权威），并通过缓存 ed25519 密钥
+`pperp_<addr>`；非零 PERP claim 仍会 bounce），并通过缓存 ed25519 密钥
 展开 + release LTO 把裸引擎吞吐从 5199 提到 7316 ops/s。
 
-## 主网路线图（已实现）
+## 主网路线图（实现状态）
 
-[`docs/mainnet/`](docs/mainnet/) 的十一个设计全部实现（按 v1 保守版 +
-v2 扩展分期；偏差与延期积压见下）：
+[`docs/mainnet/`](docs/mainnet/) 的十一个设计主题处于不同实现阶段
+（v1 保守版与 v2 扩展分期）；勾选不代表每个提案子功能都已开放或审计，禁用项与偏差见下文及机制文档：
 
 - [x] **01 欺诈罚没** — `01-fraud-slashing.md`：`validity_proof_hash` 插槽 +
   谓词判决罚没（dispute 验过 → rollup 从 operator 常备池扣 5e11 记
