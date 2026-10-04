@@ -1307,7 +1307,7 @@ impl Engine {
                         && **id != INSURANCE_ACCOUNT
                         && a.positions
                             .get(&market)
-                            .map_or(false, |p| p.qty.signum() == -remaining_pos.signum())
+                            .is_some_and(|p| p.qty.signum() == -remaining_pos.signum())
                 })
                 .map(|(id, a)| (*id, a.positions[&market].qty.unsigned_abs()))
                 .collect();
