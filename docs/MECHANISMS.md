@@ -741,8 +741,8 @@ claim 四态：`reward|sbond|slash` 按旧键支付；`pool` 仅链空闲
 每批 checkpoint 额外携带（`operp_settle`）：`wit_root`（执行完最后单元的
 witness 叶根）、`trace_root`（每单元 post wit_root 的 Obyte 原生 Merkle，
 按批序）、`units_root` / `units_set_root`（unit_id hex 批序/排序）、
-`ops_root`（op 描述串）、`fills_root`（成交描述串）、`counts_root`
-（每单元叶数）、`unit_count` / `wit_count` / `fill_count`。
+`ops_root`（op 描述串）、`fills_root`（成交描述串 + 尾随长度哨兵，见下）、
+`counts_root`（每单元叶数）、`unit_count` / `wit_count` / `fill_count`。
 
 成交描述串（`fills_element`，14 字段）：
 
@@ -752,8 +752,10 @@ f:{unit}:{idx}:{taker}:{maker}:{taker_order}:{maker_order}:{market}:{price}:{qty
 
 `taker_post` = 该笔成交占用的逐仓托管份额（USD_SCALE，taker 挂单为 cross
 时 0）；fill_math 逐仓恒等式用它 + post `ord` 叶的 `margin_left` 精确核对
-taker 抵押。fill_count 经 submit 存为 `fill_count_h`，末笔成交可走
-index-is-last 完备臂（无需右邻证明）。
+taker 抵押。`fills_root` 树 = 成交描述串 + 尾随长度哨兵 `n:{len}`
+（`fills_root_elements`）：末笔成交的右邻即该哨兵，fill_math 单笔完备性
+只靠右邻证明即可判定，谓词不读任何提交整数。`fill_count` 仍经 submit 存为
+`fill_count_h`（rollup 门与提交头使用），但 dispute 路径不再读它。
 
 witness 叶（`operp_state::wit_leaves`，排序后 Obyte 原生 Merkle）：
 

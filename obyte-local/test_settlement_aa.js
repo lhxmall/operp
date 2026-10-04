@@ -177,6 +177,11 @@ function pad2(arr, tag) {
   if (arr.length >= 2) return arr;
   return arr.concat([`pad:${tag}:${"z".repeat(16)}`]);
 }
+// fills_root tree (mirrors Rust fills_root_elements): the raw fills plus
+// one trailing length sentinel `n:{len}` — the trailing fill's right
+// neighbor. The sentinel also guarantees >= 2 leaves, so fills proofs
+// always carry >= 1 sibling (canonical JSON bans empty sibling arrays).
+const fillsTree = (a) => a.concat("n:" + a.length);
 function b6444(seed) {
   const h = crypto.createHash("sha256").update(seed, "utf8").digest("base64");
   return h; // exactly 44 chars
@@ -529,8 +534,9 @@ async function main() {
   // provable lies moved to 19a (isolated) and 19b (cross, empty range).
   const takerH = FILL_TAKER;
   const fillStr = `f:${H3_UNIT_HEX}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"e".repeat(64)}:1:100000000:100000000:9:0:0:0`;
-  const FILLS1 = pad2([fillStr], "fills1");
-  const FILLS_ROOT1 = merkle.getMerkleRoot(FILLS1);
+  const FILLS1 = [fillStr];
+  const FILLS1_TREE = fillsTree(FILLS1);
+  const FILLS_ROOT1 = merkle.getMerkleRoot(FILLS1_TREE);
   // h3 heights commit a PLACE op at k (cross): the fill_math taker leg
   // proves the unit op is this fill's own p: Place and reads its isolated
   // flag; deposit heights (h2) keep OPS_ROOT1's d: op.
@@ -584,11 +590,11 @@ async function main() {
     units_root: UNITS3_ROOT,
     units_proof: UNITS3_PROOF,
     fill: fillStr,
-    fill_proof: merkle.getMerkleProof(FILLS1, 0),
+    fill_proof: merkle.getMerkleProof(FILLS1_TREE, 0),
     op: FILL_OP,
     ops_proof: OPS3_PROOF,
-    right: FILLS1[1],
-    right_proof: merkle.getMerkleProof(FILLS1, 1),
+    right: FILLS1_TREE[1],
+    right_proof: merkle.getMerkleProof(FILLS1_TREE, 1),
     pre_wit: H3_PRE_WIT,
     post_wit: POST_H_WIT,
     post_proof: merkle.getMerkleProof(TRACE_H, 0),
@@ -660,7 +666,7 @@ async function main() {
     units_root: UNITS3_ROOT,
     units_proof: UNITS3_PROOF,
     fill: fillStr,
-    fill_proof: merkle.getMerkleProof(FILLS1, 0),
+    fill_proof: merkle.getMerkleProof(FILLS1_TREE, 0),
     pre_wit: H3_PRE_WIT,
     maker_ord: ghostOrd,
     left: gSorted[gMaker],
@@ -676,8 +682,9 @@ async function main() {
   // ---- 13. skip: better live order ignored → fraud -------------------------
   const SKIP_TRACE4 = pad2([`skip-post-wit`], "skiptrace4");
   const SKIP_TRACE4_ROOT = merkle.getMerkleRoot(SKIP_TRACE4);
-  const SKIP_FILLS = pad2([`f:${H3_UNIT_HEX}:0:${FILL_TAKER}:${"c".repeat(64)}:${"d".repeat(64)}:${"d".repeat(64)}:1:100000000:50000000:7:0:0:0`], "skipfills");
-  const SKIP_FILLS_ROOT = merkle.getMerkleRoot(SKIP_FILLS);
+  const SKIP_FILLS = [`f:${H3_UNIT_HEX}:0:${FILL_TAKER}:${"c".repeat(64)}:${"d".repeat(64)}:${"d".repeat(64)}:1:100000000:50000000:7:0:0:0`];
+  const SKIP_FILLS_TREE = fillsTree(SKIP_FILLS);
+  const SKIP_FILLS_ROOT = merkle.getMerkleRoot(SKIP_FILLS_TREE);
   // h3 was frozen by ghost: re-submit carrying the skip assertion's roots.
   await submitH3(SKIP_TRACE4_ROOT, SKIP_FILLS_ROOT);
   const skipProof = {
@@ -689,7 +696,7 @@ async function main() {
     units_root: UNITS3_ROOT,
     units_proof: UNITS3_PROOF,
     fill: SKIP_FILLS[0],
-    fill_proof: merkle.getMerkleProof(SKIP_FILLS, 0),
+    fill_proof: merkle.getMerkleProof(SKIP_FILLS_TREE, 0),
     pre_wit: H3_PRE_WIT,
     maker_ord: MAKER_ORD,
     maker_proof: merkle.getMerkleProof(H3_PRE, H3_PRE.indexOf(MAKER_ORD)),
@@ -705,8 +712,9 @@ async function main() {
   // units_proof cannot verify it, so the predicate must bounce before any
   // math. This is the exact class the old AA let through to a verdict.
   const NEG_FILL = `f:${"u".repeat(64)}:0:${takerH}:${"c".repeat(64)}:${"d".repeat(64)}:${"e".repeat(64)}:1:-100000000:100000000:9:0:0:0`;
-  const NEG_FILLS = pad2([NEG_FILL], "negfills");
-  const NEG_FILLS_ROOT = merkle.getMerkleRoot(NEG_FILLS);
+  const NEG_FILLS = [NEG_FILL];
+  const NEG_FILLS_TREE = fillsTree(NEG_FILLS);
+  const NEG_FILLS_ROOT = merkle.getMerkleRoot(NEG_FILLS_TREE);
   const NEG_POST_LIAR = [`acct:${takerH}:-499:0:0`, META1, `pos:${takerH}:1:100000000:-100000000:0:0`].sort();
   const NEG_POST_LIAR_WIT = merkle.getMerkleRoot(NEG_POST_LIAR);
   const NEG_TRACE = pad2([NEG_POST_LIAR_WIT], "negtrace");
@@ -716,9 +724,9 @@ async function main() {
     trace_root: NEG_TRACE_ROOT,
     fills_root: NEG_FILLS_ROOT,
     fill: NEG_FILL,
-    fill_proof: merkle.getMerkleProof(NEG_FILLS, 0),
-    right: NEG_FILLS[1],
-    right_proof: merkle.getMerkleProof(NEG_FILLS, 1),
+    fill_proof: merkle.getMerkleProof(NEG_FILLS_TREE, 0),
+    right: NEG_FILLS_TREE[1],
+    right_proof: merkle.getMerkleProof(NEG_FILLS_TREE, 1),
     post_wit: NEG_POST_LIAR_WIT,
     post_proof: merkle.getMerkleProof(NEG_TRACE, 0),
     post_acct: `acct:${takerH}:-499:0:0`,
@@ -863,16 +871,15 @@ async function main() {
   if (Number(st.last_submitted) !== 8) throw new Error("re-submit after pool top-up failed");
   console.log("18. depleted pool bounces 'need pool'; top-up reopens submit");
 
-  // ---- 19. PR 33 residuals: exact identity + index-is-last arm -----------
+  // ---- 19. PR 33 residuals: exact identity + sentinel right neighbor ----
   // Fresh heights 9-11 (k=0, pre_wit anchored on wit_root_8 = WIT_ROOT):
   //  19a. isolated taker open that escrowed margin, INFLATED post col
-  //       -> verdict (the old >= branch accepted any larger post, and the
-  //       missing right neighbor used to bounce every trailing fill);
+  //       -> verdict (the old >= branch accepted any larger post);
   //  19b. cross taker, post range proven empty, post col = exp + 1
   //       -> verdict (exact empty-range identity);
-  //  19c. honest isolated open -> 'no fraud', challenged with NO right
-  //       neighbor: single-fill completeness rides the fill_count
-  //       index-is-last arm alone.
+  //  19c. honest isolated open -> 'no fraud': single-fill completeness
+  //       rides the right neighbor, which for the sole fill is the
+  //       fills_root length sentinel `n:1`.
   const isoUnit = sha256Hex("iso-unit");
   const isoTOrd = "7".repeat(64);
   const isoMOrd = "3".repeat(64);
@@ -881,8 +888,9 @@ async function main() {
   // (margin escrowed at place, moved to the bucket, never returned to
   // collateral) - 500 (5bps taker fee on the 1e6 notional) = 499500.
   const isoFill = `f:${isoUnit}:0:${DEP_ACCT}:${"c".repeat(64)}:${isoTOrd}:${isoMOrd}:1:100000000:100000000:9:0:0:500000`;
-  const ISO_FILLS = pad2([isoFill], "isofills");
-  const ISO_FILLS_ROOT = merkle.getMerkleRoot(ISO_FILLS);
+  const ISO_FILLS = [isoFill];
+  const ISO_FILLS_TREE = fillsTree(ISO_FILLS);
+  const ISO_FILLS_ROOT = merkle.getMerkleRoot(ISO_FILLS_TREE);
   const isoOp = `p:${DEP_ACCT}:1:0:100000000:100000000:1:500000:0`;
   const ISO_OPS = pad2([isoOp], "isoops");
   const ISO_OPS_ROOT = merkle.getMerkleRoot(ISO_OPS);
@@ -898,8 +906,9 @@ async function main() {
   const ISO_LIAR_WIT = merkle.getMerkleRoot(ISO_LIAR);
   const ISO_LIAR_TRACE = pad2([ISO_LIAR_WIT], "isoliartrace");
   const ISO_LIAR_TRACE_ROOT = merkle.getMerkleRoot(ISO_LIAR_TRACE);
-  // Isolated open payload: no `right` (index-is-last arm), op + ord
-  // absence proofs over the post tree.
+  // Isolated open payload: single-fill completeness rides the right
+  // neighbor — for this sole fill the fills_root length sentinel `n:1` —
+  // plus op + ord absence proofs over the post tree.
   const isoFillPayload = (traceRoot, traceArr, postWit, postTree, col) => {
     const acctLeaf = `acct:${DEP_ACCT}:${col}:0:0`;
     return {
@@ -911,7 +920,9 @@ async function main() {
       units_root: ISO_UNITS_ROOT,
       units_proof: ISO_UNITS_PROOF,
       fill: isoFill,
-      fill_proof: merkle.getMerkleProof(ISO_FILLS, 0),
+      fill_proof: merkle.getMerkleProof(ISO_FILLS_TREE, 0),
+      right: ISO_FILLS_TREE[1],
+      right_proof: merkle.getMerkleProof(ISO_FILLS_TREE, 1),
       op: isoOp,
       ops_proof: merkle.getMerkleProof(ISO_OPS, 0),
       pre_wit: WIT_ROOT,
@@ -975,12 +986,13 @@ async function main() {
   );
   st = await vars(rollup);
   if (Number(st.frozen_9) !== 2) throw new Error("inflated isolated post col did not freeze h9");
-  console.log("19a. isolated escrow identity: inflated post col + missing right -> frozen=9");
+  console.log("19a. isolated escrow identity: inflated post col -> frozen=9");
 
   // 19b. Cross taker, empty range, post col = exp + 1 -> verdict.
   const crossFill = `f:${isoUnit}:0:${DEP_ACCT}:${"c".repeat(64)}:${"8".repeat(64)}:${isoMOrd}:1:100000000:100000000:9:0:0:0`;
-  const CROSS_FILLS = pad2([crossFill], "crossfills");
-  const CROSS_FILLS_ROOT = merkle.getMerkleRoot(CROSS_FILLS);
+  const CROSS_FILLS = [crossFill];
+  const CROSS_FILLS_TREE = fillsTree(CROSS_FILLS);
+  const CROSS_FILLS_ROOT = merkle.getMerkleRoot(CROSS_FILLS_TREE);
   const crossOp = `p:${DEP_ACCT}:1:0:100000000:100000000:0:0:0`;
   const CROSS_OPS = pad2([crossOp], "crossops");
   const CROSS_OPS_ROOT = merkle.getMerkleRoot(CROSS_OPS);
@@ -998,7 +1010,9 @@ async function main() {
     units_root: ISO_UNITS_ROOT,
     units_proof: ISO_UNITS_PROOF,
     fill: crossFill,
-    fill_proof: merkle.getMerkleProof(CROSS_FILLS, 0),
+    fill_proof: merkle.getMerkleProof(CROSS_FILLS_TREE, 0),
+    right: CROSS_FILLS_TREE[1],
+    right_proof: merkle.getMerkleProof(CROSS_FILLS_TREE, 1),
     op: crossOp,
     ops_proof: merkle.getMerkleProof(CROSS_OPS, 0),
     pre_wit: WIT_ROOT,
@@ -1031,8 +1045,9 @@ async function main() {
   if (Number(st.frozen_9) !== 2) throw new Error("cross exp+1 empty-range col did not freeze h9");
   console.log("19b. cross empty-range exact identity: exp+1 -> frozen=9");
 
-  // 19c. HONEST isolated open: same payload shape, matching post col and
-  // no right neighbor -> index-is-last arm + exact identity bounce.
+  // 19c. HONEST isolated open: same payload shape, matching post col —
+  // completeness rides the `n:1` sentinel right neighbor, then the exact
+  // identity bounces 'no fraud'.
   await submitIsoH(ISO_TRACE_ROOT, ISO_FILLS_ROOT, ISO_OPS_ROOT, 3);
   await triggerBounce(
     challenger,
@@ -1047,7 +1062,7 @@ async function main() {
   st = await vars(rollup);
   if (Number(st.frozen_9 || 0) !== 0) throw new Error("honest isolated open froze h9!");
   if (Number(st.last_submitted) !== 9) throw new Error("honest h9 re-submit did not land");
-  console.log("19c. honest isolated open bounced 'no fraud' via index-is-last arm");
+  console.log("19c. honest isolated open bounced 'no fraud' via sentinel right neighbor");
 
   process.exit(failures === 0 ? 0 : 1);
 }

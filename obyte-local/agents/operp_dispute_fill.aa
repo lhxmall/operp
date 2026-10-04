@@ -23,8 +23,9 @@
 	// order is cross); the collateral identity below consumes it.
 	// The fill's unit hex ($F[1]) must prove as the k-th element of the
 	// committed units_root, and it must be the unit's ONLY fill (idx 0 +
-	// right-neighbor non-membership, or the fill_count index-is-last arm)
-	// so the pre->post delta is exactly one fill's worth of collateral math.
+	// right-neighbor proof — the trailing fill's neighbor is the fills_root
+	// length sentinel `n:{len}`) so the pre->post delta is exactly one
+	// fill's worth of collateral math.
 	// Witness leaves (wit_leaves):
 	//   acct:{acct_hex_64}:{collateral}:{perp}:{W}
 	//   pos:{acct_hex_64}:{market}:{qty_signed}:{entry}:{isolated:0|1}:{bucket}
@@ -129,20 +130,17 @@
 						OR trigger.data.units_proof.root != trigger.data.units_root
 						OR !is_valid_merkle_proof($F[1], trigger.data.units_proof))
 						bounce('bad unit');
-					// Single-fill completeness: idx 0 plus either a right
-					// neighbor outside this unit's prefix, or the proven
-					// last position in the fills list (nothing can follow
-					// it), proves this is the unit's only fill, so pre->post
-					// delta is exactly this fill.
+					// Single-fill completeness: idx 0 plus a right neighbor
+					// outside this unit's prefix — the trailing fill's neighbor
+					// is the fills_root length sentinel — proves this is the
+					// unit's only fill, so pre->post delta is exactly this fill.
 					if ($F[2] != '0') bounce('no fraud');
-					$fc = (var[$rollup]['fill_count_' || $h] otherwise 0);
 					$right_ok = trigger.data.right
 						AND is_valid_merkle_proof(trigger.data.right, trigger.data.right_proof)
 						AND trigger.data.right_proof.root == trigger.data.fills_root
 						AND trigger.data.right_proof.index == trigger.data.fill_proof.index + 1
 						AND !starts_with(trigger.data.right, 'f:' || $F[1] || ':');
-					$last_ok = ($fc > 0 AND trigger.data.fill_proof.index == $fc - 1);
-					if (!$right_ok AND !$last_ok) bounce('no fraud');
+					if (!$right_ok) bounce('no fraud');
 					$who = trigger.data.who;
 					if ($who != 'taker' AND $who != 'maker') bounce('bad who');
 					$acct_hex = ($who == 'taker') ? $F[3] : $F[4];

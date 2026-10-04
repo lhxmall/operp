@@ -302,6 +302,16 @@ pub fn fills_element(unit_hex: &str, fill_index_in_unit: usize, fill: &Fill) -> 
     )
 }
 
+/// The `fills_root` tree is the fill descriptors plus one trailing
+/// length sentinel `n:{len}` — the last fill's right neighbor, so a
+/// challenge can prove "this fill is last" without a submitted integer.
+/// Not part of `Batch.fills`, `fills_per_unit`, or `fills_hash`.
+pub fn fills_root_elements(fills: &[String]) -> Vec<String> {
+    let mut v = fills.to_vec();
+    v.push(format!("n:{}", fills.len()));
+    v
+}
+
 impl Batch {
     pub fn from_applied(
         prev: &operp_state::ChainState,
@@ -373,7 +383,7 @@ impl Batch {
         let units_root = obyte_merkle::root(&unit_hexes);
         let units_set_root = obyte_merkle::root(&units_set_sorted);
         let ops_root = obyte_merkle::root(&ops);
-        let fills_root = obyte_merkle::root(&fill_elements);
+        let fills_root = obyte_merkle::root(&fills_root_elements(&fill_elements));
         let counts_root = obyte_merkle::root(&counts);
         // Height binding: adopt the next height BEFORE hashing state, so
         // meta_leaf commits the batch height and the checkpoint root is only
@@ -716,7 +726,8 @@ impl Batch {
             || obyte_merkle::root(&unit_hexes) != self.checkpoint.units_root
             || obyte_merkle::root(&units_set_sorted) != self.checkpoint.units_set_root
             || obyte_merkle::root(&replay_ops) != self.checkpoint.ops_root
-            || obyte_merkle::root(&fill_elements) != self.checkpoint.fills_root
+            || obyte_merkle::root(&fills_root_elements(&fill_elements))
+                != self.checkpoint.fills_root
             || obyte_merkle::root(&replay_counts) != self.checkpoint.counts_root
         {
             return Err(SettleError::RootMismatch);
@@ -766,7 +777,7 @@ impl Batch {
         if operp_state::wit_leaves(&replay.state).len() as u32 != self.checkpoint.wit_count
             || obyte_merkle::root(&self.trace) != self.checkpoint.trace_root
             || obyte_merkle::root(&self.ops) != self.checkpoint.ops_root
-            || obyte_merkle::root(&self.fills) != self.checkpoint.fills_root
+            || obyte_merkle::root(&fills_root_elements(&self.fills)) != self.checkpoint.fills_root
             || obyte_merkle::root(&self.counts) != self.checkpoint.counts_root
         {
             return Err(SettleError::RootMismatch);
@@ -1458,6 +1469,48 @@ mod tests {
         assert_eq!(
             batch.validate_against(prev_root, &mut pre),
             Err(SettleError::RootMismatch)
+        );
+    }
+
+    #[test]
+    fn fills_root_appends_length_sentinel() {
+        // One-fill batch (seed_trade's bid crosses the resting ask): the
+        // tree is [fill, "n:1"], so the trailing fill's right neighbor is
+        // the sentinel — no submitted integer needed.
+        let (mut eng, pre, applied, prev_root, evidences) = seed_trade();
+        let mut batch = Batch::from_applied(&pre.state, &mut eng, &applied).unwrap();
+        batch.deposit_evidences = evidences;
+        assert_eq!(batch.fills.len(), 1, "seed_trade fills exactly once");
+        let expected = obyte_merkle::root(&[batch.fills[0].clone(), "n:1".to_string()]);
+        assert_eq!(batch.checkpoint.fills_root, expected);
+        // The sentinel is not a Batch.fills element.
+        assert!(!batch.fills.iter().any(|f| f.starts_with("n:")));
+
+        // A proof of the sentinel at index 1 verifies against the posted
+        // root; the wrong length does not.
+        let tree = fills_root_elements(&batch.fills);
+        let p = obyte_merkle::proof(&tree, 1);
+        assert_eq!(p.root, batch.checkpoint.fills_root);
+        assert!(obyte_merkle::verify("n:1", &p));
+        assert!(!obyte_merkle::verify("n:2", &p));
+
+        // Replay and DA checks accept the sentinel root (they recompute
+        // through the same helper).
+        let mut pre2 = pre.clone();
+        batch
+            .validate_against(prev_root, &mut pre2)
+            .expect("sentinel root replays");
+    }
+
+    #[test]
+    fn zero_fill_batch_hashes_single_sentinel() {
+        let (mut eng, pre, _, id, ev) = one_deposit_fixture();
+        let mut batch = Batch::from_applied(&pre.state, &mut eng, &[id]).unwrap();
+        batch.deposit_evidences = vec![ev];
+        assert!(batch.fills.is_empty());
+        assert_eq!(
+            batch.checkpoint.fills_root,
+            obyte_merkle::root(&["n:0".to_string()])
         );
     }
 
