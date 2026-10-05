@@ -283,6 +283,7 @@ submit(h)    h == last_submitted+1 ∧ chain_id='operp-v2' ∧ 双根 + 六个 4
 
 fraud(h)     窗内（submitted_at+3600）任何人打 dispute / dispute_fill：
              deposit | withdraw | omit | fill_math | ghost | skip
+             （P-omit 当前禁用并恒 bounce `no fraud`，见 #23）
              验不过 → bounce('no fraud')，高度不动；
              验过 → dispute 付 10000 bytes + {verdict:'fraud',height,challenger}
                → rollup frozen_h=2、清根、last_submitted=h-1、
@@ -305,8 +306,16 @@ withdraw     vault：leaf_account==trigger.address；
 
 force(id)    rollup：{force, unit_id 64hex} → inbox_<id>=timestamp；
              主张必须把 inbox_upto 之前的 id 全收进 units_set_root，
-             漏收 = P-omit 欺诈
+             漏收本应由 P-omit 揭发；但 P-omit 当前禁用并恒 bounce `no fraud`
 ```
+
+`temp_data` 帧是 UTF-8 JSON 行：包内多帧以 LF 分隔；第一个 package 不加
+包前缀，后续 package 以一个 LF 开头；所有新 package 都不以 LF 结尾。
+`data_root` 始终是 SHA-256(按顺序直接拼接的原始 gunzip package 字节)，不含
+gzip wrapper。watcher 必须先按这些未修改字节校验 root；对旧 producer 的多包
+数据，只能在解析副本中为缺失的包间边界补 LF，不能重算/改写 `data_root`。
+因此旧 writer → 新 watcher 与新 writer → 旧 `split("\\n")` watcher 均可读，
+无需 framing-version 字段或强制 producer-first 升级；单包 inline root 也须校验。
 
 **没有 lock，没有 `{challenge:1}`，没有应诉。** 揭发必须算对那一笔；
 诚实根杀不掉。常备池是资本门槛，不是许可名单。
@@ -368,6 +377,7 @@ PERP 的三个机制接管：
 字段），烧毁只在镜像账本进行——对应真实 PERP 永久滞留 AA，协议整体对
 PERP 超抵押。精确规则见 [MECHANISMS.md](MECHANISMS.md) §15。
 
-> **Watcher：** `crates/operp-watch` 离线重放 `da_unit_<h>`，定位第一处分歧后组
-> `proof.json`，经 `post_challenge.js` 打 dispute AA（`--pred --proof`；
-> `OPERP_WATCH_MNEMONIC`，与 poster 分钥）。
+> **Watcher：** `crates/operp-watch` 离线重放 `da_unit_<h>` 并可组
+> `proof.json`。当前 `post_challenge.js` 仍是本地 aa-testkit CLI，未接入生产
+> hub 提交路径；不能据此声称生产环境会自动发挑战。#37 的自动提交项仍未解决，
+> 本 PR 也不修改该脚本。

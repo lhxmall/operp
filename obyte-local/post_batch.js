@@ -19,7 +19,11 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const zlib = require("zlib");
-const { packFrames } = require("./batch_frames");
+const {
+  DEFAULT_PACKAGE_SOURCE_CAP,
+  assertPackageSourceCap,
+  packFrames,
+} = require("./batch_frames");
 // ===== CONFIG: PERP governance asset ================================
 // Set to the real PERP asset id once issued; must match deploy_testnet.js.
 // devnet (default) has no issued asset: fall back to 'base' — the
@@ -219,12 +223,15 @@ async function main() {
     }
     return JSON.stringify(o);
   });
-  // packFrames terminates every package with a newline so raw package-byte
-  // concatenation preserves frame boundaries for the watcher.
-  const packages = packFrames(stamped, {
-    cap: 4000000,
+  // Separators occur between frames/packages, never at the final byte. This
+  // preserves old watcher split("\n") compatibility and avoids an empty
+  // trailing frame. An indivisible oversized frame must fail before posting.
+  const packageOptions = {
+    cap: DEFAULT_PACKAGE_SOURCE_CAP,
     getJsonSourceString,
-  });
+  };
+  const packages = packFrames(stamped, packageOptions);
+  assertPackageSourceCap(packages, packageOptions);
   const rawBlobs = packages.map((b) => zlib.gunzipSync(Buffer.from(b, "base64")));
   const dataRoot = crypto.createHash("sha256").update(Buffer.concat(rawBlobs)).digest("hex");
   const header = Object.assign({}, batchData);

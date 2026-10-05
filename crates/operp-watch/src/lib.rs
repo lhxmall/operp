@@ -146,8 +146,10 @@ pub fn verify_da_binding(da: &DaUnit) -> Result<(), WatchError> {
 }
 /// Assemble a multi-package header's blob: fetch each `packages` hash via
 /// `get_joint`, require its `package_blob` string (base64(gzip(frames))),
-/// gunzip, concat raw frame bytes, and check hex(sha256(concat)) against
-/// `data_root`. Returns base64(gzip(concat)) so it splices as `frames_blob`.
+/// gunzip, concat the original package bytes, and check hex(sha256(concat))
+/// against `data_root`. Only after that check, add a parse-only LF at package
+/// boundaries that have no delimiter (legacy writers emitted none). Returns
+/// base64(gzip(parse_stream)) so it splices as `frames_blob`.
 /// Transport errors map to `HubUnavailable` (caller backs off); bad content
 /// (bad base64, invalid gzip, root mismatch) maps to `BindingMismatch`.
 /// No retries here — the poll loop owns backoff.
@@ -167,6 +169,7 @@ pub fn assemble_frames<H: HubClient>(
         .ok_or_else(|| WatchError::BindingMismatch("packages header missing data_root".into()))?;
     use base64::Engine as _;
     let mut concat: Vec<u8> = Vec::new();
+    let mut parse_stream: Vec<u8> = Vec::new();
     for h in hashes {
         let s = h
             .as_str()
@@ -184,6 +187,7 @@ pub fn assemble_frames<H: HubClient>(
             .decode(b64)
             .map_err(|_| WatchError::BindingMismatch("package_blob not base64".into()))?;
         let raw = gunzip_blob(&gz)?;
+        append_package_for_decode(&mut parse_stream, &raw);
         concat.extend_from_slice(&raw);
     }
     use sha2::{Digest, Sha256};
@@ -193,7 +197,31 @@ pub fn assemble_frames<H: HubClient>(
             "data_root mismatch: want {want} got {got}"
         )));
     }
-    Ok(base64::engine::general_purpose::STANDARD.encode(operp_settle::gzip_bytes(&concat)))
+    Ok(base64::engine::general_purpose::STANDARD.encode(operp_settle::gzip_bytes(&parse_stream)))
+}
+
+/// Add exactly one LF between non-empty package payloads for parsing. The
+/// returned stream is not the `data_root` input: that root is always checked
+/// against the untouched concatenation in `assemble_frames`.
+fn append_package_for_decode(parse_stream: &mut Vec<u8>, package: &[u8]) {
+    if package.is_empty() {
+        return;
+    }
+    if parse_stream.is_empty() {
+        parse_stream.extend_from_slice(package);
+        return;
+    }
+    let previous_has_lf = parse_stream.last() == Some(&b'\n');
+    let current_has_lf = package.first() == Some(&b'\n');
+    if !previous_has_lf && !current_has_lf {
+        parse_stream.push(b'\n');
+    }
+    let skip_duplicate_lf = previous_has_lf && current_has_lf;
+    parse_stream.extend_from_slice(if skip_duplicate_lf {
+        &package[1..]
+    } else {
+        package
+    });
 }
 
 /// Replay a posted batch against the running engine and assert it reproduces
@@ -213,7 +241,8 @@ pub fn replay_and_check(
 /// scalars plus `frames_blob` (single package, base64(gzip(frames))).
 /// Multi-package (`packages`+`data_root`) arrives via `assemble_frames`
 /// before this call — legacy `units`-array headers are rejected. `data_root`
-/// covers gunzipped frame bytes, not the gzip wrapper.
+/// covers original gunzipped frame bytes, not the gzip wrapper; inline roots
+/// are checked here and multi-package roots are checked before normalization.
 pub fn gunzip_blob(gz: &[u8]) -> Result<Vec<u8>, WatchError> {
     use flate2::read::GzDecoder;
     use std::io::Read;
@@ -229,6 +258,14 @@ pub fn batch_from_data(data: &serde_json::Value) -> Result<Batch, SettleError> {
     }
     let blob = get_str(data, "frames_blob")?;
     let raw = operp_settle::decode_package_blob(blob)?;
+    if data.get("packages").is_none() {
+        let want = get_str(data, "data_root")?;
+        use sha2::{Digest, Sha256};
+        let got = hex::encode(Sha256::digest(&raw));
+        if got != want {
+            return Err(SettleError::RootMismatch);
+        }
+    }
     let text = String::from_utf8(raw).map_err(|_| SettleError::RootMismatch)?;
     let frames: Vec<String> = text.lines().map(str::to_string).collect();
     operp_settle::batch_from_frames(data, &frames)
@@ -310,6 +347,37 @@ mod tests {
             },
             "messages": [temp_data_msg(data)],
         })
+    }
+
+    fn package_fixture(raw_packages: &[Vec<u8>]) -> (serde_json::Value, MockHub) {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let mut all_raw = Vec::new();
+        let mut hashes = Vec::new();
+        let mut joints = std::collections::HashMap::new();
+        for raw in raw_packages {
+            let hash = hex::encode(Sha256::digest(raw));
+            let blob =
+                base64::engine::general_purpose::STANDARD.encode(operp_settle::gzip_bytes(raw));
+            let joint = serde_json::json!({
+                "messages": [{
+                    "app": "temp_data",
+                    "payload": {"data": {"package_blob": blob}},
+                }],
+            });
+            hashes.push(serde_json::Value::String(hash.clone()));
+            joints.insert(hash, joint);
+            all_raw.extend_from_slice(raw);
+        }
+        let root = hex::encode(Sha256::digest(&all_raw));
+        (
+            serde_json::json!({"packages": hashes, "data_root": root}),
+            MockHub {
+                vars: Default::default(),
+                joints,
+            },
+        )
     }
 
     #[test]
@@ -494,56 +562,89 @@ mod tests {
         );
     }
     #[test]
-    fn assemble_frames_multi_package_roundtrip() {
+    fn assemble_frames_reads_legacy_boundaries_and_preserves_raw_root() {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
-        let f1 = "{\"u\":1}\n".to_string();
-        let f2 = "{\"u\":2}\n".to_string();
-        let b1 = base64::engine::general_purpose::STANDARD
-            .encode(operp_settle::gzip_bytes(f1.as_bytes()));
-        let b2 = base64::engine::general_purpose::STANDARD
-            .encode(operp_settle::gzip_bytes(f2.as_bytes()));
-        let mut concat = Vec::new();
-        concat.extend_from_slice(f1.as_bytes());
-        concat.extend_from_slice(f2.as_bytes());
-        let root = hex::encode(Sha256::digest(&concat));
-        let h1 = hex::encode(Sha256::digest(f1.as_bytes()));
-        let h2 = hex::encode(Sha256::digest(f2.as_bytes()));
-        let header = serde_json::json!({"packages": [h1, h2], "data_root": root});
-        let pkg = |b: &str| {
-            serde_json::json!({
-                "unit": {"messages": [{"app": "temp_data", "payload": {"data": {"package_blob": b}}}], "unit": "x"},
-                "messages": [{"app": "temp_data", "payload": {"data": {"package_blob": b}}}],
-            })
-        };
-        let hub = MockHub {
-            vars: Default::default(),
-            joints: std::collections::HashMap::from([
-                (h1.clone(), pkg(&b1)),
-                (h2.clone(), pkg(&b2)),
-            ]),
-        };
-        let got = assemble_frames(&hub, &header).unwrap();
+        let frames = [
+            "{\"u\":\"one\"}",
+            "{\"u\":\"two-β\"}",
+            "{\"u\":\"three\"}",
+            "{\"u\":\"four\"}",
+        ];
+        // Legacy writers separated frames inside a package but not package
+        // boundaries. Both packages contain multiple frames here.
+        let raw1 = format!("{}\n{}", frames[0], frames[1]).into_bytes();
+        let raw2 = format!("{}\n{}", frames[2], frames[3]).into_bytes();
+        let raw_concat = [raw1.clone(), raw2.clone()].concat();
+        let normalized = frames.join("\n");
+        let (header, hub) = package_fixture(&[raw1, raw2]);
+        assert_eq!(
+            header["data_root"],
+            hex::encode(Sha256::digest(&raw_concat)),
+            "data_root is over the unmodified package bytes"
+        );
+        assert_ne!(
+            header["data_root"],
+            hex::encode(Sha256::digest(normalized.as_bytes())),
+            "parse-only inserted LF must not change the committed root"
+        );
+
+        let assembled = assemble_frames(&hub, &header).unwrap();
         let gz = base64::engine::general_purpose::STANDARD
-            .decode(&got)
+            .decode(assembled)
             .unwrap();
-        let raw = gunzip_blob(&gz).unwrap();
-        let text = String::from_utf8(raw).unwrap();
-        assert_eq!(text, format!("{f1}{f2}"));
+        let parse_bytes = gunzip_blob(&gz).unwrap();
+        assert_eq!(parse_bytes, normalized.as_bytes());
+        let text = String::from_utf8(parse_bytes).unwrap();
         let decoded: Vec<_> = text.lines().collect();
-        assert_eq!(decoded, ["{\"u\":1}", "{\"u\":2}"]);
+        assert_eq!(decoded, frames);
         for frame in decoded {
             serde_json::from_str::<serde_json::Value>(frame).unwrap();
         }
-        let bad = serde_json::json!({"packages": [h1], "data_root": "00".repeat(32)});
+
+        // A root computed over the normalized parser stream is not accepted
+        // in place of the root over the original legacy package bytes.
+        let mut wrong_root = header.clone();
+        wrong_root["data_root"] =
+            serde_json::json!(hex::encode(Sha256::digest(normalized.as_bytes())));
+        assert!(assemble_frames(&hub, &wrong_root).is_err());
+
+        // Legacy single-package data already has frame separators internally;
+        // it needs no assembly-time boundary insertion.
+        let one_raw = frames.join("\n").into_bytes();
+        let (one_header, one_hub) = package_fixture(&[one_raw]);
+        let one = assemble_frames(&one_hub, &one_header).unwrap();
+        let one_gz = base64::engine::general_purpose::STANDARD
+            .decode(one)
+            .unwrap();
+        assert_eq!(gunzip_blob(&one_gz).unwrap(), normalized.as_bytes());
+
+        // A previously proposed trailing-LF package shape also remains
+        // readable by the new consumer, including its final frame.
+        let trailing_raws = vec![
+            format!("{}\n", frames[0]).into_bytes(),
+            format!("{}\n{}\n", frames[1], frames[2]).into_bytes(),
+        ];
+        let (trailing_header, trailing_hub) = package_fixture(&trailing_raws);
+        let trailing = assemble_frames(&trailing_hub, &trailing_header).unwrap();
+        let trailing_gz = base64::engine::general_purpose::STANDARD
+            .decode(trailing)
+            .unwrap();
+        let trailing_text = String::from_utf8(gunzip_blob(&trailing_gz).unwrap()).unwrap();
+        assert_eq!(trailing_text.lines().collect::<Vec<_>>(), &frames[..3]);
+
+        let bad = serde_json::json!({"packages": header["packages"].clone(), "data_root": "00".repeat(32)});
         assert!(assemble_frames(&hub, &bad).is_err());
         // Invalid gzip maps to BindingMismatch, not HubUnavailable.
         let not_gz = base64::engine::general_purpose::STANDARD.encode(b"not-gzip");
         let hub2 = MockHub {
             vars: Default::default(),
-            joints: std::collections::HashMap::from([(h1.clone(), pkg(&not_gz))]),
+            joints: std::collections::HashMap::from([(
+                header["packages"][0].as_str().unwrap().to_string(),
+                serde_json::json!({"messages": [{"app": "temp_data", "payload": {"data": {"package_blob": not_gz}}}]}),
+            )]),
         };
-        let hdr2 = serde_json::json!({"packages": [h1], "data_root": root});
+        let hdr2 = serde_json::json!({"packages": [header["packages"][0].clone()], "data_root": header["data_root"].clone()});
         assert!(matches!(
             assemble_frames(&hub2, &hdr2),
             Err(WatchError::BindingMismatch(_))
@@ -551,51 +652,94 @@ mod tests {
     }
 
     #[test]
-    fn multi_package_frames_rebuild_a_real_batch() {
+    fn legacy_and_new_package_formats_rebuild_a_complete_real_batch() {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
 
         let da = build_batch_da(false);
         let expected = batch_from_data(&da.data).unwrap();
-        let mut header = da.data.clone();
-        let blob = header["frames_blob"].as_str().unwrap();
-        let raw = operp_settle::decode_package_blob(blob).unwrap();
-        let text = String::from_utf8(raw).unwrap();
+        let original = da.data["frames_blob"].as_str().unwrap();
+        let original_raw = operp_settle::decode_package_blob(original).unwrap();
+        let text = String::from_utf8(original_raw).unwrap();
         let frames: Vec<String> = text.lines().map(str::to_string).collect();
         assert!(frames.len() >= 2, "fixture needs multiple frames");
 
-        let split = frames.len() / 2;
-        let encode_package = |frames: &[String]| {
-            let mut raw = frames.join("\n").into_bytes();
-            raw.push(b'\n');
-            raw
-        };
-        let raw1 = encode_package(&frames[..split]);
-        let raw2 = encode_package(&frames[split..]);
-        let b1 = base64::engine::general_purpose::STANDARD.encode(operp_settle::gzip_bytes(&raw1));
-        let b2 = base64::engine::general_purpose::STANDARD.encode(operp_settle::gzip_bytes(&raw2));
-        let h1 = hex::encode(Sha256::digest(&raw1));
-        let h2 = hex::encode(Sha256::digest(&raw2));
-        let mut all = raw1.clone();
-        all.extend_from_slice(&raw2);
-        let root = hex::encode(Sha256::digest(&all));
-        header.as_object_mut().unwrap().remove("frames_blob");
-        header["packages"] = serde_json::json!([h1, h2]);
-        header["data_root"] = serde_json::json!(root);
+        // Legacy single package: no terminal LF; root covers exact gunzipped bytes.
+        let legacy_single_raw = frames.join("\n").into_bytes();
+        let mut legacy_single = da.data.clone();
+        legacy_single["frames_blob"] = serde_json::json!(base64::engine::general_purpose::STANDARD
+            .encode(operp_settle::gzip_bytes(&legacy_single_raw)));
+        legacy_single["data_root"] =
+            serde_json::json!(hex::encode(Sha256::digest(&legacy_single_raw)));
+        assert_eq!(batch_from_data(&legacy_single).unwrap(), expected);
+        let mut tampered_single = legacy_single.clone();
+        tampered_single["data_root"] = serde_json::json!("00".repeat(32));
+        assert!(batch_from_data(&tampered_single).is_err());
 
-        let pkg = |blob: &str| {
-            serde_json::json!({
-                "messages": [{"app": "temp_data", "payload": {"data": {"package_blob": blob}}}],
-            })
-        };
-        let hub = MockHub {
-            vars: Default::default(),
-            joints: std::collections::HashMap::from([(h1, pkg(&b1)), (h2, pkg(&b2))]),
-        };
-        header["frames_blob"] = serde_json::Value::String(assemble_frames(&hub, &header).unwrap());
-        let rebuilt = batch_from_data(&header).unwrap();
-        assert_eq!(rebuilt.units, expected.units);
-        assert_eq!(rebuilt.trace, expected.trace);
-        assert_eq!(rebuilt.checkpoint, expected.checkpoint);
+        // Legacy multi-package: no package delimiter is inserted by the old
+        // writer. The new assembler verifies this raw root before parse repair.
+        let split = frames.len() / 2;
+        let legacy_raws = vec![
+            frames[..split].join("\n").into_bytes(),
+            frames[split..].join("\n").into_bytes(),
+        ];
+        let (legacy_package_header, legacy_hub) = package_fixture(&legacy_raws);
+        let mut legacy_multi = da.data.clone();
+        legacy_multi.as_object_mut().unwrap().remove("frames_blob");
+        legacy_multi["packages"] = legacy_package_header["packages"].clone();
+        legacy_multi["data_root"] = legacy_package_header["data_root"].clone();
+        legacy_multi["frames_blob"] =
+            serde_json::json!(assemble_frames(&legacy_hub, &legacy_multi).unwrap());
+        assert_eq!(batch_from_data(&legacy_multi).unwrap(), expected);
+
+        // Current producer: first package has no prefix, each later package
+        // starts with LF, and the full wire stream has no terminal LF. Simulate
+        // the pre-PR watcher's split('\n') logic to prove rollback compatibility.
+        let new_blobs = operp_settle::pack_frames_with_cap(&frames, 1);
+        assert_eq!(new_blobs.len(), frames.len());
+        let new_raws: Vec<_> = new_blobs
+            .iter()
+            .map(|b| operp_settle::decode_package_blob(b).unwrap())
+            .collect();
+        let new_wire_raw: Vec<u8> = new_raws.iter().flatten().copied().collect();
+        assert_eq!(new_wire_raw, frames.join("\n").as_bytes());
+        assert_ne!(new_wire_raw.last(), Some(&b'\n'));
+        let old_reader_text = String::from_utf8(new_wire_raw.clone()).unwrap();
+        let old_reader_frames: Vec<String> =
+            old_reader_text.split('\n').map(str::to_string).collect();
+        assert_eq!(old_reader_frames, frames);
+        assert_eq!(
+            operp_settle::batch_from_frames(&da.data, &old_reader_frames).unwrap(),
+            expected,
+            "new producer output remains readable by the old watcher decoder"
+        );
+
+        let (new_package_header, new_hub) = package_fixture(&new_raws);
+        let mut new_multi = da.data.clone();
+        new_multi.as_object_mut().unwrap().remove("frames_blob");
+        new_multi["packages"] = new_package_header["packages"].clone();
+        new_multi["data_root"] = new_package_header["data_root"].clone();
+        new_multi["frames_blob"] =
+            serde_json::json!(assemble_frames(&new_hub, &new_multi).unwrap());
+        assert_eq!(batch_from_data(&new_multi).unwrap(), expected);
+
+        // Empty payloads are not batches; malformed UTF-8 is rejected before
+        // JSON frame parsing, without relaxing the UTF-8 wire contract.
+        let mut empty = da.data.clone();
+        let empty_raw: &[u8] = b"";
+        empty["frames_blob"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD
+                .encode(operp_settle::gzip_bytes(empty_raw)));
+        empty["data_root"] = serde_json::json!(hex::encode(Sha256::digest(empty_raw)));
+        assert!(batch_from_data(&empty).is_err());
+        let invalid_utf8 = [0xff, 0xfe];
+        let mut invalid = da.data.clone();
+        invalid["frames_blob"] = serde_json::json!(base64::engine::general_purpose::STANDARD
+            .encode(operp_settle::gzip_bytes(&invalid_utf8)));
+        invalid["data_root"] = serde_json::json!(hex::encode(Sha256::digest(invalid_utf8)));
+        assert!(matches!(
+            batch_from_data(&invalid),
+            Err(SettleError::RootMismatch)
+        ));
     }
 }

@@ -56,7 +56,7 @@ cd obyte-local && node deploy_mainnet.js      # 主网发四个 AA（需 OPERP_D
 | `operp-exec` | 引擎本体：ingest → apply → 事件流；place/cancel/deposit/withdraw/liquidate 全量入口校验 |
 | `operp-settle` | 批次 checkpoint、`validate_against` 重放审计（含独立充值证据验证）、`temp_data` 载荷、提款证明生成 |
 | `operp-gossip` | operator 之间 WantUnits/HaveUnits 按需孤儿同步（纯 P2P 层，传输无关，绝不进共识） |
-| `operp-watch` | 独立 rollup watcher：重放 `da_unit_<h>`，组谓词 proof.json，经 `post_challenge.js` 打 dispute（与 poster 分钥） |
+| `operp-watch` | 独立 rollup watcher：重放 `da_unit_<h>` 并组谓词 proof.json；当前 `post_challenge.js` 仍是本地 aa-testkit CLI，未接生产 hub 提交路径，不声称生产环境自动揭发（#37 第 2 项仍开放） |
 
 ## 协议设计原理
 
@@ -155,10 +155,14 @@ operator。
 三个 AA（`CHAIN_ID=operp-v2`）。**没有 lock，没有付钱否决。** 保证金是 GBYTE。
 
 1. **资金池 + submit（rollup）** — 常备池 `pool_<addr> >= 1000 GBYTE`（`{pool:1}` 按净流入减 10000 fee 累加）；每次提交只付 10000 bounce 费。在途 `last_submitted-last_finalized < 50` 允许 h 未终结就发 h+1。组合单元：header `temp_data`（`frames_blob` 或 `packages`+`data_root`，gzip 帧）+ `{submit, height, 双根, trace/units/ops/fills 根}`。多包时 package 单元先发，da_unit 以一单元承载 header + submit。`h == last_submitted+1`；活高度重发 → `height taken`（欺诈重开的后续高度可自由覆盖）。窗从 `submitted_at` 起算 3600 s。
-2. **揭发（dispute / dispute_fill）** — 窗内任何人提交一枪谓词（deposit/withdraw/omit/fill_math/ghost/skip）。验不过 bounce `no fraud`，高度不动；验过则 `{verdict:'fraud'}`，rollup 从 operator 常备池扣 5e11、高度重开。无应诉回合。
+   帧为 UTF-8 JSON 行：首包不加前缀，后续包以一个 LF 开头；新包均无尾 LF。
+   `data_root` 哈希按序直接拼接的原始 gunzip 包字节。新 watcher 先验原始 root，
+   再只在解析副本中为旧包补缺失边界；新旧 producer/watcher 可兼容滚动，无需
+   framing version。单包也校验原始 `data_root`。
+2. **揭发（dispute / dispute_fill）** — 窗内任何人提交一枪谓词（deposit/withdraw/omit/fill_math/ghost/skip）；P-omit 当前禁用并恒 bounce `no fraud`（#23），因此目前不能链上挑战漏单。其他谓词验不过也 bounce `no fraud`，高度不动；验过则 `{verdict:'fraud'}`，rollup 从 operator 常备池扣 5e11、高度重开。无应诉回合。
 3. **finalize（rollup）** — `submitted_at+3600` 且未冻结 → `last_finalized=h`，竞速奖 20000 bytes，不再记 sbond。链空闲（`last_submitted==last_finalized`）时 `{claim:'pool'}` 取回池子。`{escape_finalize}` 为 7 天停滞门。
 4. **withdraw（vault）** — 只读 `var[ROLLUP]['aa_forest_'||last_finalized]`，原 16 深 Merkle 折叠与 W 防重放不变。`{escape_withdraw}` 在 vault AA 中无对应 case（vault 只有 `deposit` / `deposit_perp` / `withdraw`），按未匹配触发 bounce。
-5. **force（rollup inbox）** — `{force, unit_id}` 抗审查；漏收可 P-omit。
+5. **force（rollup inbox）** — `{force, unit_id}` 记录抗审查请求；P-omit 当前禁用，暂不能链上挑战漏收。
 
 | 门 | 原点 | 时长 |
 |---|---|---|
@@ -179,8 +183,8 @@ obyte-local/
   agents/operp_dispute_fill.aa   成交谓词
   test_settlement_aa.js          三门 AA E2E（Linux/CI；win32 skip）
   deploy_mainnet.js / issue_perp.js  主网发 AA / 发 PERP
-  post_batch.js                  组合 temp_data+submit → finalize → claim
-  post_challenge.js              谓词揭发 CLI（`--pred --proof`）
+  post_batch.js                  本地 aa-testkit temp_data+submit → finalize → claim；未接生产
+  post_challenge.js              本地 aa-testkit 谓词 CLI（`--pred --proof`）；未接生产提交
 docs/PROTOCOL.md / MECHANISMS.md / ROLLUP-UPGRADE.md
 ```
 
@@ -217,7 +221,7 @@ cd obyte-local && node test_settlement_aa.js
 # 部署 vault AA 到 Obyte 测试网
 cd obyte-local && node deploy_testnet.js
 
-# operator 完整流程：package 先发，组合 da_unit（header + submit）+ finalize + 领奖
+# 本地 aa-testkit 发包/最终化演练；不是生产主网流程
 cd obyte-local && node post_batch.js
 ```
 

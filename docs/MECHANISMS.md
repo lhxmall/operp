@@ -511,10 +511,16 @@ header 只带标量（`chain_id`、height、各根计数、`aa_shard_roots`、
 JSON（`u,t,o,c,f?,l?,e?`）：`u` 为该单元 JSON（含签名），`t`/`o`/`c` 为
 trace/ops/counts 条目，无成交时省略 `f`，`e` 仅 Deposit/GovDeposit 携带
 （按 `aa_unit` 匹配证据），`l` 为该单元叶集（print-only 可省略）。
-package = base64(gzip（`\n` 连接 frames）)；cap 仍按
-`get_json_source({"package_blob": b64}).len() <= PACK_SOURCE_CAP` 核算；
-`data_root` = hex(sha256(拼接 **gunzip 后** blob 字节))，JS 侧
-`zlib.gunzipSync` + concat + sha256 对得上；非法 gzip → BindingMismatch。
+每包内部的多帧以 LF 分隔；第一个包不加前缀，之后每个包在 gunzip 后以一个
+LF 开头；新包都不以 LF 结尾。直接拼接新格式 package 字节后，得到无尾 LF 的
+JSON 行流（兼容旧 watcher 的 `split("\\n")`）。cap 按含包前缀的
+`get_json_source({"package_blob": b64}).len() <= PACK_SOURCE_CAP` 核算。
+`data_root` = hex(sha256(按序拼接**原样 gunzip 后** blob 字节))，gzip wrapper
+不计入；JS `zlib.gunzipSync` + 原始 concat 与 Rust 同义。watcher 先校验这个
+原始 root，再只在解析副本中为旧 writer 缺失的包间 LF 补分隔符。解析修复不得
+改写 root 输入。新 reader 支持旧单包、旧多包及尾 LF 历史包；新 writer 可由旧
+`split("\\n")` reader 解析。无需 framing-version 或强制升级次序。
+非法 gzip → BindingMismatch；单包 inline 的 `data_root` 同样按原始字节校验。
 `l` 保留在线上——`prove.rs` 的 `deposit_proof` 要拿 liar 贴过的叶子对
 committed `trace[k]` 开证明，省 `l` 会让一枪谓词开不了。多包时 `packages`
 记 package 单元的真实 Obyte unit hash 列表（poster 先发包、拿到 unit 后填，
@@ -522,14 +528,15 @@ Rust 打包时只留占位），watcher 按条目 `get_joint` 取包、gunzip �
 承载该对象的 Obyte 单元之规范 `data_hash`
 仍为 `hex(sha256(getJsonSource(header或package对象)))`。充值证据在 frame
 `e` 内，复原即拼接各 `e` 字段（无 header `deposit_evidences`）。
-超限（去 `l` 重打仍有包超 `PACK_SOURCE_CAP`）整批 print-only：超限包上不了链，
-watcher 在缺失 joints 上 backoff 放弃，绝不误挑战。
+空帧集合不是有效批次。不可拆分的单帧仍可能独自超 cap：Rust 在去 `l` 重打后
+仍超限时只供 print-only、不可提交；JS `post_batch.js` 在发包前执行同一 source
+cap 检查并拒绝超限输入。watcher 在缺失 joints 上 backoff 放弃，绝不误挑战。
 
 意义：
 
 - 数据可用性：任何观察者可在 1 天保留窗口内下载并本地重放
-- 重放结果与 checkpoint 逐字段比对 → 欺诈必然可被检测
-- 检测后的执行依赖 §10 的谓词揭发机制
+- 重放可定位本地 checkpoint 不一致；不等于每类不一致都有链上谓词可证
+- 可链上揭发的范围依赖 §10 谓词覆盖；P-omit 当前恒 bounce，生产自动提交脚本亦未接通
 
 `data_hash`/`data_length` 采用与 ocore 一致的**单一规范形**：
 `source = getJsonSource(data)`（递归字典序排序对象键的 minified JSON；

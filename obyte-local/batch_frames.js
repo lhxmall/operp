@@ -17,9 +17,10 @@ function packFrames(frames, options = {}) {
     throw new TypeError("getJsonSourceString must be a function");
   }
 
-  const encode = (items) => {
+  const encode = (items, packageIndex) => {
     if (items.length === 0) return "";
-    const raw = `${items.join("\n")}\n`;
+    const prefix = packageIndex > 0 ? "\n" : "";
+    const raw = `${prefix}${items.join("\n")}`;
     return zlib.gzipSync(Buffer.from(raw, "utf8")).toString("base64");
   };
   const sourceLength = (blob) =>
@@ -29,12 +30,12 @@ function packFrames(frames, options = {}) {
   let current = [];
   const flush = () => {
     if (current.length === 0) return;
-    packages.push(encode(current));
+    packages.push(encode(current, packages.length));
     current = [];
   };
 
   for (const frame of frames) {
-    const trial = encode([...current, frame]);
+    const trial = encode([...current, frame], packages.length);
     if (current.length > 0 && sourceLength(trial) > cap) flush();
     current.push(frame);
   }
@@ -42,4 +43,18 @@ function packFrames(frames, options = {}) {
   return packages;
 }
 
-module.exports = { DEFAULT_PACKAGE_SOURCE_CAP, packFrames };
+function assertPackageSourceCap(packages, options = {}) {
+  const cap = options.cap ?? DEFAULT_PACKAGE_SOURCE_CAP;
+  const getJsonSourceString = options.getJsonSourceString ?? JSON.stringify;
+  for (const blob of packages) {
+    const sourceLength = Buffer.byteLength(
+      getJsonSourceString({ package_blob: blob }),
+      "utf8",
+    );
+    if (sourceLength > cap) {
+      throw new RangeError(`package source length ${sourceLength} exceeds cap ${cap}`);
+    }
+  }
+}
+
+module.exports = { DEFAULT_PACKAGE_SOURCE_CAP, assertPackageSourceCap, packFrames };
