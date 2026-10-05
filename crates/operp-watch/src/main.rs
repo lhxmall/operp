@@ -208,11 +208,17 @@ wallet to challenge via post_challenge.js (one-shot fraud predicates, no bond)."
     );
 }
 
-fn now_ms() -> u64 {
+const CHALLENGE_WINDOW_SECS: u64 = 3600;
+
+fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn challenge_window_open(submitted_at: u64, now: u64, frozen: u64) -> bool {
+    submitted_at != 0 && now < submitted_at.saturating_add(CHALLENGE_WINDOW_SECS) && frozen == 0
 }
 
 /// Replay one height and advance the engine; surface only actionable alerts.
@@ -235,7 +241,7 @@ fn check_height(
         .map_err(|e| anyhow::anyhow!("hub: {e}"))?;
     let sa_val = sa.and_then(|v| v.as_u64()).unwrap_or(0);
     let frozen_val = frozen.and_then(|v| v.as_u64()).unwrap_or(0);
-    let in_window = sa_val != 0 && now < sa_val + 3600 && frozen_val == 0;
+    let in_window = challenge_window_open(sa_val, now, frozen_val);
 
     let mut da = match fetch_da_unit(hub, &config.rollup_address, h) {
         Ok(None) => return Ok(None),
@@ -423,7 +429,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     loop {
-        let now = now_ms();
+        let now = now_secs();
         let ll = hub
             .get_aa_state_var(&config.rollup_address, "last_submitted")
             .map_err(|e| anyhow::anyhow!("hub last_submitted: {e}"))?
@@ -439,5 +445,36 @@ fn main() -> anyhow::Result<()> {
         }
 
         std::thread::sleep(Duration::from_secs(config.poll_interval_secs));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::challenge_window_open;
+
+    #[test]
+    fn normal_seconds_timestamp_is_inside_challenge_window() {
+        let submitted_at_secs = 1_760_000_000;
+        assert!(challenge_window_open(
+            submitted_at_secs,
+            submitted_at_secs + 1_800,
+            0
+        ));
+    }
+
+    #[test]
+    fn challenge_window_closes_at_deadline_and_when_frozen() {
+        let submitted_at_secs = 1_760_000_000;
+        assert!(!challenge_window_open(
+            submitted_at_secs,
+            submitted_at_secs + 3_600,
+            0
+        ));
+        assert!(!challenge_window_open(
+            submitted_at_secs,
+            submitted_at_secs + 1,
+            1
+        ));
+        assert!(!challenge_window_open(0, submitted_at_secs, 0));
     }
 }

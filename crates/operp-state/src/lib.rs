@@ -893,21 +893,41 @@ impl ChainState {
             .get(&fill.market)
             .filter(|p| p.funding_rate)
             .map(|p| p.usd_per_unit);
-        {
-            let taker = self.account_mut(fill.taker);
+        // Stage both account transitions before writing either one back. In
+        // particular, a maker-side overflow must not leave the taker applied.
+        let mut taker = self
+            .accounts
+            .get(&fill.taker)
+            .cloned()
+            .unwrap_or_else(|| Account::new(fill.taker));
+        taker.apply_fill(
+            fill.taker_side,
+            true,
+            fill.price,
+            fill.qty,
+            fill.market,
+            funding_usd,
+            fill.taker_post,
+            fill.taker_isolated,
+        )?;
+        if fill.taker == fill.maker {
             taker.apply_fill(
-                fill.taker_side,
-                true,
+                fill.taker_side.opposite(),
+                false,
                 fill.price,
                 fill.qty,
                 fill.market,
                 funding_usd,
-                fill.taker_post,
-                fill.taker_isolated,
+                fill.maker_post,
+                fill.maker_isolated,
             )?;
-        }
-        {
-            let maker = self.account_mut(fill.maker);
+            self.accounts.insert(fill.taker, taker);
+        } else {
+            let mut maker = self
+                .accounts
+                .get(&fill.maker)
+                .cloned()
+                .unwrap_or_else(|| Account::new(fill.maker));
             maker.apply_fill(
                 fill.taker_side.opposite(),
                 false,
@@ -918,6 +938,8 @@ impl ChainState {
                 fill.maker_post,
                 fill.maker_isolated,
             )?;
+            self.accounts.insert(fill.taker, taker);
+            self.accounts.insert(fill.maker, maker);
         }
         // Taker fee: bps of notional debited from the taker's collateral and
         // credited to the insurance fund — the fund's income leg, offsetting
@@ -1833,6 +1855,48 @@ mod tests {
         // notional = 100_000 USD → fee @5bps = 50 USD credited to insurance.
         let ins = &s.accounts[&INSURANCE_ACCOUNT];
         assert_eq!(ins.collateral, INSURANCE_SEED + 50 * USD_SCALE as i128);
+    }
+
+    #[test]
+    fn maker_overflow_does_not_commit_taker_fill() {
+        use operp_account::{Account, AccountError, Position};
+
+        let mut s = ChainState::new();
+        let taker = AccountId([9; 32]);
+        let maker = AccountId([8; 32]);
+        let px = 100_000 * operp_types::PRICE_SCALE as i64;
+        let mut maker_account = Account::new(maker);
+        maker_account.positions.insert(
+            BTC_USD,
+            Position {
+                market: BTC_USD,
+                qty: i64::MIN,
+                entry_price: px,
+                isolated: false,
+            },
+        );
+        s.accounts.insert(maker, maker_account);
+        let before = s.state_root();
+        let fill = Fill {
+            taker_id: operp_types::OrderId([1; 32]),
+            maker_id: operp_types::OrderId([2; 32]),
+            taker,
+            maker,
+            market: BTC_USD,
+            price: px,
+            qty: 1,
+            seq: 1,
+            taker_side: operp_types::Side::Bid,
+            taker_post: 0,
+            maker_post: 0,
+            taker_isolated: false,
+            maker_isolated: false,
+            kind: 0,
+        };
+
+        assert_eq!(s.apply_fill_pair(&fill), Err(AccountError::Overflow));
+        assert_eq!(s.state_root(), before, "no taker or maker leg may commit");
+        assert!(!s.accounts.contains_key(&taker));
     }
 
     #[test]

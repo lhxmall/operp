@@ -59,7 +59,7 @@ cd obyte-local && node deploy_mainnet.js      # deploy the four AAs (needs OPERP
 | `operp-exec` | The engine: ingest → apply → events; place/cancel/deposit/withdraw/liquidate with full intake validation |
 | `operp-settle` | Batch checkpoints, `validate_against` replay verification, `temp_data` payloads, proof generation |
 | `operp-gossip` | WantUnits/HaveUnits on-demand orphan sync between operators (pure P2P layer, transport-agnostic, never consensus) |
-| `operp-watch` | Independent rollup watcher: replays `da_unit_<h>`, builds predicate `proof.json`, posts via `post_challenge.js` (separate key from the poster) |
+| `operp-watch` | Independent rollup watcher: replays `da_unit_<h>` and builds predicate `proof.json`; `post_challenge.js` is currently a local aa-testkit CLI, not a production hub submitter, so automatic production challenges are not claimed (#37 item 2 remains open) |
 
 ## Protocol principles
 
@@ -188,11 +188,18 @@ Three AAs (`CHAIN_ID=operp-v2`). **No lock, no pay-to-kill.** Collateral is GBYT
    `{submit, height, roots, trace/units/ops/fills roots}`.
    Multi-package heights post package units first; the da_unit carries the
    header + submit in one unit.
+   Frame bytes are UTF-8 JSON lines: packages after the first begin with one LF,
+   and no new package ends with LF. `data_root` hashes the exact concatenated
+   gunzipped package bytes. New watchers verify that raw root before adding any
+   missing legacy package separator to a parse-only copy; this keeps old and new
+   writers/readers compatible without a framing-version rollout.
    `h == last_submitted+1`; a live height re-submit bounces
    `height taken` (fraud-reopened successors overwrite freely). Window:
    `submitted_at + 3600 s`.
 2. **Fraud (dispute / dispute_fill)** — inside the window anyone submits a
-   one-shot predicate (deposit/withdraw/omit/fill_math/ghost/skip). Failing
+   one-shot predicate (deposit/withdraw/omit/fill_math/ghost/skip); P-omit is
+   currently disabled and bounces `no fraud` (#23), so omission is not an active
+   challenge path. Failing
    predicates bounce `no fraud` and leave the height alone; a proven one
    forwards `{verdict:'fraud'}` and the rollup slashes 5e11 off the
    operator's standing pool and reopens the height. No response rounds.
@@ -206,8 +213,8 @@ Three AAs (`CHAIN_ID=operp-v2`). **No lock, no pay-to-kill.** Collateral is GBYT
    `{escape_withdraw}` has no case in the vault AA (it exposes only
    `deposit` / `deposit_perp` / `withdraw`), so it bounces as an unmatched
    trigger.
-5. **force (rollup inbox)** — `{force, unit_id}` censorship escape; omission
-   is provable via P-omit.
+5. **force (rollup inbox)** — `{force, unit_id}` records a censorship request;
+   P-omit is currently disabled, so omission is not yet challengeable on-chain.
 
 | Gate | Origin | Duration |
 |---|---|---|
@@ -229,8 +236,8 @@ obyte-local/
   agents/operp_dispute_fill.aa   fill predicates
   test_settlement_aa.js          three-AA E2E (Linux/CI; win32 skips)
   deploy_mainnet.js / issue_perp.js  mainnet AA deploy / PERP issuance
-  post_batch.js                  combined temp_data+submit → finalize → claim
-  post_challenge.js              predicate CLI (`--pred --proof`)
+  post_batch.js                  local aa-testkit temp_data+submit → finalize → claim; not production-connected
+  post_challenge.js              local aa-testkit predicate CLI (`--pred --proof`); not production-connected
 docs/PROTOCOL.md / MECHANISMS.md / ROLLUP-UPGRADE.md
 ```
 
@@ -266,8 +273,7 @@ cd obyte-local && node test_settlement_aa.js
 # deploy the vault AA to Obyte testnet
 cd obyte-local && node deploy_testnet.js
 
-# operator flow: package posts then combined da_unit (header + submit) +
-# finalize + claim race reward (the complete mainnet sequence)
+# local aa-testkit poster/finalization drill only; not a production mainnet flow
 cd obyte-local && node post_batch.js
 Measured on this machine: `bench_raw` ≈ 5 500 ops/s; `hft_onedag` (8 markets,
 4 generators) ≈ 9 000–9 200 TPS aggregate with zero rejections.
@@ -432,4 +438,3 @@ records) and [ROLLUP-UPGRADE.md](docs/ROLLUP-UPGRADE.md). Validation:
 ## License
 
 MIT
-

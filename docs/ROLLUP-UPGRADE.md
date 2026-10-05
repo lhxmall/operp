@@ -122,6 +122,21 @@ P-skip 替代「在 AA 里重放订单簿」：不必证明「这是最优」，
 7 天无进展：{escape_finalize} 仍在，任意人，不越过未结欺诈
 ```
 
+### 2.7 temp_data framing 的滚动升级与回滚
+
+新 producer 保持旧 watcher 可读：包内帧以 LF 分隔；首包无前缀，后续每个包
+以 LF 开头；所有包都没有尾 LF。因此旧 watcher 的 `split("\\n")` 不会得到
+尾部空 JSON frame。新 watcher 读取旧 producer 时，先对按顺序拼接的原始
+gunzip package 字节校验 `data_root`，再仅在解析副本中补上旧多包缺失的边界 LF。
+`data_root` 永远不对规范化后的文本计算；inline 单包也校验其原始字节 root。
+
+这两个方向均可滚动：watcher 可先升级，也可先升级 producer；没有 framing-version
+或强制 producer-first 停机顺序。回滚 watcher 到旧版后，新 producer 的包仍可读，
+但旧 watcher 原本就不能正确解析「旧 producer 无包间分隔符」的多包批次；回滚会
+失去新 reader 的这项旧批次兼容。不要重打已发布 package 或修改其 `data_root`。
+曾经采用“每包尾部加 LF”的中间格式不能发给旧 watcher，因为 `split("\\n")`
+会产生空尾帧；新 watcher 可读取它，但不应将其作为发布格式。
+
 ---
 
 ## 3. 以后：升到图灵完备侧链

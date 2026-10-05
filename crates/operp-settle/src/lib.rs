@@ -558,6 +558,9 @@ impl Batch {
     /// replaces it with real unit hashes before submitting the header.
     pub fn temp_data_packages(&self) -> Result<(serde_json::Value, Vec<String>), SettleError> {
         let frames = self.frames();
+        if frames.is_empty() {
+            return Err(SettleError::Empty);
+        }
         let mut blobs = pack_frames(&frames);
         let over = blobs.iter().any(|b| {
             let obj = serde_json::json!({"package_blob": b});
@@ -814,10 +817,12 @@ pub fn evidences_from_payload(
         }
     }
 }
-/// Greedy pack: each package = base64(gzip(`\n`-joined frames)) with
-/// `get_json_source({"package_blob": b64}).len() <= cap`. `data_root` hashes
-/// the gunzipped concatenated frame bytes (content, not the gzip wrapper)
-/// so JS `zlib.gunzipSync` + concat + sha256 matches.
+/// Greedy pack: frames inside each package are joined by `\n`; every package
+/// after the first starts with `\n`, and no package ends with `\n`. Thus
+/// concatenating gunzipped packages yields newline-delimited frames without a
+/// trailing empty frame, which remains readable by the pre-PR watcher.
+/// `data_root` hashes the exact gunzipped package bytes before any consumer-side
+/// legacy-boundary normalization. The source cap includes the prefix byte.
 pub fn gzip_bytes(raw: &[u8]) -> Vec<u8> {
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
@@ -836,15 +841,26 @@ pub fn gunzip_bytes(gz: &[u8]) -> Result<Vec<u8>, SettleError> {
 }
 pub fn pack_frames_with_cap(frames: &[String], cap: usize) -> Vec<String> {
     use base64::Engine as _;
+    if frames.is_empty() {
+        return Vec::new();
+    }
     let mut out: Vec<String> = Vec::new();
     let mut cur: Vec<&String> = Vec::new();
-    let src_len = |cur: &[&String], extra: Option<&String>| -> usize {
-        let mut parts: Vec<&str> = cur.iter().map(|s| s.as_str()).collect();
-        if let Some(e) = extra {
-            parts.push(e.as_str());
+    let raw_for = |items: &[&String], package_index: usize| -> Vec<u8> {
+        let mut raw = Vec::new();
+        if package_index > 0 {
+            raw.push(b'\n');
         }
-        let joined = parts.join("\n");
-        let gz = gzip_bytes(joined.as_bytes());
+        for (index, frame) in items.iter().enumerate() {
+            if index > 0 {
+                raw.push(b'\n');
+            }
+            raw.extend_from_slice(frame.as_bytes());
+        }
+        raw
+    };
+    let source_len = |items: &[&String], package_index: usize| -> usize {
+        let gz = gzip_bytes(&raw_for(items, package_index));
         let b64 = base64::engine::general_purpose::STANDARD.encode(&gz);
         let obj = serde_json::json!({"package_blob": b64});
         crate::obyte_hash::get_json_source(&obj).len()
@@ -853,25 +869,20 @@ pub fn pack_frames_with_cap(frames: &[String], cap: usize) -> Vec<String> {
         if cur.is_empty() {
             return;
         }
-        let joined = cur
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let gz = gzip_bytes(joined.as_bytes());
+        let raw = raw_for(cur, out.len());
+        let gz = gzip_bytes(&raw);
         out.push(base64::engine::general_purpose::STANDARD.encode(&gz));
         cur.clear();
     };
     for f in frames {
-        if !cur.is_empty() && src_len(&cur, Some(f)) > cap {
+        let mut candidate = cur.clone();
+        candidate.push(f);
+        if !cur.is_empty() && source_len(&candidate, out.len()) > cap {
             flush(&mut cur, &mut out);
         }
         cur.push(f);
     }
     flush(&mut cur, &mut out);
-    if out.is_empty() {
-        out.push(base64::engine::general_purpose::STANDARD.encode(gzip_bytes(b"")));
-    }
     out
 }
 /// Pack with [`PACK_SOURCE_CAP`].
@@ -2061,7 +2072,7 @@ mod tests {
         assert_eq!(blobs.len(), 1);
         let raw = decode_package_blob(&blobs[0]).unwrap();
         let text = String::from_utf8(raw).unwrap();
-        let frames: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+        let frames: Vec<String> = text.lines().map(str::to_string).collect();
         let rebuilt = batch_from_frames(&header, &frames).unwrap();
         assert_eq!(rebuilt.deposit_evidences.len(), 1);
         assert_eq!(
@@ -2286,8 +2297,8 @@ mod tests {
         let raw = decode_package_blob(&blobs[0]).unwrap();
         let split: Vec<String> = String::from_utf8(raw)
             .unwrap()
-            .split('\n')
-            .map(|s| s.to_string())
+            .lines()
+            .map(str::to_string)
             .collect();
         assert_eq!(split, frames);
         let rebuilt = batch_from_frames(&header, &split).unwrap();
@@ -2304,26 +2315,94 @@ mod tests {
         rebuilt.validate_against(prev_root, &mut rp).unwrap();
     }
     #[test]
-    fn pack_forced_split_byte_exact() {
+    fn pack_frames_preserves_compatible_boundaries_and_cap_edges() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
         let frames = vec![
-            "{\"a\":1}".to_string(),
-            "{\"b\":2}".to_string(),
-            "{\"c\":3}".to_string(),
+            "{\"a\":\"α\"}".to_string(),
+            "{\"b\":\"β\"}".to_string(),
+            "{\"c\":\"γ\"}".to_string(),
         ];
+        assert!(pack_frames_with_cap(&[], 1000).is_empty());
+
+        // A generous cap keeps multiple frames inside one package.
         let packs = pack_frames_with_cap(&frames, 1000);
-        assert!(!packs.is_empty());
-        let mut seen: Vec<String> = Vec::new();
-        for p in &packs {
-            let obj = serde_json::json!({"package_blob": p});
-            assert!(crate::obyte_hash::get_json_source(&obj).len() <= 1000);
-            let raw = decode_package_blob(p).unwrap();
-            for line in String::from_utf8(raw).unwrap().split('\n') {
-                seen.push(line.to_string());
+        assert_eq!(packs.len(), 1);
+        let raw = decode_package_blob(&packs[0]).unwrap();
+        assert_eq!(raw, frames.join("\n").as_bytes());
+        let object_source =
+            crate::obyte_hash::get_json_source(&serde_json::json!({"package_blob": &packs[0]}));
+        assert!(object_source.len() <= 1000);
+
+        // Select a cap that fits every one-frame package (including a later
+        // package's prefix) but not two frames together; all emitted packages
+        // must still satisfy the exact JSON-source cap.
+        let entropy = |seed: u8| {
+            let mut bytes = Vec::new();
+            for counter in 0u8..32 {
+                bytes.extend_from_slice(&sha2::Sha256::digest([seed, counter]));
+            }
+            hex::encode(bytes)
+        };
+        let cap_frames: Vec<String> = (1..=3)
+            .map(|seed| format!("{{\"data\":\"{}\"}}", entropy(seed)))
+            .collect();
+        let source_len = |raw: &[u8]| {
+            let blob = base64::engine::general_purpose::STANDARD.encode(gzip_bytes(raw));
+            crate::obyte_hash::get_json_source(&serde_json::json!({"package_blob": blob})).len()
+        };
+        let cap = [
+            source_len(cap_frames[0].as_bytes()),
+            source_len(format!("\n{}", cap_frames[1]).as_bytes()),
+            source_len(format!("\n{}", cap_frames[2]).as_bytes()),
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        assert!(source_len(format!("{}\n{}", cap_frames[0], cap_frames[1]).as_bytes()) > cap);
+        assert!(source_len(format!("\n{}\n{}", cap_frames[1], cap_frames[2]).as_bytes()) > cap);
+        let capped = pack_frames_with_cap(&cap_frames, cap);
+        assert_eq!(capped.len(), cap_frames.len());
+        for (index, blob) in capped.iter().enumerate() {
+            let object_source =
+                crate::obyte_hash::get_json_source(&serde_json::json!({"package_blob": blob}));
+            assert!(object_source.len() <= cap);
+            let raw = decode_package_blob(blob).unwrap();
+            if index > 0 {
+                assert_eq!(raw.first(), Some(&b'\n'));
             }
         }
-        assert_eq!(seen, frames);
-        let tiny = pack_frames_with_cap(&frames, 30);
-        assert!(tiny.len() >= frames.len());
+
+        // A tiny cap forces one frame per package. Only subsequent package
+        // prefixes carry the separator; no package adds a trailing newline.
+        let packs = pack_frames_with_cap(&frames, 1);
+        assert_eq!(packs.len(), frames.len());
+        let raws: Vec<_> = packs
+            .iter()
+            .map(|p| decode_package_blob(p).unwrap())
+            .collect();
+        assert_eq!(raws[0], frames[0].as_bytes());
+        for (index, raw) in raws.iter().enumerate().skip(1) {
+            assert_eq!(raw.first(), Some(&b'\n'));
+            assert_eq!(&raw[1..], frames[index].as_bytes());
+        }
+        let joined: Vec<u8> = raws.into_iter().flatten().collect();
+        assert_eq!(joined, frames.join("\n").as_bytes());
+        assert_ne!(joined.last(), Some(&b'\n'));
+
+        // The cap is measured over the encoded package object, including the
+        // prefix. An indivisible oversized frame remains one oversized package.
+        let oversize = vec![format!("{{\"large\":\"{}\"}}", "x".repeat(256))];
+        let oversize_pack = pack_frames_with_cap(&oversize, 1);
+        assert_eq!(oversize_pack.len(), 1);
+        let source = crate::obyte_hash::get_json_source(
+            &serde_json::json!({"package_blob": oversize_pack[0]}),
+        );
+        assert!(source.len() > 1);
+        assert_eq!(
+            decode_package_blob(&oversize_pack[0]).unwrap(),
+            oversize[0].as_bytes()
+        );
     }
     #[test]
     fn data_root_golden() {
