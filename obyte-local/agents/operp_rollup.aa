@@ -113,12 +113,29 @@
 					$h = trigger.data.height;
 					$ls = (var['last_submitted'] otherwise 0);
 					$lf = (var['last_finalized'] otherwise 0);
+					// #37-7/37-8: a fraud-failed height (frozen==2) may be
+					// RE-SUBMITTED in place — verdict now KEEPS
+					// last_submitted pinned at the failed top, so both the
+					// failed top itself (h == ls) and a lower stale height
+					// (h < ls, blocked by frozen_6 in the adjacent-fraud
+					// case) are re-opened through this branch.
+					$frozen_h = (var['frozen_' || $h] otherwise 0);
 					if (trigger.data.chain_id != 'operp-v2'
-						OR !$h OR $h != $ls + 1
+						OR !$h OR ($h != $ls + 1 AND $frozen_h != 2)
 						OR trigger.data.assertion_version != 1
 						OR !trigger.data.state_root OR length(trigger.data.state_root) != 64
 						OR !trigger.data.prev_state_hash OR length(trigger.data.prev_state_hash) != 64
+						// #37-4: the 1024-hex forest is bound to one 64-hex
+						// forest hash at SUBMIT time (sha256 over its
+						// concatenation, same domain as Rust's
+						// aa_forest_hash). Length-checking aa_root alone
+						// would let a poster store a bogus pair that no
+						// honest chain can restate — freezing finalize at
+						// that height; the fold check bounces it here where
+						// the height is still claimable by the honest chain.
+						OR !trigger.data.aa_root OR length(trigger.data.aa_root) != 64
 						OR !trigger.data.aa_forest OR length(trigger.data.aa_forest) != 1024
+						OR sha256(trigger.data.aa_forest, 'hex') != trigger.data.aa_root
 						OR !trigger.data.wit_root OR length(trigger.data.wit_root) != 44
 						OR !trigger.data.trace_root OR length(trigger.data.trace_root) != 44
 						OR !trigger.data.units_root OR length(trigger.data.units_root) != 44
@@ -129,16 +146,32 @@
 						OR !is_integer(trigger.data.wit_count) OR trigger.data.wit_count < 1
 						OR !is_integer(trigger.data.fill_count) OR trigger.data.fill_count < 0)
 					bounce('bad submit');
-					if ($ls > 0 AND (var['frozen_' || $ls] otherwise 0) != 2
-						AND trigger.data.prev_state_hash != var['state_root_' || $ls])
-						bounce('prev mismatch');
+					// #37-8: a resubmit MUST bind to the actual pre-root of
+					// its height (prev == state_root_<h-1>) — never to the
+					// old cleared top/root pair. If the predecessor is also
+					// fraud-failed (state_root zeroed) the bind fails
+					// closed: fix the lower height first.
+					if ($frozen_h == 2){
+						if ($h > 1 AND trigger.data.prev_state_hash != (var['state_root_' || ($h - 1)] otherwise 0))
+							bounce('prev mismatch');
+					} else {
+						// Fresh forward submit at ls+1: reject while the
+						// predecessor is fraud-failed (its root is gone —
+						// old code exempted this check, letting a submit
+						// chain build on a failed height). Heights above a
+						// failed top must resubmit via the frozen branch.
+						if ($ls > 0 AND (var['frozen_' || $ls] otherwise 0) == 2)
+							bounce('prev mismatch');
+						if ($ls > 0 AND trigger.data.prev_state_hash != var['state_root_' || $ls])
+							bounce('prev mismatch');
+					}
 					if (trigger.output[[asset=base]] < 10000)
 						bounce('need fee');
 					if ((var['pool_' || trigger.address] otherwise 0) < 1000000000000)
 						bounce('need pool');
 					if ($ls - $lf >= 50)
 						bounce('pool occupancy');
-					if (var['active_bond_' || $h] AND $h <= $ls AND (var['frozen_' || $h] otherwise 0) != 2)
+					if (var['active_bond_' || $h] AND $h <= $ls AND $frozen_h != 2)
 						bounce('height taken');
 				}",
 				messages: [
@@ -147,6 +180,9 @@
 						state: "{
 							var['submitted_at_' || trigger.data.height] = timestamp;
 							var['state_root_' || trigger.data.height] = trigger.data.state_root;
+							// #37-4: same-height twin binding — the forest hash
+							// rides every submit alongside its 1024-hex expansion.
+							var['aa_root_' || trigger.data.height] = trigger.data.aa_root;
 							var['aa_forest_' || trigger.data.height] = trigger.data.aa_forest;
 							var['prev_' || trigger.data.height] = trigger.data.prev_state_hash;
 							var['wit_root_' || trigger.data.height] = trigger.data.wit_root;
@@ -180,6 +216,15 @@
 						bounce('not submitted');
 					if (var['frozen_' || $h])
 						bounce('challenged');
+					// #37-7: heights submitted ABOVE a later-failed height
+					// keep stale roots (no loop clearing); their prev_<h>
+					// no longer equals the (resubmitted or zeroed)
+					// state_root_<h-1>, so require the chain binding to
+					// hold at finalize — else a stale h+1 could finalize on
+					// a superseded state and pay the vault from a forest
+					// the honest chain never committed.
+					if ($h > 1 AND var['prev_' || $h] != (var['state_root_' || ($h - 1)] otherwise 0))
+						bounce('stale height');
 					$lf = (var['last_finalized'] otherwise 0);
 					$sa = (var['submitted_at_' || $h] otherwise 0);
 					if (timestamp < $sa + (trigger.data.escape_finalize ? 604800 : 3600)
@@ -188,8 +233,19 @@
 				}",
 				messages: [
 					{
+						// #37-4: on-chain binding of the finalized forest to
+						// the submit-committed hash. submit() already stored
+						// aa_root_<h> alongside the 1024-hex expansion; the
+						// operator cannot present a different corpus at
+						// finalize/vault time. sha256(x,'hex') hashes the
+						// UTF-8 forest string — same domain as Rust's
+						// aa_forest_hash over the concatenated shard roots.
 						app: "state",
 						state: "{
+							$forest = var['aa_forest_' || trigger.data.height];
+							$root = var['aa_root_' || trigger.data.height];
+							if (sha256($forest, 'hex') != $root)
+								bounce('forest hash mismatch');
 							var['last_finalized'] = trigger.data.height;
 							$fw = var['fee_winner_' || trigger.data.height];
 							if ($fw){
@@ -201,7 +257,9 @@
 			},
 			{
 				// Fraud verdict from a bound dispute AA: fail the height,
-				// slash half the submit bond to the challenger, reopen h.
+				// slash up to half the submit bond from the operator's
+				// standing pool (capped at the pool's actual balance),
+				// reopen h.
 				if: "{trigger.data.verdict}",
 				init: "{
 					$da = (var['dispute_aa'] otherwise 0);
@@ -225,15 +283,28 @@
 							var['frozen_' || trigger.data.height] = 2;
 							var['state_root_' || trigger.data.height] = 0;
 							var['aa_forest_' || trigger.data.height] = 0;
+							var['aa_root_' || trigger.data.height] = 0;
 							$op = var['active_bond_' || trigger.data.height];
-							if ($op){
+							if ($op AND (var['pool_' || $op] otherwise 0) > 0){
+								// #37-6: the shield debt can never exceed the
+								// actually-seized amount — reward += pool
+								// rounded to 0 when the standing pool is
+								// drained (present constant lied about its
+								// deposits and left shortfalls to the other
+								// operators' shared pool).
 								$p = (var['pool_' || $op] otherwise 0);
-								var['pool_' || $op] = ($p > 500000000000 ? $p - 500000000000 : 0);
+								$slashed = $p > 500000000000 ? 500000000000 : $p;
+								var['pool_' || $op] = $p - $slashed;
+								var['slash_reward_' || trigger.data.challenger] = (var['slash_reward_' || trigger.data.challenger] otherwise 0) + $slashed;
 							}
 							var['active_bond_' || trigger.data.height] = 0;
 							var['fee_winner_' || trigger.data.height] = 0;
-							var['last_submitted'] = trigger.data.height - 1;
-							var['slash_reward_' || trigger.data.challenger] += 500000000000;
+							// #37-7: last_submitted STAYS at the failed height
+							// (frozen_<h>=2 means "failed, awaiting resubmit").
+							// Rolling back to h-1 let the operator drain the
+							// pool backing the still-live higher heights via
+							// {claim:'pool'} the moment ls==lf again.
+							var['last_submitted'] = trigger.data.height;
 						}"
 					}
 				]
@@ -245,6 +316,15 @@
 					if ($k != 'reward' AND $k != 'sbond' AND $k != 'slash' AND $k != 'pool')
 						bounce('bad claim kind');
 					if ($k == 'pool' AND (var['last_submitted'] otherwise 0) != (var['last_finalized'] otherwise 0))
+						bounce('pool busy');
+					// #37-7: a failed height keeps last_submitted pinned at
+					// itself, so the busy gate alone again reads idle even
+					// while that height still owes a correct re-submit —
+					// block the drain while the highest submitted height is
+					// fraud-failed (frozen==2). Heights j < h were finalized
+					// before h (finalize is strictly sequential) and > h
+					// cannot exist beyond the pinned top.
+					if ($k == 'pool' AND (var['frozen_' || (var['last_submitted'] otherwise 0)] otherwise 0) == 2)
 						bounce('pool busy');
 					$key = ($k == 'reward' ? 'reward_' : ($k == 'sbond' ? 'sbond_' : ($k == 'slash' ? 'slash_reward_' : 'pool_')));
 					$owed = (var[$key || trigger.address] otherwise 0);

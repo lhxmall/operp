@@ -70,6 +70,7 @@ function submitData(h, prev) {
     state_root: sha256Hex("state-" + h),
     prev_state_hash: prev,
     aa_forest: FOREST,
+    aa_root: sha256Hex(FOREST), // #37-4 fold binding
     wit_root: WIT_ROOT,
     trace_root: TRACE_ROOT,
     units_root: UNITS_ROOT,
