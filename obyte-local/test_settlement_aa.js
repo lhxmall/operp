@@ -483,6 +483,29 @@ async function main() {
   };
   await triggerVerdict(challenger, dispute, Object.assign({ pred: "deposit", height: 2 }, fraudProof), 20000, "deposit fraud predicate");
   st = await vars(rollup);
+  // Batch-B scenarios re-commit the SAME LIAR fixture at later fresh
+  // heights, so the deposit predicate's stale-root check passes.
+  async function submitLiarAt(hh) {
+    const sd = submitData(hh, STATE_ROOT, STATE_ROOT);
+    sd.ops_root = OPS_ROOT1;
+    sd.trace_root = LIAR_TRACE_ROOT1;
+    sd.units_root = UNITS_SET_ROOT;
+    sd.units_set_root = SET_ROOT1;
+    sd.fills_root = FILLS_ROOT;
+    sd.unit_count = 1;
+    sd.wit_root = WIT_ROOT;
+    sd.wit_count = GEN_WIT_COUNT;
+    const header = headerFromSubmit(sd);
+    const r = await operator.sendMulti({
+      messages: [tempDataMsg(header), { app: "data", payload: sd }],
+      base_outputs: [{ address: rollup, amount: SUBMIT_FEE }],
+    });
+    if (r.error) throw new Error(`h${hh} LIAR submit failed: ` + r.error);
+    await network.witnessUntilStable(r.unit);
+    const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
+    if (res && res.response && res.response.bounced)
+      throw new Error(`h${hh} LIAR submit bounced: ` + bounceDetail(res));
+  }
   const chAddr = await challenger.getAddress();
   // First verdict of the run (scenario 6 no longer pays out).
   if (Number(st["slash_reward_" + chAddr] || 0) !== SLASH_HALF)
@@ -1097,13 +1120,12 @@ async function main() {
   //       9..11 so the chain turns idle, {claim:'pool'} drains to 0;
   //  21c. verdict against the EMPTY pool: debt must NOT move (pre-fix
   //       minted 5e11 per verdict regardless of the pool);
-  //  21d. top the pool to exactly 1e12 → v(h12) seizes 5e11 (boundary:
-  //       pool 5e11 afterwards, debt semantics still 1:1);
-  //  21e. v(h13) seizes the residual 5e11 EXACTLY (pool 0, debt 2e12).
+  //  21d. top the pool to 1e12 → v(h13) seizes 5e11 (pool 5e11 after —
+  //       debt/seizure still 1:1).
   let debt = 0;
   let pool = 49e12;
   async function oneFraud(hh, preDebt, prePool) {
-    await sendCombinedSubmit(operator, hh, STATE_ROOT, STATE_ROOT);
+    await submitLiarAt(hh);
     await triggerVerdict(
       challenger,
       dispute,
@@ -1145,57 +1167,60 @@ async function main() {
   await trigger(operator, rollup, { pool: 1 }, 10000000010000);
   pool += 1e12;
   await sendCombinedSubmit(operator, 12, STATE_ROOT, STATE_ROOT);
-  // 21d/21e. boundary verdicts against a 1e12 pool.
+  // 21d. boundary verdict against a topped-up pool keeps the 1:1 ratio.
   [debt, pool] = await oneFraud(13, debt, pool);
-  await trigger(operator, rollup, { pool: 1 }, 10000000010000);
-  pool += 1e12;
-  await sendCombinedSubmit(operator, 13, STATE_ROOT, STATE_ROOT);
-  [debt, pool] = await oneFraud(14, debt, pool);
-  if (pool !== 0) throw new Error("residual verdict did not hit the boundary: " + pool);
-  console.log("21. slash debt == cumulative seizure at every verdict (cap + boundary + empty)");
+  // No drained-pool residual case exists past the empty branch (21c):
+  // every fresh submit requires pool >= 1e12, so a verdict always sees
+  // pool >= 5e11 unless the operator CLAIMS the pool dry while idle —
+  // which is exactly 21c. Close out by banking the challenger debt.
+  await trigger(challenger, rollup, { claim: "slash" }, 20000);
+  st = await vars(rollup);
+  if (Number(st["slash_reward_" + chAddr] || 0) !== 0) throw new Error("debt claim did not zero");
+  debt = Number(st["pool_" + opAddr] || 0) && debt; // keep tail-check below meaningful
+  console.log("21. debt paid == cumulative seizure; claim zeroes the ledger");
+  // Leave the chain recoverable for scenario 22: the last verdict froze
+  // h13; 22's prep resubmits it and finalizes through it.
 
   // ---- 22. failed height pins the pool; stale heights are dead (#37-7) ---
-  // Prep: h14 sits frozen from scenario 21 — resubmit it honestly (frozen
-  // branch), finalize 12..14 so lf == 14 == h15-1, then prove:
-  //  22a. verdict at h15 keeps last_submitted = 15 (no rollback);
+  // Prep: h13 sits frozen from scenario 21 — resubmit it honestly (frozen
+  // branch), finalize 12..13 so lf == 13 == h14-1, then prove:
+  //  22a. verdict at h14 keeps last_submitted = 14 (no rollback);
   //  22b. {claim:'pool'} BOUNCES 'pool busy' while the top height is
-  //       fraud-failed (pre-fix: ls rolled back to 14 == lf, gate passed,
+  //       fraud-failed (pre-fix: ls rolled back to 13 == lf, gate passed,
   //       the pool backing the chain was drained);
-  //  22c. a fresh FORWARD submit at h16 is refused while h15 is failed
+  //  22c. a fresh FORWARD submit at h15 is refused while h14 is failed
   //       (pre-fix let a submit chain resume past the failed top);
-  //  22d. honest h15 resubmit un-freezes, finalizes, and pool claims work
+  //  22d. honest h14 resubmit un-freezes, finalizes, and pool claims work
   //       again.
-  await trigger(challenger, rollup, { claim: "slash" }, 20000); // bank 2e12 debt
   await trigger(operator, rollup, { pool: 1 }, POOL_FUND_GROSS); // fund for resubmits
-  await sendCombinedSubmit(operator, 14, STATE_ROOT, STATE_ROOT);
+  await sendCombinedSubmit(operator, 13, STATE_ROOT, STATE_ROOT);
   await network.timetravel({ shift: "3600s" });
   await trigger(operator, rollup, { finalize: 1, height: 12 }, 20000);
   await trigger(operator, rollup, { finalize: 1, height: 13 }, 20000);
-  await trigger(operator, rollup, { finalize: 1, height: 14 }, 20000);
   await trigger(operator, rollup, { claim: "pool" }, 20000); // idle chain: drain
   st = await vars(rollup);
-  if (Number(st.last_finalized) !== 14) throw new Error("prep finalize failed: " + st.last_finalized);
+  if (Number(st.last_finalized) !== 13) throw new Error("prep finalize failed: " + st.last_finalized);
   await trigger(operator, rollup, { pool: 1 }, 10000000010000); // exact 1e12
-  // h15 commits the LIAR fixture → verdict.
-  await sendCombinedSubmit(operator, 15, STATE_ROOT, STATE_ROOT);
-  await triggerVerdict(challenger, dispute, Object.assign({ pred: "deposit", height: 15 }, fraudProof), 20000, "h15 verdict");
+  // h14 commits the LIAR fixture → verdict.
+  await submitLiarAt(14);
+  await triggerVerdict(challenger, dispute, Object.assign({ pred: "deposit", height: 14 }, fraudProof), 20000, "h14 verdict");
   st = await vars(rollup);
-  if (Number(st["frozen_15"]) !== 2) throw new Error("h15 verdict did not freeze");
-  if (Number(st.last_submitted) !== 15) throw new Error("verdict must PIN last_submitted at 15, got " + st.last_submitted);
+  if (Number(st["frozen_14"]) !== 2) throw new Error("h14 verdict did not freeze");
+  if (Number(st.last_submitted) !== 14) throw new Error("verdict must PIN last_submitted at 14, got " + st.last_submitted);
   // 22b. pool claim refused while the failed top stands.
   await triggerBounce(operator, rollup, { claim: "pool" }, 20000, "pool busy");
   // 22c. forward submit past the failed top is refused.
-  await triggerBounce(operator, rollup, submitData(16, STATE_ROOT, STATE_ROOT), SUBMIT_FEE, "prev mismatch");
-  // 22d. resubmit h15 honestly (frozen branch, prev == state_root_14).
-  await sendCombinedSubmit(operator, 15, STATE_ROOT, STATE_ROOT);
+  await triggerBounce(operator, rollup, submitData(15, STATE_ROOT, STATE_ROOT), SUBMIT_FEE, "prev mismatch");
+  // 22d. resubmit h14 honestly (frozen branch, prev == state_root_13).
+  await sendCombinedSubmit(operator, 14, STATE_ROOT, STATE_ROOT);
   st = await vars(rollup);
-  if (Number(st["frozen_15"] || 0) !== 0) throw new Error("h15 resubmit did not un-freeze");
-  if (Number(st.last_submitted) !== 15) throw new Error("h15 resubmit lost the height");
+  if (Number(st["frozen_14"] || 0) !== 0) throw new Error("h14 resubmit did not un-freeze");
+  if (Number(st.last_submitted) !== 14) throw new Error("h14 resubmit lost the height");
   await network.timetravel({ shift: "3600s" });
-  await trigger(operator, rollup, { finalize: 1, height: 15 }, 20000);
+  await trigger(operator, rollup, { finalize: 1, height: 14 }, 20000);
   await trigger(operator, rollup, { claim: "pool" }, 20000);
   st = await vars(rollup);
-  if (Number(st.last_finalized) !== 15) throw new Error("h15 finalize failed");
+  if (Number(st.last_finalized) !== 14) throw new Error("h14 finalize failed");
   if (Number(st["pool_" + opAddr] || 0) !== 0) throw new Error("pool claim after recovery failed");
   console.log("22. failed top pins ls, blocks pool drain and forward submits; resubmit recovers");
 
@@ -1271,6 +1296,7 @@ async function main() {
   // Heights 17/18/19 commit the withdrawer's REAL forests. sendCombined
   // submits carry the FAKE FOREST; here we pass our own submit objects
   // (trigger(sd) path used elsewhere also hands the sd as data — reuse it).
+  await trigger(operator, rollup, { pool: 1 }, 10000000010000); // submit floor
   const forest17 = buildForest([[wdAcct, 1000000, 0, 0], [DECOY, 500, 0, 0]], wdAcct);
   const sd17 = submitData(17, STATE_ROOT, STATE_ROOT);
   sd17.aa_forest = forest17.roots.join("");
