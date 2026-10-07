@@ -206,6 +206,8 @@ function submitData(height, stateRoot, prev) {
     state_root: stateRoot,
     prev_state_hash: prev,
     aa_forest: FOREST,
+    // #37-4: real fold binding — forest hash must equal sha256(forest).
+    aa_root: sha256Hex(FOREST),
     wit_root: WIT_ROOT,
     trace_root: TRACE_ROOT,
     units_root: UNITS_ROOT,
@@ -230,7 +232,7 @@ function headerFromSubmit(sd, frameOp) {
     height: sd.height,
     prev_state_hash: sd.prev_state_hash,
     state_root: sd.state_root,
-    aa_root: sha256Hex("aa"),
+    aa_root: sha256Hex(sd.aa_forest || ""),
     aa_shard_roots: Array(16).fill(sha256Hex("shard")),
     last_unit: sha256Hex("last"),
     seq: sd.height,
@@ -295,8 +297,9 @@ async function main() {
     .with.agent({ vault: VAULT_SRC })
     .with.wallet({ operator: 2e14 })
     .with.wallet({ challenger: 1e13 })
+    .with.wallet({ challenger2: 2e13 })
     .run();
-  const { operator, challenger } = network.wallet;
+  const { operator, challenger, challenger2 } = network.wallet;
   const rollup = network.agent.rollup;
   const dispute = network.agent.dispute;
   const fill = network.agent.fill;
@@ -480,6 +483,29 @@ async function main() {
   };
   await triggerVerdict(challenger, dispute, Object.assign({ pred: "deposit", height: 2 }, fraudProof), 20000, "deposit fraud predicate");
   st = await vars(rollup);
+  // Batch-B scenarios re-commit the SAME LIAR fixture at later fresh
+  // heights, so the deposit predicate's stale-root check passes.
+  async function submitLiarAt(hh) {
+    const sd = submitData(hh, STATE_ROOT, STATE_ROOT);
+    sd.ops_root = OPS_ROOT1;
+    sd.trace_root = LIAR_TRACE_ROOT1;
+    sd.units_root = UNITS_SET_ROOT;
+    sd.units_set_root = SET_ROOT1;
+    sd.fills_root = FILLS_ROOT;
+    sd.unit_count = 1;
+    sd.wit_root = WIT_ROOT;
+    sd.wit_count = GEN_WIT_COUNT;
+    const header = headerFromSubmit(sd);
+    const r = await operator.sendMulti({
+      messages: [tempDataMsg(header), { app: "data", payload: sd }],
+      base_outputs: [{ address: rollup, amount: SUBMIT_FEE }],
+    });
+    if (r.error) throw new Error(`h${hh} LIAR submit failed: ` + r.error);
+    await network.witnessUntilStable(r.unit);
+    const res = await network.getAaResponseToUnit(r.unit).catch(() => null);
+    if (res && res.response && res.response.bounced)
+      throw new Error(`h${hh} LIAR submit bounced: ` + bounceDetail(res));
+  }
   const chAddr = await challenger.getAddress();
   // First verdict of the run (scenario 6 no longer pays out).
   if (Number(st["slash_reward_" + chAddr] || 0) !== SLASH_HALF)
@@ -1063,6 +1089,270 @@ async function main() {
   if (Number(st.frozen_9 || 0) !== 0) throw new Error("honest isolated open froze h9!");
   if (Number(st.last_submitted) !== 9) throw new Error("honest h9 re-submit did not land");
   console.log("19c. honest isolated open bounced 'no fraud' via sentinel right neighbor");
+
+  // ===== Batch B (#37): 4 aa_root binding / 6 slash debt cap / 7 ls pins //
+  // ===== + pool drain / 11 vault balance formula + freshness lock       //
+  // ---- 20. aa_root fold binding: bogus (forest, root) pair bounces -----
+  // The 1024-hex forest is bound to one sha256 fold the operator cannot
+  // decouple (pre-fix the submit gate only length-checked aa_root and
+  // stored any pair; finalize/vault trusted the stored 1024-hex forest,
+  // letting a detached corpus pay the vault — #37-4's exploit).
+  {
+    const sdWrong = submitData(10, STATE_ROOT, STATE_ROOT);
+    sdWrong.aa_root = sha256Hex("wrong-fold"); // length ok, fold wrong
+    await triggerBounce(operator, rollup, sdWrong, SUBMIT_FEE, "bad submit");
+    // The right fold stays the same FOREST everywhere else: every other
+    // submit in this run (helper submitData) already carries the real
+    // fold — assert a correct one is ACCEPTED here, h10 fresh.
+    st = await vars(rollup);
+    if (Number(st.last_submitted) !== 9) throw new Error("h10 wrong-fold submit must not advance ls: " + st.last_submitted);
+    await sendCombinedSubmit(operator, 10, STATE_ROOT, STATE_ROOT);
+    st = await vars(rollup);
+    if (Number(st.last_submitted) !== 10) throw new Error("h10 honest submit failed");
+    if (st.aa_root_10 !== sha256Hex(FOREST)) throw new Error("aa_root_10 fold not stored");
+  }
+  console.log("20. aa_root fold bound at submit: bogus pair bounces, honest pair lands");
+
+  // ---- 21. slash debt is bounded by the ACTUALLY-seized pool (#37-6) ----
+  // Verdict credit must be exactly min(5e11, pool-before-verdict):
+  //  21a. pool 49e12 → v(h11) seizes 5e11 (debt 5e11, pool 48.5e12);
+  //  21b. drain-by-claim: resubmit h11 honestly (frozen branch), finalize
+  //       9..11 so the chain turns idle, {claim:'pool'} drains to 0;
+  //  21c. verdict against the EMPTY pool: debt must NOT move (pre-fix
+  //       minted 5e11 per verdict regardless of the pool);
+  //  21d. top the pool to 1e12 → v(h13) seizes 5e11 (pool 5e11 after —
+  //       debt/seizure still 1:1).
+  let debt = 0;
+  let pool = 49e12;
+  async function oneFraud(hh, preDebt, prePool) {
+    await submitLiarAt(hh);
+    await triggerVerdict(
+      challenger,
+      dispute,
+      Object.assign({ pred: "deposit", height: hh }, fraudProof),
+      20000,
+      "deposit fraud predicate h" + hh
+    );
+    st = await vars(rollup);
+    if (Number(st["frozen_" + hh]) !== 2) throw new Error("h" + hh + " verdict did not freeze");
+    const seized = Math.min(SLASH_HALF, prePool);
+    const afterDebt = Number(st["slash_reward_" + chAddr] || 0);
+    const afterPool = Number(st["pool_" + opAddr] || 0);
+    if (afterDebt !== preDebt + seized)
+      throw new Error(`h${hh} debt ${afterDebt} != banked ${preDebt} + seized ${seized} (pool was ${prePool})`);
+    if (afterPool !== prePool - seized)
+      throw new Error(`h${hh} pool ${afterPool} != ${prePool} - ${seized}`);
+    console.log(`21. h${hh}: seized ${seized}, debt ${afterDebt}, pool ${afterPool}`);
+    return [afterDebt, afterPool];
+  }
+  [debt, pool] = await oneFraud(11, 0, 49e12);
+  // 21b. resubmit h11 honestly, finalize 9..11, claim the pool to 0.
+  await sendCombinedSubmit(operator, 11, STATE_ROOT, STATE_ROOT);
+  st = await vars(rollup);
+  if (Number(st["frozen_11"] || 0) !== 0) throw new Error("h11 resubmit did not un-freeze");
+  await network.timetravel({ shift: "3600s" });
+  await trigger(operator, rollup, { finalize: 1, height: 9 }, 20000);
+  await trigger(operator, rollup, { finalize: 1, height: 10 }, 20000);
+  await trigger(operator, rollup, { finalize: 1, height: 11 }, 20000);
+  await trigger(operator, rollup, { claim: "pool" }, 20000);
+  st = await vars(rollup);
+  pool = Number(st["pool_" + opAddr] || 0);
+  if (pool !== 0) throw new Error("pool not drained by claim: " + pool);
+  console.log("21. pool drained to 0 via idle-chain claim");
+  // 21c. verdict on an empty pool must mint NOTHING.
+  [debt, pool] = await oneFraud(12, debt, 0);
+  if (debt !== 5e11) throw new Error("empty-pool verdict minted debt: " + debt);
+  console.log("21. empty-pool verdict: seize 0, debt stays " + debt);
+  // resubmit h12 honestly (needs the pool floor: top up first).
+  await trigger(operator, rollup, { pool: 1 }, 10000000010000);
+  pool += 1e12;
+  await sendCombinedSubmit(operator, 12, STATE_ROOT, STATE_ROOT);
+  // 21d. boundary verdict against a topped-up pool keeps the 1:1 ratio.
+  [debt, pool] = await oneFraud(13, debt, pool);
+  // No drained-pool residual case exists past the empty branch (21c):
+  // every fresh submit requires pool >= 1e12, so a verdict always sees
+  // pool >= 5e11 unless the operator CLAIMS the pool dry while idle —
+  // which is exactly 21c. Close out by banking the challenger debt.
+  await trigger(challenger, rollup, { claim: "slash" }, 20000);
+  st = await vars(rollup);
+  if (Number(st["slash_reward_" + chAddr] || 0) !== 0) throw new Error("debt claim did not zero");
+  debt = Number(st["pool_" + opAddr] || 0) && debt; // keep tail-check below meaningful
+  console.log("21. debt paid == cumulative seizure; claim zeroes the ledger");
+  // Leave the chain recoverable for scenario 22: the last verdict froze
+  // h13; 22's prep resubmits it and finalizes through it.
+
+  // ---- 22. failed height pins the pool; stale heights are dead (#37-7) ---
+  // Prep: h13 sits frozen from scenario 21 — resubmit it honestly (frozen
+  // branch), finalize 12..13 so lf == 13 == h14-1, then prove:
+  //  22a. verdict at h14 keeps last_submitted = 14 (no rollback);
+  //  22b. {claim:'pool'} BOUNCES 'pool busy' while the top height is
+  //       fraud-failed (pre-fix: ls rolled back to 13 == lf, gate passed,
+  //       the pool backing the chain was drained);
+  //  22c. a fresh FORWARD submit at h15 is refused while h14 is failed
+  //       (pre-fix let a submit chain resume past the failed top);
+  //  22d. honest h14 resubmit un-freezes, finalizes, and pool claims work
+  //       again.
+  await trigger(operator, rollup, { pool: 1 }, POOL_FUND_GROSS); // fund for resubmits
+  await sendCombinedSubmit(operator, 13, STATE_ROOT, STATE_ROOT);
+  await network.timetravel({ shift: "3600s" });
+  await trigger(operator, rollup, { finalize: 1, height: 12 }, 20000);
+  await trigger(operator, rollup, { finalize: 1, height: 13 }, 20000);
+  await trigger(operator, rollup, { claim: "pool" }, 20000); // idle chain: drain
+  st = await vars(rollup);
+  if (Number(st.last_finalized) !== 13) throw new Error("prep finalize failed: " + st.last_finalized);
+  await trigger(operator, rollup, { pool: 1 }, 10000000010000); // exact 1e12
+  // h14 commits the LIAR fixture → verdict.
+  await submitLiarAt(14);
+  await triggerVerdict(challenger, dispute, Object.assign({ pred: "deposit", height: 14 }, fraudProof), 20000, "h14 verdict");
+  st = await vars(rollup);
+  if (Number(st["frozen_14"]) !== 2) throw new Error("h14 verdict did not freeze");
+  if (Number(st.last_submitted) !== 14) throw new Error("verdict must PIN last_submitted at 14, got " + st.last_submitted);
+  // 22b. pool claim refused while the failed top stands.
+  await triggerBounce(operator, rollup, { claim: "pool" }, 20000, "pool busy");
+  // 22c. forward submit past the failed top is refused.
+  await triggerBounce(operator, rollup, submitData(15, STATE_ROOT, STATE_ROOT), SUBMIT_FEE, "prev mismatch");
+  // 22d. resubmit h14 honestly (frozen branch, prev == state_root_13).
+  await sendCombinedSubmit(operator, 14, STATE_ROOT, STATE_ROOT);
+  st = await vars(rollup);
+  if (Number(st["frozen_14"] || 0) !== 0) throw new Error("h14 resubmit did not un-freeze");
+  if (Number(st.last_submitted) !== 14) throw new Error("h14 resubmit lost the height");
+  await network.timetravel({ shift: "3600s" });
+  await trigger(operator, rollup, { finalize: 1, height: 14 }, 20000);
+  await trigger(operator, rollup, { claim: "pool" }, 20000);
+  st = await vars(rollup);
+  if (Number(st.last_finalized) !== 14) throw new Error("h14 finalize failed");
+  if (Number(st["pool_" + opAddr] || 0) !== 0) throw new Error("pool claim after recovery failed");
+  console.log("22. failed top pins ls, blocks pool drain and forward submits; resubmit recovers");
+
+  // ---- 23. vault withdraw: W-watermark gate (#37-11) + fold binding (#37-4)
+  // Real sharded forest (hex domain) over the WITHDRAWER address, built in
+  // JS with the SAME fold the AA runs (leaf=sha256('acct:a:c:p:w'), node=
+  // sha256_hex(left||right), odd level duplicates its last element). Three
+  // finals (h17/h18/h19 each commit the heights' forest):
+  //   F@17: (col=1000000, W=0)               → claim 700000 (issue shape:
+  //        pre-fix needing col<=amount<=min(col,W) bricked here since the
+  //        sidechain had ALREADY debited the 700000)
+  //   F@18: (col=300000, W=700000), claim 700000 → wd_=700000
+  //   F@19: (col=0, W=1000000), claim 300000 → wd_=1000000 (no dead-end)
+  //   replay of the h17 leaf (W=0, amount=0) after wd_ advanced → the
+  //   watermark bounces it (clamped by amount+wd_ <= W).
+  // Decoy peer keeps the withdrawer's shard bucket >= 2 members (empty
+  // proof arrays are illegal in trigger data) and carries no address
+  // binding (nobody can claim it).
+  const wdShard = (addr) => {
+    const h = sha256Hex(addr);
+    return parseInt(h.slice(0, 2), 16) & 15;
+  };
+  const hexLeafOf = (addr, col, perp, w) => sha256Hex(`acct:${addr}:${col}:${perp}:${w}`);
+  const foldLR = (l, r) => sha256Hex(l + r);
+  function shardRoot(bucket, addr) {
+    let level = bucket.map(([a, c, p, w]) => hexLeafOf(a, c, p, w)).sort();
+    // Sibling path for addr inside this bucket (same walk as the AA).
+    const leaf = hexLeafOf(addr, ...bucket.find(([a]) => a === addr).slice(1));
+    let idx = level.indexOf(leaf);
+    let sibs = [];
+    while (level.length > 1) {
+      if (level.length % 2 === 1) level.push(level[level.length - 1]);
+      const pairIdx = idx ^ 1;
+      sibs.push({ hash: level[pairIdx], right: pairIdx > idx });
+      const nxt = [];
+      for (let j = 0; j < level.length; j += 2) nxt.push(foldLR(level[j], level[j + 1]));
+      level = nxt;
+      idx = idx >> 1;
+    }
+    return [level[0], sibs];
+  }
+  function buildForest(pairs, wdAddr) {
+    const buckets = Array.from({ length: 16 }, () => []);
+    for (const pr of pairs) buckets[wdShard(pr[0])].push(pr);
+    const wdBucket = buckets[wdShard(wdAddr)];
+    const [wdRoot, sibs] = shardRoot(wdBucket, wdAddr);
+    const roots = [];
+    for (let i = 0; i < 16; i++) {
+      if (buckets[i].length === 0) { roots[i] = sha256Hex("empty:" + i); continue; }
+      const [r] = shardRoot(buckets[i], buckets[i][0][0]);
+      roots[i] = r;
+    }
+    roots[wdShard(wdAddr)] = wdRoot;
+    return { roots, sibs, shard: wdShard(wdAddr) };
+  }
+  const DECOY = "5B7BJSCMFQYUOLDLJHROMOKC5QCLPZLK3UEE4O25";
+  async function vaultWithdrawTrigger(wdAddr, forest, amount, withdrawn, col, proof) {
+    return operator.triggerAaWithData({
+      toAddress: vault,
+      amount: 20000,
+      data: {
+        withdraw: 1, amount, withdrawn, leaf_account: wdAddr,
+        collateral: String(col), perp: "0", shard: forest.shard, proof,
+      },
+    });
+  }
+  // Seed the vault: 1 USD deposit (1_000_000 micro) + bounce fee headroom.
+  const dep1 = await operator.triggerAaWithData({
+    toAddress: vault, amount: 1000000 + 10000, data: { deposit: 1 },
+  });
+  if (dep1.error) throw new Error("vault deposit failed: " + dep1.error);
+  await network.witnessUntilStable(dep1.unit);
+  // Heights 17/18/19 commit the withdrawer's REAL forests. sendCombined
+  // submits carry the FAKE FOREST; here we pass our own submit objects
+  // (trigger(sd) path used elsewhere also hands the sd as data — reuse it).
+  await trigger(operator, rollup, { pool: 1 }, 10000000010000); // submit floor
+  const forest17 = buildForest([[wdAcct, 1000000, 0, 0], [DECOY, 500, 0, 0]], wdAcct);
+  const sd17 = submitData(17, STATE_ROOT, STATE_ROOT);
+  sd17.aa_forest = forest17.roots.join("");
+  sd17.aa_root = sha256Hex(sd17.aa_forest);
+  await trigger(operator, rollup, sd17, SUBMIT_FEE);
+  await network.timetravel({ shift: "3600s" });
+  await trigger(operator, rollup, { finalize: 1, height: 17 }, 20000);
+  // h17 leaf (col=1e6, W=0): W=0 authorizes ZERO vault payout.
+  await triggerBounce(operator, vault, {
+    withdraw: 1, amount: 700000, withdrawn: 0, leaf_account: wdAcct,
+    collateral: "1000000", perp: "0", shard: forest17.shard, proof: forest17.sibs,
+  }, 20000, "bad claim amount");
+  // h18: sidechain withdraw 700000 → leaf (col=300000, W=700000).
+  const forest18 = buildForest([[wdAcct, 300000, 0, 700000], [DECOY, 500, 0, 0]], wdAcct);
+  const sd18 = submitData(18, STATE_ROOT, STATE_ROOT);
+  sd18.aa_forest = forest18.roots.join("");
+  sd18.aa_root = sha256Hex(sd18.aa_forest);
+  await trigger(operator, rollup, sd18, SUBMIT_FEE);
+  await network.timetravel({ shift: "3600s" });
+  await trigger(operator, rollup, { finalize: 1, height: 18 }, 20000);
+  const res18 = await vaultWithdrawTrigger(wdAcct, forest18, 700000, 700000, 300000, forest18.sibs);
+  if (res18.error) throw new Error("h18 withdraw trigger failed: " + res18.error);
+  await network.witnessUntilStable(res18.unit);
+  const rr18 = await network.getAaResponseToUnit(res18.unit).catch(() => null);
+  const log18 = JSON.stringify(rr18 || {});
+  if (log18.includes('"bounced":true')) throw new Error("h18 withdraw bounced: " + bounceDetail(rr18));
+  st = await vars(vault);
+  if (Number(st["wd_" + wdAcct] || 0) !== 700000) throw new Error("wd_ not advanced: " + JSON.stringify(st["wd_" + wdAcct]));
+  console.log("23. issue example (col=300k, W=700k) pays the pending 700k — no brick");
+  // Old-leaf replay: h17's leaf (W=0, amount 0) — watermark bounces it.
+  await triggerBounce(operator, vault, {
+    withdraw: 1, amount: 0, withdrawn: 0, leaf_account: wdAcct,
+    collateral: "1000000", perp: "0", shard: forest17.shard, proof: forest17.sibs,
+  }, 20000, "bad claim amount");
+  // h19: residual (col=0, W=1000000) — pays the last 300000 (no dead-end).
+  const forest19 = buildForest([[wdAcct, 0, 0, 1000000], [DECOY, 500, 0, 0]], wdAcct);
+  const sd19 = submitData(19, STATE_ROOT, STATE_ROOT);
+  sd19.aa_forest = forest19.roots.join("");
+  sd19.aa_root = sha256Hex(sd19.aa_forest);
+  await trigger(operator, rollup, sd19, SUBMIT_FEE);
+  await network.timetravel({ shift: "3600s" });
+  await trigger(operator, rollup, { finalize: 1, height: 19 }, 20000);
+  const res19 = await vaultWithdrawTrigger(wdAcct, forest19, 300000, 1000000, 0, forest19.sibs);
+  if (res19.error) throw new Error("h19 residual withdraw trigger failed: " + res19.error);
+  await network.witnessUntilStable(res19.unit);
+  const rr19 = await network.getAaResponseToUnit(res19.unit).catch(() => null);
+  const log19 = JSON.stringify(rr19 || {});
+  if (log19.includes('"bounced":true')) throw new Error("h19 residual withdraw bounced: " + bounceDetail(rr19));
+  st = await vars(vault);
+  if (Number(st["wd_" + wdAcct] || 0) !== 1000000) throw new Error("residual claim failed: " + JSON.stringify(st["wd_" + wdAcct]));
+  // Post-drain replay of the h19 leaf with amount 1 — watermark stops it.
+  await triggerBounce(operator, vault, {
+    withdraw: 1, amount: 1, withdrawn: 1000000, leaf_account: wdAcct,
+    collateral: "0", perp: "0", shard: forest19.shard, proof: forest19.sibs,
+  }, 20000, "bad claim amount");
+  console.log("23. sequential withdrawals drain the deposit with no dead-end; replays bounce");
 
   process.exit(failures === 0 ? 0 : 1);
 }

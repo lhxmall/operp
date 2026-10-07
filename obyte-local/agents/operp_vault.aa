@@ -17,11 +17,18 @@
 	// withdraw requires amount, withdrawn, leaf_account, collateral, perp,
 	// shard, proof. shard = the account shard index 0..15; perp = proven
 	// PERP balance (may be 0); withdrawn = leaf cumulative withdrawal total
-	// W. The AA enforces amount + wd_<addr> <= min(collateral, withdrawn)
-	// (amount non-negative; decimal strings capped at 15 chars); optional
-	// perp_amount claims less than the full PERP remainder. proof = sibling
-	// list within the shard tree (depth <= 16); the AA folds it, extracts
-	// the claimed shard root via substring(shard*64, 64) and compares.
+	// W — the sidechain's own debit record and the ONLY payment authority
+	// (#37-11): the gate is amount + wd_<addr> <= withdrawn, so payouts are
+	// bounded by debited-withdrawn bytes, wd_ advances kill stale-leaf
+	// replays, and later forests raise W so sequential withdrawals never
+	// dead-end (the old min(collateral, withdrawn) gate brick accounts
+	// whose W exceed their residual collateral; amount non-negative;
+	// decimal strings capped at 15 chars); optional perp_amount claims
+	// less than the full PERP remainder. proof = sibling list within the
+	// shard tree (depth <= 16); the AA folds it, extracts the claimed
+	// shard root via substring(shard*64, 64) and compares.
+	// #37-4: the finalized forest must fold to the rollup's stored
+	// aa_root_<h> before any shard root is consulted.
 	// Empty shards commit a distinct sentinel root off-chain so zero-proofs
 	// cannot hop shards. ROLLUP_AA_HERE is substituted at deploy/test time.
 	// State vars: wd_<addr> (cumulative base withdrawn), wp_<addr>
@@ -93,6 +100,14 @@
 						bounce('bad shard');
 					// Root source: the rollup's finalized forest.
 					$src = var['ROLLUP_AA_HERE']['aa_forest_' || $h];
+					// #37-4: the finalized forest must fold to the height's
+					// stored forest hash — vault cannot trust a forest
+					// corpus the rollup never anchored (submit stores
+					// aa_root_<h>; rollup finalize re-checks the fold, and
+					// this recheck keeps the payment side bound to the
+					// same pair).
+					if (sha256($src, 'hex') != var['ROLLUP_AA_HERE']['aa_root_' || $h])
+						bounce('bad forest hash');
 					// perp length cap must run BEFORE the subtraction below: a
 					// malformed over-15-digit string would fatal in the
 					// arithmetic instead of bouncing (same short-circuit issue
@@ -121,13 +136,38 @@
 					if ($perp_claimed > 0)
 						bounce('perp claim needs burn');
 					// Length caps come FIRST: OR short-circuits, so a malformed
-					// over-15-digit string must bounce here — reaching `min`
-					// below with such input would fatal (not a decimal) instead
-					// of bouncing, and the cap would never be evaluated.
+					// over-15-digit string must bounce here — reaching the
+					// arithmetic below with such input would fatal (not a
+					// decimal) instead of bouncing, and the cap would never
+					// be evaluated.
+					//
+					// #37-11: the ONLY spendable-by-vault quantity a leaf
+					// commits is its cumulative-withdrawn W — the bytes the
+					// sidechain has already DEBITED from the account and now
+					// owes as a cash payout. The leaf's `collateral` column
+					// is live trading balance (fills/Liq/funding move it
+					// without any withdrawal op), so it can never gate a
+					// payment: capping on col (or min(col, W), the old
+					// double-count) permanently bricks any account whose
+					// cumulative W ever exceeded its residual col (issue
+					// example: deposit 1000, sidechain withdraw 700 → leaf
+					// (300, 700): the payout of those 700 was refused).
+					// The sound gate is amount + wd_ <= leaf.withdrawn:
+					//   • payments are bounded by the sidechain's own debit
+					//     record (W), so Σ payments ≤ Σ W ≤ Σ deposits —
+					//     the vault's AA balance stays solvent over all
+					//     accounts, not just this one;
+					//   • wd_ advances on every payout, so a replay of ANY
+					//     staler leaf (smaller W) fails the cap without a
+					//     second freshness var — the proven W is itself the
+					//     freshness watermark;
+					//   • later finalized forests raise W, so sequential
+					//     honest withdrawals (700 then the residual 300)
+					//     each pay out without dead-ending.
 					if (trigger.data.leaf_account != trigger.address
 						OR length(trigger.data.collateral) > 15 OR length(trigger.data.perp) > 15 OR length(trigger.data.withdrawn) > 15
 						OR trigger.data.amount < 0
-						OR trigger.data.amount + (var['wd_' || trigger.address] otherwise 0) > min(trigger.data.collateral, trigger.data.withdrawn)
+						OR trigger.data.amount + (var['wd_' || trigger.address] otherwise 0) > trigger.data.withdrawn
 						OR $perp_claimed < 0)
 						bounce('bad claim amount');
 					$fold = ($acc, $i, $sib) => (!$acc OR !$sib.hash) ? false

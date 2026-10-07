@@ -288,6 +288,10 @@ async function main() {
     height: header.height,
     prev_state_hash: header.prev_state_hash,
     state_root: header.state_root,
+    // #37-4: the forest hash must ride the submit alongside its
+    // 1024-hex expansion so the rollup AA can bind finalize and
+    // vault payments to the submitted corpus.
+    aa_root: header.aa_root || require("crypto").createHash("sha256").update(aaForest, "utf8").digest("hex"),
     aa_forest: aaForest,
     assertion_version: header.assertion_version || 1,
     wit_root: header.wit_root,
